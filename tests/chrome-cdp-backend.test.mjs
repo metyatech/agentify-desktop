@@ -400,3 +400,106 @@ test('chrome-cdp-backend: start does not reuse a disconnected client as healthy 
     await backend.dispose();
   }
 });
+
+async function createSessionWithFileInputs(selectorNodeIds) {
+  const calls = [];
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  backend.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}, sessionId) => {
+      calls.push({ method, params, sessionId });
+      if (method === 'Target.createTarget') return { targetId: 'file-target' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'file-session' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 9 };
+      if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+      if (method === 'DOM.querySelectorAll') return { nodeIds: selectorNodeIds[params.selector] || [] };
+      if (method === 'DOM.setFileInputFiles') return {};
+      return {};
+    }
+  };
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  return { session, calls };
+}
+
+test('chrome-cdp-backend: selector-targeted file input uses only the selected node', async () => {
+  const { session, calls } = await createSessionWithFileInputs({
+    '#upload-files': [101],
+    'input[type="file"]': [101, 102, 103]
+  });
+
+  const result = await session.page.setFileInputFiles(['C:\\tmp\\attachment.txt'], { selector: '#upload-files' });
+
+  assert.deepEqual(result, { selector: '#upload-files', found: 1, nodeId: 101 });
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.querySelectorAll').map((call) => call.params.selector),
+    ['#upload-files']
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.setFileInputFiles').map((call) => call.params.nodeId),
+    [101]
+  );
+});
+
+test('chrome-cdp-backend: selector-targeted input never uses photo or camera nodes', async () => {
+  const { session, calls } = await createSessionWithFileInputs({
+    '#upload-files': [201],
+    '#upload-photos': [202],
+    '#upload-camera': [203]
+  });
+
+  await session.page.setFileInputFiles(['C:\\tmp\\attachment.txt'], { selector: '#upload-files' });
+
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.setFileInputFiles').map((call) => call.params.nodeId),
+    [201]
+  );
+  assert.equal(calls.some((call) => call.method === 'DOM.querySelectorAll' && call.params.selector !== '#upload-files'), false);
+});
+
+test('chrome-cdp-backend: missing selector-targeted input does not fall back to another file input', async () => {
+  const { session, calls } = await createSessionWithFileInputs({
+    '#upload-files': [],
+    'input[type="file"]': [301, 302, 303]
+  });
+
+  await assert.rejects(
+    session.page.setFileInputFiles(['C:\\tmp\\attachment.txt'], { selector: '#upload-files' }),
+    (error) => {
+      assert.equal(error.message, 'missing_file_input');
+      assert.deepEqual(error.data, { selector: '#upload-files', found: 0 });
+      return true;
+    }
+  );
+
+  assert.equal(calls.some((call) => call.method === 'DOM.setFileInputFiles'), false);
+  assert.equal(calls.some((call) => call.method === 'DOM.querySelectorAll' && call.params.selector === 'input[type="file"]'), false);
+});
+
+test('chrome-cdp-backend: ambiguous selector-targeted input does not set files', async () => {
+  const { session, calls } = await createSessionWithFileInputs({ '#upload-files': [401, 402] });
+
+  await assert.rejects(
+    session.page.setFileInputFiles(['C:\\tmp\\attachment.txt'], { selector: '#upload-files' }),
+    (error) => {
+      assert.equal(error.message, 'ambiguous_file_input');
+      assert.deepEqual(error.data, { selector: '#upload-files', found: 2 });
+      return true;
+    }
+  );
+
+  assert.equal(calls.some((call) => call.method === 'DOM.setFileInputFiles'), false);
+});
+
+test('chrome-cdp-backend: generic file input selection remains unchanged without a selector', async () => {
+  const { session, calls } = await createSessionWithFileInputs({ 'input[type="file"]': [501, 502, 503] });
+
+  const result = await session.page.setFileInputFiles(['C:\\tmp\\attachment.txt']);
+
+  assert.equal(result, undefined);
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.setFileInputFiles').map((call) => call.params.nodeId),
+    [503]
+  );
+});

@@ -402,7 +402,33 @@ class ChromeCdpPageAdapter {
     await this.client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount }, this.sessionId);
   }
 
-  async setFileInputFiles(files) {
+  async setFileInputFiles(files, { selector = null } = {}) {
+    const targetSelector = String(selector || '').trim();
+    if (targetSelector) {
+      let found = 0;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
+        const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: targetSelector }, this.sessionId);
+        const nodeIds = Array.isArray(q?.nodeIds) ? q.nodeIds : [];
+        found = nodeIds.length;
+        if (found === 1) {
+          const nodeId = nodeIds[0];
+          await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
+          return { selector: targetSelector, found, nodeId };
+        }
+        if (found > 1) {
+          const err = new Error('ambiguous_file_input');
+          err.data = { selector: targetSelector, found };
+          throw err;
+        }
+        if (attempt < 9) await sleep(180);
+      }
+
+      const err = new Error('missing_file_input');
+      err.data = { selector: targetSelector, found };
+      throw err;
+    }
+
     let lastNodeIds = [];
     for (let attempt = 0; attempt < 10; attempt++) {
       const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);

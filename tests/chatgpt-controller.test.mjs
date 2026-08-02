@@ -61,8 +61,9 @@ function createPage({ events, onEvaluate }) {
       events.push(x >= 80 ? 'normal-send-click' : 'prompt-click');
     },
     async mouseUp() {},
-    async setFileInputFiles(files) {
+    async setFileInputFiles(files, options = {}) {
       events.push(`files-set:${files.length}`);
+      if (options?.selector) events.push(`files-selector:${options.selector}`);
     }
   };
 }
@@ -184,6 +185,7 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
   try {
     const events = [];
     let attachmentReadyPolls = 0;
+    let fileMenuSelected = false;
     const page = createPage({
       events,
       onEvaluate: async (js) => {
@@ -209,8 +211,12 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
           return { isChatGPT: true, opened: true };
         }
         if (js.includes('const visibleMenuRoots')) {
-          events.push('attachment-file-option');
-          return { inputAvailable: false, selected: true };
+          if (!fileMenuSelected) {
+            fileMenuSelected = true;
+            events.push('attachment-file-option');
+            return { inputAvailable: false, selected: true };
+          }
+          return { inputAvailable: true, selected: false };
         }
         if (js.includes('const expectedFileNames')) {
           attachmentReadyPolls += 1;
@@ -280,6 +286,7 @@ test('chatgpt-controller: aborts before sending when attachment upload readiness
 
   try {
     const events = [];
+    let fileMenuSelected = false;
     const page = createPage({
       events,
       onEvaluate: async (js) => {
@@ -288,8 +295,12 @@ test('chatgpt-controller: aborts before sending when attachment upload readiness
           return { isChatGPT: true, opened: true };
         }
         if (js.includes('const fileMenuItems')) {
-          events.push('attachment-file-option');
-          return { isChatGPT: true, selected: true };
+          if (!fileMenuSelected) {
+            fileMenuSelected = true;
+            events.push('attachment-file-option');
+            return { isChatGPT: true, inputAvailable: false, selected: true };
+          }
+          return { isChatGPT: true, inputAvailable: true, selected: false };
         }
         if (js.includes('const attachmentReady')) {
           events.push('attachment-not-ready');
@@ -433,6 +444,7 @@ test('chatgpt-controller: waits for all attachment names in two consecutive comp
   try {
     const events = [];
     let attachmentPolls = 0;
+    let fileMenuSelected = false;
     const page = createPage({
       events,
       onEvaluate: async (js) => {
@@ -537,6 +549,7 @@ test('chatgpt-controller: limits attachment selection to the active composer and
   try {
     const events = [];
     let attachmentPolls = 0;
+    let fileMenuSelected = false;
     const page = createPage({
       events,
       onEvaluate: async (js) => {
@@ -552,8 +565,12 @@ test('chatgpt-controller: limits attachment selection to the active composer and
         }
         if (js.includes('const visibleMenuRoots')) {
           assert.equal(js.includes('visibleMenuRoots.flatMap'), true, 'must search only visible menu roots');
-          events.push('visible-menu-file-option');
-          return { inputAvailable: false, selected: true };
+          if (!fileMenuSelected) {
+            fileMenuSelected = true;
+            events.push('visible-menu-file-option');
+            return { inputAvailable: false, selected: true };
+          }
+          return { inputAvailable: true, selected: false };
         }
         if (js.includes('const expectedFileNames')) {
           attachmentPolls += 1;
@@ -1267,4 +1284,183 @@ test('chatgpt-controller: recognizes the Japanese ChatGPT send and stop aria lab
   assert.equal(source.includes('button[aria-label="生成を停止する"]'), true);
   assert.equal(source.includes('button[aria-label="生成を停止"]'), true);
   assert.equal(source.includes('button[aria-label="停止"]'), true);
+});
+
+async function withTempAttachments(names, fn) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
+  const files = [];
+  try {
+    for (const name of names) {
+      const file = path.join(tempDir, name);
+      await fs.writeFile(file, name);
+      files.push(file);
+    }
+    return await fn(files);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function attachmentCardSnapshot(fileStates, { observedFileNames, promptTextLength = 12, hasSendButton = true, sendDisabled = false, busy = false, conditionsReady = true } = {}) {
+  return {
+    isChatGPT: true,
+    fileStates,
+    observedFileNames: observedFileNames || fileStates.filter((state) => state.found).map((state) => state.fileName),
+    missingFileNames: fileStates.filter((state) => !state.found).map((state) => state.fileName),
+    pendingFileNames: fileStates.filter((state) => state.pending).map((state) => state.fileName),
+    failedFileNames: fileStates.filter((state) => state.failed).map((state) => state.fileName),
+    promptTextLength,
+    hasSendButton,
+    sendDisabled,
+    busy,
+    conditionsReady
+  };
+}
+
+function createDirectUploadPage({ events, fileStateForPoll, onNormalSend = null }) {
+  let attachmentPolls = 0;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'uploaded-turn', txt: 'uploaded' });
+      if (js.includes('const chatgptUploadInputs')) {
+        assert.equal(js.includes("activeComposer.querySelectorAll('input#upload-files[type=\"file\"]')"), true);
+        assert.equal(js.includes("document.querySelectorAll('#upload-files')"), true);
+        assert.equal(js.includes("uploadInput.id !== 'upload-photos'"), true);
+        assert.equal(js.includes("uploadInput.id !== 'upload-camera'"), true);
+        return { isChatGPT: true, inputReady: true };
+      }
+      if (js.includes('const attachCandidates')) throw new Error('attachment_menu_must_not_open');
+      if (js.includes('const expectedFileNames')) {
+        attachmentPolls += 1;
+        return fileStateForPoll(attachmentPolls);
+      }
+      if (isClickSendEvaluation(js)) {
+        onNormalSend?.(attachmentPolls);
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  return { page, attachmentPolls: () => attachmentPolls };
+}
+
+test('chatgpt-controller: targets only the active composer upload-files input without opening the attachment menu', async () => {
+  await withTempAttachments(['normal.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => attachmentCardSnapshot([{ fileName: 'normal.txt', found: true, pending: false, failed: false }])
+    });
+
+    await createController(page).query({ prompt: 'attach only the ordinary file', attachments: [attachment], timeoutMs: 5_000 });
+
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+    assert.equal(events.includes('attachment-menu-open'), false);
+  });
+});
+
+test('chatgpt-controller: waits for visible cursor-wait and circular attachment progress before two ready polls', async () => {
+  await withTempAttachments(['progress.txt'], async ([attachment]) => {
+    for (const pendingKind of ['cursor-wait', 'circle[stroke-dasharray]']) {
+      const events = [];
+      let sentAt = 0;
+      const { page, attachmentPolls } = createDirectUploadPage({
+        events,
+        fileStateForPoll: (poll) => attachmentCardSnapshot([{
+          fileName: 'progress.txt',
+          found: true,
+          pending: poll === 1,
+          failed: false,
+          pendingKind
+        }]),
+        onNormalSend: (poll) => { sentAt = poll; }
+      });
+
+      await createController(page).query({ prompt: `wait for ${pendingKind}`, attachments: [attachment], timeoutMs: 5_000 });
+
+      assert.equal(attachmentPolls(), 3);
+      assert.equal(sentAt, 3);
+    }
+  });
+});
+
+test('chatgpt-controller: stops immediately on a visible attachment upload failure without sending', async () => {
+  await withTempAttachments(['failed.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => attachmentCardSnapshot([{ fileName: 'failed.txt', found: true, pending: false, failed: true }])
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not send failures', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => {
+        assert.equal(error.message, 'attachment_upload_failed');
+        assert.deepEqual(error.data?.failedFileNames, ['failed.txt']);
+        return true;
+      }
+    );
+    assert.equal(events.includes('normal-send-click'), false);
+  });
+});
+
+test('chatgpt-controller: does not treat composer text as an attachment card and waits for every file', async () => {
+  await withTempAttachments(['first.txt', 'second.txt'], async ([first, second]) => {
+    const events = [];
+    const { page } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => attachmentCardSnapshot([
+        { fileName: 'first.txt', found: true, pending: false, failed: false },
+        { fileName: 'second.txt', found: false, pending: true, failed: false }
+      ], {
+        observedFileNames: ['first.txt', 'second.txt'],
+        conditionsReady: true
+      })
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'all cards must be present', attachments: [first, second], timeoutMs: 20 }),
+      (error) => {
+        assert.equal(error.message, 'attachment_upload_timeout');
+        assert.deepEqual(error.data?.missingFileNames, ['second.txt']);
+        assert.deepEqual(error.data?.pendingFileNames, ['second.txt']);
+        return true;
+      }
+    );
+    assert.equal(events.includes('normal-send-click'), false);
+  });
+});
+
+test('chatgpt-controller: includes attachment card readiness diagnostics on timeout', async () => {
+  await withTempAttachments(['diagnostic.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => attachmentCardSnapshot([
+        { fileName: 'diagnostic.txt', found: true, pending: true, failed: false }
+      ], { promptTextLength: 9, hasSendButton: true, sendDisabled: true, busy: true, conditionsReady: false })
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'wait for diagnosis', attachments: [attachment], timeoutMs: 20 }),
+      (error) => {
+        assert.equal(error.message, 'attachment_upload_timeout');
+        assert.deepEqual(error.data?.expectedFileNames, ['diagnostic.txt']);
+        assert.deepEqual(error.data?.observedFileNames, ['diagnostic.txt']);
+        assert.deepEqual(error.data?.missingFileNames, []);
+        assert.deepEqual(error.data?.pendingFileNames, ['diagnostic.txt']);
+        assert.deepEqual(error.data?.failedFileNames, []);
+        assert.equal(error.data?.promptTextLength, 9);
+        assert.equal(error.data?.hasSendButton, true);
+        assert.equal(error.data?.sendDisabled, true);
+        assert.equal(error.data?.busy, true);
+        return true;
+      }
+    );
+    assert.equal(events.includes('normal-send-click'), false);
+  });
 });

@@ -307,11 +307,8 @@ export class ChatGPTController {
   }
 
   async #typeHuman(text) {
-    for (const ch of String(text)) {
-      this.#throwIfStopRequested();
-      await this.page.insertText(ch);
-      await sleep(jitter(12, 45));
-    }
+    this.#throwIfStopRequested();
+    await this.page.insertText(String(text));
   }
 
   async #moveMouseTo(x, y) {
@@ -469,13 +466,8 @@ export class ChatGPTController {
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const res = await this.#eval(`(() => {
-      const stop = Array.from(document.querySelectorAll(${stopSel})).find((n) => {
-        const r = n.getBoundingClientRect();
-        const style = window.getComputedStyle(n);
-        return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-      });
-      if (stop) return { ok:false, error:'already_generating' };
       const host = location.hostname || '';
+      const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
       const visible = (n) => {
         const r = n.getBoundingClientRect();
         const style = window.getComputedStyle(n);
@@ -547,6 +539,46 @@ export class ChatGPTController {
         prompt?.closest('[data-testid*=\"composer\" i], [data-testid*=\"prompt\" i], [data-testid*=\"chat-input\" i], [aria-label*=\"message\" i], [aria-label*=\"prompt\" i]') ||
         prompt?.closest('main') ||
         null;
+      const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+      const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
+      if (isChatGPT) {
+        let chatgptComposer = prompt?.closest('form') || null;
+        for (let node = prompt?.parentElement || null; !chatgptComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          if (node.querySelector(chatgptSendSel)) chatgptComposer = node;
+        }
+        const normalSend = chatgptComposer
+          ? Array.from(chatgptComposer.querySelectorAll(chatgptSendSel)).find(visible)
+          : null;
+        const normalStop = chatgptComposer
+          ? Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible)
+          : null;
+        if (normalStop && (!normalSend || disabled(normalSend))) {
+          return { ok: false, error: 'already_generating', isChatGPT: true, host };
+        }
+        if (normalSend && disabled(normalSend)) {
+          return { ok: false, error: 'send_button_disabled', isChatGPT: true, host };
+        }
+        if (normalSend) {
+          const rect = normalSend.getBoundingClientRect();
+          return {
+            ok: true,
+            isChatGPT: true,
+            fallbackEnter: false,
+            rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+            requestSubmit: !!prompt?.closest('form'),
+            host
+          };
+        }
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: true,
+          requestSubmit: !!prompt?.closest('form'),
+          host
+        };
+      }
+      const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
+      if (stop) return { ok: false, error: 'already_generating', host };
       const promptRect = prompt ? prompt.getBoundingClientRect() : null;
       const score = (n) => {
         const r = n.getBoundingClientRect();
@@ -611,9 +643,12 @@ export class ChatGPTController {
       sent = await this.#waitForSendSignal({ timeoutMs: 2200, pollMs: 120 });
     }
 
-    if (!sent && !res?.fallbackEnter) {
+    if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
       this.#throwIfStopRequested();
       await this.#eval(`(() => {
+        const host = location.hostname || '';
+        const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
         const visible = (n) => {
           if (!n) return false;
           const r = n.getBoundingClientRect();
@@ -640,10 +675,12 @@ export class ChatGPTController {
         const prompt = uniq.find(editable) || document.activeElement;
         const form = prompt?.closest?.('form') || null;
         if (form && typeof form.requestSubmit === 'function') {
-          const submitBtn = Array.from(form.querySelectorAll(${sendSel})).find((n) => visible(n) && !disabled(n));
+          const submitSel = isChatGPT ? chatgptSendSel : ${sendSel};
+          const submitBtn = Array.from(form.querySelectorAll(submitSel)).find((n) => visible(n) && !disabled(n));
           form.requestSubmit(submitBtn || undefined);
           return true;
         }
+        if (isChatGPT) return false;
         const submitBtn = form
           ? Array.from(form.querySelectorAll(${sendSel})).find((n) => visible(n) && !disabled(n))
           : document.querySelector(${sendSel});
@@ -656,7 +693,7 @@ export class ChatGPTController {
       sent = await this.#waitForSendSignal({ timeoutMs: 1400, pollMs: 120 });
     }
 
-    if (!sent) {
+    if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
       const host = String(res?.host || '');
       const isMac = process.platform === 'darwin';
       const combos = [];
@@ -695,20 +732,147 @@ export class ChatGPTController {
     const absFiles = files.map((p) => path.resolve(p));
     for (const f of absFiles) await fs.access(f);
 
-    // Best-effort: click the paperclip/attach UI, then set <input type=file> via DevTools protocol.
-    await this.#eval(`(() => {
-      const candidates = Array.from(document.querySelectorAll('button, [role=\"button\"]'));
-      const attach = candidates.find(b => /attach|upload|paperclip/i.test((b.getAttribute('aria-label')||'') + ' ' + (b.textContent||'')));
-      if (attach) attach.click();
-      return true;
+    const opened = await this.#eval(`(() => {
+      const host = location.hostname || '';
+      const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const labelOf = (node) => [
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('title') || '',
+        node.getAttribute('data-testid') || '',
+        node.textContent || ''
+      ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      const excluded = (label) => /deep research|image generation|generate image|camera|microphone|voice|音声|マイク|カメラ|画像生成|ディープリサーチ/i.test(label);
+      const attachCandidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const attach = attachCandidates.find((node) => {
+        const label = labelOf(node);
+        return visible(node) && !excluded(label) && /attach|upload|paperclip|add photos? & files?|添付|写真とファイルを追加|ファイル/i.test(label);
+      });
+      if (!attach) return { isChatGPT, opened: false };
+      attach.click();
+      return { isChatGPT, opened: true };
     })()`);
 
+    if (opened?.isChatGPT && !opened?.opened) {
+      const err = new Error('attachment_button_not_found');
+      err.data = opened;
+      throw err;
+    }
+
+    if (opened?.isChatGPT) {
+      const selected = await this.#eval(`(() => {
+        const visible = (node) => {
+          if (!node) return false;
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const labelOf = (node) => [
+          node.getAttribute('aria-label') || '',
+          node.getAttribute('title') || '',
+          node.getAttribute('data-testid') || '',
+          node.textContent || ''
+        ].join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const excluded = (label) => /deep research|image generation|generate image|camera|microphone|voice|音声|マイク|カメラ|画像生成|ディープリサーチ/i.test(label);
+        const isAttachControl = (label) => /attach|paperclip|upload/i.test(label) && !/add photos & files|写真とファイルを追加/i.test(label);
+        const isFileOption = (label) => /(?:^|\b)(?:file|files|add photos & files)(?:\b|$)|ファイル|写真とファイルを追加/i.test(label);
+        const fileMenuItems = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"], a'));
+        const fileMenuItem = fileMenuItems.find((node) => {
+          const label = labelOf(node);
+          return visible(node) && !excluded(label) && !isAttachControl(label) && isFileOption(label);
+        });
+        if (!fileMenuItem) return { selected: false };
+        fileMenuItem.click();
+        return { selected: true };
+      })()`);
+      if (!selected?.selected) {
+        const err = new Error('attachment_file_option_not_found');
+        err.data = selected;
+        throw err;
+      }
+    }
+
     await this.page.setFileInputFiles(absFiles);
+  }
+
+  async #waitForAttachmentsReady({ timeoutMs }) {
+    const maxWaitMs = Math.min(120_000, Math.max(0, Number(timeoutMs) || 0));
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const start = Date.now();
+    let last = null;
+
+    while (true) {
+      this.#throwIfStopRequested();
+      last = await this.#eval(`(() => {
+        const host = location.hostname || '';
+        const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+        if (!isChatGPT) return { isChatGPT: false, ready: true };
+
+        const visible = (node) => {
+          if (!node) return false;
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const disabled = (node) => !!node?.disabled || String(node?.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+        const editable = (node) => {
+          if (!node || !visible(node)) return false;
+          if (node.matches('textarea')) return !node.disabled && !node.readOnly;
+          if (node.matches('input')) return !node.disabled && !node.readOnly && !/password|search|email|url|number|tel/i.test(String(node.type || 'text'));
+          return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+        };
+        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+        const promptCandidates = Array.from(document.querySelectorAll(${promptSel}));
+        const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+        const candidates = [];
+        const seen = new Set();
+        for (const node of [...promptCandidates, ...fallback]) {
+          if (!node || seen.has(node) || !editable(node)) continue;
+          seen.add(node);
+          candidates.push(node);
+        }
+        const prompt = candidates.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)[0] || null;
+        let composer = prompt?.closest('form') || null;
+        for (let node = prompt?.parentElement || null; !composer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          if (node.querySelector(chatgptSendSel)) composer = node;
+        }
+        const send = composer ? Array.from(composer.querySelectorAll(chatgptSendSel)).find(visible) : null;
+        const promptText = prompt?.matches('textarea, input')
+          ? String(prompt.value || '').trim()
+          : String(prompt?.innerText || prompt?.textContent || '').trim();
+        const busy = !!composer && Array.from(composer.querySelectorAll('[role="progressbar"], [aria-busy="true"]')).some(visible);
+        const attachmentReady = promptText.length > 0 && !!send && !disabled(send) && !busy;
+        return {
+          isChatGPT: true,
+          ready: attachmentReady,
+          promptTextLength: promptText.length,
+          hasSendButton: !!send,
+          sendVisible: !!send,
+          sendDisabled: !!send && disabled(send),
+          busy
+        };
+      })()`);
+
+      if (!last?.isChatGPT || last?.ready) return;
+      const elapsed = Date.now() - start;
+      if (elapsed >= maxWaitMs) break;
+      await sleep(Math.min(200, maxWaitMs - elapsed));
+    }
+
+    const err = new Error('attachment_upload_timeout');
+    err.data = last;
+    throw err;
   }
 
   async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400 } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
+    const chatgptAssistantSel = JSON.stringify('[data-message-author-role="assistant"], article[data-turn="assistant"]');
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const start = Date.now();
@@ -726,15 +890,18 @@ export class ChatGPTController {
           const style = window.getComputedStyle(n);
           return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         });
-        const sendEnabled = send ? !send.disabled : true;
-        const nodes = Array.from(document.querySelectorAll(${assistantSel}));
+        const sendEnabled = send ? !send.disabled && String(send.getAttribute('aria-disabled') || '').toLowerCase() !== 'true' : true;
+        const host = location.hostname || '';
+        const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+        const assistantCandidates = isChatGPT ? ${chatgptAssistantSel} : ${assistantSel};
+        const nodes = Array.from(document.querySelectorAll(assistantCandidates));
         const lastNode = nodes[nodes.length - 1];
-        const fallbackMainText = ((document.querySelector('main') || document.body)?.innerText || '').trim();
-        const txt = (lastNode?.innerText || fallbackMainText).trim();
+        const fallbackMainText = isChatGPT ? '' : ((document.querySelector('main') || document.body)?.innerText || '').trim();
+        const txt = (lastNode ? lastNode.innerText : fallbackMainText).trim();
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { stop, sendEnabled, txt, count: nodes.length, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
+        return { isChatGPT, stop, sendEnabled, txt, count: nodes.length, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
       })()`);
 
       const txt = String(snap?.txt || '');
@@ -764,21 +931,24 @@ export class ChatGPTController {
       }
 
       const readyByNodes = (snap?.count || 0) > 0;
-      const fallbackWaited = !!snap?.usedFallback && (Date.now() - start >= 2500);
-      const fallbackStableLongEnough = txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
+      const fallbackWaited = !snap?.isChatGPT && !!snap?.usedFallback && (Date.now() - start >= 2500);
+      const fallbackStableLongEnough = !snap?.isChatGPT && txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
       const done =
         (!generating && stopGoneLongEnough && snap?.sendEnabled && stable && txt.length > 0 && (readyByNodes || fallbackWaited)) ||
         (!generating && fallbackStableLongEnough && (readyByNodes || fallbackWaited));
       if (done) {
         const extra = await this.#eval(`(() => {
-          const nodes = Array.from(document.querySelectorAll(${assistantSel}));
+          const host = location.hostname || '';
+          const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+          const assistantCandidates = isChatGPT ? ${chatgptAssistantSel} : ${assistantSel};
+          const nodes = Array.from(document.querySelectorAll(assistantCandidates));
           const lastNode = nodes[nodes.length - 1];
-          const codes = Array.from(lastNode?.querySelectorAll('pre code') || []).map(c => {
+          const codeBlocks = Array.from(lastNode?.querySelectorAll('pre code') || []).map(c => {
             const cls = String(c.className || '');
             const lang = (cls.match(/language-([a-z0-9_-]+)/i) || [])[1] || null;
             return { language: lang, text: (c.innerText || '').trim() };
           }).filter(c => c.text);
-          return { codeBlocks: codes };
+          return { codeBlocks };
         })()`);
         return { text: txt, codeBlocks: extra?.codeBlocks || [], meta: { count: snap?.count || 0, hasError: !!snap?.hasError } };
       }
@@ -798,8 +968,11 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs });
-      await this.#attachFiles(attachments);
       await this.#typePrompt(prompt);
+      if (attachments?.length) {
+        await this.#attachFiles(attachments);
+        await this.#waitForAttachmentsReady({ timeoutMs });
+      }
       await this.#clickSend();
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
     } finally {

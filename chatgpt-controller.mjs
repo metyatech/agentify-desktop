@@ -25,6 +25,15 @@ export function isChatGPTAttachmentCardDisplayName(fileName, displayName) {
   return numericSuffix !== '0' && numericSuffix !== '1';
 }
 
+export function hasSameChatGPTAttachmentFileNameMultiset(expectedFileNames, selectedFileNames) {
+  const normalizeFileNames = (fileNames) => (Array.isArray(fileNames) ? fileNames : [])
+    .map((fileName) => String(fileName || '').trim().toLocaleLowerCase())
+    .sort();
+  const expected = normalizeFileNames(expectedFileNames);
+  const selected = normalizeFileNames(selectedFileNames);
+  return expected.length === selected.length && expected.every((fileName, index) => fileName === selected[index]);
+}
+
 function blockedTitle(kind) {
   if (kind === 'login') return 'Needs sign-in';
   if (kind === 'captcha') return 'Needs CAPTCHA';
@@ -1238,6 +1247,7 @@ export class ChatGPTController {
     pageUploadInputCount = 0
   } = {}) {
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const expectedFileNamesJson = JSON.stringify(expectedFileNames);
     const result = await this.#eval(`(() => {
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
@@ -1283,7 +1293,9 @@ export class ChatGPTController {
       const uploadInput = composerUploadInputs[0] || null;
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
       const fileCards = activeComposer ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard) : [];
+      const expectedFileNames = ${expectedFileNamesJson};
       const snapshot = {
+        expectedFileNames,
         selectedFileNames: Array.from(uploadInput?.files || []).map((file) => file.name),
         cardDisplayNames: fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim()),
         composerInputCount: composerUploadInputs.length,
@@ -1292,6 +1304,8 @@ export class ChatGPTController {
       if (!uploadInput || composerUploadInputs.length !== 1 || pageUploadInputs.length !== 1 || fileCards.length !== 0) {
         return { ok: false, reason: 'invalid_clear_state', ...snapshot };
       }
+      const selectionMatchesExpected = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, snapshot.selectedFileNames);
+      if (!selectionMatchesExpected) return { ok: false, reason: 'file_selection_changed', ...snapshot };
       const nativeValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
       if (!nativeValueSetter) return { ok: false, reason: 'missing_native_value_setter', ...snapshot };
       try {

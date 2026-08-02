@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { ChatGPTController, isChatGPTAttachmentCardDisplayName } from '../chatgpt-controller.mjs';
+import {
+  ChatGPTController,
+  hasSameChatGPTAttachmentFileNameMultiset,
+  isChatGPTAttachmentCardDisplayName
+} from '../chatgpt-controller.mjs';
 
 const selectors = {
   promptTextarea: '#prompt-textarea',
@@ -1484,7 +1488,7 @@ function chatgptUploadInputState({
   };
 }
 
-function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null }) {
+function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null, clearEvaluationResult = null }) {
   let attachmentPolls = 0;
   let clearPolls = 0;
   const page = createPage({
@@ -1498,9 +1502,11 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
         return initialState;
       }
       if (js.includes('const nativeValueSetter')) {
+        assert.doesNotThrow(() => new Function(js));
         assert.equal(js.includes("nativeValueSetter.call(uploadInput, '')"), true);
         assert.equal(js.includes("new Event('input', { bubbles: true, composed: true })"), true);
         assert.equal(js.includes("new Event('change', { bubbles: true, composed: true })"), true);
+        if (clearEvaluationResult) return await clearEvaluationResult(js);
         events.push('native-clear');
         events.push('native-input');
         events.push('native-change');
@@ -1885,4 +1891,65 @@ test('chatgpt-controller: uses native value-setter clearing only for stale selec
   assert.equal(source.includes("nativeValueSetter.call(uploadInput, '')"), true);
   assert.equal(source.includes("new Event('input', { bubbles: true, composed: true })"), true);
   assert.equal(source.includes("new Event('change', { bubbles: true, composed: true })"), true);
+});
+
+test('chatgpt-controller: does not clear when the FileList changes after stale-selection detection', async () => {
+  await withTempAttachments(['expected.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({
+        selectedFileNames: ['expected.txt'],
+        selectionMatchesExpected: true
+      }),
+      clearEvaluationResult: async (js) => {
+        assert.equal(js.includes('const expectedFileNames = ["expected.txt"];'), true);
+        assert.equal(js.includes('file_selection_changed'), true);
+        return {
+          ok: false,
+          reason: 'file_selection_changed',
+          expectedFileNames: ['expected.txt'],
+          selectedFileNames: ['different.txt'],
+          cardDisplayNames: [],
+          composerInputCount: 1,
+          pageUploadInputCount: 1
+        };
+      }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not clear another file', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => {
+        assert.equal(error.message, 'chatgpt_file_input_clear_failed');
+        assert.equal(error.data?.reason, 'file_selection_changed');
+        assert.deepEqual(error.data?.expectedFileNames, ['expected.txt']);
+        assert.deepEqual(error.data?.selectedFileNames, ['different.txt']);
+        assert.deepEqual(error.data?.cardDisplayNames, []);
+        assert.equal(error.data?.composerInputCount, 1);
+        assert.equal(error.data?.pageUploadInputCount, 1);
+        return true;
+      }
+    );
+    assert.equal(events.includes('native-clear'), false);
+    assert.equal(events.includes('native-input'), false);
+    assert.equal(events.includes('native-change'), false);
+    assert.equal(events.some((event) => event.startsWith('files-set:')), false);
+  });
+});
+
+test('chatgpt-controller: revalidates FileList names as a case-insensitive duplicate-preserving multiset', async () => {
+  assert.equal(
+    hasSameChatGPTAttachmentFileNameMultiset(
+      ['foo.txt', 'foo.txt', 'bar.txt'],
+      ['BAR.TXT', 'foo.txt', 'FOO.TXT']
+    ),
+    true
+  );
+  assert.equal(
+    hasSameChatGPTAttachmentFileNameMultiset(
+      ['foo.txt', 'foo.txt', 'bar.txt'],
+      ['foo.txt', 'bar.txt']
+    ),
+    false
+  );
 });

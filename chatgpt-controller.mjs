@@ -483,7 +483,7 @@ export class ChatGPTController {
               activePrompt = node;
             }
           }
-          const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+          const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
           const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
           let chatgptComposer = activePrompt?.closest('form') || null;
           for (let node = activePrompt?.parentElement || null; !chatgptComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
@@ -559,6 +559,111 @@ export class ChatGPTController {
       await sleep(pollMs);
     }
     return false;
+  }
+
+  async #tryChatGPTExactSubmissionFallback({ sendBaseline, action }) {
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const fallbackBaselineName = action === 'dom_click' ? 'clickFallbackBaselineText' : 'submitFallbackBaselineText';
+    const fallbackBaselineText = String(sendBaseline?.activePromptText || '').replace(/\s+/g, ' ').trim();
+    const actionCode = action === 'dom_click'
+      ? `normalSend.click();
+          return { attempted: true, lastFallbackResult: 'dom_click' };`
+      : `const form = chatgptComposer?.matches('form') ? chatgptComposer : chatgptComposer?.closest('form') || null;
+          if (!form || typeof form.requestSubmit !== 'function' || normalSend.form !== form) {
+            return { attempted: false, lastFallbackResult: 'active_composer_form_not_found' };
+          }
+          try {
+            form.requestSubmit(normalSend);
+            return { attempted: true, lastFallbackResult: 'request_submit_with_button' };
+          } catch (error) {
+            if (!(error instanceof TypeError)) {
+              return { attempted: false, lastFallbackResult: 'request_submit_with_button_failed' };
+            }
+            try {
+              form.requestSubmit();
+              return { attempted: true, lastFallbackResult: 'request_submit_without_button' };
+            } catch {
+              return { attempted: false, lastFallbackResult: 'request_submit_without_button_failed' };
+            }
+          }`;
+    return await this.#eval(`(() => {
+      const host = location.hostname || '';
+      const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+      if (!isChatGPT) return { attempted: false, lastFallbackResult: 'not_chatgpt' };
+      const ${fallbackBaselineName} = ${JSON.stringify(fallbackBaselineText)};
+      const normalizeText = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
+      const visible = (n) => {
+        if (!n) return false;
+        const r = n.getBoundingClientRect();
+        const style = window.getComputedStyle(n);
+        return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const disabled = (n) => !!n?.disabled || String(n?.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+      const editable = (n) => {
+        if (!n || !visible(n)) return false;
+        if (n.matches('textarea')) return !n.disabled && !n.readOnly;
+        if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
+        return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
+      };
+      const promptScore = (n) => {
+        const r = n.getBoundingClientRect();
+        const label = [
+          n.getAttribute('aria-label') || '',
+          n.getAttribute('placeholder') || '',
+          n.getAttribute('name') || '',
+          n.getAttribute('id') || '',
+          n.getAttribute('data-testid') || ''
+        ].join(' ').toLowerCase();
+        let score = 0;
+        if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+        if (n.matches('textarea')) score += 50;
+        if (n.isContentEditable || n.getAttribute('contenteditable') === 'true') score += 35;
+        if (n.getAttribute('role') === 'textbox') score += 25;
+        if (r.width >= 260 && r.height >= 26) score += 20;
+        score += Math.min(180, Math.max(0, (r.width * r.height) / 2500));
+        score += Math.max(0, r.y / 8);
+        return score;
+      };
+      const promptCandidates = Array.from(document.querySelectorAll(${promptSel}));
+      const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+      const candidates = [];
+      const seen = new Set();
+      for (const node of [...promptCandidates, ...fallback]) {
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+        candidates.push(node);
+      }
+      let activePrompt = null;
+      let bestScore = -Infinity;
+      for (const node of candidates) {
+        if (!editable(node)) continue;
+        const score = promptScore(node);
+        if (score > bestScore) {
+          bestScore = score;
+          activePrompt = node;
+        }
+      }
+      if (!activePrompt) return { attempted: false, lastFallbackResult: 'active_prompt_not_found' };
+      const activePromptText = activePrompt.matches('textarea, input')
+        ? String(activePrompt.value || '')
+        : String(activePrompt.innerText || activePrompt.textContent || '');
+      if (normalizeText(activePromptText) !== ${fallbackBaselineName}) {
+        return { attempted: false, lastFallbackResult: 'prompt_changed' };
+      }
+      const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
+      const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
+      let chatgptComposer = activePrompt.closest('form') || null;
+      for (let node = activePrompt.parentElement || null; !chatgptComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+        if (node.querySelector(chatgptSendSel) || node.querySelector(chatgptStopSel)) chatgptComposer = node;
+      }
+      if (!chatgptComposer) return { attempted: false, lastFallbackResult: 'active_composer_not_found' };
+      const normalSend = Array.from(chatgptComposer.querySelectorAll(chatgptSendSel)).find(visible);
+      const normalStop = Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible);
+      if (!normalSend) return { attempted: false, lastFallbackResult: 'normal_send_not_found' };
+      if (disabled(normalSend)) return { attempted: false, lastFallbackResult: 'normal_send_disabled' };
+      if (normalStop) return { attempted: false, lastFallbackResult: 'normal_stop_visible' };
+      ${actionCode}
+    })()`);
   }
 
   async #clickSend({ timeoutMs = 5_000 } = {}) {
@@ -640,7 +745,7 @@ export class ChatGPTController {
         prompt?.closest('[data-testid*=\"composer\" i], [data-testid*=\"prompt\" i], [data-testid*=\"chat-input\" i], [aria-label*=\"message\" i], [aria-label*=\"prompt\" i]') ||
         prompt?.closest('main') ||
         null;
-      const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+      const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
       const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
       if (isChatGPT) {
         let chatgptComposer = prompt?.closest('form') || null;
@@ -757,11 +862,16 @@ export class ChatGPTController {
     }
 
     let sent = false;
+    let coordinateClickAttempted = false;
+    let domClickAttempted = false;
+    let requestSubmitAttempted = false;
+    let lastFallbackResult = null;
     if (res?.rect?.w > 0 && res?.rect?.h > 0) {
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy);
+      coordinateClickAttempted = true;
       sent = await this.#waitForSendSignal({
         timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 2200,
         pollMs: 120,
@@ -769,12 +879,44 @@ export class ChatGPTController {
       });
     }
 
+    if (!sent && res?.isChatGPT && coordinateClickAttempted) {
+      const domFallback = await this.#tryChatGPTExactSubmissionFallback({
+        sendBaseline: res?.sendBaseline,
+        action: 'dom_click'
+      });
+      domClickAttempted = !!domFallback?.attempted;
+      lastFallbackResult = domFallback?.lastFallbackResult || null;
+      if (domClickAttempted) {
+        sent = await this.#waitForSendSignal({
+          timeoutMs: chatgptSignalTimeoutMs,
+          pollMs: 120,
+          sendBaseline: res?.sendBaseline
+        });
+      }
+
+      if (!sent && domClickAttempted) {
+        const submitFallback = await this.#tryChatGPTExactSubmissionFallback({
+          sendBaseline: res?.sendBaseline,
+          action: 'request_submit'
+        });
+        requestSubmitAttempted = !!submitFallback?.attempted;
+        lastFallbackResult = submitFallback?.lastFallbackResult || lastFallbackResult;
+        if (requestSubmitAttempted) {
+          sent = await this.#waitForSendSignal({
+            timeoutMs: chatgptSignalTimeoutMs,
+            pollMs: 120,
+            sendBaseline: res?.sendBaseline
+          });
+        }
+      }
+    }
+
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
       this.#throwIfStopRequested();
       await this.#eval(`(() => {
         const host = location.hostname || '';
         const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
-        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
         const visible = (n) => {
           if (!n) return false;
           const r = n.getBoundingClientRect();
@@ -823,7 +965,7 @@ export class ChatGPTController {
       });
     }
 
-    if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
+    if (!sent && !res?.isChatGPT) {
       const host = String(res?.host || '');
       const isMac = process.platform === 'darwin';
       const combos = [];
@@ -855,7 +997,15 @@ export class ChatGPTController {
 
     if (!sent) {
       const err = new Error('send_not_triggered');
-      err.data = { host: res?.host || null };
+      err.data = res?.isChatGPT
+        ? {
+            host: res?.host || null,
+            coordinateClickAttempted,
+            domClickAttempted,
+            requestSubmitAttempted,
+            lastFallbackResult
+          }
+        : { host: res?.host || null };
       throw err;
     }
   }

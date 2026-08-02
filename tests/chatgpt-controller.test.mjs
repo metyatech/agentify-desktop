@@ -722,6 +722,9 @@ test('chatgpt-controller: rejects an unchanged ChatGPT send state without a norm
           activePromptText: baseline.activePromptText
         });
       }
+      if (js.includes('const clickFallbackBaselineText')) {
+        return { attempted: false, lastFallbackResult: 'unchanged_prompt' };
+      }
       throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     }
   });
@@ -765,4 +768,243 @@ test('chatgpt-controller: checks send completion only within the active composer
   const result = await createController(page).send({ text: 'composer-only', timeoutMs: 100 });
 
   assert.deepEqual(result, { ok: true });
+});
+
+function normalChatGPTSendResult(baseline) {
+  return {
+    ok: true,
+    isChatGPT: true,
+    fallbackEnter: false,
+    host: 'chatgpt.com',
+    rect: { x: 90, y: 10, w: 20, h: 20 },
+    sendBaseline: baseline
+  };
+}
+
+test('chatgpt-controller: query uses the exact DOM send button when the coordinate click produces no signal', async () => {
+  const events = [];
+  let domClickAttempted = false;
+  const prompt = 'submit through exact DOM button';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        return assistantSnapshot({ txt: 'DOM-SUBMISSION-ANSWER', count: 1, lastAssistantId: 'new-assistant' });
+      }
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({
+          userCount: domClickAttempted ? 1 : 0,
+          lastUserId: domClickAttempted ? 'dom-submitted-user' : '',
+          lastUserText: domClickAttempted ? prompt : '',
+          activePromptText: prompt
+        });
+      }
+      if (js.includes('const clickFallbackBaselineText')) {
+        assert.equal(js.includes('normalSend.click()'), true);
+        assert.equal(js.includes('chatgptComposer.querySelectorAll(chatgptSendSel)'), true);
+        events.push('dom-send-click');
+        domClickAttempted = true;
+        return { attempted: true, lastFallbackResult: 'dom_click' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).query({ prompt, timeoutMs: 2_000 });
+
+  assert.equal(result.text, 'DOM-SUBMISSION-ANSWER');
+  assert.deepEqual(events.filter((event) => event === 'normal-send-click' || event === 'dom-send-click'), ['normal-send-click', 'dom-send-click']);
+  assert.equal(events.includes('requestSubmit'), false);
+});
+
+test('chatgpt-controller: does not use DOM fallback after a successful coordinate click', async () => {
+  const events = [];
+  const prompt = 'coordinate click works';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({ userCount: 1, lastUserId: 'coordinate-user', lastUserText: prompt, activePromptText: prompt });
+      }
+      if (js.includes('const clickFallbackBaselineText') || js.includes('const submitFallbackBaselineText')) {
+        throw new Error('fallback_must_not_run_after_coordinate_success');
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: prompt, timeoutMs: 100 });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(events.includes('normal-send-click'), true);
+  assert.equal(events.includes('dom-send-click'), false);
+  assert.equal(events.includes('requestSubmit'), false);
+});
+
+test('chatgpt-controller: uses the active composer requestSubmit after the DOM send click has no signal', async () => {
+  const events = [];
+  let requestSubmitAttempted = false;
+  const prompt = 'submit through active composer form';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({
+          userCount: 0,
+          activePromptText: requestSubmitAttempted ? '' : prompt
+        });
+      }
+      if (js.includes('const clickFallbackBaselineText')) {
+        events.push('dom-send-click');
+        return { attempted: true, lastFallbackResult: 'dom_click' };
+      }
+      if (js.includes('const submitFallbackBaselineText')) {
+        assert.equal(js.includes('form.requestSubmit(normalSend)'), true);
+        assert.equal(js.includes('form.requestSubmit()'), true);
+        assert.equal(js.includes('chatgptComposer.querySelectorAll(chatgptSendSel)'), true);
+        events.push('requestSubmit');
+        requestSubmitAttempted = true;
+        return { attempted: true, lastFallbackResult: 'request_submit_with_button' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: prompt, timeoutMs: 20 });
+
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(events.filter((event) => event === 'normal-send-click' || event === 'dom-send-click' || event === 'requestSubmit'), [
+    'normal-send-click',
+    'dom-send-click',
+    'requestSubmit'
+  ]);
+  assert.equal(events.includes('key:Enter'), false);
+});
+
+test('chatgpt-controller: skips DOM submission fallbacks when the prompt changed after coordinate click', async () => {
+  const events = [];
+  const prompt = 'original prompt';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ activePromptText: prompt });
+      if (js.includes('const clickFallbackBaselineText')) {
+        events.push('fallback-checked');
+        return { attempted: false, lastFallbackResult: 'prompt_changed' };
+      }
+      if (js.includes('const submitFallbackBaselineText')) throw new Error('request_submit_must_not_run_after_prompt_change');
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: prompt, timeoutMs: 20 }),
+    (error) => {
+      assert.equal(error.message, 'send_not_triggered');
+      assert.equal(error.data?.coordinateClickAttempted, true);
+      assert.equal(error.data?.domClickAttempted, false);
+      assert.equal(error.data?.requestSubmitAttempted, false);
+      assert.equal(error.data?.lastFallbackResult, 'prompt_changed');
+      return true;
+    }
+  );
+
+  assert.deepEqual(events.filter((event) => event === 'dom-send-click' || event === 'requestSubmit'), []);
+});
+
+test('chatgpt-controller: skips DOM submission fallbacks for disabled or stopped composers', async () => {
+  for (const state of ['disabled', 'aria_disabled', 'stop_visible']) {
+    const events = [];
+    const prompt = `skip fallback ${state}`;
+    const page = createPage({
+      events,
+      onEvaluate: async (js) => {
+        if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+        if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ activePromptText: prompt });
+        if (js.includes('const clickFallbackBaselineText')) {
+          assert.equal(js.includes('disabled(normalSend)'), true);
+          assert.equal(js.includes('normalStop'), true);
+          return { attempted: false, lastFallbackResult: state };
+        }
+        if (js.includes('const submitFallbackBaselineText')) throw new Error(`request_submit_must_not_run:${state}`);
+        throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      }
+    });
+
+    await assert.rejects(createController(page).send({ text: prompt, timeoutMs: 20 }), /send_not_triggered/);
+    assert.equal(events.includes('dom-send-click'), false);
+    assert.equal(events.includes('requestSubmit'), false);
+  }
+});
+
+test('chatgpt-controller: limits DOM submission fallback to the active composer exact send button', async () => {
+  const events = [];
+  const prompt = 'active composer exact send only';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ activePromptText: prompt });
+      if (js.includes('const clickFallbackBaselineText')) {
+        assert.equal(js.includes('chatgptComposer.querySelectorAll(chatgptSendSel)'), true);
+        assert.equal(js.includes('document.querySelectorAll(chatgptSendSel)'), false);
+        assert.equal(js.includes("querySelectorAll('button, [role=\\\"button\\\"]')"), false);
+        return { attempted: false, lastFallbackResult: 'no_active_composer_send' };
+      }
+      if (js.includes('const submitFallbackBaselineText')) throw new Error('request_submit_must_not_run_without_exact_active_button');
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(createController(page).send({ text: prompt, timeoutMs: 20 }), /send_not_triggered/);
+  assert.equal(events.includes('dom-send-click'), false);
+  assert.equal(events.includes('requestSubmit'), false);
+});
+
+test('chatgpt-controller: reports every exact submission fallback when no send signal arrives', async () => {
+  const events = [];
+  const prompt = 'no send signal';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ activePromptText: prompt });
+      if (js.includes('const clickFallbackBaselineText')) {
+        events.push('dom-send-click');
+        return { attempted: true, lastFallbackResult: 'dom_click' };
+      }
+      if (js.includes('const submitFallbackBaselineText')) {
+        events.push('requestSubmit');
+        return { attempted: true, lastFallbackResult: 'request_submit_with_button' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: prompt, timeoutMs: 20 }),
+    (error) => {
+      assert.equal(error.message, 'send_not_triggered');
+      assert.deepEqual(error.data, {
+        host: 'chatgpt.com',
+        coordinateClickAttempted: true,
+        domClickAttempted: true,
+        requestSubmitAttempted: true,
+        lastFallbackResult: 'request_submit_with_button'
+      });
+      return true;
+    }
+  );
+
+  assert.deepEqual(events.filter((event) => event === 'normal-send-click' || event === 'dom-send-click' || event === 'requestSubmit'), [
+    'normal-send-click',
+    'dom-send-click',
+    'requestSubmit'
+  ]);
 });

@@ -1259,6 +1259,9 @@ export class ChatGPTController {
     let lastChange = Date.now();
     let stopGoneAt = null;
     let continueClicks = 0;
+    let lastSnap = null;
+    let lastNewChatGPTAssistant = false;
+    let lastComposerIdle = false;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
@@ -1272,29 +1275,69 @@ export class ChatGPTController {
           return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         };
         const disabled = (node) => !!node?.disabled || String(node?.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
-        const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
+        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
+        const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="生成を停止する"], button[aria-label="生成を停止"], button[aria-label="停止"]';
         let stop = false;
+        let sendPresent = false;
         let sendEnabled = true;
+        let promptTextLength = -1;
         if (isChatGPT) {
+          const editable = (node) => {
+            if (!node || !visible(node)) return false;
+            if (node.matches('textarea')) return !node.disabled && !node.readOnly;
+            if (node.matches('input')) return !node.disabled && !node.readOnly && !/password|search|email|url|number|tel/i.test(String(node.type || 'text'));
+            return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+          };
+          const promptScore = (node) => {
+            const rect = node.getBoundingClientRect();
+            const label = [
+              node.getAttribute('aria-label') || '',
+              node.getAttribute('placeholder') || '',
+              node.getAttribute('name') || '',
+              node.getAttribute('id') || '',
+              node.getAttribute('data-testid') || ''
+            ].join(' ').toLowerCase();
+            let score = 0;
+            if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+            if (node.matches('textarea')) score += 50;
+            if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') score += 35;
+            if (node.getAttribute('role') === 'textbox') score += 25;
+            if (rect.width >= 260 && rect.height >= 26) score += 20;
+            score += Math.min(180, Math.max(0, (rect.width * rect.height) / 2500));
+            score += Math.max(0, rect.y / 8);
+            return score;
+          };
           const promptCandidates = Array.from(document.querySelectorAll(${JSON.stringify(this.selectors.promptTextarea)}));
           const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
-          const prompt = [...promptCandidates, ...fallback]
-            .filter((node, index, nodes) => nodes.indexOf(node) === index)
-            .filter((node) => {
-              if (!visible(node)) return false;
-              if (node.matches('textarea')) return !node.disabled && !node.readOnly;
-              if (node.matches('input')) return !node.disabled && !node.readOnly;
-              return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
-            })
-            .sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)[0] || null;
+          const candidates = [];
+          const seen = new Set();
+          for (const node of [...promptCandidates, ...fallback]) {
+            if (!node || seen.has(node)) continue;
+            seen.add(node);
+            candidates.push(node);
+          }
+          let prompt = null;
+          let bestScore = -Infinity;
+          for (const node of candidates) {
+            if (!editable(node)) continue;
+            const score = promptScore(node);
+            if (score > bestScore) {
+              bestScore = score;
+              prompt = node;
+            }
+          }
           let composer = prompt?.closest('form') || null;
           for (let node = prompt?.parentElement || null; !composer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
             if (node.querySelector(chatgptSendSel) || node.querySelector(chatgptStopSel)) composer = node;
           }
           const send = composer ? Array.from(composer.querySelectorAll(chatgptSendSel)).find(visible) : null;
           stop = !!(composer && Array.from(composer.querySelectorAll(chatgptStopSel)).find(visible));
+          sendPresent = !!send;
           sendEnabled = !!send && !disabled(send);
+          const promptText = prompt?.matches('textarea, input')
+            ? String(prompt.value || '')
+            : String(prompt?.innerText || prompt?.textContent || '');
+          promptTextLength = prompt ? promptText.trim().length : -1;
         } else {
           stop = !!document.querySelector(${stopSel});
           const send = Array.from(document.querySelectorAll(${sendSel})).find((n) => {
@@ -1302,6 +1345,7 @@ export class ChatGPTController {
             const style = window.getComputedStyle(n);
             return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
           });
+          sendPresent = !!send;
           sendEnabled = send ? !send.disabled && String(send.getAttribute('aria-disabled') || '').toLowerCase() !== 'true' : true;
         }
         const assistantCandidates = isChatGPT ? ${chatgptAssistantSel} : ${assistantSel};
@@ -1319,8 +1363,9 @@ export class ChatGPTController {
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { isChatGPT, stop, sendEnabled, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
+        return { isChatGPT, stop, sendPresent, sendEnabled, promptTextLength, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
       })()`);
+      lastSnap = snap;
 
       const txt = String(snap?.txt || '');
       if (txt !== last) {
@@ -1355,11 +1400,17 @@ export class ChatGPTController {
         (snap?.count || 0) > baselineAssistantCount ||
         (baselineAssistantId && snap?.lastAssistantId && baselineAssistantId !== snap.lastAssistantId) ||
         (baselineAssistantCount === 0 && (snap?.count || 0) >= 1);
+      const composerIdle =
+        snap?.promptTextLength === 0 &&
+        !snap?.stop &&
+        (!snap?.sendPresent || !!snap?.sendEnabled);
+      lastNewChatGPTAssistant = !!newChatGPTAssistant;
+      lastComposerIdle = !!composerIdle;
       const chatGPTDone =
         !!snap?.isChatGPT &&
         newChatGPTAssistant &&
         !snap?.stop &&
-        snap?.sendEnabled &&
+        composerIdle &&
         stopGoneLongEnough &&
         stable &&
         txt.length > 0;
@@ -1389,7 +1440,17 @@ export class ChatGPTController {
     }
 
     const err = new Error('timeout_waiting_for_response');
-    err.data = { last };
+    err.data = {
+      last,
+      lastAssistantCount: Number(lastSnap?.count) || 0,
+      lastAssistantId: String(lastSnap?.lastAssistantId || ''),
+      sendPresent: !!lastSnap?.sendPresent,
+      sendEnabled: !!lastSnap?.sendEnabled,
+      stop: !!lastSnap?.stop,
+      promptTextLength: Number.isFinite(Number(lastSnap?.promptTextLength)) ? Number(lastSnap.promptTextLength) : -1,
+      newChatGPTAssistant: lastNewChatGPTAssistant,
+      composerIdle: lastComposerIdle
+    };
     throw err;
   }
 

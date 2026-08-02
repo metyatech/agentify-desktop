@@ -503,3 +503,23 @@ test('chrome-cdp-backend: generic file input selection remains unchanged without
     [503]
   );
 });
+
+test('chrome-cdp-backend: selector-targeted file input accepts an empty file list to clear it', async () => {
+  const { session, calls } = await createSessionWithFileInputs({
+    '#upload-files': [601],
+    '#upload-photos': [602],
+    '#upload-camera': [603]
+  });
+
+  const result = await session.page.setFileInputFiles([], { selector: '#upload-files' });
+
+  assert.deepEqual(result, { selector: '#upload-files', found: 1, nodeId: 601 });
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.querySelectorAll').map((call) => call.params.selector),
+    ['#upload-files']
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'DOM.setFileInputFiles').map((call) => ({ nodeId: call.params.nodeId, files: call.params.files })),
+    [{ nodeId: 601, files: [] }]
+  );
+});

@@ -1015,6 +1015,8 @@ export class ChatGPTController {
     await this.#emitProgress({ phase: 'uploading_files' });
     const absFiles = files.map((p) => path.resolve(p));
     for (const f of absFiles) await fs.access(f);
+    const expectedFileNames = absFiles.map((file) => path.basename(file).trim());
+    const expectedFileNamesJson = JSON.stringify(expectedFileNames);
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
 
     const opened = await this.#eval(`(() => {
@@ -1067,14 +1069,48 @@ export class ChatGPTController {
       const pageUploadInputs = isChatGPT ? Array.from(document.querySelectorAll('#upload-files')) : [];
       const uploadInput = chatgptUploadInputs[0] || null;
       const inputReady = chatgptUploadInputs.length === 1 && pageUploadInputs.length === 1 && !!uploadInput && !uploadInput.disabled && !uploadInput.readOnly && uploadInput.id === 'upload-files' && uploadInput.id !== 'upload-photos' && uploadInput.id !== 'upload-camera';
-      if (inputReady) return { isChatGPT: true, opened: false, inputReady: true };
+      const expectedFileNames = ${expectedFileNamesJson};
+      const normalizeFileNames = (fileNames) => fileNames
+        .map((fileName) => String(fileName || '').trim().toLocaleLowerCase())
+        .sort();
+      const sameFileNames = (left, right) => left.length === right.length && left.every((fileName, index) => fileName === right[index]);
+      const selectedFileNames = Array.from(uploadInput?.files || []).map((file) => file.name);
+      const normalizedExpectedFileNames = normalizeFileNames(expectedFileNames);
+      const activeCardFileNames = activeComposer
+        ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]'))
+            .map((card) => String(card.getAttribute('aria-label') || '').trim())
+            .filter((fileName) => normalizedExpectedFileNames.includes(String(fileName).toLocaleLowerCase()))
+        : [];
+      const activeCardCounts = new Map();
+      for (const fileName of normalizeFileNames(activeCardFileNames)) {
+        activeCardCounts.set(fileName, (activeCardCounts.get(fileName) || 0) + 1);
+      }
+      const expectedCardCounts = new Map();
+      for (const fileName of normalizedExpectedFileNames) {
+        expectedCardCounts.set(fileName, (expectedCardCounts.get(fileName) || 0) + 1);
+      }
+      const allExpectedCardsPresent = Array.from(expectedCardCounts).every(([fileName, count]) => (activeCardCounts.get(fileName) || 0) >= count);
+      const noExpectedCardsPresent = activeCardFileNames.length === 0;
+      const someExpectedCardsPresent = activeCardFileNames.length > 0;
+      const inputState = {
+        isChatGPT: true,
+        opened: false,
+        inputReady,
+        selectedFileNames,
+        expectedFileNames,
+        selectionMatchesExpected: sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames),
+        activeCardFileNames,
+        allExpectedCardsPresent,
+        noExpectedCardsPresent,
+        someExpectedCardsPresent,
+        composerInputCount: chatgptUploadInputs.length,
+        pageUploadInputCount: pageUploadInputs.length
+      };
+      if (inputReady) return inputState;
       if (chatgptUploadInputs.length > 0) {
         return {
-          isChatGPT: true,
-          opened: false,
+          ...inputState,
           inputPresent: true,
-          composerInputCount: chatgptUploadInputs.length,
-          pageUploadInputCount: pageUploadInputs.length,
           inputDisabled: !!uploadInput?.disabled
         };
       }
@@ -1091,6 +1127,26 @@ export class ChatGPTController {
     })()`);
 
     if (opened?.isChatGPT && opened?.inputReady) {
+      if (opened?.allExpectedCardsPresent) return absFiles;
+      if (opened?.selectionMatchesExpected && opened?.someExpectedCardsPresent) {
+        const err = new Error('chatgpt_file_input_state_conflict');
+        err.data = {
+          expectedFileNames: opened.expectedFileNames || expectedFileNames,
+          selectedFileNames: opened.selectedFileNames || [],
+          activeCardFileNames: opened.activeCardFileNames || []
+        };
+        throw err;
+      }
+      if (opened?.selectionMatchesExpected && opened?.noExpectedCardsPresent) {
+        await this.page.setFileInputFiles([], { selector: '#upload-files' });
+        await this.#waitForChatGPTFileInputCleared({
+          expectedFileNames: opened.expectedFileNames || expectedFileNames,
+          selectedFileNames: opened.selectedFileNames || [],
+          activeCardFileNames: opened.activeCardFileNames || [],
+          composerInputCount: opened.composerInputCount,
+          pageUploadInputCount: opened.pageUploadInputCount
+        });
+      }
       await this.page.setFileInputFiles(absFiles, { selector: '#upload-files' });
       return absFiles;
     }
@@ -1114,6 +1170,89 @@ export class ChatGPTController {
       await this.page.setFileInputFiles(absFiles);
     }
     return absFiles;
+  }
+
+  async #waitForChatGPTFileInputCleared({
+    expectedFileNames = [],
+    selectedFileNames = [],
+    activeCardFileNames = [],
+    composerInputCount = 0,
+    pageUploadInputCount = 0,
+    timeoutMs = 2_000
+  } = {}) {
+    const start = Date.now();
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    let last = null;
+
+    while (true) {
+      this.#throwIfStopRequested();
+      last = await this.#eval(`(() => {
+        const host = location.hostname || '';
+        const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+        if (!isChatGPT) return { isChatGPT: false, cleared: true };
+        const visible = (node) => {
+          if (!node) return false;
+          const rect = node.getBoundingClientRect();
+          const style = window.getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const editable = (node) => {
+          if (!node || !visible(node)) return false;
+          if (node.matches('textarea, input')) return !node.disabled && !node.readOnly;
+          return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+        };
+        const promptScore = (node) => {
+          const rect = node.getBoundingClientRect();
+          const label = [node.getAttribute('aria-label') || '', node.getAttribute('placeholder') || '', node.getAttribute('name') || '', node.getAttribute('id') || '', node.getAttribute('data-testid') || ''].join(' ').toLowerCase();
+          let score = 0;
+          if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+          if (node.matches('textarea')) score += 50;
+          if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') score += 35;
+          if (node.getAttribute('role') === 'textbox') score += 25;
+          if (rect.width >= 260 && rect.height >= 26) score += 20;
+          score += Math.min(180, Math.max(0, (rect.width * rect.height) / 2500));
+          score += Math.max(0, rect.y / 8);
+          return score;
+        };
+        const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
+        const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="生成を停止する"], button[aria-label="生成を停止"], button[aria-label="停止"]';
+        const promptCandidates = Array.from(document.querySelectorAll(${promptSel}));
+        const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+        const prompt = [...promptCandidates, ...fallback]
+          .filter((node, index, nodes) => nodes.indexOf(node) === index)
+          .filter(editable)
+          .reduce((best, node) => !best || promptScore(node) > promptScore(best) ? node : best, null);
+        let activeComposer = prompt?.closest('form') || null;
+        for (let node = prompt?.parentElement || null; !activeComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          if (node.querySelector(chatgptSendSel) || node.querySelector(chatgptStopSel)) activeComposer = node;
+        }
+        const clearInput = activeComposer?.querySelector('input#upload-files[type="file"]') || null;
+        const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
+        const selectedFileNames = Array.from(clearInput?.files || []).map((file) => file.name);
+        return {
+          isChatGPT: true,
+          cleared: !!clearInput && pageUploadInputs.length === 1 && selectedFileNames.length === 0,
+          selectedFileNames,
+          composerInputCount: activeComposer ? activeComposer.querySelectorAll('input#upload-files[type="file"]').length : 0,
+          pageUploadInputCount: pageUploadInputs.length
+        };
+      })()`);
+
+      if (last?.cleared) return;
+      const elapsed = Date.now() - start;
+      if (elapsed >= timeoutMs) break;
+      await sleep(Math.min(100, timeoutMs - elapsed));
+    }
+
+    const err = new Error('chatgpt_file_input_clear_timeout');
+    err.data = {
+      expectedFileNames,
+      selectedFileNames,
+      activeCardFileNames,
+      composerInputCount,
+      pageUploadInputCount
+    };
+    throw err;
   }
 
   async #waitForChatGPTFileInputOrMenu({ timeoutMs = 5_000 } = {}) {

@@ -413,20 +413,107 @@ export class ChatGPTController {
     await this.#typeHuman(prompt);
   }
 
-  async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120 } = {}) {
+  async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120, sendBaseline = null } = {}) {
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
     const start = Date.now();
+    const normalizeText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+    const baseline = {
+      userCount: Math.max(0, Number(sendBaseline?.userCount) || 0),
+      lastUserId: String(sendBaseline?.lastUserId || '').trim(),
+      lastUserText: normalizeText(sendBaseline?.lastUserText),
+      activePromptText: normalizeText(sendBaseline?.activePromptText),
+      activePromptTextLength: Math.max(0, Number(sendBaseline?.activePromptTextLength) || 0)
+    };
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
       const snap = await this.#eval(`(() => {
+        const host = location.hostname || '';
+        const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
         const visible = (n) => {
           if (!n) return false;
           const r = n.getBoundingClientRect();
           const style = window.getComputedStyle(n);
           return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
         };
+        if (isChatGPT) {
+          const normalizeText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+          const editable = (n) => {
+            if (!n || !visible(n)) return false;
+            if (n.matches('textarea')) return !n.disabled && !n.readOnly;
+            if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
+            return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
+          };
+          const promptScore = (n) => {
+            const r = n.getBoundingClientRect();
+            const label = [
+              n.getAttribute('aria-label') || '',
+              n.getAttribute('placeholder') || '',
+              n.getAttribute('name') || '',
+              n.getAttribute('id') || '',
+              n.getAttribute('data-testid') || ''
+            ].join(' ').toLowerCase();
+            let score = 0;
+            if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+            if (n.matches('textarea')) score += 50;
+            if (n.isContentEditable || n.getAttribute('contenteditable') === 'true') score += 35;
+            if (n.getAttribute('role') === 'textbox') score += 25;
+            if (r.width >= 260 && r.height >= 26) score += 20;
+            score += Math.min(180, Math.max(0, (r.width * r.height) / 2500));
+            score += Math.max(0, r.y / 8);
+            return score;
+          };
+          const promptCandidates = Array.from(document.querySelectorAll(${promptSel}));
+          const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+          const candidates = [];
+          const seen = new Set();
+          for (const node of [...promptCandidates, ...fallback]) {
+            if (!node || seen.has(node)) continue;
+            seen.add(node);
+            candidates.push(node);
+          }
+          let activePrompt = null;
+          let bestScore = -Infinity;
+          for (const node of candidates) {
+            if (!editable(node)) continue;
+            const score = promptScore(node);
+            if (score > bestScore) {
+              bestScore = score;
+              activePrompt = node;
+            }
+          }
+          const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]';
+          const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
+          let chatgptComposer = activePrompt?.closest('form') || null;
+          for (let node = activePrompt?.parentElement || null; !chatgptComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+            if (node.querySelector(chatgptSendSel) || node.querySelector(chatgptStopSel)) chatgptComposer = node;
+          }
+          const normalSend = chatgptComposer ? Array.from(chatgptComposer.querySelectorAll(chatgptSendSel)).find(visible) : null;
+          const normalStopVisible = !!(chatgptComposer && Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible));
+          const chatgptUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+          const lastUserTurn = chatgptUserTurns[chatgptUserTurns.length - 1] || null;
+          const lastUserId = lastUserTurn
+            ? [
+                lastUserTurn.getAttribute('data-message-id'),
+                lastUserTurn.id,
+                lastUserTurn.getAttribute('data-testid')
+              ].map((value) => String(value || '').trim()).find(Boolean) || ''
+            : '';
+          const activePromptText = activePrompt?.matches('textarea, input')
+            ? String(activePrompt.value || '')
+            : String(activePrompt?.innerText || activePrompt?.textContent || '');
+          return {
+            isChatGPT: true,
+            userCount: chatgptUserTurns.length,
+            lastUserId,
+            lastUserText: normalizeText(lastUserTurn?.innerText || ''),
+            activePromptText: normalizeText(activePromptText),
+            activePromptTextLength: normalizeText(activePromptText).length,
+            hasNormalSend: !!normalSend,
+            normalStopVisible
+          };
+        }
         const stopVisible = Array.from(document.querySelectorAll(${stopSel})).some(visible);
         const send = Array.from(document.querySelectorAll(${sendSel})).find(visible);
         const sendDisabled = !!send && !!send.disabled;
@@ -455,16 +542,30 @@ export class ChatGPTController {
         return { stopVisible, sendDisabled, promptLen };
       })()`);
 
+      if (snap?.isChatGPT) {
+        const userCountIncreased = (snap.userCount || 0) > baseline.userCount;
+        const userIdChanged = !!baseline.lastUserId && !!snap.lastUserId && baseline.lastUserId !== snap.lastUserId;
+        const userTextMatchesPrompt =
+          baseline.activePromptTextLength >= 1 &&
+          snap.lastUserText === baseline.activePromptText &&
+          snap.lastUserText !== baseline.lastUserText;
+        const promptWasCleared = baseline.activePromptTextLength >= 1 && snap.activePromptTextLength === 0;
+        if (userCountIncreased || userIdChanged || userTextMatchesPrompt || promptWasCleared || snap.normalStopVisible) return true;
+        await sleep(pollMs);
+        continue;
+      }
+
       if (snap?.stopVisible || snap?.sendDisabled || snap?.promptLen === 0) return true;
       await sleep(pollMs);
     }
     return false;
   }
 
-  async #clickSend() {
+  async #clickSend({ timeoutMs = 5_000 } = {}) {
     await this.#emitProgress({ phase: 'sending_prompt' });
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
+    const chatgptSignalTimeoutMs = Math.min(5_000, Math.max(0, Number(timeoutMs) || 0));
     const res = await this.#eval(`(() => {
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
@@ -552,11 +653,30 @@ export class ChatGPTController {
         const normalStop = chatgptComposer
           ? Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible)
           : null;
+        const chatgptUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+        const lastUserTurn = chatgptUserTurns[chatgptUserTurns.length - 1] || null;
+        const lastUserId = lastUserTurn
+          ? [
+              lastUserTurn.getAttribute('data-message-id'),
+              lastUserTurn.id,
+              lastUserTurn.getAttribute('data-testid')
+            ].map((value) => String(value || '').trim()).find(Boolean) || ''
+          : '';
+        const activePromptText = prompt?.matches('textarea, input')
+          ? String(prompt.value || '')
+          : String(prompt?.innerText || prompt?.textContent || '');
+        const sendBaseline = {
+          userCount: chatgptUserTurns.length,
+          lastUserId,
+          lastUserText: String(lastUserTurn?.innerText || '').trim(),
+          activePromptText: activePromptText.trim(),
+          activePromptTextLength: activePromptText.trim().length
+        };
         if (normalStop && (!normalSend || disabled(normalSend))) {
-          return { ok: false, error: 'already_generating', isChatGPT: true, host };
+          return { ok: false, error: 'already_generating', isChatGPT: true, host, sendBaseline };
         }
         if (normalSend && disabled(normalSend)) {
-          return { ok: false, error: 'send_button_disabled', isChatGPT: true, host };
+          return { ok: false, error: 'send_button_disabled', isChatGPT: true, host, sendBaseline };
         }
         if (normalSend) {
           const rect = normalSend.getBoundingClientRect();
@@ -566,7 +686,8 @@ export class ChatGPTController {
             fallbackEnter: false,
             rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
             requestSubmit: !!prompt?.closest('form'),
-            host
+            host,
+            sendBaseline
           };
         }
         return {
@@ -574,7 +695,8 @@ export class ChatGPTController {
           isChatGPT: true,
           fallbackEnter: true,
           requestSubmit: !!prompt?.closest('form'),
-          host
+          host,
+          sendBaseline
         };
       }
       const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
@@ -640,7 +762,11 @@ export class ChatGPTController {
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy);
-      sent = await this.#waitForSendSignal({ timeoutMs: 2200, pollMs: 120 });
+      sent = await this.#waitForSendSignal({
+        timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 2200,
+        pollMs: 120,
+        sendBaseline: res?.sendBaseline
+      });
     }
 
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
@@ -690,7 +816,11 @@ export class ChatGPTController {
         }
         return false;
       })()`);
-      sent = await this.#waitForSendSignal({ timeoutMs: 1400, pollMs: 120 });
+      sent = await this.#waitForSendSignal({
+        timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1400,
+        pollMs: 120,
+        sendBaseline: res?.sendBaseline
+      });
     }
 
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
@@ -714,7 +844,11 @@ export class ChatGPTController {
         this.#throwIfStopRequested();
         await sleep(jitter(25, 90));
         await this.#sendKey(key, { modifiers });
-        sent = await this.#waitForSendSignal({ timeoutMs: 1500, pollMs: 120 });
+        sent = await this.#waitForSendSignal({
+          timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1500,
+          pollMs: 120,
+          sendBaseline: res?.sendBaseline
+        });
         if (sent) break;
       }
     }
@@ -1125,7 +1259,7 @@ export class ChatGPTController {
         });
       }
       const baseline = await this.#captureChatGPTAssistantBaseline();
-      await this.#clickSend();
+      await this.#clickSend({ timeoutMs });
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
@@ -1143,7 +1277,7 @@ export class ChatGPTController {
       try {
         await this.ensureReady({ timeoutMs });
         await this.#typePrompt(prompt);
-        await this.#clickSend();
+        await this.#clickSend({ timeoutMs });
 
         if (stopAfterSend) {
           const start = Date.now();

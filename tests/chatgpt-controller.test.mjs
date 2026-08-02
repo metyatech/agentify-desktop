@@ -72,7 +72,7 @@ function createController(page) {
 }
 
 function isClickSendEvaluation(js) {
-  return js.includes('const chatgptSendSel') || js.includes('already_generating');
+  return js.includes('const sendBaseline');
 }
 
 test('chatgpt-controller: send falls back to requestSubmit on the active composer before Enter', async () => {
@@ -577,4 +577,192 @@ test('chatgpt-controller: limits attachment selection to the active composer and
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
+});
+
+function sendBaseline({ userCount = 0, lastUserId = '', lastUserText = '', activePromptText = 'send prompt' } = {}) {
+  return {
+    userCount,
+    lastUserId,
+    lastUserText,
+    activePromptText,
+    activePromptTextLength: activePromptText.length
+  };
+}
+
+function chatgptSendSignal({
+  userCount = 0,
+  lastUserId = '',
+  lastUserText = '',
+  activePromptText = 'send prompt',
+  normalStopVisible = false
+} = {}) {
+  return {
+    isChatGPT: true,
+    userCount,
+    lastUserId,
+    lastUserText,
+    activePromptText,
+    activePromptTextLength: activePromptText.length,
+    normalStopVisible
+  };
+}
+
+test('chatgpt-controller: recognizes a new user turn when controls do not change after a normal send click', async () => {
+  const events = [];
+  let sendPolls = 0;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) {
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: false,
+          host: 'chatgpt.com',
+          rect: { x: 90, y: 10, w: 20, h: 20 },
+          sendBaseline: sendBaseline({ activePromptText: 'count-based send' })
+        };
+      }
+      if (js.includes('const chatgptUserTurns')) {
+        sendPolls += 1;
+        return chatgptSendSignal({
+          userCount: 1,
+          lastUserId: 'new-user-turn',
+          lastUserText: 'count-based send',
+          activePromptText: 'count-based send'
+        });
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: 'count-based send', timeoutMs: 100 });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(sendPolls, 1);
+  assert.equal(events.includes('normal-send-click'), true);
+});
+
+test('chatgpt-controller: recognizes a virtualized user turn when only its identifier changes', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) {
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: false,
+          host: 'chatgpt.com',
+          rect: { x: 90, y: 10, w: 20, h: 20 },
+          sendBaseline: sendBaseline({ userCount: 1, lastUserId: 'old-user-turn', lastUserText: 'OLD' })
+        };
+      }
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({ userCount: 1, lastUserId: 'virtualized-user-turn', lastUserText: 'new prompt' });
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: 'new prompt', timeoutMs: 100 });
+
+  assert.deepEqual(result, { ok: true });
+});
+
+test('chatgpt-controller: recognizes a multiline user turn by text when identifiers are unavailable', async () => {
+  const events = [];
+  const prompt = 'line1\nline2\nline3';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) {
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: false,
+          host: 'chatgpt.com',
+          rect: { x: 90, y: 10, w: 20, h: 20 },
+          sendBaseline: sendBaseline({ userCount: 1, lastUserText: 'OLD-USER-TURN', activePromptText: prompt })
+        };
+      }
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({ userCount: 1, lastUserText: 'line1 line2 line3', activePromptText: prompt });
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: prompt, timeoutMs: 100 });
+
+  assert.deepEqual(result, { ok: true });
+});
+
+test('chatgpt-controller: rejects an unchanged ChatGPT send state without a normal stop button', async () => {
+  const events = [];
+  const baseline = sendBaseline({ userCount: 1, lastUserId: 'old-user-turn', lastUserText: 'OLD', activePromptText: 'unchanged prompt' });
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) {
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: false,
+          host: 'chatgpt.com',
+          rect: { x: 90, y: 10, w: 20, h: 20 },
+          sendBaseline: baseline
+        };
+      }
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({
+          userCount: baseline.userCount,
+          lastUserId: baseline.lastUserId,
+          lastUserText: baseline.lastUserText,
+          activePromptText: baseline.activePromptText
+        });
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: 'unchanged prompt', timeoutMs: 20 }),
+    /send_not_triggered/
+  );
+
+  assert.equal(events.includes('normal-send-click'), true);
+});
+
+test('chatgpt-controller: checks send completion only within the active composer', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const sendBaseline')) {
+        return {
+          ok: true,
+          isChatGPT: true,
+          fallbackEnter: false,
+          host: 'chatgpt.com',
+          rect: { x: 90, y: 10, w: 20, h: 20 },
+          sendBaseline: sendBaseline({ activePromptText: 'composer-only' })
+        };
+      }
+      if (js.includes('const chatgptUserTurns')) {
+        if (!js.includes('chatgptComposer.querySelectorAll(chatgptSendSel)')) {
+          throw new Error('composer-external send button consulted');
+        }
+        if (!js.includes('chatgptComposer.querySelectorAll(chatgptStopSel)')) {
+          throw new Error('composer-external stop button consulted');
+        }
+        return chatgptSendSignal({ userCount: 1, lastUserId: 'composer-user-turn', lastUserText: 'composer-only', activePromptText: 'composer-only' });
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: 'composer-only', timeoutMs: 100 });
+
+  assert.deepEqual(result, { ok: true });
 });

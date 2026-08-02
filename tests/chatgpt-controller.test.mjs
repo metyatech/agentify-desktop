@@ -126,6 +126,7 @@ test('chatgpt-controller: query returns the final ChatGPT assistant message, not
   const page = createPage({
     events,
     onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
       if (js.includes('const assistantCandidates')) {
         return {
@@ -180,9 +181,11 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
 
   try {
     const events = [];
+    let attachmentReadyPolls = 0;
     const page = createPage({
       events,
       onEvaluate: async (js) => {
+        if (js.includes('const assistantBaseline')) return assistantBaseline();
         if (js.includes('const codeBlocks')) return { codeBlocks: [] };
         if (js.includes('const assistantCandidates')) {
           return {
@@ -201,20 +204,21 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
           events.push('attachment-menu-open');
           return { isChatGPT: true, opened: true };
         }
-        if (js.includes('const fileMenuItems')) {
+        if (js.includes('const visibleMenuRoots')) {
           events.push('attachment-file-option');
-          return { isChatGPT: true, selected: true };
+          return { inputAvailable: false, selected: true };
         }
-        if (js.includes('const attachmentReady')) {
+        if (js.includes('const expectedFileNames')) {
+          attachmentReadyPolls += 1;
           events.push('attachment-ready');
           return {
             isChatGPT: true,
-            ready: true,
             promptTextLength: 14,
             hasSendButton: true,
-            sendVisible: true,
             sendDisabled: false,
-            busy: false
+            busy: false,
+            conditionsReady: true,
+            observedFileNames: ['attachment.txt']
           };
         }
         if (isClickSendEvaluation(js)) {
@@ -311,6 +315,265 @@ test('chatgpt-controller: aborts before sending when attachment upload readiness
 
     assert.equal(events.includes('normal-send-click'), false);
     assert.equal(events.includes('requestSubmit'), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+function assistantBaseline({ count = 0, lastAssistantId = '', lastAssistantText = '' } = {}) {
+  return { isChatGPT: true, assistantCount: count, lastAssistantId, lastAssistantText };
+}
+
+function assistantSnapshot({
+  stop = false,
+  sendEnabled = true,
+  txt = '',
+  count = 0,
+  lastAssistantId = '',
+  hasContinue = false
+} = {}) {
+  return {
+    isChatGPT: true,
+    stop,
+    sendEnabled,
+    txt,
+    count,
+    lastAssistantId,
+    usedFallback: false,
+    hasError: false,
+    hasContinue,
+    hasRegenerate: false
+  };
+}
+
+test('chatgpt-controller: waits for a new assistant turn instead of returning the previous answer', async () => {
+  const events = [];
+  let baselineCaptured = false;
+  let responsePolls = 0;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) {
+        baselineCaptured = true;
+        return assistantBaseline({ count: 1, lastAssistantId: 'old-turn', lastAssistantText: 'OLD-ANSWER' });
+      }
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        assert.equal(baselineCaptured, true);
+        responsePolls += 1;
+        return responsePolls < 5
+          ? assistantSnapshot({ count: 1, lastAssistantId: 'old-turn', txt: 'OLD-ANSWER' })
+          : assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'NEW-ANSWER' });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).query({ prompt: 'return only the new answer', timeoutMs: 8_000 });
+
+  assert.equal(result.text, 'NEW-ANSWER');
+  assert.ok(responsePolls >= 5);
+});
+
+test('chatgpt-controller: treats a visible normal stop button without a send button as generating', async () => {
+  const events = [];
+  let baselineCaptured = false;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) {
+        baselineCaptured = true;
+        return assistantBaseline({ count: 1, lastAssistantId: 'old-turn', lastAssistantText: 'OLD-ANSWER' });
+      }
+      if (js.includes('const assistantCandidates')) {
+        assert.equal(baselineCaptured, true);
+        return assistantSnapshot({
+          stop: true,
+          sendEnabled: false,
+          count: 1,
+          lastAssistantId: 'old-turn',
+          txt: 'OLD-ANSWER'
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'wait for the current generation', timeoutMs: 25 }),
+    (error) => {
+      assert.equal(error.message, 'timeout_waiting_for_response');
+      assert.equal(error.data?.last, 'OLD-ANSWER');
+      return true;
+    }
+  );
+});
+
+test('chatgpt-controller: waits for all attachment names in two consecutive composer polls', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
+  const attachment = path.join(tempDir, 'expected.txt');
+  await fs.writeFile(attachment, 'test attachment');
+
+  try {
+    const events = [];
+    let attachmentPolls = 0;
+    const page = createPage({
+      events,
+      onEvaluate: async (js) => {
+        if (js.includes('const assistantBaseline')) return assistantBaseline();
+        if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'uploaded' });
+        if (js.includes('const attachCandidates')) {
+          if (!js.includes(`activeComposer.querySelectorAll('button, [role="button"]')`)) {
+            throw new Error('composer-external attachment button selected');
+          }
+          events.push('attachment-menu-open');
+          return { isChatGPT: true, opened: true };
+        }
+        if (js.includes('const visibleMenuRoots')) {
+          events.push('file-input-ready');
+          return { inputAvailable: true, selected: false };
+        }
+        if (js.includes('const expectedFileNames')) {
+          attachmentPolls += 1;
+          events.push(`attachment-check:${attachmentPolls}`);
+          return {
+            isChatGPT: true,
+            promptTextLength: 14,
+            hasSendButton: true,
+            sendDisabled: false,
+            busy: false,
+            conditionsReady: true,
+            observedFileNames: attachmentPolls === 1 ? [] : ['expected.txt']
+          };
+        }
+        if (isClickSendEvaluation(js)) {
+          return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+        }
+        if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+        throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      }
+    });
+
+    await createController(page).query({ prompt: 'upload expected file', attachments: [attachment], timeoutMs: 5_000 });
+
+    assert.equal(attachmentPolls, 3);
+    assert.ok(events.indexOf('attachment-check:3') < events.indexOf('normal-send-click'));
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('chatgpt-controller: rejects an attachment set when even one expected filename never appears', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
+  const firstAttachment = path.join(tempDir, 'first.txt');
+  const secondAttachment = path.join(tempDir, 'second.txt');
+  await fs.writeFile(firstAttachment, 'first');
+  await fs.writeFile(secondAttachment, 'second');
+
+  try {
+    const events = [];
+    const page = createPage({
+      events,
+      onEvaluate: async (js) => {
+        if (js.includes('const attachCandidates')) return { isChatGPT: true, opened: true };
+        if (js.includes('const visibleMenuRoots')) return { inputAvailable: true, selected: false };
+        if (js.includes('const expectedFileNames')) {
+          return {
+            isChatGPT: true,
+            promptTextLength: 12,
+            hasSendButton: true,
+            sendDisabled: false,
+            busy: false,
+            observedFileNames: ['first.txt']
+          };
+        }
+        if (isClickSendEvaluation(js)) throw new Error('send_must_not_be_checked');
+        throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'wait for both', attachments: [firstAttachment, secondAttachment], timeoutMs: 20 }),
+      (error) => {
+        assert.equal(error.message, 'attachment_upload_timeout');
+        assert.deepEqual(error.data?.expectedFileNames, ['first.txt', 'second.txt']);
+        assert.deepEqual(error.data?.observedFileNames, ['first.txt']);
+        assert.equal(error.data?.promptTextLength, 12);
+        assert.equal(error.data?.hasSendButton, true);
+        assert.equal(error.data?.sendDisabled, false);
+        assert.equal(error.data?.busy, false);
+        return true;
+      }
+    );
+
+    assert.equal(events.includes('normal-send-click'), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('chatgpt-controller: limits attachment selection to the active composer and visible file menu', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
+  const attachment = path.join(tempDir, 'menu.txt');
+  await fs.writeFile(attachment, 'menu');
+
+  try {
+    const events = [];
+    let attachmentPolls = 0;
+    const page = createPage({
+      events,
+      onEvaluate: async (js) => {
+        if (js.includes('const assistantBaseline')) return assistantBaseline();
+        if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'menu uploaded' });
+        if (js.includes('const attachCandidates')) {
+          if (!js.includes(`activeComposer.querySelectorAll('button, [role="button"]')`)) {
+            throw new Error('composer-external attachment button selected');
+          }
+          events.push('active-composer-attachment');
+          return { isChatGPT: true, opened: true };
+        }
+        if (js.includes('const visibleMenuRoots')) {
+          assert.equal(js.includes('visibleMenuRoots.flatMap'), true, 'must search only visible menu roots');
+          events.push('visible-menu-file-option');
+          return { inputAvailable: false, selected: true };
+        }
+        if (js.includes('const expectedFileNames')) {
+          attachmentPolls += 1;
+          return {
+            isChatGPT: true,
+            promptTextLength: 12,
+            hasSendButton: true,
+            sendDisabled: false,
+            busy: false,
+            conditionsReady: true,
+            observedFileNames: ['menu.txt']
+          };
+        }
+        if (isClickSendEvaluation(js)) {
+          return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+        }
+        if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+        throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      }
+    });
+
+    await createController(page).query({ prompt: 'use active composer', attachments: [attachment], timeoutMs: 5_000 });
+
+    assert.equal(attachmentPolls, 2);
+    assert.deepEqual(
+      events.filter((event) => event === 'active-composer-attachment' || event === 'visible-menu-file-option'),
+      ['active-composer-attachment', 'visible-menu-file-option']
+    );
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { ChatGPTController } from '../chatgpt-controller.mjs';
+import { ChatGPTController, isChatGPTAttachmentCardDisplayName } from '../chatgpt-controller.mjs';
 
 const selectors = {
   promptTextarea: '#prompt-textarea',
@@ -222,15 +222,7 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
         if (js.includes('const expectedFileNames')) {
           attachmentReadyPolls += 1;
           events.push('attachment-ready');
-          return {
-            isChatGPT: true,
-            promptTextLength: 14,
-            hasSendButton: true,
-            sendDisabled: false,
-            busy: false,
-            conditionsReady: true,
-            observedFileNames: ['attachment.txt']
-          };
+          return attachmentCardSnapshot([{ fileName: 'attachment.txt', found: true, pending: false, failed: false }], { promptTextLength: 14 });
         }
         if (isClickSendEvaluation(js)) {
           return {
@@ -466,15 +458,16 @@ test('chatgpt-controller: waits for all attachment names in two consecutive comp
         if (js.includes('const expectedFileNames')) {
           attachmentPolls += 1;
           events.push(`attachment-check:${attachmentPolls}`);
-          return {
-            isChatGPT: true,
+          return attachmentCardSnapshot([{
+            fileName: 'expected.txt',
+            found: attachmentPolls > 1,
+            pending: false,
+            failed: false
+          }], {
             promptTextLength: 14,
-            hasSendButton: true,
-            sendDisabled: false,
-            busy: false,
-            conditionsReady: true,
-            observedFileNames: attachmentPolls === 1 ? [] : ['expected.txt']
-          };
+            conditionsReady: attachmentPolls > 1,
+            mappingComplete: attachmentPolls > 1
+          });
         }
         if (isClickSendEvaluation(js)) {
           return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
@@ -508,14 +501,15 @@ test('chatgpt-controller: rejects an attachment set when even one expected filen
         if (js.includes('const attachCandidates')) return { isChatGPT: true, opened: true };
         if (js.includes('const visibleMenuRoots')) return { inputAvailable: true, selected: false };
         if (js.includes('const expectedFileNames')) {
-          return {
-            isChatGPT: true,
+          return attachmentCardSnapshot([
+            { fileName: 'first.txt', found: true, pending: false, failed: false },
+            { fileName: 'second.txt', found: false, pending: false, failed: false }
+          ], {
             promptTextLength: 12,
-            hasSendButton: true,
-            sendDisabled: false,
-            busy: false,
-            observedFileNames: ['first.txt']
-          };
+            conditionsReady: false,
+            mappingComplete: false,
+            mappingErrors: ['file_card_count_mismatch']
+          });
         }
         if (isClickSendEvaluation(js)) throw new Error('send_must_not_be_checked');
         throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
@@ -575,15 +569,7 @@ test('chatgpt-controller: limits attachment selection to the active composer and
         }
         if (js.includes('const expectedFileNames')) {
           attachmentPolls += 1;
-          return {
-            isChatGPT: true,
-            promptTextLength: 12,
-            hasSendButton: true,
-            sendDisabled: false,
-            busy: false,
-            conditionsReady: true,
-            observedFileNames: ['menu.txt']
-          };
+          return attachmentCardSnapshot([{ fileName: 'menu.txt', found: true, pending: false, failed: false }]);
         }
         if (isClickSendEvaluation(js)) {
           return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
@@ -1302,11 +1288,19 @@ async function withTempAttachments(names, fn) {
   }
 }
 
-function attachmentCardSnapshot(fileStates, { observedFileNames, promptTextLength = 12, hasSendButton = true, sendDisabled = false, busy = false, conditionsReady = true } = {}) {
+function attachmentCardSnapshot(fileStates, { observedFileNames, promptTextLength = 12, hasSendButton = true, sendDisabled = false, busy = false, conditionsReady = true, mappingComplete = true, mappingErrors = [] } = {}) {
   return {
     isChatGPT: true,
     fileStates,
     observedFileNames: observedFileNames || fileStates.filter((state) => state.found).map((state) => state.fileName),
+    observedDisplayNames: fileStates.filter((state) => state.found && state.displayNameValid !== false).map((state) => state.displayName || state.fileName),
+    selectedFileNames: fileStates.map((state) => state.fileName),
+    cardDisplayNames: fileStates.filter((state) => state.found).map((state) => state.displayName || state.fileName),
+    fileCount: fileStates.length,
+    cardCount: fileStates.filter((state) => state.found).length,
+    countsMatch: fileStates.length === fileStates.filter((state) => state.found).length,
+    mappingComplete,
+    mappingErrors,
     missingFileNames: fileStates.filter((state) => !state.found).map((state) => state.fileName),
     pendingFileNames: fileStates.filter((state) => state.pending).map((state) => state.fileName),
     failedFileNames: fileStates.filter((state) => state.failed).map((state) => state.fileName),
@@ -1468,21 +1462,23 @@ test('chatgpt-controller: includes attachment card readiness diagnostics on time
 
 function chatgptUploadInputState({
   selectedFileNames = [],
-  activeCardFileNames = [],
+  cardDisplayNames = [],
   selectionMatchesExpected = false,
-  allExpectedCardsPresent = false,
-  noExpectedCardsPresent = false,
-  someExpectedCardsPresent = false
+  mappingComplete = false,
+  mappingErrors = []
 } = {}) {
   return {
     isChatGPT: true,
     inputReady: true,
     selectedFileNames,
-    activeCardFileNames,
+    selectedFiles: selectedFileNames.map((name, index) => ({ name, size: 0, type: 'text/plain', lastModified: 0, index })),
+    cardDisplayNames,
     selectionMatchesExpected,
-    allExpectedCardsPresent,
-    noExpectedCardsPresent,
-    someExpectedCardsPresent,
+    fileCount: selectedFileNames.length,
+    cardCount: cardDisplayNames.length,
+    countsMatch: selectedFileNames.length === cardDisplayNames.length,
+    mappingComplete,
+    mappingErrors,
     composerInputCount: 1,
     pageUploadInputCount: 1
   };
@@ -1497,7 +1493,19 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
       if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'reselected-turn', txt: 'uploaded' });
-      if (js.includes('const chatgptUploadInputs')) return initialState;
+      if (js.includes('const chatgptUploadInputs')) {
+        assert.doesNotThrow(() => new Function(js));
+        return initialState;
+      }
+      if (js.includes('const nativeValueSetter')) {
+        assert.equal(js.includes("nativeValueSetter.call(uploadInput, '')"), true);
+        assert.equal(js.includes("new Event('input', { bubbles: true, composed: true })"), true);
+        assert.equal(js.includes("new Event('change', { bubbles: true, composed: true })"), true);
+        events.push('native-clear');
+        events.push('native-input');
+        events.push('native-change');
+        return { ok: true };
+      }
       if (js.includes('const clearInput')) {
         clearPolls += 1;
         const cleared = clearAfterPoll > 0 && clearPolls >= clearAfterPoll;
@@ -1507,7 +1515,10 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
           selectedFileNames: cleared ? [] : initialState.selectedFileNames,
           composerInputCount: 1,
           pageUploadInputCount: 1,
-          activeCardFileNames: initialState.activeCardFileNames
+          cardDisplayNames: initialState.cardDisplayNames || [],
+          filesLength: cleared ? 0 : initialState.selectedFileNames.length,
+          inputValueLength: cleared ? 0 : 32,
+          cardCount: 0
         };
       }
       if (js.includes('const expectedFileNames')) {
@@ -1529,7 +1540,7 @@ test('chatgpt-controller: initial attachment sets the ordinary file once without
     const events = [];
     const { page } = createUploadInputStatePage({
       events,
-      initialState: chatgptUploadInputState({ selectedFileNames: [], noExpectedCardsPresent: true })
+      initialState: chatgptUploadInputState({ selectedFileNames: [] })
     });
 
     await createController(page).query({ prompt: 'attach initially', attachments: [attachment], timeoutMs: 5_000 });
@@ -1545,17 +1556,15 @@ test('chatgpt-controller: clears a stale same-file selection before reselecting 
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       }),
       clearAfterPoll: 1
     });
 
     await createController(page).query({ prompt: 'reselect the same file', attachments: [attachment], timeoutMs: 5_000 });
 
-    assert.deepEqual(events.filter((event) => event.startsWith('files-')), [
-      'files-set:0', 'files-selector:#upload-files', 'files-set:1', 'files-selector:#upload-files'
-    ]);
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+    assert.deepEqual(events.filter((event) => event.startsWith('native-')), ['native-clear', 'native-input', 'native-change']);
   });
 });
 
@@ -1566,8 +1575,7 @@ test('chatgpt-controller: waits for the active file input to clear before resele
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       }),
       clearAfterPoll: 2
     });
@@ -1575,9 +1583,8 @@ test('chatgpt-controller: waits for the active file input to clear before resele
     await createController(page).query({ prompt: 'wait for clear', attachments: [attachment], timeoutMs: 5_000 });
 
     assert.equal(clearPolls(), 2);
-    assert.deepEqual(events.filter((event) => event.startsWith('files-')), [
-      'files-set:0', 'files-selector:#upload-files', 'files-set:1', 'files-selector:#upload-files'
-    ]);
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+    assert.equal(events.indexOf('native-clear') < events.indexOf('files-set:1'), true);
   });
 });
 
@@ -1588,9 +1595,7 @@ test('chatgpt-controller: reports a file-input clear timeout without reselecting
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        activeCardFileNames: [],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       })
     });
 
@@ -1600,13 +1605,17 @@ test('chatgpt-controller: reports a file-input clear timeout without reselecting
         assert.equal(error.message, 'chatgpt_file_input_clear_timeout');
         assert.deepEqual(error.data?.expectedFileNames, ['repeat.txt']);
         assert.deepEqual(error.data?.selectedFileNames, ['repeat.txt']);
-        assert.deepEqual(error.data?.activeCardFileNames, []);
+        assert.deepEqual(error.data?.cardDisplayNames, []);
         assert.equal(error.data?.composerInputCount, 1);
         assert.equal(error.data?.pageUploadInputCount, 1);
+        assert.equal(error.data?.filesLength, 1);
+        assert.equal(error.data?.inputValueLength, 32);
+        assert.equal(error.data?.cardCount, 0);
         return true;
       }
     );
-    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:0', 'files-selector:#upload-files']);
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
+    assert.equal(events.includes('native-clear'), true);
   });
 });
 
@@ -1617,10 +1626,9 @@ test('chatgpt-controller: reuses complete active composer cards without clearing
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        activeCardFileNames: ['repeat.txt'],
+        cardDisplayNames: ['repeat.txt'],
         selectionMatchesExpected: true,
-        allExpectedCardsPresent: true,
-        someExpectedCardsPresent: true
+        mappingComplete: true
       })
     });
 
@@ -1638,9 +1646,9 @@ test('chatgpt-controller: rejects a partial active composer attachment state wit
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['first.txt', 'second.txt'],
-        activeCardFileNames: ['first.txt'],
+        cardDisplayNames: ['first.txt'],
         selectionMatchesExpected: true,
-        someExpectedCardsPresent: true
+        mappingErrors: ['file_card_count_mismatch']
       })
     });
 
@@ -1650,7 +1658,7 @@ test('chatgpt-controller: rejects a partial active composer attachment state wit
         assert.equal(error.message, 'chatgpt_file_input_state_conflict');
         assert.deepEqual(error.data?.expectedFileNames, ['first.txt', 'second.txt']);
         assert.deepEqual(error.data?.selectedFileNames, ['first.txt', 'second.txt']);
-        assert.deepEqual(error.data?.activeCardFileNames, ['first.txt']);
+        assert.deepEqual(error.data?.cardDisplayNames, ['first.txt']);
         return true;
       }
     );
@@ -1665,18 +1673,15 @@ test('chatgpt-controller: ignores a historical same-name card when deciding to c
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        activeCardFileNames: [],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       }),
       clearAfterPoll: 1
     });
 
     await createController(page).query({ prompt: 'historical card is irrelevant', attachments: [attachment], timeoutMs: 5_000 });
 
-    assert.deepEqual(events.filter((event) => event.startsWith('files-')), [
-      'files-set:0', 'files-selector:#upload-files', 'files-set:1', 'files-selector:#upload-files'
-    ]);
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+    assert.equal(events.includes('native-clear'), true);
   });
 });
 
@@ -1685,7 +1690,7 @@ test('chatgpt-controller: replaces a different selected file without clearing fi
     const events = [];
     const { page } = createUploadInputStatePage({
       events,
-      initialState: chatgptUploadInputState({ selectedFileNames: ['other.txt'], noExpectedCardsPresent: true })
+      initialState: chatgptUploadInputState({ selectedFileNames: ['other.txt'] })
     });
 
     await createController(page).query({ prompt: 'replace another file', attachments: [attachment], timeoutMs: 5_000 });
@@ -1701,15 +1706,15 @@ test('chatgpt-controller: treats basename case differences as a stale same-file 
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       }),
       clearAfterPoll: 1
     });
 
     await createController(page).query({ prompt: 'case-insensitive repeat', attachments: [attachment], timeoutMs: 5_000 });
 
-    assert.equal(events.filter((event) => event === 'files-set:0').length, 1);
+    assert.equal(events.filter((event) => event === 'files-set:0').length, 0);
+    assert.equal(events.filter((event) => event === 'native-clear').length, 1);
   });
 });
 
@@ -1720,8 +1725,7 @@ test('chatgpt-controller: treats reordered duplicate basenames as a stale same-f
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['SECOND.TXT', 'FIRST.TXT', 'first.txt'],
-        selectionMatchesExpected: true,
-        noExpectedCardsPresent: true
+        selectionMatchesExpected: true
       }),
       clearAfterPoll: 1,
       fileStateForPoll: () => attachmentCardSnapshot([
@@ -1733,7 +1737,152 @@ test('chatgpt-controller: treats reordered duplicate basenames as a stale same-f
 
     await createController(page).query({ prompt: 'reordered repeated files', attachments: [first, second, duplicate], timeoutMs: 5_000 });
 
-    assert.equal(events.filter((event) => event === 'files-set:0').length, 1);
+    assert.equal(events.filter((event) => event === 'files-set:0').length, 0);
+    assert.equal(events.filter((event) => event === 'native-clear').length, 1);
     assert.equal(events.filter((event) => event === 'files-set:3').length, 1);
   });
+});
+
+test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attachment card display names', () => {
+  const accepted = [
+    ['foo.txt', 'foo.txt'],
+    ['foo.txt', 'foo(2).txt'],
+    ['foo.txt', 'foo(15).txt'],
+    ['foo(2).txt', 'foo(2).txt'],
+    ['foo(2).txt', 'foo(2)(2).txt'],
+    ['archive.tar.gz', 'archive.tar(2).gz'],
+    ['README', 'README(2)'],
+    ['.env', '.env(2)']
+  ];
+  const rejected = [
+    ['foo.txt', 'foo (2).txt'],
+    ['foo.txt', 'foo-2.txt'],
+    ['foo.txt', 'foo(1).txt'],
+    ['foo.txt', 'bar(2).txt'],
+    ['foo.txt', 'foo(2).md']
+  ];
+
+  for (const [fileName, displayName] of accepted) {
+    assert.equal(isChatGPTAttachmentCardDisplayName(fileName, displayName), true, `${fileName} -> ${displayName}`);
+  }
+  for (const [fileName, displayName] of rejected) {
+    assert.equal(isChatGPTAttachmentCardDisplayName(fileName, displayName), false, `${fileName} -> ${displayName}`);
+  }
+});
+
+test('chatgpt-controller: reuses a completed renamed ChatGPT card mapped from the active FileList', async () => {
+  await withTempAttachments(['foo.txt'], async ([attachment]) => {
+    const events = [];
+    const { page, attachmentPolls } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({
+        selectedFileNames: ['foo.txt'],
+        cardDisplayNames: ['foo(2).txt'],
+        selectionMatchesExpected: true,
+        mappingComplete: true
+      }),
+      fileStateForPoll: () => attachmentCardSnapshot([{
+        fileName: 'foo.txt',
+        displayName: 'foo(2).txt',
+        found: true,
+        displayNameValid: true,
+        pending: false,
+        failed: false
+      }])
+    });
+
+    await createController(page).query({ prompt: 'reuse renamed attachment', attachments: [attachment], timeoutMs: 5_000 });
+
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
+    assert.equal(events.includes('native-clear'), false);
+    assert.equal(attachmentPolls(), 2);
+  });
+});
+
+test('chatgpt-controller: reuses duplicate FileList entries only when every ordered card maps', async () => {
+  await withTempAttachments(['foo.txt'], async ([attachment]) => {
+    const events = [];
+    const { page, attachmentPolls } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({
+        selectedFileNames: ['foo.txt', 'foo.txt'],
+        cardDisplayNames: ['foo.txt', 'foo(2).txt'],
+        selectionMatchesExpected: true,
+        mappingComplete: true
+      }),
+      fileStateForPoll: () => attachmentCardSnapshot([
+        { fileName: 'foo.txt', displayName: 'foo.txt', found: true, displayNameValid: true, pending: false, failed: false },
+        { fileName: 'foo.txt', displayName: 'foo(2).txt', found: true, displayNameValid: true, pending: false, failed: false }
+      ])
+    });
+
+    await createController(page).query({ prompt: 'reuse duplicate attachments', attachments: [attachment, attachment], timeoutMs: 5_000 });
+
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
+    assert.equal(attachmentPolls(), 2);
+  });
+});
+
+test('chatgpt-controller: refuses an invalid renamed active card without sending or clearing it', async () => {
+  await withTempAttachments(['foo.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({
+        selectedFileNames: ['foo.txt'],
+        cardDisplayNames: ['foo (2).txt'],
+        selectionMatchesExpected: true,
+        mappingErrors: ['display_name_mismatch:0']
+      })
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not infer renamed cards', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => {
+        assert.equal(error.message, 'chatgpt_file_input_state_conflict');
+        assert.deepEqual(error.data?.cardDisplayNames, ['foo (2).txt']);
+        return true;
+      }
+    );
+    assert.equal(events.includes('native-clear'), false);
+    assert.equal(events.some((event) => event.startsWith('files-set:')), false);
+  });
+});
+
+test('chatgpt-controller: rejects reversed or count-mismatched active card mappings without clearing', async () => {
+  await withTempAttachments(['first.txt', 'second.txt'], async ([first, second]) => {
+    for (const cardDisplayNames of [['second.txt', 'first.txt'], ['first.txt']]) {
+      const events = [];
+      const { page } = createUploadInputStatePage({
+        events,
+        initialState: chatgptUploadInputState({
+          selectedFileNames: ['first.txt', 'second.txt'],
+          cardDisplayNames,
+          selectionMatchesExpected: true,
+          mappingErrors: cardDisplayNames.length === 2 ? ['display_name_mismatch:0'] : ['file_card_count_mismatch']
+        })
+      });
+
+      await assert.rejects(
+        createController(page).query({ prompt: 'preserve unresolved attachments', attachments: [first, second], timeoutMs: 5_000 }),
+        (error) => {
+          assert.equal(error.message, 'chatgpt_file_input_state_conflict');
+          assert.deepEqual(error.data?.cardDisplayNames, cardDisplayNames);
+          return true;
+        }
+      );
+      assert.equal(events.includes('native-clear'), false);
+      assert.equal(events.some((event) => event.startsWith('files-set:')), false);
+    }
+  });
+});
+
+test('chatgpt-controller: uses native value-setter clearing only for stale selections and never calls the empty CDP FileList API', async () => {
+  const source = await fs.readFile(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
+
+  assert.equal(source.includes('setFileInputFiles([], { selector: \'#upload-files\' })'), false);
+  assert.equal(source.includes("Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set"), true);
+  assert.equal(source.includes("nativeValueSetter.call(uploadInput, '')"), true);
+  assert.equal(source.includes("new Event('input', { bubbles: true, composed: true })"), true);
+  assert.equal(source.includes("new Event('change', { bubbles: true, composed: true })"), true);
 });

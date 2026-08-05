@@ -2807,6 +2807,25 @@ test('http-api: conversation turns requires an existing ChatGPT tab and does not
   assert.equal(reads, 1);
   assert.equal(creates, 0);
 
+  const byId = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/turns',
+    body: { tabId: 'chat-1', maxTurns: 2 }
+  });
+  assert.equal(byId.res.status, 200);
+  assert.equal(byId.data.tabId, 'chat-1');
+  assert.equal(reads, 2);
+
+  const ambiguous = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', tabId: 'chat-1' } });
+  assert.equal(ambiguous.res.status, 400);
+  assert.equal(ambiguous.data.error, 'ambiguous_conversation_tab');
+
+  const missingSelector = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { maxTurns: 2 } });
+  assert.equal(missingSelector.res.status, 400);
+  assert.equal(missingSelector.data.error, 'missing_conversation_tab');
+
   const missing = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'missing' } });
   assert.equal(missing.res.status, 404);
   assert.equal(missing.data.error, 'tab_not_found');
@@ -2814,7 +2833,7 @@ test('http-api: conversation turns requires an existing ChatGPT tab and does not
 
   const unauthorized = await req({ port, method: 'POST', pth: '/conversation/turns', body: { key: 'review' } });
   assert.equal(unauthorized.res.status, 401);
-  assert.equal(reads, 1);
+  assert.equal(reads, 2);
 });
 
 test('http-api: conversation turns rejects non-ChatGPT tabs and missing controllers', async (t) => {
@@ -2839,4 +2858,33 @@ test('http-api: conversation turns rejects non-ChatGPT tabs and missing controll
   const rejected = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'other' } });
   assert.equal(rejected.res.status, 409);
   assert.equal(rejected.data.error, 'chatgpt_tab_required');
+});
+
+test('http-api: conversation turns rejects duplicate keyed tabs before controller access', async (t) => {
+  let reads = 0;
+  const tabs = {
+    listTabs: () => [
+      { id: 'chat-1', key: 'review', vendorId: 'chatgpt' },
+      { id: 'chat-2', key: 'review', vendorId: 'chatgpt' }
+    ],
+    ensureTab: async () => 'created',
+    createTab: async () => 'created',
+    closeTab: async () => true,
+    getControllerById: () => ({ readConversationTurns: async () => { reads += 1; return { url: 'https://chatgpt.com/c/test', turns: [] }; } })
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const duplicate = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review' } });
+  assert.equal(duplicate.res.status, 404);
+  assert.equal(duplicate.data.error, 'tab_not_found');
+  assert.equal(reads, 0);
 });

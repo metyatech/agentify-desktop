@@ -280,13 +280,16 @@ POST /conversation/turns
 Authorization: Bearer <local-token>
 Content-Type: application/json
 
-{"key":"review-tab","maxTurns":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000}
+{"tabId":"existing-chatgpt-tab","maxTurns":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000}
 ```
 
-The request resolves exactly one existing tab, requires `vendorId: "chatgpt"`,
-and never creates a tab, navigates, queries, sends, or falls back to another
-vendor. The response is bounded and returns `ok`, `tabId`, `vendorId`, the
-conversation URL, and DOM-ordered turns with `id`, `role`, `text`, and `index`.
+The request accepts exactly one of `tabId` or `key` (a key-only request remains
+supported), requires the resolved tab's `vendorId: "chatgpt"`, and never creates
+a tab, navigates, queries, sends, or falls back to another vendor. The response
+is bounded and returns `ok`, `tabId`, `vendorId`, the conversation URL, and the
+latest valid DOM-ordered turns with `id`, `role`, `text`, and `index`.
+Clients should send the resolved `tabId` without duplicating `key` or
+`vendorId`; requests containing both selectors are rejected.
 Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,
 composer and control text, empty turns, and NUL characters are excluded while
 Markdown, JSON, and code blocks are preserved. The endpoint is intended for the

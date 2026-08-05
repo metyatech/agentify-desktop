@@ -131,6 +131,30 @@ test('chatgpt-controller: reads only structured ChatGPT turns through the mutex'
   assert.deepEqual(result.turns.map((turn) => turn.role), ['user', 'assistant']);
 });
 
+test('chatgpt-controller: returns the latest valid turns while preserving conversation indexes', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async (js) => {
+      assert.match(js, /const selectedTurns = turns\.slice\(Math\.max\(0, turns\.length - maxTurns\)\)/u);
+      return {
+        turns: Array.from({ length: 150 }, (_, index) => ({
+          role: index % 2 ? 'assistant' : 'user',
+          text: `turn-${index}`,
+          index,
+          messageId: `message-${index}`
+        })),
+        limitExceeded: false,
+        limitKind: null
+      };
+    }
+  });
+  const result = await createController(page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 20_000 });
+  assert.equal(result.turns.length, 100);
+  assert.deepEqual(result.turns.map((turn) => turn.index), Array.from({ length: 100 }, (_, index) => index + 50));
+  assert.equal(result.turns[0].text, 'turn-50');
+  assert.equal(result.turns.at(-1).text, 'turn-149');
+});
+
 test('chatgpt-controller: rejects bounded conversation results instead of returning oversized text', async () => {
   const page = createPage({
     events: [],

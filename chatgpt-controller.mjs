@@ -183,11 +183,8 @@ export class ChatGPTController {
           .trim();
         const nodes = Array.from(document.querySelectorAll(messageSelector));
         const turns = [];
-        let totalChars = 0;
-        let limitExceeded = false;
-        let limitKind = null;
 
-        for (let domIndex = 0; domIndex < nodes.length && turns.length < maxTurns; domIndex += 1) {
+        for (let domIndex = 0; domIndex < nodes.length; domIndex += 1) {
           const node = nodes[domIndex];
           let parent = node.parentElement;
           let nested = false;
@@ -211,26 +208,32 @@ export class ChatGPTController {
           }
           const text = normalize(clone.innerText || clone.textContent || '');
           if (!text) continue;
-          if (text.length > maxCharsPerTurn) {
-            limitExceeded = true;
-            limitKind = 'per-turn';
-            break;
-          }
-          if (totalChars + text.length > maxTotalChars) {
-            limitExceeded = true;
-            limitKind = 'total';
-            break;
-          }
-
           const directId = String(node.getAttribute('data-message-id') || '').trim();
           const nearestMessage = node.closest?.('[data-message-id]');
           const nearestTurn = node.closest?.('[data-turn-id]');
           const stableId = directId || String(nearestMessage?.getAttribute('data-message-id') || '').trim() || String(nearestTurn?.getAttribute('data-turn-id') || '').trim();
           turns.push({ role, text, index: domIndex, messageId: stableId || null });
-          totalChars += text.length;
         }
 
-        return { turns, limitExceeded, limitKind };
+        const selectedTurns = turns.slice(Math.max(0, turns.length - maxTurns));
+        let totalChars = 0;
+        let limitExceeded = false;
+        let limitKind = null;
+        for (const turn of selectedTurns) {
+          if (turn.text.length > maxCharsPerTurn) {
+            limitExceeded = true;
+            limitKind = 'per-turn';
+            break;
+          }
+          if (totalChars + turn.text.length > maxTotalChars) {
+            limitExceeded = true;
+            limitKind = 'total';
+            break;
+          }
+          totalChars += turn.text.length;
+        }
+
+        return { turns: selectedTurns, limitExceeded, limitKind };
       })()`);
 
       if (!result || result.limitExceeded) {
@@ -257,8 +260,22 @@ export class ChatGPTController {
             text,
             index
           };
-        }).filter(Boolean)
+        }).filter(Boolean).slice(-limits.maxTurns)
         : [];
+      let totalChars = 0;
+      for (const turn of turns) {
+        if (turn.text.length > limits.maxCharsPerTurn) {
+          const error = new Error('conversation_turn_too_large');
+          error.data = { ...limits, limitKind: 'per-turn' };
+          throw error;
+        }
+        totalChars += turn.text.length;
+        if (totalChars > limits.maxTotalChars) {
+          const error = new Error('conversation_too_large');
+          error.data = { ...limits, limitKind: 'total' };
+          throw error;
+        }
+      }
       return { url: String(await this.getUrl()), turns };
     });
   }

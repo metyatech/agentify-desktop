@@ -104,6 +104,44 @@ test('chatgpt-controller: send falls back to requestSubmit on the active compose
   assert.equal(events.includes('key:Enter'), false);
 });
 
+test('chatgpt-controller: reads only structured ChatGPT turns through the mutex', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      assert.match(js, /data-message-author-role="user"/u);
+      assert.match(js, /data-message-author-role="assistant"/u);
+      assert.match(js, /data-testid\*="copy"/u);
+      assert.doesNotMatch(js, /\.navigate\(|\.query\(|\.send\(/u);
+      return {
+        turns: [
+          { role: 'user', text: '開始', index: 0, messageId: 'message-user' },
+          { role: 'assistant', text: 'AUTOPILOT_PROPOSAL_BEGIN_V1\n{"ok":true}\nAUTOPILOT_PROPOSAL_END_V1', index: 1, messageId: null }
+        ],
+        limitExceeded: false,
+        limitKind: null
+      };
+    }
+  });
+  const controller = createController(page);
+  const result = await controller.readConversationTurns({ maxTurns: 2, maxCharsPerTurn: 1000, maxTotalChars: 2000 });
+  assert.equal(result.url, 'https://chatgpt.com/');
+  assert.equal(result.turns[0].id, 'message-user');
+  assert.match(result.turns[1].id, /^turn-[0-9a-f]{24}$/u);
+  assert.deepEqual(result.turns.map((turn) => turn.role), ['user', 'assistant']);
+});
+
+test('chatgpt-controller: rejects bounded conversation results instead of returning oversized text', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async () => ({ turns: [], limitExceeded: true, limitKind: 'per-turn' })
+  });
+  await assert.rejects(
+    () => createController(page).readConversationTurns({ maxTurns: 2, maxCharsPerTurn: 10, maxTotalChars: 20 }),
+    (error) => error.message === 'conversation_turn_too_large' && error.data.limitKind === 'per-turn'
+  );
+});
+
 test('chatgpt-controller: inserts a multiline prompt once without sending Enter', async () => {
   const events = [];
   const page = createPage({

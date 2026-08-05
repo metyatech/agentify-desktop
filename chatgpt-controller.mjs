@@ -1,5 +1,29 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
+
+export const MAX_CONVERSATION_TURNS = 200;
+export const MAX_CONVERSATION_TURN_CHARS = 200_000;
+export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
+
+function normalizeConversationText(value) {
+  return String(value || '')
+    .replace(/\u0000/g, '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/u, ''))
+    .join('\n')
+    .trim();
+}
+
+function fallbackConversationTurnId({ role, index, text }) {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`${role}\u0000${index}\u0000${text}`, 'utf8')
+    .digest('hex')
+    .slice(0, 24);
+  return `turn-${digest}`;
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -116,6 +140,127 @@ export class ChatGPTController {
       return txt.slice(0, cap);
     })()`);
     return String(text || '');
+  }
+
+  async readConversationTurns({
+    maxTurns = 100,
+    maxCharsPerTurn = 100_000,
+    maxTotalChars = 1_000_000
+  } = {}) {
+    const limits = {
+      maxTurns: Number(maxTurns),
+      maxCharsPerTurn: Number(maxCharsPerTurn),
+      maxTotalChars: Number(maxTotalChars)
+    };
+    if (!Number.isInteger(limits.maxTurns) || limits.maxTurns < 1 || limits.maxTurns > MAX_CONVERSATION_TURNS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+    if (!Number.isInteger(limits.maxCharsPerTurn) || limits.maxCharsPerTurn < 1 || limits.maxCharsPerTurn > MAX_CONVERSATION_TURN_CHARS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+    if (!Number.isInteger(limits.maxTotalChars) || limits.maxTotalChars < 1 || limits.maxTotalChars > MAX_CONVERSATION_TOTAL_CHARS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+
+    return await this.runExclusive(async () => {
+      const result = await this.#eval(`(() => {
+        const maxTurns = ${limits.maxTurns};
+        const maxCharsPerTurn = ${limits.maxCharsPerTurn};
+        const maxTotalChars = ${limits.maxTotalChars};
+        const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+        const excludedSelector = [
+          'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
+          '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
+          '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
+          '[aria-label*="composer" i]'
+        ].join(',');
+        const normalize = (value) => String(value || '')
+          .replace(/\\u0000/g, '')
+          .replace(/\\r\\n?/g, '\\n')
+          .split('\\n')
+          .map((line) => line.replace(/[ \\t]+$/u, ''))
+          .join('\\n')
+          .trim();
+        const nodes = Array.from(document.querySelectorAll(messageSelector));
+        const turns = [];
+        let totalChars = 0;
+        let limitExceeded = false;
+        let limitKind = null;
+
+        for (let domIndex = 0; domIndex < nodes.length && turns.length < maxTurns; domIndex += 1) {
+          const node = nodes[domIndex];
+          let parent = node.parentElement;
+          let nested = false;
+          while (parent) {
+            if (parent.matches?.(messageSelector)) {
+              nested = true;
+              break;
+            }
+            parent = parent.parentElement;
+          }
+          if (nested) continue;
+
+          const role = node.getAttribute('data-message-author-role');
+          if (role !== 'user' && role !== 'assistant') continue;
+
+          const clone = node.cloneNode(true);
+          if (clone.matches?.(excludedSelector)) {
+            clone.remove();
+          } else {
+            clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
+          }
+          const text = normalize(clone.innerText || clone.textContent || '');
+          if (!text) continue;
+          if (text.length > maxCharsPerTurn) {
+            limitExceeded = true;
+            limitKind = 'per-turn';
+            break;
+          }
+          if (totalChars + text.length > maxTotalChars) {
+            limitExceeded = true;
+            limitKind = 'total';
+            break;
+          }
+
+          const directId = String(node.getAttribute('data-message-id') || '').trim();
+          const nearestMessage = node.closest?.('[data-message-id]');
+          const nearestTurn = node.closest?.('[data-turn-id]');
+          const stableId = directId || String(nearestMessage?.getAttribute('data-message-id') || '').trim() || String(nearestTurn?.getAttribute('data-turn-id') || '').trim();
+          turns.push({ role, text, index: domIndex, messageId: stableId || null });
+          totalChars += text.length;
+        }
+
+        return { turns, limitExceeded, limitKind };
+      })()`);
+
+      if (!result || result.limitExceeded) {
+        const error = new Error(result?.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large');
+        error.data = {
+          maxTurns: limits.maxTurns,
+          maxCharsPerTurn: limits.maxCharsPerTurn,
+          maxTotalChars: limits.maxTotalChars,
+          limitKind: result?.limitKind || 'unknown'
+        };
+        throw error;
+      }
+
+      const turns = Array.isArray(result.turns)
+        ? result.turns.map((turn) => {
+          const role = turn?.role === 'user' || turn?.role === 'assistant' ? turn.role : null;
+          const text = normalizeConversationText(turn?.text);
+          const index = Number.isInteger(turn?.index) ? turn.index : -1;
+          if (!role || !text || index < 0) return null;
+          const messageId = typeof turn.messageId === 'string' ? turn.messageId.trim() : '';
+          return {
+            id: messageId || fallbackConversationTurnId({ role, index, text }),
+            role,
+            text,
+            index
+          };
+        }).filter(Boolean)
+        : [];
+      return { url: String(await this.getUrl()), turns };
+    });
   }
 
   async detectChallenge() {

@@ -14,8 +14,12 @@ function isLoopback(remoteAddress) {
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
-function sendJson(res, code, body) {
-  const data = JSON.stringify(body);
+function sendJson(res, code, body, { maxBytes = Number.POSITIVE_INFINITY } = {}) {
+  let data = JSON.stringify(body);
+  if (Buffer.byteLength(data, 'utf8') > maxBytes) {
+    code = 413;
+    data = JSON.stringify({ error: 'response_too_large' });
+  }
   res.writeHead(code, {
     'content-type': 'application/json',
     'cache-control': 'no-store, max-age=0',
@@ -71,6 +75,12 @@ function mapErrorToHttp(error) {
   if (msg === 'watch_folder_not_found') return { code: 404, body: { error: 'watch_folder_not_found' } };
   if (msg === 'prompt_too_large') return { code: 400, body: { error: 'prompt_too_large' } };
   if (msg === 'missing_tabId') return { code: 400, body: { error: 'missing_tabId' } };
+  if (msg === 'missing_conversation_tab') return { code: 400, body: { error: 'missing_conversation_tab' } };
+  if (msg === 'ambiguous_conversation_tab') return { code: 400, body: { error: 'ambiguous_conversation_tab' } };
+  if (msg === 'chatgpt_tab_required') return { code: 409, body: { error: 'chatgpt_tab_required' } };
+  if (msg === 'conversation_controller_unavailable') return { code: 409, body: { error: 'conversation_controller_unavailable' } };
+  if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
+  if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
   if (msg === 'tab_busy') return { code: 409, body: { error: 'tab_busy', data: error?.data || null } };
   if (msg === 'key_vendor_mismatch') return { code: 409, body: { error: 'key_vendor_mismatch' } };
@@ -1021,6 +1031,42 @@ export function startHttpApi({
         const controller = tabs.getControllerById(tabId);
         const text = await runExclusive(controller, async () => controller.readPageText({ maxChars }));
         return sendJson(res, 200, { ok: true, tabId, text });
+      }
+
+      if (url.pathname === '/conversation/turns' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readConversationTurns !== 'function') {
+          throw new Error('conversation_controller_unavailable');
+        }
+        const result = await controller.readConversationTurns({
+          maxTurns: positiveIntOr(body.maxTurns, 100, 200),
+          maxCharsPerTurn: positiveIntOr(body.maxCharsPerTurn, 100_000, 200_000),
+          maxTotalChars: positiveIntOr(body.maxTotalChars, 1_000_000, 2_000_000)
+        });
+        if (!result || typeof result.url !== 'string' || !Array.isArray(result.turns)) {
+          throw new Error('conversation_controller_unavailable');
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          tabId: tab.id,
+          vendorId: 'chatgpt',
+          url: result.url,
+          turns: result.turns
+        }, { maxBytes: 2_000_000 });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

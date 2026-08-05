@@ -270,6 +270,29 @@ Agentify Desktop does not bypass CAPTCHAs or use third-party solvers. If a verif
 
 If your account uses Google, Microsoft, or Apple SSO, keep auth popups enabled in the Control Center. If embedded login remains unreliable, use Chrome CDP.
 
+## Structured Conversation Turns
+
+The authenticated loopback API exposes a read-only ChatGPT conversation boundary
+for local controllers:
+
+```text
+POST /conversation/turns
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"key":"review-tab","maxTurns":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000}
+```
+
+The request resolves exactly one existing tab, requires `vendorId: "chatgpt"`,
+and never creates a tab, navigates, queries, sends, or falls back to another
+vendor. The response is bounded and returns `ok`, `tabId`, `vendorId`, the
+conversation URL, and DOM-ordered turns with `id`, `role`, `text`, and `index`.
+Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,
+composer and control text, empty turns, and NUL characters are excluded while
+Markdown, JSON, and code blocks are preserved. The endpoint is intended for the
+ai-autopilot approval watcher and uses the existing loopback and bearer-token
+security boundary.
+
 ## Windows Notes
 
 Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.

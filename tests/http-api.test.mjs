@@ -2753,3 +2753,90 @@ test('http-api: send uses governor too', async (t) => {
   const r3 = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'hi3' } });
   assert.equal(r3.res.status, 200);
 });
+
+test('http-api: conversation turns requires an existing ChatGPT tab and does not create or query', async (t) => {
+  let creates = 0;
+  let reads = 0;
+  const controller = {
+    navigate: async () => { throw new Error('must_not_navigate'); },
+    query: async () => { throw new Error('must_not_query'); },
+    send: async () => { throw new Error('must_not_send'); },
+    readConversationTurns: async (limits) => {
+      reads += 1;
+      assert.equal(limits.maxTurns, 2);
+      return {
+        url: 'https://chatgpt.com/c/test',
+        turns: [{ id: 'm1', role: 'user', text: 'hello', index: 0 }]
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    ensureTab: async () => { creates += 1; return 'created'; },
+    createTab: async () => { creates += 1; return 'created'; },
+    closeTab: async () => true,
+    getControllerById: (id) => id === 'chat-1' ? controller : (() => { throw new Error('tab_not_found'); })()
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const result = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/turns',
+    body: { key: 'review', maxTurns: 2, maxCharsPerTurn: 100, maxTotalChars: 500 }
+  });
+  assert.equal(result.res.status, 200);
+  assert.deepEqual(result.data, {
+    ok: true,
+    tabId: 'chat-1',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/test',
+    turns: [{ id: 'm1', role: 'user', text: 'hello', index: 0 }]
+  });
+  assert.equal(reads, 1);
+  assert.equal(creates, 0);
+
+  const missing = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'missing' } });
+  assert.equal(missing.res.status, 404);
+  assert.equal(missing.data.error, 'tab_not_found');
+  assert.equal(creates, 0);
+
+  const unauthorized = await req({ port, method: 'POST', pth: '/conversation/turns', body: { key: 'review' } });
+  assert.equal(unauthorized.res.status, 401);
+  assert.equal(reads, 1);
+});
+
+test('http-api: conversation turns rejects non-ChatGPT tabs and missing controllers', async (t) => {
+  const tabs = {
+    listTabs: () => [{ id: 'claude-1', key: 'other', vendorId: 'claude' }],
+    ensureTab: async () => 'created',
+    createTab: async () => 'created',
+    closeTab: async () => true,
+    getControllerById: () => ({})
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'claude-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const rejected = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'other' } });
+  assert.equal(rejected.res.status, 409);
+  assert.equal(rejected.data.error, 'chatgpt_tab_required');
+});

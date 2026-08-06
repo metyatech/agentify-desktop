@@ -12,6 +12,8 @@ const UNSENT_DRAFT_CLEANUP_TIMEOUT_MS = 1_500;
 const UNSENT_DRAFT_CLEANUP_POLL_MS = 50;
 const PROVIDER_STOP_TOKEN_ACTIVATION_TIMEOUT_MS = 1_000;
 const PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS = 500;
+const PROVIDER_STOP_RETRY_TIMEOUT_MS = 800;
+const PROVIDER_STOP_RETRY_POLL_MS = 75;
 
 let latestProviderStopGeneration = 0;
 
@@ -364,7 +366,7 @@ export class ChatGPTController {
         const token = ${token};
         const current = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
           ? globalThis.__agentifyProviderStopState
-          : { generation: 0, sequence: 0, token: null, retiredSequence: 0, dispatch: null };
+          : { generation: 0, sequence: 0, token: null, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: null };
         const currentGeneration = Number(current.generation) || 0;
         const currentSequence = Number(current.sequence) || 0;
         const retiredSequence = Number(current.retiredSequence) || 0;
@@ -379,6 +381,8 @@ export class ChatGPTController {
           sequence,
           token,
           stopRequested: false,
+          stopClicked: false,
+          stopWatcherActive: false,
           retiredSequence: newerGeneration ? 0 : retiredSequence,
           dispatch: { generation, sequence, state: 'pending' }
         };
@@ -393,10 +397,11 @@ export class ChatGPTController {
       const token = ${token};
       const current = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
         ? globalThis.__agentifyProviderStopState
-        : { generation: 0, sequence: 0, token: null, retiredSequence: 0, dispatch: null };
+        : { generation: 0, sequence: 0, token: null, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: null };
       const currentGeneration = Number(current.generation) || 0;
       const currentSequence = Number(current.sequence) || 0;
       const exact = currentGeneration === generation && currentSequence === sequence && current.token === token;
+      if (exact && current.stopWatcherActive === true) return { ok: true, cleared: false, deferred: true };
       if (exact) {
         const currentDispatch = current.dispatch && typeof current.dispatch === 'object' ? current.dispatch : null;
         const state = ['dispatching', 'dispatched'].includes(currentDispatch?.state) ? currentDispatch.state : 'cancelled';
@@ -440,12 +445,28 @@ export class ChatGPTController {
     })()`;
   }
 
-  #scheduleProviderStopStateScript(run, { action = 'release' } = {}) {
+  #scheduleProviderStopStateScriptNow(run, { action = 'release' } = {}) {
     const evaluation = Promise.resolve()
       .then(() => this.#eval(this.#providerStopStateScript(run, { action })));
     evaluation.catch(() => {});
     const timeout = new Promise((resolve) => setTimeout(resolve, PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS));
     Promise.race([evaluation, timeout]).catch(() => {});
+  }
+
+  #scheduleProviderStopStateScript(run, { action = 'release' } = {}) {
+    if (action !== 'release' || !run) {
+      this.#scheduleProviderStopStateScriptNow(run, { action });
+      return;
+    }
+    if (run.providerStopReleaseScheduled) return;
+    run.providerStopReleaseScheduled = true;
+    const release = () => this.#scheduleProviderStopStateScriptNow(run, { action });
+    const stopAttempt = run.providerStopStopAttempt;
+    if (!stopAttempt) {
+      release();
+      return;
+    }
+    Promise.resolve(stopAttempt).then(release, release).catch(() => {});
   }
 
   async #boundedProviderStopStateEvaluation(js, { signal = null } = {}) {
@@ -551,44 +572,73 @@ export class ChatGPTController {
     const sequence = this.#providerStopSequence(run);
     const token = JSON.stringify(run.providerStopToken);
     const stopSel = JSON.stringify(this.selectors.stopButton);
-    return `(() => {
+    return `(async () => {
       const agentifyStopTokenStop = true;
       const expectedGeneration = ${generation};
       const expectedSequence = ${sequence};
       const expectedToken = ${token};
-      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+      const readState = () => globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
         ? globalThis.__agentifyProviderStopState
         : null;
-      const exact = Number(state?.generation) === expectedGeneration && Number(state?.sequence) === expectedSequence &&
+      const isExact = (state) => Number(state?.generation) === expectedGeneration && Number(state?.sequence) === expectedSequence &&
         state?.token === expectedToken && Number(state?.retiredSequence) < expectedSequence;
-      if (!exact) return { ok: true, state: 'mismatch', clicked: false };
+      const state = readState();
+      if (!isExact(state)) return { ok: true, state: 'mismatch', clicked: false };
       const dispatchState = state?.dispatch?.state;
-      if (state.stopRequested === true) return { ok: true, state: dispatchState || 'unknown', clicked: false, reason: 'provider_stop_already_requested' };
+      if (state.stopClicked === true) return { ok: true, state: dispatchState || 'unknown', clicked: false, reason: 'provider_stop_already_clicked' };
       if (dispatchState === 'pending') {
         globalThis.__agentifyProviderStopState = {
           ...state,
           stopRequested: true,
+          stopClicked: false,
+          stopWatcherActive: false,
           retiredSequence: Math.max(Number(state.retiredSequence) || 0, expectedSequence),
           dispatch: { generation: expectedGeneration, sequence: expectedSequence, state: 'cancelled' }
         };
         return { ok: true, state: 'cancelled', cancelled: true, clicked: false };
       }
       if (!['dispatching', 'dispatched'].includes(dispatchState)) return { ok: true, state: dispatchState || 'unknown', clicked: false };
-      globalThis.__agentifyProviderStopState = { ...state, stopRequested: true };
+      if (state.stopWatcherActive === true) return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_already_requested', retrying: true };
+      globalThis.__agentifyProviderStopState = { ...state, stopRequested: true, stopClicked: false, stopWatcherActive: true };
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
         const style = window.getComputedStyle(node);
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
-      const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
-      if (!stop) return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_not_found' };
-      try {
-        stop.click();
-        return { ok: true, state: dispatchState, clicked: true, reason: 'provider_stop_clicked' };
-      } catch {
-        return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_click_failed' };
+      const finish = ({ clicked, reason }) => {
+        const current = readState();
+        if (!isExact(current)) return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        globalThis.__agentifyProviderStopState = {
+          ...current,
+          stopRequested: true,
+          stopClicked: clicked === true,
+          stopWatcherActive: false
+        };
+        return { ok: true, state: dispatchState, clicked: clicked === true, reason };
+      };
+      const tryClick = () => {
+        const current = readState();
+        if (!isExact(current)) return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        if (current.stopClicked === true) return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_already_clicked' };
+        const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
+        if (!stop) return null;
+        try {
+          stop.click();
+          return finish({ clicked: true, reason: 'provider_stop_clicked' });
+        } catch {
+          return finish({ clicked: false, reason: 'provider_stop_click_failed' });
+        }
+      };
+      let result = tryClick();
+      if (result) return result;
+      const deadline = Date.now() + ${PROVIDER_STOP_RETRY_TIMEOUT_MS};
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, ${PROVIDER_STOP_RETRY_POLL_MS}));
+        result = tryClick();
+        if (result) return result;
       }
+      return finish({ clicked: false, reason: 'provider_stop_not_found' });
     })()`;
   }
 
@@ -637,14 +687,23 @@ export class ChatGPTController {
   }
 
   async #arbitrateProviderStop(run) {
-    const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopStopScript(run), { signal: null });
-    if (outcome.status !== 'completed' || outcome.value?.ok !== true) {
-      run.dispatchStateUnknown = true;
-      return { ok: false, state: 'unknown', clicked: false, reason: 'provider_stop_state_unknown' };
-    }
-    run.dispatchState = outcome.value.state;
-    if (outcome.value.state === 'dispatching' || outcome.value.state === 'dispatched') run.messageDispatchStarted = true;
-    return outcome.value;
+    if (run.providerStopStopAttempt) return await run.providerStopStopAttempt;
+    const attempt = (async () => {
+      const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopStopScript(run), { signal: null });
+      if (outcome.status !== 'completed' || outcome.value?.ok !== true) {
+        run.dispatchStateUnknown = true;
+        return { ok: false, state: 'unknown', clicked: false, reason: 'provider_stop_state_unknown' };
+      }
+      run.dispatchState = outcome.value.state;
+      if (outcome.value.state === 'dispatching' || outcome.value.state === 'dispatched') run.messageDispatchStarted = true;
+      return outcome.value;
+    })();
+    run.providerStopStopAttempt = attempt;
+    attempt.then(
+      () => { if (run.providerStopStopAttempt === attempt) run.providerStopStopAttempt = null; },
+      () => { if (run.providerStopStopAttempt === attempt) run.providerStopStopAttempt = null; }
+    ).catch(() => {});
+    return await attempt;
   }
 
   async #activateProviderStopToken(run, signal = null) {

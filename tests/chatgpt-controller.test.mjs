@@ -124,6 +124,67 @@ function createController(page) {
   return new ChatGPTController({ page, selectors });
 }
 
+function createProviderStopDomPage({ state, isStopVisible }) {
+  let clickCount = 0;
+  let lastStopScript = '';
+  const stopButton = {
+    getBoundingClientRect: () => ({ x: 10, y: 10, width: 20, height: 20 }),
+    click: () => { clickCount += 1; }
+  };
+  const context = {
+    document: {
+      querySelectorAll: () => isStopVisible() ? [stopButton] : []
+    },
+    window: {
+      getComputedStyle: () => ({ visibility: 'visible', display: 'block' })
+    },
+    setTimeout,
+    clearTimeout
+  };
+  context.globalThis = context;
+  context.__agentifyProviderStopState = structuredClone(state);
+  const page = createPage({
+    events: [],
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) {
+        const current = context.__agentifyProviderStopState;
+        return {
+          ok: true,
+          generation: current.generation,
+          sequence: current.sequence,
+          retiredSequence: current.retiredSequence,
+          dispatchState: current.dispatch?.state || null
+        };
+      }
+      if (js.includes('agentifyStopTokenStop')) {
+        lastStopScript = js;
+        return await vm.runInNewContext(js, context);
+      }
+      if (js.includes('agentifyStopTokenRelease')) return await vm.runInNewContext(js, context);
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  return {
+    page,
+    context,
+    clickCount: () => clickCount,
+    stopScript: () => lastStopScript,
+    state: () => context.__agentifyProviderStopState
+  };
+}
+
+async function waitForCondition(check, { timeoutMs = 1_500, pollMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  assert.equal(check(), true, 'condition did not become true before timeout');
+}
+
 function isClickSendEvaluation(js) {
   return js.includes('const sendBaseline');
 }
@@ -2723,6 +2784,170 @@ test('chatgpt-controller: a retired provider stop cannot click after a held page
   assert.equal(providerStopClicks, 0);
   assert.equal(browserState.token, null);
   assert.equal(run.providerStopRetired, true);
+});
+
+test('chatgpt-controller: retries an exact provider stop until a delayed button appears', async () => {
+  let stopVisible = false;
+  const token = 'd'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 1, sequence: 1, token, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 1, sequence: 1, state: 'dispatching' } },
+    isStopVisible: () => stopVisible
+  });
+  const controller = createController(fixture.page);
+  const run = { operationId: 'delayed-stop', providerStopGeneration: 1, providerStopSequence: 1, providerStopToken: token, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const visibleTimer = setTimeout(() => { stopVisible = true; }, 225);
+  const startedAt = Date.now();
+  const result = await controller.requestStop({ expectedOperationId: 'delayed-stop' });
+  clearTimeout(visibleTimer);
+  assert.equal(result.clicked, true);
+  assert.equal(result.reason, 'provider_stop_clicked');
+  assert.equal(fixture.clickCount(), 1);
+  assert.ok(Date.now() - startedAt < 800);
+  assert.equal(fixture.state().stopRequested, true);
+  assert.equal(fixture.state().stopClicked, true);
+  assert.equal(fixture.state().stopWatcherActive, false);
+  controller.retireProviderStop({ expectedOperationId: 'delayed-stop' });
+  await waitForCondition(() => fixture.state().token === null);
+});
+
+test('chatgpt-controller: repeated exact provider stops share one active watcher and one click', async () => {
+  let stopVisible = false;
+  const token = 'e'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 2, sequence: 3, token, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 2, sequence: 3, state: 'dispatched' } },
+    isStopVisible: () => stopVisible
+  });
+  const controller = createController(fixture.page);
+  const run = { operationId: 'repeated-stop', providerStopGeneration: 2, providerStopSequence: 3, providerStopToken: token, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const first = controller.requestStop({ expectedOperationId: 'repeated-stop' });
+  await waitForCondition(() => fixture.state().stopWatcherActive === true);
+  const second = controller.requestStop({ expectedOperationId: 'repeated-stop' });
+  setTimeout(() => { stopVisible = true; }, 225);
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.clicked, true);
+  assert.equal(secondResult.clicked, true);
+  assert.notEqual(firstResult.reason, 'provider_stop_already_requested');
+  assert.notEqual(secondResult.reason, 'provider_stop_already_requested');
+  assert.equal(fixture.clickCount(), 1);
+  assert.equal(fixture.state().stopClicked, true);
+  assert.equal(fixture.state().stopWatcherActive, false);
+  controller.retireProviderStop({ expectedOperationId: 'repeated-stop' });
+  await waitForCondition(() => fixture.state().token === null);
+});
+
+test('chatgpt-controller: defers release until an exact delayed stop attempt settles', async () => {
+  let stopVisible = false;
+  const token = 'f'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 3, sequence: 4, token, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 3, sequence: 4, state: 'dispatched' } },
+    isStopVisible: () => stopVisible
+  });
+  const controller = createController(fixture.page);
+  const run = { operationId: 'finalization-race', providerStopGeneration: 3, providerStopSequence: 4, providerStopToken: token, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const stopPromise = controller.requestStop({ expectedOperationId: 'finalization-race' });
+  await waitForCondition(() => fixture.state().stopWatcherActive === true);
+  const retirement = controller.retireProviderStop({ expectedOperationId: 'finalization-race' });
+  assert.equal(retirement.retired, true);
+  assert.equal(fixture.state().token, token);
+  setTimeout(() => { stopVisible = true; }, 225);
+  const result = await stopPromise;
+  assert.equal(result.clicked, true);
+  assert.equal(fixture.clickCount(), 1);
+  await waitForCondition(() => fixture.state().token === null);
+  assert.equal(fixture.state().stopWatcherActive, false);
+  assert.equal(run.providerStopRetired, true);
+});
+
+test('chatgpt-controller: bounded provider stop timeout cleans the watcher without treating it as already stopped', async () => {
+  const token = 'g'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 4, sequence: 5, token, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 4, sequence: 5, state: 'dispatching' } },
+    isStopVisible: () => false
+  });
+  const controller = createController(fixture.page);
+  const run = { operationId: 'never-stop', providerStopGeneration: 4, providerStopSequence: 5, providerStopToken: token, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const startedAt = Date.now();
+  const result = await controller.requestStop({ expectedOperationId: 'never-stop' });
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.clicked, false);
+  assert.equal(result.reason, 'provider_stop_not_found');
+  assert.equal(fixture.clickCount(), 0);
+  assert.ok(elapsed >= 700 && elapsed < 1_050);
+  assert.equal(fixture.state().stopRequested, true);
+  assert.equal(fixture.state().stopClicked, false);
+  assert.equal(fixture.state().stopWatcherActive, false);
+  controller.retireProviderStop({ expectedOperationId: 'never-stop' });
+  await waitForCondition(() => fixture.state().token === null);
+});
+
+test('chatgpt-controller: stale provider stop script cannot click the following exact operation', async () => {
+  const tokenA = 'a'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 5, sequence: 6, token: tokenA, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 5, sequence: 6, state: 'dispatched' } },
+    isStopVisible: () => true
+  });
+  const controller = createController(fixture.page);
+  const runA = { operationId: 'following-a', providerStopGeneration: 5, providerStopSequence: 6, providerStopToken: tokenA, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = runA;
+  controller.providerStopOwner = runA;
+  const resultA = await controller.requestStop({ expectedOperationId: 'following-a' });
+  assert.equal(resultA.clicked, true);
+  const staleScript = fixture.stopScript();
+  controller.retireProviderStop({ expectedOperationId: 'following-a' });
+  await waitForCondition(() => fixture.state().token === null);
+
+  const tokenB = 'b'.repeat(64);
+  fixture.context.__agentifyProviderStopState = {
+    generation: 6,
+    sequence: 1,
+    token: tokenB,
+    stopRequested: false,
+    stopClicked: false,
+    stopWatcherActive: false,
+    retiredSequence: 0,
+    dispatch: { generation: 6, sequence: 1, state: 'dispatched' }
+  };
+  const staleResult = await vm.runInNewContext(staleScript, fixture.context);
+  assert.equal(staleResult.clicked, false);
+  assert.equal(staleResult.reason, undefined);
+  assert.equal(fixture.clickCount(), 1);
+
+  const runB = { operationId: 'following-b', providerStopGeneration: 6, providerStopSequence: 1, providerStopToken: tokenB, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = runB;
+  controller.providerStopOwner = runB;
+  const resultB = await controller.requestStop({ expectedOperationId: 'following-b' });
+  assert.equal(resultB.clicked, true);
+  assert.equal(fixture.clickCount(), 2);
+  controller.retireProviderStop({ expectedOperationId: 'following-b' });
+  await waitForCondition(() => fixture.state().token === null);
+});
+
+test('chatgpt-controller: an immediately visible provider stop button is clicked once', async () => {
+  const token = 'c'.repeat(64);
+  const fixture = createProviderStopDomPage({
+    state: { generation: 7, sequence: 2, token, stopRequested: false, stopClicked: false, stopWatcherActive: false, retiredSequence: 0, dispatch: { generation: 7, sequence: 2, state: 'dispatched' } },
+    isStopVisible: () => true
+  });
+  const controller = createController(fixture.page);
+  const run = { operationId: 'immediate-stop', providerStopGeneration: 7, providerStopSequence: 2, providerStopToken: token, providerStopRetired: false, requested: false, messageDispatchStarted: true };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const startedAt = Date.now();
+  const result = await controller.requestStop({ expectedOperationId: 'immediate-stop' });
+  assert.equal(result.clicked, true);
+  assert.equal(result.reason, 'provider_stop_clicked');
+  assert.equal(fixture.clickCount(), 1);
+  assert.ok(Date.now() - startedAt < 200);
+  controller.retireProviderStop({ expectedOperationId: 'immediate-stop' });
+  await waitForCondition(() => fixture.state().token === null);
 });
 
 test('chatgpt-controller: activation abort is bounded and never types the prompt', async () => {

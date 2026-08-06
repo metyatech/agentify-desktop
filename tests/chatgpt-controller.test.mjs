@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 
 import {
   ChatGPTController,
@@ -17,6 +19,14 @@ const selectors = {
   stopButton: 'button[data-testid="stop-button"]',
   assistantMessage: '[data-message-author-role="assistant"]'
 };
+
+function normalizeUserTurnTextForTest(value) {
+  return String(value || '').replace(/\u0000/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function userTurnDigestForTest(value) {
+  return crypto.createHash('sha256').update(normalizeUserTurnTextForTest(value), 'utf8').digest('hex');
+}
 
 function readyState() {
   return {
@@ -44,14 +54,17 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onSetFileInputFiles = null, includeUserTurnBaseline = false }) {
+function createPage({ events, onEvaluate, onSetFileInputFiles = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   return {
     async navigate() {},
     async evaluate(js) {
       const basic = basicEvaluation(js);
       if (basic !== undefined) {
         if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
-          return { ...basic, userTurnBaseline: { count: 0, lastId: '', lastText: '' } };
+          return {
+            ...basic,
+            userTurnBaseline: userTurnBaseline || { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') }
+          };
         }
         return basic;
       }
@@ -1948,11 +1961,196 @@ test('chatgpt-controller: seven-file attachment readiness succeeds with reordere
   });
 });
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true }) {
+function createCleanupDom({ events, promptText, uploadInputCount = 0, selectedFileNames = [], cardCount = 0, userTurnTexts = [], userTurnIds = [] }) {
+  class FakeNode {
+    constructor(tagName, attributes = {}) {
+      this.tagName = String(tagName || 'div').toUpperCase();
+      this.attributes = { ...attributes };
+      this.children = [];
+      this.parentElement = null;
+      this.innerText = '';
+      this.textContent = '';
+      this._rect = { x: 10, y: 10, width: 400, height: 40 };
+      this.classList = { contains: (name) => String(this.attributes.class || '').split(/\s+/u).includes(name) };
+    }
+
+    append(child) {
+      child.parentElement = this;
+      this.children.push(child);
+      return child;
+    }
+
+    getAttribute(name) {
+      return this.attributes[name] ?? null;
+    }
+
+    matches(selector) {
+      return String(selector || '').split(',').some((rawSelector) => {
+        const part = rawSelector.trim();
+        if (part.startsWith('main ')) return this.tagName === part.slice(5).toUpperCase() && this.hasAncestor('MAIN');
+        if (part === 'textarea') return this.tagName === 'TEXTAREA';
+        if (part === 'input') return this.tagName === 'INPUT';
+        if (part === 'form') return this.tagName === 'FORM';
+        if (part === '#prompt-textarea') return this.attributes.id === 'prompt-textarea';
+        if (/^input#upload-files(?:\[type="file"\])?$/u.test(part)) return this.tagName === 'INPUT' && this.attributes.id === 'upload-files' && (!part.includes('[type=') || this.attributes.type === 'file');
+        if (part === '[role="group"][aria-label]') return this.attributes.role === 'group' && !!this.attributes['aria-label'];
+        if (part === 'button[aria-label]') return this.tagName === 'BUTTON' && !!this.attributes['aria-label'];
+        if (part === '[role="button"][aria-label]') return this.attributes.role === 'button' && !!this.attributes['aria-label'];
+        if (part === '[data-message-author-role="user"]') return this.attributes['data-message-author-role'] === 'user';
+        if (part === 'article[data-turn="user"]') return this.tagName === 'ARTICLE' && this.attributes['data-turn'] === 'user';
+        if (part === 'textarea, input') return this.tagName === 'TEXTAREA' || this.tagName === 'INPUT';
+        if (part === '[role="textbox"]' || part === '[contenteditable="true"]') return this.attributes.role === 'textbox' || this.attributes.contenteditable === 'true';
+        if (part === 'main') return this.tagName === 'MAIN';
+        return false;
+      });
+    }
+
+    hasAncestor(tagName) {
+      for (let node = this.parentElement; node; node = node.parentElement) {
+        if (node.tagName === tagName) return true;
+      }
+      return false;
+    }
+
+    querySelectorAll(selector) {
+      const found = [];
+      const visit = (node) => {
+        for (const child of node.children) {
+          if (child.matches(selector)) found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    }
+
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
+    }
+
+    closest(selector) {
+      for (let node = this; node; node = node.parentElement) {
+        if (node.matches(selector)) return node;
+      }
+      return null;
+    }
+
+    getBoundingClientRect() {
+      return { x: this._rect.x, y: this._rect.y, width: this._rect.width, height: this._rect.height };
+    }
+
+    focus() {}
+
+    dispatchEvent() {}
+
+    click() {
+      this._onClick?.();
+    }
+  }
+
+  class FakeInputElement extends FakeNode {
+    constructor(attributes = {}) {
+      super('input', attributes);
+      this.files = [];
+      this._value = '';
+    }
+  }
+  Object.defineProperty(FakeInputElement.prototype, 'value', {
+    configurable: true,
+    get() { return this._value; },
+    set(value) {
+      this._value = String(value || '');
+      if (!this._value) this.files = [];
+      events.push('input-clear');
+    }
+  });
+  class FakeTextAreaElement extends FakeNode {
+    constructor(attributes = {}) {
+      super('textarea', attributes);
+      this._value = '';
+    }
+  }
+  Object.defineProperty(FakeTextAreaElement.prototype, 'value', {
+    configurable: true,
+    get() { return this._value; },
+    set(value) {
+      this._value = String(value || '');
+      this.innerText = this._value;
+      this.textContent = this._value;
+      events.push('prompt-clear');
+    }
+  });
+
+  const documentElement = new FakeNode('html');
+  const body = documentElement.append(new FakeNode('body'));
+  const main = body.append(new FakeNode('main'));
+  const composer = main.append(new FakeNode('form'));
+  const prompt = composer.append(new FakeTextAreaElement({ id: 'prompt-textarea', role: 'textbox' }));
+  prompt._value = String(promptText || '');
+  prompt.innerText = prompt._value;
+  prompt.textContent = prompt._value;
+  const uploadInputs = [];
+  for (let index = 0; index < uploadInputCount; index += 1) {
+    const input = composer.append(new FakeInputElement({ id: 'upload-files', type: 'file' }));
+    input.files = index === 0 ? selectedFileNames.map((name) => ({ name })) : [];
+    uploadInputs.push(input);
+  }
+  for (let index = 0; index < cardCount; index += 1) {
+    const card = composer.append(new FakeNode('div', { role: 'group', 'aria-label': selectedFileNames[index] || `card-${index + 1}`, class: 'group/file-tile' }));
+    const remove = card.append(new FakeNode('button', { 'aria-label': 'Remove file' }));
+    remove._onClick = () => {
+      events.push('card-remove');
+      card.parentElement.children = card.parentElement.children.filter((child) => child !== card);
+    };
+  }
+  for (let index = 0; index < userTurnTexts.length; index += 1) {
+    const userTurn = main.append(new FakeNode('article', {
+      'data-turn': 'user',
+      ...(userTurnIds[index] ? { 'data-message-id': userTurnIds[index] } : {})
+    }));
+    userTurn.innerText = String(userTurnTexts[index] || '');
+    userTurn.textContent = userTurn.innerText;
+  }
+  const document = {
+    body,
+    documentElement,
+    querySelectorAll(selector) {
+      if (selector === '#upload-files') return documentElement.querySelectorAll('input#upload-files');
+      if (selector === '[data-message-author-role="user"], article[data-turn="user"]') return documentElement.querySelectorAll('article[data-turn="user"]');
+      if (selector === '#prompt-textarea') return [prompt];
+      if (selector.includes('main textarea') || selector.includes('textarea')) return [prompt];
+      return documentElement.querySelectorAll(selector);
+    }
+  };
+  return {
+    document,
+    prompt,
+    composer,
+    uploadInputs,
+    window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+    HTMLInputElement: FakeInputElement,
+    HTMLTextAreaElement: FakeTextAreaElement,
+    InputEvent: class InputEvent {},
+    Event: class Event {}
+  };
+}
+
+async function evaluateCleanupScript(js, dom) {
+  return await vm.runInNewContext(js, {
+    ...dom,
+    crypto: crypto.webcrypto,
+    TextEncoder,
+    setTimeout,
+    clearTimeout
+  });
+}
+
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null }) {
   let cleanupScript = '';
   const page = createPage({
     events,
     includeUserTurnBaseline: true,
+    userTurnBaseline,
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
@@ -1961,6 +2159,7 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
       if (js.includes('const agentifyAttachmentCleanup')) {
         cleanupScript = js;
         events.push('cleanup-draft');
+        if (cleanupDom) return await evaluateCleanupScript(js, cleanupDom);
         return cleanupResult;
       }
       if (js.includes('const expectedFileNames')) return attachmentState;
@@ -2043,6 +2242,174 @@ test('chatgpt-controller: cleanup failure preserves the original error code and 
       (error) => error.message === 'attachment_upload_timeout' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'prompt_changed'
     );
   });
+});
+
+test('chatgpt-controller: text-only cleanup succeeds without an upload input', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'text-only draft' });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'text-only draft', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'cleared'
+  );
+  assert.equal(dom.prompt.value, '');
+  assert.equal(dom.uploadInputs.length, 0);
+  assert.equal(events.includes('attachment-menu-click'), false);
+  assert.equal(events.filter((event) => event === 'card-remove').length, 0);
+});
+
+test('chatgpt-controller: text-only cleanup succeeds with one empty upload input', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'text-only empty input', uploadInputCount: 1 });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'text-only empty input', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'cleared'
+  );
+  assert.equal(dom.prompt.value, '');
+  assert.deepEqual(dom.uploadInputs[0].files, []);
+  assert.equal(events.includes('attachment-menu-click'), false);
+});
+
+test('chatgpt-controller: text-only cleanup refuses an unexpected attachment card', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'card must remain', cardCount: 1 });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'card must remain', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_set_changed'
+  );
+  assert.equal(dom.prompt.value, 'card must remain');
+  assert.equal(events.filter((event) => event === 'card-remove').length, 0);
+});
+
+test('chatgpt-controller: text-only cleanup refuses an unexpected selected file', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'selected file must remain', uploadInputCount: 1, selectedFileNames: ['foreign.txt'] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'selected file must remain', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_set_changed'
+  );
+  assert.equal(dom.prompt.value, 'selected file must remain');
+  assert.deepEqual(dom.uploadInputs[0].files.map((file) => file.name), ['foreign.txt']);
+});
+
+test('chatgpt-controller: attachment cleanup still removes owned input and cards through the DOM script', async () => {
+  await withTempAttachments(['owned.txt'], async ([attachment]) => {
+    const events = [];
+    const dom = createCleanupDom({ events, promptText: 'owned attachment draft', uploadInputCount: 1, selectedFileNames: ['owned.txt'], cardCount: 1 });
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'owned.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: null,
+      cleanupDom: dom
+    });
+    await assert.rejects(
+      createController(page).query({ prompt: 'owned attachment draft', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data.cleanup.status === 'cleared'
+    );
+    assert.equal(dom.prompt.value, '');
+    assert.deepEqual(dom.uploadInputs[0].files, []);
+    assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
+    assert.equal(events.includes('card-remove'), true);
+  });
+});
+
+test('chatgpt-controller: long user turn without an ID uses a full digest baseline', async () => {
+  const longUserText = `${'long-user-turn-'.repeat(40)}end`;
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'long baseline draft', userTurnTexts: [longUserText] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom,
+    userTurnBaseline: { count: 1, lastId: '', lastTextDigest: userTurnDigestForTest(longUserText) }
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'long baseline draft', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'cleared'
+  );
+  assert.equal(dom.prompt.value, '');
+});
+
+test('chatgpt-controller: same-count changed user turn refuses text-only cleanup', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'changed baseline draft', userTurnTexts: ['new user turn with same count'] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom,
+    userTurnBaseline: { count: 1, lastId: '', lastTextDigest: userTurnDigestForTest('old user turn') }
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'changed baseline draft', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'user_turn_added'
+  );
+  assert.equal(dom.prompt.value, 'changed baseline draft');
+});
+
+test('chatgpt-controller: requestStop protects foreign and manual runs from provider stop clicks', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const stop = Array.from')) {
+        events.push('provider-stop-click');
+        return true;
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  controller.currentRun = { operationId: 'operation-b', requested: false, messageDispatchStarted: true };
+  const foreign = await controller.requestStop({ expectedOperationId: 'operation-a' });
+  assert.equal(foreign.reason, 'operation_mismatch');
+  assert.equal(controller.currentRun.requested, false);
+  assert.equal(events.includes('provider-stop-click'), false);
+  controller.currentRun = null;
+  const manual = await controller.requestStop({ expectedOperationId: 'operation-a' });
+  assert.equal(manual.reason, 'no_matching_run');
+  assert.equal(events.includes('provider-stop-click'), false);
+  controller.currentRun = { operationId: 'operation-a', requested: false, messageDispatchStarted: true };
+  const exact = await controller.requestStop({ expectedOperationId: 'operation-a' });
+  assert.equal(exact.reason, 'provider_stop_clicked');
+  assert.equal(exact.clicked, true);
+  assert.deepEqual(events.filter((event) => event === 'provider-stop-click'), ['provider-stop-click']);
 });
 
 test('chatgpt-controller: send-started failure never auto-clears the composer', async () => {

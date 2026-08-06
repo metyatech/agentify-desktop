@@ -21,6 +21,20 @@ function normalizeConversationText(value) {
     .trim();
 }
 
+function normalizeUserTurnText(value) {
+  return String(value || '')
+    .replace(/\u0000/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function userTurnTextDigest(value) {
+  return crypto
+    .createHash('sha256')
+    .update(normalizeUserTurnText(value), 'utf8')
+    .digest('hex');
+}
+
 function fallbackConversationTurnId({ role, index, text }) {
   const digest = crypto
     .createHash('sha256')
@@ -200,6 +214,21 @@ function boundedAttachmentStates(values) {
 
 function boundedAttachmentError(value) {
   return String(value || '').replace(/[\r\n\t]+/gu, ' ').trim().slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH);
+}
+
+function normalizeUserTurnBaseline(value) {
+  const baseline = value && typeof value === 'object' ? value : {};
+  const rawDigest = String(baseline.lastTextDigest || '').trim().toLowerCase();
+  const lastTextDigest = /^[0-9a-f]{64}$/u.test(rawDigest)
+    ? rawDigest
+    : typeof baseline.lastText === 'string'
+      ? userTurnTextDigest(baseline.lastText)
+      : '';
+  return {
+    count: Math.max(0, Number(baseline.count) || 0),
+    lastId: boundedAttachmentError(baseline.lastId),
+    lastTextDigest
+  };
 }
 
 function boundedAttachmentErrorList(values) {
@@ -646,14 +675,18 @@ export class ChatGPTController {
     })()`);
   }
 
-  async requestStop({ reason = 'user_stop' } = {}) {
-    if (this.currentRun) {
-      this.currentRun.requested = true;
-      this.currentRun.requestedAt = Date.now();
-      this.currentRun.reason = reason || 'user_stop';
+  async requestStop({ reason = 'user_stop', expectedOperationId = null } = {}) {
+    const run = this.currentRun;
+    if (!run) return { ok: true, requested: false, clicked: false, reason: 'no_matching_run' };
+    if (expectedOperationId && run.operationId !== expectedOperationId) {
+      return { ok: true, requested: false, clicked: false, reason: 'operation_mismatch' };
     }
+    run.requested = true;
+    run.requestedAt = Date.now();
+    run.reason = reason || 'user_stop';
+    if (!run.messageDispatchStarted) return { ok: true, requested: true, clicked: false, reason: 'before_dispatch' };
     const clicked = await this.#clickVisibleStop().catch(() => false);
-    return { ok: true, requested: !!this.currentRun || !!clicked, clicked };
+    return { ok: true, requested: true, clicked, reason: clicked ? 'provider_stop_clicked' : 'provider_stop_not_found' };
   }
 
   async #typeHuman(text) {
@@ -687,7 +720,7 @@ export class ChatGPTController {
   async #typePrompt(prompt) {
     await this.#emitProgress({ phase: 'typing_prompt' });
     const sel = JSON.stringify(this.selectors.promptTextarea);
-    const ok = await this.#eval(`(() => {
+    const ok = await this.#eval(`(async () => {
       const visible = (n) => {
         const r = n.getBoundingClientRect();
         const style = window.getComputedStyle(n);
@@ -747,13 +780,21 @@ export class ChatGPTController {
         ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')]
           .map((value) => String(value || '').trim()).find(Boolean) || ''
         : '';
+      const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
+      const lastUserText = String(lastUserTurn?.innerText || '');
+      const lastUserTextDigest = await (async (value) => {
+        const bytes = new TextEncoder().encode(normalizeUserTurnText(value));
+        const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      })(lastUserText);
       return {
         ok:true,
         rect: { x: r.x, y: r.y, w: r.width, h: r.height },
         userTurnBaseline: {
           count: userTurns.length,
           lastId: lastUserId,
-          lastText: String(lastUserTurn?.innerText || '').replace(/\\s+/g, ' ').trim()
+          lastTextDigest,
+          lastText
         }
       };
     })()`);
@@ -762,7 +803,9 @@ export class ChatGPTController {
       err.data = ok;
       throw err;
     }
-    if (this.currentRun) this.currentRun.userTurnBaseline = ok.userTurnBaseline || null;
+    const userTurnBaseline = normalizeUserTurnBaseline(ok.userTurnBaseline);
+    if (this.currentRun) this.currentRun.userTurnBaseline = userTurnBaseline;
+    ok.userTurnBaseline = userTurnBaseline;
 
     // Human-like click + select-all + type.
     if (ok?.rect?.w > 0 && ok?.rect?.h > 0) {
@@ -791,13 +834,18 @@ export class ChatGPTController {
     const baseline = {
       userCount: Math.max(0, Number(sendBaseline?.userCount) || 0),
       lastUserId: String(sendBaseline?.lastUserId || '').trim(),
-      lastUserText: normalizeText(sendBaseline?.lastUserText),
+      lastUserTextDigest: /^[0-9a-f]{64}$/u.test(String(sendBaseline?.lastUserTextDigest || '').trim().toLowerCase())
+        ? String(sendBaseline.lastUserTextDigest).trim().toLowerCase()
+        : typeof sendBaseline?.lastUserText === 'string' ? userTurnTextDigest(sendBaseline.lastUserText) : '',
       activePromptText: normalizeText(sendBaseline?.activePromptText),
+      activePromptTextDigest: /^[0-9a-f]{64}$/u.test(String(sendBaseline?.activePromptTextDigest || '').trim().toLowerCase())
+        ? String(sendBaseline.activePromptTextDigest).trim().toLowerCase()
+        : userTurnTextDigest(sendBaseline?.activePromptText || ''),
       activePromptTextLength: Math.max(0, Number(sendBaseline?.activePromptTextLength) || 0)
     };
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
-      const snap = await this.#eval(`(() => {
+      const snap = await this.#eval(`(async () => {
         const host = location.hostname || '';
         const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
         const visible = (n) => {
@@ -808,6 +856,12 @@ export class ChatGPTController {
         };
         if (isChatGPT) {
           const normalizeText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+          const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
+          const digestUserText = async (value) => {
+            const bytes = new TextEncoder().encode(normalizeUserTurnText(value));
+            const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+            return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+          };
           const editable = (n) => {
             if (!n || !visible(n)) return false;
             if (n.matches('textarea')) return !n.disabled && !n.readOnly;
@@ -876,8 +930,9 @@ export class ChatGPTController {
             isChatGPT: true,
             userCount: chatgptUserTurns.length,
             lastUserId,
-            lastUserText: normalizeText(lastUserTurn?.innerText || ''),
+            lastUserTextDigest: await digestUserText(lastUserTurn?.innerText || ''),
             activePromptText: normalizeText(activePromptText),
+            activePromptTextDigest: await digestUserText(activePromptText),
             activePromptTextLength: normalizeText(activePromptText).length,
             hasNormalSend: !!normalSend,
             normalStopVisible
@@ -914,10 +969,13 @@ export class ChatGPTController {
       if (snap?.isChatGPT) {
         const userCountIncreased = (snap.userCount || 0) > baseline.userCount;
         const userIdChanged = !!baseline.lastUserId && !!snap.lastUserId && baseline.lastUserId !== snap.lastUserId;
+        const lastUserTextDigest = /^[0-9a-f]{64}$/u.test(String(snap.lastUserTextDigest || '').trim().toLowerCase())
+          ? String(snap.lastUserTextDigest).trim().toLowerCase()
+          : typeof snap.lastUserText === 'string' ? userTurnTextDigest(snap.lastUserText) : '';
         const userTextMatchesPrompt =
           baseline.activePromptTextLength >= 1 &&
-          snap.lastUserText === baseline.activePromptText &&
-          snap.lastUserText !== baseline.lastUserText;
+          lastUserTextDigest === baseline.activePromptTextDigest &&
+          lastUserTextDigest !== baseline.lastUserTextDigest;
         const promptWasCleared = baseline.activePromptTextLength >= 1 && snap.activePromptTextLength === 0;
         if (userCountIncreased || userIdChanged || userTextMatchesPrompt || promptWasCleared || snap.normalStopVisible) return true;
         await sleep(pollMs);
@@ -1040,7 +1098,7 @@ export class ChatGPTController {
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const chatgptSignalTimeoutMs = Math.min(5_000, Math.max(0, Number(timeoutMs) || 0));
-    const res = await this.#eval(`(() => {
+    const res = await this.#eval(`(async () => {
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
       const visible = (n) => {
@@ -1134,16 +1192,23 @@ export class ChatGPTController {
               lastUserTurn.getAttribute('data-message-id'),
               lastUserTurn.id,
               lastUserTurn.getAttribute('data-testid')
-            ].map((value) => String(value || '').trim()).find(Boolean) || ''
-          : '';
+          ].map((value) => String(value || '').trim()).find(Boolean) || ''
+            : '';
+        const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
+        const digestUserText = async (value) => {
+          const bytes = new TextEncoder().encode(normalizeUserTurnText(value));
+          const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+          return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+        };
         const activePromptText = prompt?.matches('textarea, input')
           ? String(prompt.value || '')
           : String(prompt?.innerText || prompt?.textContent || '');
         const sendBaseline = {
           userCount: chatgptUserTurns.length,
           lastUserId,
-          lastUserText: String(lastUserTurn?.innerText || '').trim(),
+          lastUserTextDigest: await digestUserText(lastUserTurn?.innerText || ''),
           activePromptText: activePromptText.trim(),
+          activePromptTextDigest: await digestUserText(activePromptText),
           activePromptTextLength: activePromptText.trim().length
         };
         if (normalStop && (!normalSend || disabled(normalSend))) {
@@ -2104,12 +2169,16 @@ export class ChatGPTController {
     if (!userTurnBaseline || !Number.isFinite(Number(userTurnBaseline.count))) {
       return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
     }
+    const normalizedUserTurnBaseline = normalizeUserTurnBaseline(userTurnBaseline);
+    if (!normalizedUserTurnBaseline.lastId && !normalizedUserTurnBaseline.lastTextDigest) {
+      return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
+    }
     const promptJson = JSON.stringify(String(prompt || '').slice(0, 200_000));
     const expectedFileNamesJson = JSON.stringify(boundedAttachmentNameList(expectedFileNames));
     const baselineJson = JSON.stringify({
-      count: Math.max(0, Number(userTurnBaseline.count) || 0),
-      lastId: boundedAttachmentError(userTurnBaseline.lastId),
-      lastText: boundedAttachmentError(userTurnBaseline.lastText)
+      count: normalizedUserTurnBaseline.count,
+      lastId: normalizedUserTurnBaseline.lastId,
+      lastTextDigest: normalizedUserTurnBaseline.lastTextDigest
     });
     const result = await this.#eval(`(async () => {
       const agentifyAttachmentCleanup = true;
@@ -2168,8 +2237,14 @@ export class ChatGPTController {
       const lastUserId = lastUserTurn
         ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')].map((value) => String(value || '').trim()).find(Boolean) || ''
         : '';
-      const lastUserText = String(lastUserTurn?.innerText || '').replace(/\\s+/g, ' ').trim();
-      const baselineChanged = userTurns.length !== baseline.count || (baseline.lastId && lastUserId && baseline.lastId !== lastUserId) || (!baseline.lastId && lastUserText !== baseline.lastText);
+      const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
+      const lastUserText = String(lastUserTurn?.innerText || '');
+      const lastUserTextDigest = await (async (value) => {
+        const bytes = new TextEncoder().encode(normalizeUserTurnText(value));
+        const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      })(lastUserText);
+      const baselineChanged = userTurns.length !== baseline.count || (baseline.lastId ? baseline.lastId !== lastUserId : !baseline.lastTextDigest || baseline.lastTextDigest !== lastUserTextDigest);
       if (baselineChanged) return { ok: false, reason: 'user_turn_added', userTurnCount: userTurns.length };
       const uploadInputs = Array.from(composer.querySelectorAll('input#upload-files[type="file"]'));
       const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
@@ -2180,22 +2255,28 @@ export class ChatGPTController {
       const cardDisplayNames = names(fileCards.map((card) => card.getAttribute('aria-label') || ''));
       const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
       const selectedMatches = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, selectedFileNames);
-      if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || !selectedMatches || !mappingResult.mappingComplete) {
-        return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
-      }
-      for (const card of fileCards) {
-        const remove = Array.from(card.querySelectorAll('button[aria-label], [role="button"][aria-label]')).find((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')) && visible(button));
-        if (!remove) return { ok: false, reason: 'attachment_remove_button_missing', cardDisplayNames };
-        try { remove.click(); } catch (error) { return { ok: false, reason: 'attachment_remove_failed', error: String(error?.message || error).slice(0, 160), cardDisplayNames }; }
-      }
-      const nativeValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-      if (!nativeValueSetter) return { ok: false, reason: 'missing_native_value_setter' };
-      try {
-        nativeValueSetter.call(uploadInput, '');
-        uploadInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-        uploadInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-      } catch (error) {
-        return { ok: false, reason: 'file_input_clear_failed', error: String(error?.message || error).slice(0, 160) };
+      if (expectedFileNames.length === 0) {
+        if (pageUploadInputs.length > 1 || uploadInputs.length > 1 || selectedFileNames.length > 0 || fileCards.length > 0) {
+          return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, inputCount: pageUploadInputs.length };
+        }
+      } else {
+        if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || !selectedMatches || !mappingResult.mappingComplete) {
+          return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
+        }
+        for (const card of fileCards) {
+          const remove = Array.from(card.querySelectorAll('button[aria-label], [role="button"][aria-label]')).find((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')) && visible(button));
+          if (!remove) return { ok: false, reason: 'attachment_remove_button_missing', cardDisplayNames };
+          try { remove.click(); } catch (error) { return { ok: false, reason: 'attachment_remove_failed', error: String(error?.message || error).slice(0, 160), cardDisplayNames }; }
+        }
+        const nativeValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (!nativeValueSetter) return { ok: false, reason: 'missing_native_value_setter' };
+        try {
+          nativeValueSetter.call(uploadInput, '');
+          uploadInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          uploadInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        } catch (error) {
+          return { ok: false, reason: 'file_input_clear_failed', error: String(error?.message || error).slice(0, 160) };
+        }
       }
       try {
         if (promptNode.matches('textarea, input')) {
@@ -2477,13 +2558,14 @@ export class ChatGPTController {
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, signal = null } = {}) {
+  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, signal = null, operationId = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
     throwIfSignalAborted(signal);
     const expectedFileNames = (Array.isArray(attachments) ? attachments : []).map((file) => boundedAttachmentName(path.basename(String(file || '')))).filter(Boolean);
     const run = {
       kind: 'query',
+      operationId: operationId ? String(operationId) : null,
       requested: false,
       requestedAt: null,
       reason: null,
@@ -2543,7 +2625,7 @@ export class ChatGPTController {
     }
   }
 
-  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null } = {}) {
+  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null, operationId = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
@@ -2553,6 +2635,7 @@ export class ChatGPTController {
       throwIfSignalAborted(signal);
       const run = {
         kind: 'send',
+        operationId: operationId ? String(operationId) : null,
         requested: false,
         requestedAt: null,
         reason: null,

@@ -13,6 +13,41 @@ const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
+const PROVIDER_STOP_TIMEOUT_MS = 1_000;
+
+async function boundedProviderStop(controller, { expectedOperationId, reason = 'user_stop' } = {}) {
+  if (!controller || typeof controller.requestStop !== 'function') {
+    return { status: 'not_attempted', reason: 'controller_stop_unavailable', requested: false, clicked: false };
+  }
+  let timer = null;
+  let providerStop;
+  try {
+    providerStop = Promise.resolve(controller.requestStop({ reason, expectedOperationId }))
+      .then((result) => ({
+        status: result?.reason === 'operation_mismatch' || result?.reason === 'no_matching_run' || result?.reason === 'before_dispatch' ? result.reason : 'completed',
+        requested: !!result?.requested,
+        clicked: !!result?.clicked,
+        reason: result?.reason || null
+      }))
+      .catch(() => ({ status: 'failed', reason: 'provider_stop_failed', requested: false, clicked: false }));
+  } catch {
+    providerStop = Promise.resolve({ status: 'failed', reason: 'provider_stop_failed', requested: false, clicked: false });
+  }
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({
+      status: 'timeout',
+      reason: 'provider_stop_timeout',
+      timeoutMs: PROVIDER_STOP_TIMEOUT_MS,
+      requested: false,
+      clicked: false
+    }), PROVIDER_STOP_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([providerStop, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function isLoopback(remoteAddress) {
   const a = String(remoteAddress || '');
@@ -862,14 +897,15 @@ export function startHttpApi({
     }
     control.abortController.abort();
     const controller = activeTabId ? tabs.getControllerById(activeTabId) : null;
-    const stopped = typeof controller?.requestStop === 'function'
-      ? await controller.requestStop({ reason: 'user_stop' })
-      : { ok: true, requested: false, clicked: false };
+    const providerStop = activeTabId
+      ? await boundedProviderStop(controller, { reason: 'user_stop', expectedOperationId: op.id })
+      : { status: 'not_attempted', reason: 'operation_not_bound_to_tab', requested: false, clicked: false };
     return {
       ok: true,
       tabId: responseTabId,
       requested: true,
-      clicked: !!stopped?.clicked,
+      clicked: !!providerStop.clicked,
+      providerStop,
       activeQuery: activeTabId ? activeQueries.get(activeTabId) || active || null : null,
       runtime: runtimeSnapshot()
     };
@@ -1093,6 +1129,7 @@ export function startHttpApi({
                 attachments: packed.attachments,
                 timeoutMs,
                 signal,
+                operationId: op.id,
                 onProgress: (patch) => patchActiveQuery(tabId, patch)
               });
             });
@@ -1175,6 +1212,7 @@ export function startHttpApi({
             timeoutMs,
             stopAfterSend,
             signal,
+            operationId: op.id,
             onProgress: (patch) => patchActiveQuery(tabId, patch)
           });
           setLastOutcome(tabId, {

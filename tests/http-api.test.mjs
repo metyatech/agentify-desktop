@@ -736,12 +736,16 @@ test('http-api: hanging provider stop is bounded and does not block the next ope
   let queryStartedResolve;
   const queryStarted = new Promise((resolve) => { queryStartedResolve = resolve; });
   let providerStopCalls = 0;
+  let retireProviderStopCalls = 0;
+  let retiredOperationId = null;
   let queryCalls = 0;
+  let firstOperationId = null;
   const controller = {
     currentRun: null,
     runExclusive: async (fn) => await fn(),
     query: async ({ operationId, signal }) => {
       queryCalls += 1;
+      if (queryCalls === 1) firstOperationId = operationId;
       controller.currentRun = { operationId, requested: false, messageDispatchStarted: true };
       queryStartedResolve();
       if (queryCalls > 1) {
@@ -758,6 +762,11 @@ test('http-api: hanging provider stop is bounded and does not block the next ope
     requestStop: async () => {
       providerStopCalls += 1;
       return await new Promise(() => {});
+    },
+    retireProviderStop: async ({ expectedOperationId }) => {
+      retireProviderStopCalls += 1;
+      retiredOperationId = expectedOperationId;
+      return { ok: true, retired: true };
     }
   };
   const tabs = {
@@ -789,6 +798,8 @@ test('http-api: hanging provider stop is bounded and does not block the next ope
   assert.equal(stop.data.providerStop.reason, 'provider_stop_timeout');
   assert.ok(stopElapsedMs < 1_300, `stop took ${stopElapsedMs}ms`);
   assert.equal(providerStopCalls, 1);
+  assert.equal(retireProviderStopCalls, 1);
+  assert.equal(retiredOperationId, firstOperationId);
   const queryResponse = await query;
   assert.equal(queryResponse.res.status, 409);
   assert.equal(queryResponse.data.error, 'query_aborted');

@@ -54,10 +54,11 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onSetFileInputFiles = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, onSetFileInputFiles = null, onStopTokenEvaluate = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   return {
     async navigate() {},
     async evaluate(js) {
+      if (js.includes('agentifyStopTokenLifecycle')) return await onStopTokenEvaluate?.(js) || { ok: true };
       const basic = basicEvaluation(js);
       if (basic !== undefined) {
         if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
@@ -2396,7 +2397,7 @@ test('chatgpt-controller: requestStop protects foreign and manual runs from prov
     }
   });
   const controller = createController(page);
-  controller.currentRun = { operationId: 'operation-b', requested: false, messageDispatchStarted: true };
+  controller.currentRun = { operationId: 'operation-b', providerStopToken: 'operation-b-token', requested: false, messageDispatchStarted: true };
   const foreign = await controller.requestStop({ expectedOperationId: 'operation-a' });
   assert.equal(foreign.reason, 'operation_mismatch');
   assert.equal(controller.currentRun.requested, false);
@@ -2405,11 +2406,66 @@ test('chatgpt-controller: requestStop protects foreign and manual runs from prov
   const manual = await controller.requestStop({ expectedOperationId: 'operation-a' });
   assert.equal(manual.reason, 'no_matching_run');
   assert.equal(events.includes('provider-stop-click'), false);
-  controller.currentRun = { operationId: 'operation-a', requested: false, messageDispatchStarted: true };
+  controller.currentRun = { operationId: 'operation-a', providerStopToken: 'operation-a-token', requested: false, messageDispatchStarted: true };
   const exact = await controller.requestStop({ expectedOperationId: 'operation-a' });
   assert.equal(exact.reason, 'provider_stop_clicked');
   assert.equal(exact.clicked, true);
   assert.deepEqual(events.filter((event) => event === 'provider-stop-click'), ['provider-stop-click']);
+});
+
+test('chatgpt-controller: a retired provider stop cannot click after a held page evaluation resumes', async () => {
+  const events = [];
+  const providerStopToken = 'a'.repeat(64);
+  let browserToken = providerStopToken;
+  let providerStopClicks = 0;
+  let stopEvaluationStarted;
+  const stopStarted = new Promise((resolve) => { stopEvaluationStarted = resolve; });
+  let releaseStopEvaluation;
+  const release = new Promise((resolve) => { releaseStopEvaluation = resolve; });
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      const tokenMatch = /const token = ("[0-9a-f]+")/u.exec(js);
+      const token = tokenMatch ? JSON.parse(tokenMatch[1]) : null;
+      if (js.includes('globalThis.__agentifyProviderStopToken = token')) browserToken = token;
+      if (js.includes('globalThis.__agentifyProviderStopToken = null') && browserToken === token) browserToken = null;
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      if (js.includes('const expectedToken')) {
+        const token = JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)[1]);
+        stopEvaluationStarted();
+        await release;
+        if (browserToken !== token) return { clicked: false, reason: 'provider_stop_token_mismatch' };
+        providerStopClicks += 1;
+        return { clicked: true, reason: 'provider_stop_clicked' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  const run = {
+    operationId: 'operation-a',
+    providerStopToken,
+    providerStopRetired: false,
+    requested: false,
+    messageDispatchStarted: true
+  };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+
+  const stopPromise = controller.requestStop({ expectedOperationId: 'operation-a' });
+  await stopStarted;
+  const retirement = await controller.retireProviderStop({ expectedOperationId: 'operation-a' });
+  assert.equal(retirement.retired, true);
+  releaseStopEvaluation();
+  const stop = await stopPromise;
+
+  assert.equal(stop.clicked, false);
+  assert.equal(stop.reason, 'provider_stop_token_mismatch');
+  assert.equal(providerStopClicks, 0);
+  assert.equal(browserToken, null);
+  assert.equal(run.providerStopRetired, true);
 });
 
 test('chatgpt-controller: send-started failure never auto-clears the composer', async () => {

@@ -274,6 +274,7 @@ export class ChatGPTController {
     this.serverId = null;
     this.mouse = { x: 30, y: 30 };
     this.currentRun = null;
+    this.providerStopOwner = null;
   }
 
   async runExclusive(fn) {
@@ -286,6 +287,43 @@ export class ChatGPTController {
 
   async #eval(js) {
     return await this.page.evaluate(js);
+  }
+
+  #newProviderStopToken() {
+    return crypto.randomBytes(32).toString('hex');
+  }
+
+  async #activateProviderStopToken(run) {
+    const token = run.providerStopToken;
+    this.providerStopOwner = run;
+    try {
+      const result = await this.#eval(`(() => {
+        const agentifyStopTokenLifecycle = true;
+        const token = ${JSON.stringify(token)};
+        globalThis.__agentifyProviderStopToken = token;
+        return { ok: true };
+      })()`);
+      if (result?.ok === false) throw new Error('provider_stop_token_unavailable');
+    } catch (error) {
+      if (this.providerStopOwner === run) this.providerStopOwner = null;
+      throw error;
+    }
+  }
+
+  async #releaseProviderStopToken(run) {
+    if (this.providerStopOwner !== run) return false;
+    this.providerStopOwner = null;
+    run.providerStopRetired = true;
+    try {
+      await this.#eval(`(() => {
+        const agentifyStopTokenLifecycle = true;
+        const token = ${JSON.stringify(run.providerStopToken)};
+        if (globalThis.__agentifyProviderStopToken !== token) return false;
+        globalThis.__agentifyProviderStopToken = null;
+        return true;
+      })()`);
+    } catch {}
+    return true;
   }
 
   async #emitProgress(patch) {
@@ -655,9 +693,13 @@ export class ChatGPTController {
     if (this.currentRun) this.currentRun.messageDispatchStarted = true;
   }
 
-  async #clickVisibleStop() {
+  async #clickVisibleStop({ expectedToken = null } = {}) {
     const stopSel = JSON.stringify(this.selectors.stopButton);
     return await this.#eval(`(() => {
+      const expectedToken = ${JSON.stringify(expectedToken)};
+      if (!expectedToken || globalThis.__agentifyProviderStopToken !== expectedToken) {
+        return { clicked: false, reason: 'provider_stop_token_mismatch' };
+      }
       const visible = (n) => {
         if (!n) return false;
         const r = n.getBoundingClientRect();
@@ -665,12 +707,15 @@ export class ChatGPTController {
         return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
       const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
-      if (!stop) return false;
+      if (!stop) return { clicked: false, reason: 'provider_stop_not_found' };
+      if (globalThis.__agentifyProviderStopToken !== expectedToken) {
+        return { clicked: false, reason: 'provider_stop_token_mismatch' };
+      }
       try {
         stop.click();
-        return true;
+        return { clicked: true, reason: 'provider_stop_clicked' };
       } catch {
-        return false;
+        return { clicked: false, reason: 'provider_stop_click_failed' };
       }
     })()`);
   }
@@ -681,12 +726,40 @@ export class ChatGPTController {
     if (expectedOperationId && run.operationId !== expectedOperationId) {
       return { ok: true, requested: false, clicked: false, reason: 'operation_mismatch' };
     }
+    if (run.providerStopRetired) {
+      return { ok: true, requested: false, clicked: false, reason: 'provider_stop_retired' };
+    }
     run.requested = true;
     run.requestedAt = Date.now();
     run.reason = reason || 'user_stop';
     if (!run.messageDispatchStarted) return { ok: true, requested: true, clicked: false, reason: 'before_dispatch' };
-    const clicked = await this.#clickVisibleStop().catch(() => false);
-    return { ok: true, requested: true, clicked, reason: clicked ? 'provider_stop_clicked' : 'provider_stop_not_found' };
+    const stopResult = await this.#clickVisibleStop({ expectedToken: run.providerStopToken }).catch(() => null);
+    const clicked = stopResult === true || stopResult?.clicked === true;
+    return {
+      ok: true,
+      requested: true,
+      clicked,
+      reason: stopResult?.reason || (clicked ? 'provider_stop_clicked' : 'provider_stop_not_found')
+    };
+  }
+
+  async retireProviderStop({ expectedOperationId = null } = {}) {
+    const owner = this.providerStopOwner;
+    if (!owner || (expectedOperationId && owner.operationId !== expectedOperationId)) {
+      return { ok: true, retired: false, reason: 'operation_mismatch' };
+    }
+    owner.providerStopRetired = true;
+    this.providerStopOwner = null;
+    try {
+      await this.#eval(`(() => {
+        const agentifyStopTokenLifecycle = true;
+        const token = ${JSON.stringify(owner.providerStopToken)};
+        if (globalThis.__agentifyProviderStopToken !== token) return false;
+        globalThis.__agentifyProviderStopToken = null;
+        return true;
+      })()`);
+    } catch {}
+    return { ok: true, retired: true };
   }
 
   async #typeHuman(text) {
@@ -2566,6 +2639,8 @@ export class ChatGPTController {
     const run = {
       kind: 'query',
       operationId: operationId ? String(operationId) : null,
+      providerStopToken: this.#newProviderStopToken(),
+      providerStopRetired: false,
       requested: false,
       requestedAt: null,
       reason: null,
@@ -2579,6 +2654,7 @@ export class ChatGPTController {
     this.currentRun = run;
     const detachRunSignal = this.#bindRunSignal(run, signal);
     try {
+      await this.#activateProviderStopToken(run);
       this.#throwIfStopRequested();
       await this.ensureReady({ timeoutMs });
       this.#throwIfStopRequested();
@@ -2620,6 +2696,7 @@ export class ChatGPTController {
       }
       throw error;
     } finally {
+      await this.#releaseProviderStopToken(run);
       detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;
     }
@@ -2636,6 +2713,8 @@ export class ChatGPTController {
       const run = {
         kind: 'send',
         operationId: operationId ? String(operationId) : null,
+        providerStopToken: this.#newProviderStopToken(),
+        providerStopRetired: false,
         requested: false,
         requestedAt: null,
         reason: null,
@@ -2649,6 +2728,7 @@ export class ChatGPTController {
       this.currentRun = run;
       const detachRunSignal = this.#bindRunSignal(run, signal);
       try {
+        await this.#activateProviderStopToken(run);
         this.#throwIfStopRequested();
         await this.ensureReady({ timeoutMs });
         this.#throwIfStopRequested();
@@ -2662,7 +2742,8 @@ export class ChatGPTController {
           const start = Date.now();
           while (Date.now() - start < 2500) {
             this.#throwIfStopRequested();
-            const clicked = await this.#clickVisibleStop();
+            const stopResult = await this.#clickVisibleStop({ expectedToken: run.providerStopToken });
+            const clicked = stopResult === true || stopResult?.clicked === true;
             if (clicked) break;
             await sleep(120);
           }
@@ -2693,6 +2774,7 @@ export class ChatGPTController {
         }
         throw error;
       } finally {
+        await this.#releaseProviderStopToken(run);
         detachRunSignal();
         if (this.currentRun === run) this.currentRun = null;
       }

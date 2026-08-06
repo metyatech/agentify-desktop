@@ -34,13 +34,19 @@ async function boundedProviderStop(controller, { expectedOperationId, reason = '
     providerStop = Promise.resolve({ status: 'failed', reason: 'provider_stop_failed', requested: false, clicked: false });
   }
   const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({
-      status: 'timeout',
-      reason: 'provider_stop_timeout',
-      timeoutMs: PROVIDER_STOP_TIMEOUT_MS,
-      requested: false,
-      clicked: false
-    }), PROVIDER_STOP_TIMEOUT_MS);
+    timer = setTimeout(() => {
+      try {
+        const retire = controller.retireProviderStop?.({ expectedOperationId });
+        Promise.resolve(retire).catch(() => {});
+      } catch {}
+      resolve({
+        status: 'timeout',
+        reason: 'provider_stop_timeout',
+        timeoutMs: PROVIDER_STOP_TIMEOUT_MS,
+        requested: false,
+        clicked: false
+      });
+    }, PROVIDER_STOP_TIMEOUT_MS);
   });
   try {
     return await Promise.race([providerStop, timeout]);

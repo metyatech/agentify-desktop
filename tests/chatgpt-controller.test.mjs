@@ -54,7 +54,7 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   const defaultStopTokenEvaluation = (js) => {
     if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
     const generation = Number(/const (?:generation|expectedGeneration) = ([0-9]+)/u.exec(js)?.[1] || 0);
@@ -65,7 +65,11 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText =
     }
     if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, generation, sequence, retiredSequence: 0, dispatchState: 'pending' };
     if (js.includes('agentifyStopTokenDispatchClaim')) return { ok: true, claimed: true, state: 'claimed' };
-    if (js.includes('agentifyStopTokenDispatchStart')) return { ok: true, started: true, state: 'dispatching' };
+    if (js.includes('agentifyStopTokenDispatchStart')) {
+      const startGeneration = Number(/dispatch: \{ generation: ([0-9]+)/u.exec(js)?.[1] || 0);
+      const startSequence = Number(/sequence: ([0-9]+)/u.exec(js)?.[1] || 0);
+      return { ok: true, started: true, state: 'dispatching', generation: startGeneration, sequence: startSequence };
+    }
     if (js.includes('agentifyStopTokenDispatchRollback')) return { ok: true, rolledBack: true, state: 'cancelled' };
     if (js.includes('agentifyStopTokenDispatchComplete')) return { ok: true, state: 'dispatched' };
     if (js.includes('agentifyStopTokenDispatchRead')) return { ok: true, state: 'dispatching' };
@@ -115,7 +119,9 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText =
       events.push(x >= 80 ? 'normal-send-click' : 'prompt-click');
       await onMouseDown?.(x);
     },
-    async mouseUp() {},
+    async mouseUp(x) {
+      await onMouseUp?.(x);
+    },
     async setFileInputFiles(files, options = {}) {
       events.push(`files-set:${files.length}`);
       if (options?.selector) events.push(`files-selector:${options.selector}`);
@@ -2250,7 +2256,7 @@ async function evaluateCleanupScript(js, dom) {
   });
 }
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null, onMouseDown = null, onSendKey = null, onEvaluateExtra = null }) {
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onEvaluateExtra = null }) {
   let cleanupScript = '';
   const page = createPage({
     events,
@@ -2260,6 +2266,7 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
     onInsertText,
     onStopTokenEvaluate,
     onMouseDown,
+    onMouseUp,
     onSendKey,
     onEvaluate: async (js) => {
       const extra = await onEvaluateExtra?.(js);
@@ -2288,10 +2295,11 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
   return { page, cleanupScript: () => cleanupScript };
 }
 
-function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic', actionGate = null, claimGate = null, onActionStarted = null, onClaimStarted = null, onClaimCompleted = null, onMouseDown = null, onSendKey = null, onRollback = null, claimStateOverride = null, actionError = null, cleanupResult = null, markDispatchingBeforeActionGate = false }) {
+function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic', actionGate = null, claimGate = null, startGate = null, startResult = null, onActionStarted = null, onClaimStarted = null, onClaimCompleted = null, onStartStarted = null, onStartCompleted = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onRollback = null, claimStateOverride = null, actionError = null, cleanupResult = null, markDispatchingBeforeActionGate = false }) {
   let browserState = { generation: 0, sequence: 0, token: null, stopRequested: false, retiredSequence: 0, dispatch: null };
   let actionCount = 0;
   let providerStopCount = 0;
+  let startEvaluationCount = 0;
   const parseLifecycle = (js) => ({
     generation: Number(/(?:const generation = |dispatch: \{ generation: )([0-9]+)/u.exec(js)?.[1] || 0),
     sequence: Number(/(?:const sequence = |sequence: )([0-9]+)/u.exec(js)?.[1] || 0),
@@ -2302,6 +2310,11 @@ function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic',
     sequence: Number(/const expectedSequence = ([0-9]+)/u.exec(js)?.[1] || 0),
     token: JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null')
   });
+  const parseReadExpected = (js) => ({
+    generation: Number(/currentGeneration === ([0-9]+)/u.exec(js)?.[1] || 0),
+    sequence: Number(/currentSequence === ([0-9]+)/u.exec(js)?.[1] || 0),
+    token: JSON.parse(/state\?\.token === ("[0-9a-f]+")/u.exec(js)?.[1] || 'null')
+  });
   const exact = ({ generation, sequence, token }) => browserState.generation === generation && browserState.sequence === sequence && browserState.token === token;
   const pageResult = { actionCount: () => actionCount, providerStopCount: () => providerStopCount, state: () => browserState };
   const { page } = createAttachmentCleanupPage({
@@ -2309,6 +2322,7 @@ function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic',
     attachmentState: attachmentCardSnapshot([]),
     cleanupResult,
     onMouseDown,
+    onMouseUp,
     onSendKey,
     recordSendEvaluation: false,
     onStopTokenEvaluate: async (js) => {
@@ -2364,10 +2378,19 @@ function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic',
         return { ok: true, claimed: true, state: 'claimed' };
       }
       if (js.includes('agentifyStopTokenDispatchStart')) {
+        const startEvaluationId = ++startEvaluationCount;
+        onStartStarted?.(startEvaluationId, js);
+        const currentStartGate = typeof startGate === 'function' ? startGate(startEvaluationId, js) : startGate;
+        if (currentStartGate) await currentStartGate;
         const expected = parseLifecycle(js);
-        if (!exact(expected) || browserState.stopRequested || browserState.dispatch?.state !== 'claimed') return { ok: true, started: false, state: browserState.dispatch?.state || 'mismatch' };
+        if (startResult) {
+          const customResult = typeof startResult === 'function' ? await startResult({ count: startEvaluationId, expected, state: browserState, js }) : startResult;
+          if (customResult !== undefined) return customResult;
+        }
+        if (!exact(expected) || browserState.stopRequested || browserState.dispatch?.state !== 'claimed') return { ok: true, started: false, state: browserState.dispatch?.state || 'mismatch', generation: browserState.generation, sequence: browserState.sequence };
         browserState = { ...browserState, dispatch: { generation: expected.generation, sequence: expected.sequence, state: 'dispatching' } };
-        return { ok: true, started: true, state: 'dispatching' };
+        await onStartCompleted?.(startEvaluationId, js);
+        return { ok: true, started: true, state: 'dispatching', generation: expected.generation, sequence: expected.sequence };
       }
       if (js.includes('agentifyStopTokenDispatchRollback')) {
         const expected = parseLifecycle(js);
@@ -2389,10 +2412,12 @@ function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic',
         }
         return { ok: true, state: exact(lifecycle) ? browserState.dispatch?.state || 'unknown' : 'mismatch' };
       }
-      if (js.includes('agentifyStopTokenDispatchRead')) return {
-        ok: true,
-        state: exact(parseLifecycle(js)) && ['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled'].includes(browserState.dispatch?.state) ? browserState.dispatch.state : 'mismatch'
-      };
+      if (js.includes('agentifyStopTokenDispatchRead')) {
+        return {
+          ok: true,
+          state: exact(parseReadExpected(js)) && ['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled'].includes(browserState.dispatch?.state) ? browserState.dispatch.state : 'mismatch'
+        };
+      }
       if (js.includes('agentifyStopTokenRelease')) {
         const lifecycle = parseLifecycle(js);
         if (exact(lifecycle)) browserState = { ...browserState, token: null, retiredSequence: Math.max(browserState.retiredSequence, lifecycle.sequence), dispatch: { generation: lifecycle.generation, sequence: lifecycle.sequence, state: ['dispatching', 'dispatched'].includes(browserState.dispatch?.state) ? browserState.dispatch.state : 'cancelled' } };
@@ -3589,6 +3614,256 @@ test('chatgpt-controller: dispatch rollback rejects a claimed-state mismatch wit
   assert.deepEqual(rollbackResult, { ok: true, rolledBack: false, state: 'dispatching' });
   assert.equal(run.messageDispatchStarted, false);
   assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: coordinate start lease held during stop prevents mouse input and cleans the draft', async () => {
+  const events = [];
+  let mouseDownCount = 0;
+  let mouseUpCount = 0;
+  let startStartedResolve;
+  const startStarted = new Promise((resolve) => { startStartedResolve = resolve; });
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    startGate,
+    onStartStarted: startStartedResolve,
+    onMouseDown: async (x) => { if (x >= 80) mouseDownCount += 1; },
+    onMouseUp: async (x) => { if (x >= 80) mouseUpCount += 1; },
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'held coordinate start', activePromptTextDigest: userTurnDigestForTest('held coordinate start'), activePromptTextLength: 20 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'held coordinate start', timeoutMs: 5_000 });
+  await startStarted;
+  assert.equal(harness.state().dispatch.state, 'claimed');
+  const run = controller.currentRun;
+  const stop = await controller.requestStop();
+  assert.equal(stop.reason, 'before_dispatch');
+  assert.equal(harness.state().dispatch.state, 'cancelled');
+  releaseStart();
+  await assert.rejects(sendPromise, /query_aborted/u);
+  assert.equal(mouseDownCount, 0);
+  assert.equal(mouseUpCount, 0);
+  assert.equal(harness.providerStopCount(), 0);
+  assert.equal(run.messageDispatchStarted, false);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: keyboard start lease held during stop prevents key input and cleans the draft', async () => {
+  const events = [];
+  let keyCount = 0;
+  let startStartedResolve;
+  const startStarted = new Promise((resolve) => { startStartedResolve = resolve; });
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionMode: 'none',
+    startGate,
+    onStartStarted: startStartedResolve,
+    onSendKey: async (key) => { if (key === 'Enter') keyCount += 1; },
+    sendResult: { ok: true, isChatGPT: false, fallbackEnter: true, host: 'example.com' },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'held keyboard start', timeoutMs: 5_000 });
+  await startStarted;
+  assert.equal(harness.state().dispatch.state, 'claimed');
+  const run = controller.currentRun;
+  const stop = await controller.requestStop();
+  assert.equal(stop.reason, 'before_dispatch');
+  assert.equal(harness.state().dispatch.state, 'cancelled');
+  releaseStart();
+  await assert.rejects(sendPromise, /query_aborted/u);
+  assert.equal(keyCount, 0);
+  assert.equal(harness.providerStopCount(), 0);
+  assert.equal(run.messageDispatchStarted, false);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: start success followed by stop before the input sync section sends nothing and cleans the draft', async () => {
+  const events = [];
+  let mouseDownCount = 0;
+  let stopPromise = null;
+  const harness = createDispatchRaceHarness({
+    onStartCompleted: async () => {
+      stopPromise = controller.requestStop();
+    },
+    onMouseDown: async (x) => { if (x >= 80) mouseDownCount += 1; },
+    events,
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'stop first', activePromptTextDigest: userTurnDigestForTest('stop first'), activePromptTextLength: 10 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'stop first', timeoutMs: 5_000 });
+  await assert.rejects(sendPromise, /query_aborted/u);
+  await stopPromise;
+  assert.equal(mouseDownCount, 0);
+  assert.equal(harness.state().token, null);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: start timeout reconciles a claimed lease and cleans the unsent draft', async () => {
+  const events = [];
+  let startStartedResolve;
+  const startStarted = new Promise((resolve) => { startStartedResolve = resolve; });
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  let mouseDownCount = 0;
+  const harness = createDispatchRaceHarness({
+    events,
+    startGate,
+    onStartStarted: startStartedResolve,
+    onMouseDown: async (x) => { if (x >= 80) mouseDownCount += 1; },
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'start timeout', activePromptTextDigest: userTurnDigestForTest('start timeout'), activePromptTextLength: 12 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'start timeout', timeoutMs: 5_000 });
+  await startStarted;
+  await assert.rejects(sendPromise, /provider_stop_token_not_active/u);
+  releaseStart();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(mouseDownCount, 0);
+  assert.equal(controller.currentRun, null);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: keyboard start timeout reconciles a claimed lease and cleans the unsent draft', async () => {
+  const events = [];
+  let keyCount = 0;
+  let startStartedResolve;
+  const startStarted = new Promise((resolve) => { startStartedResolve = resolve; });
+  let releaseStart;
+  const startGate = new Promise((resolve) => { releaseStart = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionMode: 'none',
+    startGate,
+    onStartStarted: startStartedResolve,
+    onSendKey: async (key) => { if (key === 'Enter') keyCount += 1; },
+    sendResult: { ok: true, isChatGPT: false, fallbackEnter: true, host: 'example.com' },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'keyboard start timeout', timeoutMs: 5_000 });
+  await startStarted;
+  await assert.rejects(sendPromise, /provider_stop_token_not_active/u);
+  assert.equal(keyCount, 0);
+  assert.equal(harness.state().token, null);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+  releaseStart();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(controller.currentRun, null);
+});
+
+test('chatgpt-controller: unknown start state suppresses automatic draft cleanup', async () => {
+  const events = [];
+  let mouseDownCount = 0;
+  const harness = createDispatchRaceHarness({
+    events,
+    claimStateOverride: 'unknown',
+    onMouseDown: async (x) => { if (x >= 80) mouseDownCount += 1; },
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'unknown start', activePromptTextDigest: userTurnDigestForTest('unknown start'), activePromptTextLength: 13 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'unknown start', timeoutMs: 5_000 });
+  await assert.rejects(sendPromise, /provider_stop_dispatch_unknown/u);
+  assert.equal(mouseDownCount, 0);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), []);
+});
+
+test('chatgpt-controller: stale start evaluation cannot change the newer run or start input', async () => {
+  const events = [];
+  let releaseFirstStart;
+  const firstStartGate = new Promise((resolve) => { releaseFirstStart = resolve; });
+  let firstStartStartedResolve;
+  const firstStartStarted = new Promise((resolve) => { firstStartStartedResolve = resolve; });
+  let secondStartStartedResolve;
+  const secondStartStarted = new Promise((resolve) => { secondStartStartedResolve = resolve; });
+  let firstStartFinishedResolve;
+  const firstStartFinished = new Promise((resolve) => { firstStartFinishedResolve = resolve; });
+  let mouseDownStartedResolve;
+  const mouseDownStarted = new Promise((resolve) => { mouseDownStartedResolve = resolve; });
+  let releaseMouseDown;
+  const mouseDownGate = new Promise((resolve) => { releaseMouseDown = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    startGate: (count) => count === 1 ? firstStartGate : null,
+    startResult: ({ count, state }) => {
+      if (count !== 1) return undefined;
+      firstStartFinishedResolve();
+      return { ok: true, started: false, state: 'mismatch', generation: state.generation, sequence: state.sequence };
+    },
+    onStartStarted: (count) => {
+      if (count === 1) firstStartStartedResolve();
+      else secondStartStartedResolve();
+    },
+    onMouseDown: async (x) => {
+      if (x < 80) return;
+      mouseDownStartedResolve();
+      await mouseDownGate;
+    },
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'stale start', activePromptTextDigest: userTurnDigestForTest('stale start'), activePromptTextLength: 11 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const firstSend = controller.send({ text: 'stale start', timeoutMs: 5_000 });
+  await firstStartStarted;
+  await assert.rejects(firstSend, /provider_stop_token_not_active|provider_stop_dispatch_unknown/u);
+
+  const secondSend = controller.send({ text: 'newer start', timeoutMs: 5_000 });
+  await secondStartStarted;
+  await mouseDownStarted;
+  const stateBeforeLateFirstStart = structuredClone(harness.state());
+  releaseFirstStart();
+  await firstStartFinished;
+  assert.deepEqual(harness.state(), stateBeforeLateFirstStart);
+  assert.equal(events.filter((event) => event === 'normal-send-click').length, 1);
+
+  const stop = await controller.requestStop();
+  assert.equal(stop.clicked, true);
+  assert.equal(harness.providerStopCount(), 1);
+  releaseMouseDown();
+  await assert.rejects(secondSend, /query_aborted|send_not_triggered|provider_stop_token_not_active/u);
+  assert.equal(events.filter((event) => event === 'cleanup-draft').length, 1);
+});
+
+test('chatgpt-controller: start result fence and state mismatches never start coordinate or keyboard input', async () => {
+  const mismatchCases = [
+    ['generation mismatch', ({ expected }) => ({ ok: true, started: true, state: 'dispatching', generation: expected.generation + 1, sequence: expected.sequence })],
+    ['sequence mismatch', ({ expected }) => ({ ok: true, started: true, state: 'dispatching', generation: expected.generation, sequence: expected.sequence + 1 })],
+    ['started false', ({ expected }) => ({ ok: true, started: false, state: 'claimed', generation: expected.generation, sequence: expected.sequence })],
+    ['cancelled', ({ expected }) => ({ ok: true, started: false, state: 'cancelled', generation: expected.generation, sequence: expected.sequence })]
+  ];
+
+  for (const [label, makeResult] of mismatchCases) {
+    for (const mode of ['coordinate', 'keyboard']) {
+      const events = [];
+      let mouseDownCount = 0;
+      let keyCount = 0;
+      const harness = createDispatchRaceHarness({
+        events,
+        actionMode: mode === 'keyboard' ? 'none' : 'generic',
+        startResult: makeResult,
+        onMouseDown: async (x) => { if (x >= 80) mouseDownCount += 1; },
+        onSendKey: async (key) => { if (key === 'Enter') keyCount += 1; },
+        sendResult: mode === 'keyboard'
+          ? { ok: true, isChatGPT: false, fallbackEnter: true, host: 'example.com' }
+          : { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 }, sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: label, activePromptTextDigest: userTurnDigestForTest(label), activePromptTextLength: label.length } },
+        cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+      });
+      const controller = createController(harness.page);
+      const sendPromise = controller.send({ text: `${label} ${mode}`, timeoutMs: 5_000 });
+      await assert.rejects(sendPromise, /provider_stop_token_not_active|provider_stop_dispatch_unknown/u, `${label}/${mode}`);
+      assert.equal(mouseDownCount, 0, `${label}/${mode} mouseDown`);
+      assert.equal(keyCount, 0, `${label}/${mode} sendKey`);
+      assert.equal(harness.providerStopCount(), 0, `${label}/${mode} provider stop`);
+      assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft'], `${label}/${mode} cleanup`);
+    }
+  }
 });
 
 test('chatgpt-controller: stop during a DOM click fallback prevents the retry and stops only the exact dispatch', async () => {

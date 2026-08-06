@@ -594,16 +594,24 @@ export class ChatGPTController {
       const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
         ? globalThis.__agentifyProviderStopState
         : null;
-      const exact = Number(state?.generation) === ${generation} && Number(state?.sequence) === ${sequence} &&
+      const currentGeneration = Number(state?.generation);
+      const currentSequence = Number(state?.sequence);
+      const exact = currentGeneration === ${generation} && currentSequence === ${sequence} &&
         state?.token === ${token} && Number(state?.retiredSequence) < ${sequence};
       if (exact && state?.stopRequested !== true && state?.dispatch?.state === 'claimed') {
         globalThis.__agentifyProviderStopState = {
           ...state,
           dispatch: { generation: ${generation}, sequence: ${sequence}, state: 'dispatching' }
         };
-        return { ok: true, started: true, state: 'dispatching' };
+        return { ok: true, started: true, state: 'dispatching', generation: ${generation}, sequence: ${sequence} };
       }
-      return { ok: true, started: false, state: exact ? state?.dispatch?.state || 'unknown' : 'mismatch' };
+      return {
+        ok: true,
+        started: false,
+        state: exact ? state?.dispatch?.state || 'unknown' : 'mismatch',
+        generation: Number.isSafeInteger(currentGeneration) ? currentGeneration : null,
+        sequence: Number.isSafeInteger(currentSequence) ? currentSequence : null
+      };
     })()`;
   }
 
@@ -808,17 +816,68 @@ export class ChatGPTController {
     return { ok: false, rolledBack: false, state: run.dispatchState || 'unknown' };
   }
 
-  #beginProviderStopDispatch(run) {
-    if (!run || this.currentRun !== run || run.providerStopRetired || run.requested || run.dispatchState !== 'claimed') return false;
+  async #beginProviderStopDispatch(run) {
+    if (!run || this.currentRun !== run || run.providerStopRetired || run.dispatchState !== 'claimed') {
+      if (run?.requested) throw queryAbortedError(run.reason || 'user_stop');
+      throw this.#providerStopDispatchError('dispatch');
+    }
+    const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchStartScript(run), { signal: run.signal });
+    const result = outcome.status === 'completed' && outcome.value?.ok === true ? outcome.value : null;
+    const expectedGeneration = this.#providerStopGeneration(run);
+    const expectedSequence = this.#providerStopSequence(run);
+    const exactFence = result?.generation === expectedGeneration && result.sequence === expectedSequence;
+    const exactStarted = result?.started === true && result.state === 'dispatching' && exactFence;
+    if (this.currentRun !== run) {
+      run.messageDispatchStarted = false;
+      run.dispatchStateUnknown = true;
+      throw this.#providerStopDispatchError('dispatch', 'provider_stop_dispatch_unknown');
+    }
+    if (exactStarted && !run.requested && !run.providerStopRetired) {
+      run.messageDispatchStarted = false;
+      run.dispatchState = 'dispatching';
+      run.providerStopDispatchLease = true;
+      return result;
+    }
+    if (exactStarted && run.requested) {
+      run.messageDispatchStarted = false;
+      run.dispatchState = 'cancelled';
+      throw queryAbortedError(run.reason || 'user_stop');
+    }
+    const state = result && exactFence && ['pending', 'claimed', 'cancelled', 'dispatching', 'dispatched'].includes(result.state)
+      ? result.state
+      : await this.#reconcileProviderStopDispatch(run);
+    run.dispatchState = state;
+    if (['pending', 'claimed', 'cancelled'].includes(state)) {
+      run.messageDispatchStarted = false;
+      throw run.requested || outcome.status === 'aborted'
+        ? queryAbortedError(run.reason || 'user_stop')
+        : this.#providerStopDispatchError('dispatch');
+    }
+    run.messageDispatchStarted = false;
+    run.dispatchStateUnknown = true;
+    throw this.#providerStopDispatchError('dispatch', 'provider_stop_dispatch_unknown');
+  }
+
+  #commitProviderStopDispatchBeforeInput(run) {
+    if (!run || this.currentRun !== run || run.providerStopRetired || !run.providerStopDispatchLease || run.dispatchState !== 'dispatching') {
+      if (run?.requested) {
+        run.messageDispatchStarted = false;
+        run.dispatchState = 'cancelled';
+        throw queryAbortedError(run.reason || 'user_stop');
+      }
+      if (run) {
+        run.messageDispatchStarted = false;
+        run.dispatchStateUnknown = true;
+      }
+      throw this.#providerStopDispatchError('dispatch', 'provider_stop_dispatch_unknown');
+    }
+    if (run.requested) {
+      run.messageDispatchStarted = false;
+      run.dispatchState = 'cancelled';
+      throw queryAbortedError(run.reason || 'user_stop');
+    }
     run.messageDispatchStarted = true;
-    run.dispatchState = 'dispatching';
-    const startEvaluation = this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchStartScript(run), {
-      signal: null,
-      timeoutMs: PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS
-    });
-    run.providerStopDispatchStartAttempt = startEvaluation;
-    startEvaluation.catch(() => {});
-    return true;
+    run.providerStopInputStarted = true;
   }
 
   async #completeProviderStopDispatch(run) {
@@ -1399,8 +1458,8 @@ export class ChatGPTController {
     await this.#moveMouseTo(x, y);
     this.#throwIfStopRequested();
     await onBeforeMouseDownAsync?.();
-    this.#throwIfStopRequested();
-    onBeforeMouseDown?.();
+    if (onBeforeMouseDown) onBeforeMouseDown();
+    else this.#throwIfStopRequested();
     await this.page.mouseDown(x, y, { button: 'left', clickCount: 1 });
     await sleep(jitter(20, 60));
     await this.page.mouseUp(x, y, { button: 'left', clickCount: 1 });
@@ -2061,9 +2120,13 @@ export class ChatGPTController {
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy, {
-        onBeforeMouseDownAsync: () => this.#claimProviderStopDispatch(this.currentRun),
+        onBeforeMouseDownAsync: async () => {
+          const run = this.currentRun;
+          await this.#claimProviderStopDispatch(run);
+          await this.#beginProviderStopDispatch(run);
+        },
         onBeforeMouseDown: () => {
-          if (!this.#beginProviderStopDispatch(this.currentRun)) throw this.#providerStopDispatchError('dispatch');
+          this.#commitProviderStopDispatchBeforeInput(this.currentRun);
         }
       });
       coordinateClickAttempted = true;
@@ -2237,9 +2300,10 @@ export class ChatGPTController {
         await sleep(jitter(25, 90));
         this.#throwIfStopRequested();
         await this.#claimProviderStopDispatch(this.currentRun, { allowRetry: true });
+        await this.#beginProviderStopDispatch(this.currentRun);
         this.#throwIfStopRequested();
         try {
-          if (!this.#beginProviderStopDispatch(this.currentRun)) throw this.#providerStopDispatchError('dispatch');
+          this.#commitProviderStopDispatchBeforeInput(this.currentRun);
           await this.#sendKey(key, { modifiers });
           await this.#completeProviderStopDispatch(this.currentRun);
         } catch (error) {
@@ -3411,6 +3475,8 @@ export class ChatGPTController {
       messageDispatchStarted: false,
       dispatchState: null,
       dispatchStateUnknown: false,
+      providerStopDispatchLease: false,
+      providerStopInputStarted: false,
       userTurnBaseline: null,
       signal
     };
@@ -3492,6 +3558,8 @@ export class ChatGPTController {
         messageDispatchStarted: false,
         dispatchState: null,
         dispatchStateUnknown: false,
+        providerStopDispatchLease: false,
+        providerStopInputStarted: false,
         userTurnBaseline: null,
         signal
       };

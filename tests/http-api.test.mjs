@@ -732,6 +732,74 @@ test('http-api: stopping context preparation does not click a manual generation 
   assert.equal(status.data.runtime.inflightQueries, 0);
 });
 
+test('http-api: activation abort releases active query, scope, inflight, and control state', async (t) => {
+  let activationStartedResolve;
+  const activationStarted = new Promise((resolve) => { activationStartedResolve = resolve; });
+  let queryFinished = false;
+  let queryCalls = 0;
+  let requestStopCalls = 0;
+  const controller = {
+    currentRun: null,
+    runExclusive: async (fn) => await fn(),
+    query: async ({ operationId, signal }) => {
+      queryCalls += 1;
+      if (queryCalls > 1) return { text: 'next operation', codeBlocks: [], meta: {} };
+      controller.currentRun = { operationId, requested: false, messageDispatchStarted: false };
+      activationStartedResolve();
+      try {
+        await new Promise((resolve, reject) => {
+          signal.addEventListener('abort', () => reject(Object.assign(new Error('query_aborted'), { data: { reason: 'user_stop' } })), { once: true });
+        });
+      } finally {
+        controller.currentRun = null;
+        queryFinished = true;
+      }
+    },
+    requestStop: async ({ expectedOperationId }) => {
+      if (controller.currentRun?.operationId !== expectedOperationId) return { ok: true, requested: false, clicked: false, reason: 'no_matching_run' };
+      requestStopCalls += 1;
+      controller.currentRun.requested = true;
+      return { ok: true, requested: true, clicked: false, reason: 'before_dispatch' };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'activation-hang', prompt: 'activation waits' } });
+  await activationStarted;
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: { key: 'activation-hang' } });
+  const queryResponse = await query;
+  assert.equal(stop.res.status, 200);
+  assert.equal(stop.data.requested, true);
+  assert.equal(requestStopCalls, 1);
+  assert.equal(queryResponse.res.status, 409);
+  assert.equal(queryResponse.data.error, 'query_aborted');
+  assert.equal(queryFinished, true);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.activeQueries.length, 0);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'activation-hang', prompt: 'after activation stop' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(queryCalls, 2);
+});
+
 test('http-api: hanging provider stop is bounded and does not block the next operation', async (t) => {
   let queryStartedResolve;
   const queryStarted = new Promise((resolve) => { queryStartedResolve = resolve; });

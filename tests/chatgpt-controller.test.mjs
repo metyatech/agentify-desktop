@@ -1962,7 +1962,7 @@ test('chatgpt-controller: seven-file attachment readiness succeeds with reordere
   });
 });
 
-function createCleanupDom({ events, promptText, uploadInputCount = 0, selectedFileNames = [], cardCount = 0, userTurnTexts = [], userTurnIds = [] }) {
+function createCleanupDom({ events, promptText, uploadInputCount = 0, uploadInputValue = '', pageUploadInputCount = 0, pageSelectedFileNames = [], pageUploadInputValue = '', selectedFileNames = [], cardCount = 0, userTurnTexts = [], userTurnIds = [] }) {
   class FakeNode {
     constructor(tagName, attributes = {}) {
       this.tagName = String(tagName || 'div').toUpperCase();
@@ -2094,7 +2094,15 @@ function createCleanupDom({ events, promptText, uploadInputCount = 0, selectedFi
   for (let index = 0; index < uploadInputCount; index += 1) {
     const input = composer.append(new FakeInputElement({ id: 'upload-files', type: 'file' }));
     input.files = index === 0 ? selectedFileNames.map((name) => ({ name })) : [];
+    if (index === 0) input._value = String(uploadInputValue || '');
     uploadInputs.push(input);
+  }
+  const pageUploadInputs = [];
+  for (let index = 0; index < pageUploadInputCount; index += 1) {
+    const input = body.append(new FakeInputElement({ id: 'upload-files', type: 'file' }));
+    input.files = index === 0 ? pageSelectedFileNames.map((name) => ({ name })) : [];
+    if (index === 0) input._value = String(pageUploadInputValue || '');
+    pageUploadInputs.push(input);
   }
   for (let index = 0; index < cardCount; index += 1) {
     const card = composer.append(new FakeNode('div', { role: 'group', 'aria-label': selectedFileNames[index] || `card-${index + 1}`, class: 'group/file-tile' }));
@@ -2128,6 +2136,7 @@ function createCleanupDom({ events, promptText, uploadInputCount = 0, selectedFi
     prompt,
     composer,
     uploadInputs,
+    pageUploadInputs,
     window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
     HTMLInputElement: FakeInputElement,
     HTMLTextAreaElement: FakeTextAreaElement,
@@ -2286,6 +2295,99 @@ test('chatgpt-controller: text-only cleanup succeeds with one empty upload input
   assert.equal(events.includes('attachment-menu-click'), false);
 });
 
+test('chatgpt-controller: text-only cleanup observes one empty composer-external page input', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'external empty input', pageUploadInputCount: 1 });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'external empty input', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'cleared'
+  );
+  assert.equal(dom.prompt.value, '');
+  assert.deepEqual(dom.pageUploadInputs[0].files, []);
+  assert.equal(events.includes('attachment-menu-click'), false);
+});
+
+test('chatgpt-controller: text-only cleanup refuses a selected composer-external page file', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'external selected file', pageUploadInputCount: 1, pageSelectedFileNames: ['foreign.txt'] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'external selected file', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_set_changed'
+  );
+  assert.equal(dom.prompt.value, 'external selected file');
+  assert.deepEqual(dom.pageUploadInputs[0].files.map((file) => file.name), ['foreign.txt']);
+});
+
+test('chatgpt-controller: text-only cleanup refuses a non-empty composer-external page input value', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'external input value', pageUploadInputCount: 1, pageUploadInputValue: 'C:\\fakepath\\foreign.txt' });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'external input value', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_set_changed'
+  );
+  assert.equal(dom.prompt.value, 'external input value');
+});
+
+test('chatgpt-controller: text-only cleanup refuses an owned composer plus another page input', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'multiple inputs', uploadInputCount: 1, pageUploadInputCount: 1 });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'multiple inputs', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_ownership_unknown'
+  );
+  assert.equal(dom.prompt.value, 'multiple inputs');
+});
+
+test('chatgpt-controller: text-only cleanup refuses multiple page upload inputs', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'two page inputs', pageUploadInputCount: 2 });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    sendResult: { ok: false, error: 'send_not_triggered' },
+    recordSendEvaluation: false,
+    cleanupDom: dom
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'two page inputs', timeoutMs: 20 }),
+    (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'attachment_ownership_unknown'
+  );
+  assert.equal(dom.prompt.value, 'two page inputs');
+});
+
 test('chatgpt-controller: text-only cleanup refuses an unexpected attachment card', async () => {
   const events = [];
   const dom = createCleanupDom({ events, promptText: 'card must remain', cardCount: 1 });
@@ -2416,7 +2518,7 @@ test('chatgpt-controller: requestStop protects foreign and manual runs from prov
 test('chatgpt-controller: a retired provider stop cannot click after a held page evaluation resumes', async () => {
   const events = [];
   const providerStopToken = 'a'.repeat(64);
-  let browserToken = providerStopToken;
+  let browserState = { epoch: 1, token: providerStopToken, retiredEpoch: 0 };
   let providerStopClicks = 0;
   let stopEvaluationStarted;
   const stopStarted = new Promise((resolve) => { stopEvaluationStarted = resolve; });
@@ -2426,17 +2528,25 @@ test('chatgpt-controller: a retired provider stop cannot click after a held page
     events,
     onStopTokenEvaluate: async (js) => {
       const tokenMatch = /const token = ("[0-9a-f]+")/u.exec(js);
+      const epochMatch = /const epoch = ([0-9]+)/u.exec(js);
       const token = tokenMatch ? JSON.parse(tokenMatch[1]) : null;
-      if (js.includes('globalThis.__agentifyProviderStopToken = token')) browserToken = token;
-      if (js.includes('globalThis.__agentifyProviderStopToken = null') && browserToken === token) browserToken = null;
+      const epoch = epochMatch ? Number(epochMatch[1]) : 0;
+      if (js.includes('agentifyStopTokenRelease')) {
+        browserState = {
+          ...browserState,
+          retiredEpoch: Math.max(browserState.retiredEpoch, epoch),
+          token: browserState.epoch === epoch && browserState.token === token ? null : browserState.token
+        };
+      }
       return { ok: true };
     },
     onEvaluate: async (js) => {
       if (js.includes('const expectedToken')) {
+        const epoch = Number(/const expectedEpoch = ([0-9]+)/u.exec(js)[1]);
         const token = JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)[1]);
         stopEvaluationStarted();
         await release;
-        if (browserToken !== token) return { clicked: false, reason: 'provider_stop_token_mismatch' };
+        if (browserState.epoch !== epoch || browserState.token !== token) return { clicked: false, reason: 'provider_stop_token_mismatch' };
         providerStopClicks += 1;
         return { clicked: true, reason: 'provider_stop_clicked' };
       }
@@ -2446,6 +2556,7 @@ test('chatgpt-controller: a retired provider stop cannot click after a held page
   const controller = createController(page);
   const run = {
     operationId: 'operation-a',
+    providerStopEpoch: 1,
     providerStopToken,
     providerStopRetired: false,
     requested: false,
@@ -2464,8 +2575,197 @@ test('chatgpt-controller: a retired provider stop cannot click after a held page
   assert.equal(stop.clicked, false);
   assert.equal(stop.reason, 'provider_stop_token_mismatch');
   assert.equal(providerStopClicks, 0);
-  assert.equal(browserToken, null);
+  assert.equal(browserState.token, null);
   assert.equal(run.providerStopRetired, true);
+});
+
+test('chatgpt-controller: activation abort is bounded and never types the prompt', async () => {
+  const events = [];
+  let activationStartedResolve;
+  const activationStarted = new Promise((resolve) => { activationStartedResolve = resolve; });
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenActivation')) {
+        activationStartedResolve();
+        return await new Promise(() => {});
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  const signalController = new AbortController();
+  const query = controller.query({ prompt: 'must not type during activation hang', operationId: 'activation-abort', signal: signalController.signal, timeoutMs: 5_000 });
+  await activationStarted;
+  const startedAt = Date.now();
+  signalController.abort();
+  await assert.rejects(query, (error) => error.message === 'query_aborted' && error.data?.reason === 'user_stop');
+  assert.ok(Date.now() - startedAt < 500, 'activation abort should not wait for the page evaluation');
+  assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
+  assert.equal(controller.currentRun, null);
+  assert.equal(controller.providerStopOwner, null);
+});
+
+test('chatgpt-controller: activation timeout returns an explicit bounded error', async () => {
+  const events = [];
+  let activationStartedResolve;
+  const activationStarted = new Promise((resolve) => { activationStartedResolve = resolve; });
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenActivation')) {
+        activationStartedResolve();
+        return await new Promise(() => {});
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  const startedAt = Date.now();
+  const query = controller.query({ prompt: 'must not type after activation timeout', operationId: 'activation-timeout', timeoutMs: 5_000 });
+  await activationStarted;
+  await assert.rejects(query, (error) => error.message === 'provider_stop_token_activation_timeout' && error.data?.timeoutMs === 1_000);
+  assert.ok(Date.now() - startedAt < 1_300, 'activation timeout should be bounded');
+  assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
+  assert.equal(controller.currentRun, null);
+  assert.equal(controller.providerStopOwner, null);
+});
+
+test('chatgpt-controller: late activation cannot overwrite a newer epoch token', async () => {
+  const events = [];
+  let browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+  let aActivationStartedResolve;
+  const aActivationStarted = new Promise((resolve) => { aActivationStartedResolve = resolve; });
+  let releaseAActivation;
+  const aActivationRelease = new Promise((resolve) => { releaseAActivation = resolve; });
+  let aActivationFinishedResolve;
+  const aActivationFinished = new Promise((resolve) => { aActivationFinishedResolve = resolve; });
+  let bActivationStartedResolve;
+  const bActivationStarted = new Promise((resolve) => { bActivationStartedResolve = resolve; });
+  let releaseBActivation;
+  const bActivationRelease = new Promise((resolve) => { releaseBActivation = resolve; });
+  const parseLifecycle = (js) => ({
+    epoch: Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0),
+    token: JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || '""')
+  });
+  const applyActivation = ({ epoch, token }) => {
+    if (browserState.epoch > epoch || browserState.retiredEpoch >= epoch) return false;
+    browserState = { epoch, token, retiredEpoch: browserState.retiredEpoch };
+    return true;
+  };
+  const applyRelease = ({ epoch, token }) => {
+    const current = browserState;
+    browserState = {
+      ...current,
+      retiredEpoch: Math.max(current.retiredEpoch, epoch),
+      token: current.epoch === epoch && current.token === token ? null : current.token
+    };
+  };
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      const lifecycle = parseLifecycle(js);
+      if (js.includes('agentifyStopTokenActivation')) {
+        if (lifecycle.epoch === 1) {
+          aActivationStartedResolve();
+          await aActivationRelease;
+          applyActivation(lifecycle);
+          aActivationFinishedResolve();
+          return { ok: true };
+        }
+        applyActivation(lifecycle);
+        bActivationStartedResolve();
+        await bActivationRelease;
+        return { ok: true };
+      }
+      if (js.includes('agentifyStopTokenRelease')) applyRelease(lifecycle);
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  const aSignal = new AbortController();
+  const aQuery = controller.query({ prompt: 'old activation', operationId: 'activation-a', signal: aSignal.signal, timeoutMs: 5_000 });
+  await aActivationStarted;
+  aSignal.abort();
+  await assert.rejects(aQuery, /query_aborted/u);
+
+  const bSignal = new AbortController();
+  const bQuery = controller.query({ prompt: 'new activation', operationId: 'activation-b', signal: bSignal.signal, timeoutMs: 5_000 });
+  await bActivationStarted;
+  const bToken = browserState.token;
+  assert.equal(browserState.epoch, 2);
+  assert.ok(bToken);
+  releaseAActivation();
+  await aActivationFinished;
+  assert.equal(browserState.epoch, 2);
+  assert.equal(browserState.token, bToken);
+  bSignal.abort();
+  releaseBActivation();
+  await assert.rejects(bQuery, /query_aborted/u);
+});
+
+test('chatgpt-controller: release is non-blocking and an old release cannot clear a newer token', async () => {
+  const events = [];
+  const providerStopTokenA = 'a'.repeat(64);
+  const providerStopTokenB = 'b'.repeat(64);
+  let browserState = { epoch: 2, token: providerStopTokenB, retiredEpoch: 0 };
+  let releaseStartedResolve;
+  const releaseStarted = new Promise((resolve) => { releaseStartedResolve = resolve; });
+  let releaseProviderState;
+  const releaseGate = new Promise((resolve) => { releaseProviderState = resolve; });
+  let releaseFinishedResolve;
+  const releaseFinished = new Promise((resolve) => { releaseFinishedResolve = resolve; });
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenRelease')) {
+        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || '""');
+        releaseStartedResolve();
+        await releaseGate;
+        browserState = {
+          ...browserState,
+          retiredEpoch: Math.max(browserState.retiredEpoch, epoch),
+          token: browserState.epoch === epoch && browserState.token === token ? null : browserState.token
+        };
+        releaseFinishedResolve();
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const controller = createController(page);
+  const run = {
+    operationId: 'release-a',
+    providerStopEpoch: 1,
+    providerStopToken: providerStopTokenA,
+    providerStopRetired: false,
+    requested: false,
+    messageDispatchStarted: true
+  };
+  controller.currentRun = run;
+  controller.providerStopOwner = run;
+  const startedAt = Date.now();
+  const retired = controller.retireProviderStop({ expectedOperationId: 'release-a' });
+  assert.equal(retired.retired, true);
+  assert.ok(Date.now() - startedAt < 100, 'release must not wait for page evaluation');
+  assert.equal(controller.providerStopOwner, null);
+  await releaseStarted;
+  releaseProviderState();
+  await releaseFinished;
+  assert.equal(browserState.epoch, 2);
+  assert.equal(browserState.token, providerStopTokenB);
 });
 
 test('chatgpt-controller: send-started failure never auto-clears the composer', async () => {

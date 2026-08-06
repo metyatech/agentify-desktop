@@ -54,11 +54,25 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onSetFileInputFiles = null, onStopTokenEvaluate = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+  const defaultStopTokenEvaluation = (js) => {
+    if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
+    const epoch = Number(/const (?:epoch|expectedEpoch) = ([0-9]+)/u.exec(js)?.[1] || 0);
+    if (js.includes('agentifyStopTokenActivation')) {
+      const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+      return { ok: true, applied: true, epoch, token };
+    }
+    if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, epoch, retiredEpoch: 0 };
+    return { ok: true };
+  };
   return {
     async navigate() {},
     async evaluate(js) {
-      if (js.includes('agentifyStopTokenLifecycle')) return await onStopTokenEvaluate?.(js) || { ok: true };
+      if (js.includes('agentifyStopTokenLifecycle') || js.includes('agentifyStopTokenStateRead') || js.includes('agentifyStopTokenDispatchCheck')) {
+        return await onStopTokenEvaluate?.(js) ?? defaultStopTokenEvaluation(js);
+      }
+      const basicOverride = await onBasicEvaluate?.(js);
+      if (basicOverride !== undefined) return basicOverride;
       const basic = basicEvaluation(js);
       if (basic !== undefined) {
         if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
@@ -79,6 +93,7 @@ function createPage({ events, onEvaluate, onSetFileInputFiles = null, onStopToke
     },
     async insertText(text) {
       events.push(`text:${text}`);
+      await onInsertText?.(text);
     },
     async moveMouse() {},
     async mouseDown(x) {
@@ -2155,12 +2170,15 @@ async function evaluateCleanupScript(js, dom) {
   });
 }
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null }) {
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null }) {
   let cleanupScript = '';
   const page = createPage({
     events,
     includeUserTurnBaseline: true,
     userTurnBaseline,
+    onBasicEvaluate,
+    onInsertText,
+    onStopTokenEvaluate,
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
@@ -2586,6 +2604,7 @@ test('chatgpt-controller: activation abort is bounded and never types the prompt
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
       if (js.includes('agentifyStopTokenActivation')) {
         activationStartedResolve();
         return await new Promise(() => {});
@@ -2616,6 +2635,7 @@ test('chatgpt-controller: activation timeout returns an explicit bounded error',
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
       if (js.includes('agentifyStopTokenActivation')) {
         activationStartedResolve();
         return await new Promise(() => {});
@@ -2670,19 +2690,20 @@ test('chatgpt-controller: late activation cannot overwrite a newer epoch token',
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
       const lifecycle = parseLifecycle(js);
       if (js.includes('agentifyStopTokenActivation')) {
         if (lifecycle.epoch === 1) {
           aActivationStartedResolve();
           await aActivationRelease;
-          applyActivation(lifecycle);
+          const applied = applyActivation(lifecycle);
           aActivationFinishedResolve();
-          return { ok: true };
+          return { ok: true, applied, epoch: lifecycle.epoch, token: lifecycle.token };
         }
-        applyActivation(lifecycle);
+        const applied = applyActivation(lifecycle);
         bActivationStartedResolve();
         await bActivationRelease;
-        return { ok: true };
+        return { ok: true, applied, epoch: lifecycle.epoch, token: lifecycle.token };
       }
       if (js.includes('agentifyStopTokenRelease')) applyRelease(lifecycle);
       return { ok: true };
@@ -2711,6 +2732,204 @@ test('chatgpt-controller: late activation cannot overwrite a newer epoch token',
   bSignal.abort();
   releaseBActivation();
   await assert.rejects(bQuery, /query_aborted/u);
+});
+
+test('chatgpt-controller: activation follows ready after navigation state wipe and stopAfterSend uses the exact active token', async () => {
+  const events = [];
+  let browserState = { epoch: 4, token: 'old-token', retiredEpoch: 0 };
+  let activationEpoch = null;
+  let activationToken = null;
+  const page = createPage({
+    events,
+    onBasicEvaluate: async (js) => {
+      if (js.includes('const hasTurnstile')) {
+        events.push('ready');
+        browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+      }
+      if (js.includes('missing_prompt_textarea')) events.push('prompt-ready');
+    },
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) {
+        events.push('state-read');
+        return { ok: true, epoch: browserState.epoch };
+      }
+      if (js.includes('agentifyStopTokenActivation')) {
+        activationEpoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        activationToken = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        browserState = { epoch: activationEpoch, token: activationToken, retiredEpoch: 0 };
+        events.push('activation');
+        return { ok: true, applied: true, epoch: activationEpoch, token: activationToken };
+      }
+      if (js.includes('agentifyStopTokenDispatchCheck')) {
+        events.push('dispatch-check');
+        const expectedEpoch = Number(/const expectedEpoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        return { ok: true, active: browserState.epoch === expectedEpoch && browserState.token === activationToken, epoch: browserState.epoch, retiredEpoch: browserState.retiredEpoch };
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      if (js.includes('const expectedToken')) {
+        events.push('exact-stop');
+        return { clicked: true, reason: 'provider_stop_clicked' };
+      }
+      if (js.includes('form.requestSubmit')) {
+        events.push('requestSubmit');
+        return true;
+      }
+      if (isClickSendEvaluation(js)) return { ok: true, isChatGPT: true, fallbackEnter: true, host: 'chatgpt.com' };
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: 'after navigation', timeoutMs: 5_000, stopAfterSend: true });
+
+  assert.deepEqual(result, { ok: true });
+  assert.ok(activationEpoch >= 1);
+  assert.equal(activationToken?.length, 64);
+  assert.ok(events.indexOf('ready') < events.indexOf('state-read'));
+  assert.ok(events.indexOf('state-read') < events.indexOf('activation'));
+  assert.ok(events.indexOf('activation') < events.indexOf('prompt-ready'));
+  assert.ok(events.indexOf('dispatch-check') < events.indexOf('requestSubmit'));
+  assert.equal(events.includes('exact-stop'), true);
+});
+
+test('chatgpt-controller: state wipe after prompt typing blocks every send dispatch and cleans the unsent draft', async () => {
+  const events = [];
+  const dom = createCleanupDom({ events, promptText: 'typed but unsent' });
+  let browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: null,
+    recordSendEvaluation: false,
+    cleanupDom: dom,
+    onInsertText: async () => {
+      browserState = { epoch: 1, token: null, retiredEpoch: 1 };
+    },
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
+      if (js.includes('agentifyStopTokenActivation')) {
+        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        browserState = { epoch, token, retiredEpoch: 0 };
+        return { ok: true, applied: true, epoch, token };
+      }
+      if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: false, epoch: browserState.epoch, retiredEpoch: browserState.retiredEpoch };
+      return { ok: true };
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: 'typed but unsent', timeoutMs: 5_000 }),
+    (error) => error.message === 'provider_stop_token_not_active' && error.data.cleanup.status === 'cleared'
+  );
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.equal(events.includes('key:Enter'), false);
+  assert.equal(events.includes('requestSubmit'), false);
+  assert.equal(events.includes('cleanup-draft'), true);
+  assert.equal(dom.prompt.value, '');
+});
+
+test('chatgpt-controller: applied false activation blocks prompt typing without leaking the token', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
+      if (js.includes('agentifyStopTokenActivation')) {
+        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        return { ok: true, applied: false, epoch, token };
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`prompt_or_dispatch_must_not_run:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: 'must not type', timeoutMs: 5_000 }),
+    (error) => error.message === 'provider_stop_token_not_active' && error.data.phase === 'activation' && error.data.applied === false && !JSON.stringify(error).includes('providerStopToken')
+  );
+  assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
+});
+
+test('chatgpt-controller: stale browser epoch activation blocks the operation before typing', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 20 };
+      if (js.includes('agentifyStopTokenActivation')) {
+        const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        return { ok: true, applied: false, epoch: 22, token };
+      }
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`prompt_or_dispatch_must_not_run:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'stale epoch', timeoutMs: 5_000 }),
+    (error) => error.message === 'provider_stop_token_not_active' && error.data.phase === 'activation'
+  );
+  assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
+});
+
+test('chatgpt-controller: browser stop state read failure blocks the operation before typing', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) throw new Error('browser_state_unavailable');
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`prompt_or_dispatch_must_not_run:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: 'state read failure', timeoutMs: 5_000 }),
+    (error) => error.message === 'provider_stop_token_state_unavailable' && error.data.phase === 'read' && error.data.status === 'failed'
+  );
+  assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
+});
+
+test('chatgpt-controller: recreated controller starts above the existing browser epoch', async () => {
+  const events = [];
+  let browserState = { epoch: 20, token: null, retiredEpoch: 0 };
+  let firstOperationEpoch = null;
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
+      if (js.includes('agentifyStopTokenActivation')) {
+        firstOperationEpoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        browserState = { epoch: firstOperationEpoch, token, retiredEpoch: 0 };
+        return { ok: true, applied: true, epoch: firstOperationEpoch, token };
+      }
+      if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, epoch: browserState.epoch, retiredEpoch: 0 };
+      return { ok: true };
+    },
+    onEvaluate: async (js) => {
+      if (js.includes('form.requestSubmit')) return true;
+      if (isClickSendEvaluation(js)) return { ok: true, fallbackEnter: true, host: 'chatgpt.com', isChatGPT: true };
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).send({ text: 'after recreation', timeoutMs: 5_000 });
+
+  assert.deepEqual(result, { ok: true });
+  assert.ok(Number.isSafeInteger(firstOperationEpoch));
+  assert.ok(firstOperationEpoch >= 21);
 });
 
 test('chatgpt-controller: release is non-blocking and an old release cannot clear a newer token', async () => {

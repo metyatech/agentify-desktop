@@ -304,6 +304,18 @@ export class ChatGPTController {
     return true;
   }
 
+  #providerStopStateReadScript() {
+    return `(() => {
+      const agentifyStopTokenStateRead = true;
+      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const epoch = Number(state?.epoch ?? 0);
+      if (!Number.isSafeInteger(epoch) || epoch < 0) return { ok: false, error: 'invalid_provider_stop_epoch' };
+      return { ok: true, epoch };
+    })()`;
+  }
+
   #providerStopStateScript(run, { action = 'activate' } = {}) {
     const epoch = Number(run.providerStopEpoch) || 0;
     const token = JSON.stringify(run.providerStopToken);
@@ -318,7 +330,7 @@ export class ChatGPTController {
           : { epoch: 0, token: null, retiredEpoch: 0 };
         const currentEpoch = Number(current.epoch) || 0;
         const retiredEpoch = Number(current.retiredEpoch) || 0;
-        if (currentEpoch > epoch || retiredEpoch >= epoch) return { ok: true, applied: false, epoch: currentEpoch, token: current.token || null };
+        if (currentEpoch > epoch || retiredEpoch >= epoch) return { ok: true, applied: false, epoch: currentEpoch };
         globalThis.__agentifyProviderStopState = { epoch, token, retiredEpoch };
         return { ok: true, applied: true, epoch, token };
       })()`;
@@ -339,6 +351,28 @@ export class ChatGPTController {
         globalThis.__agentifyProviderStopState = { ...current, retiredEpoch };
       }
       return { ok: true, cleared: currentEpoch === epoch && current.token === token, epoch: currentEpoch, token: globalThis.__agentifyProviderStopState.token || null };
+    })()`;
+  }
+
+  #providerStopDispatchCheckScript(run) {
+    const epoch = Number(run.providerStopEpoch) || 0;
+    const token = JSON.stringify(run.providerStopToken);
+    return `(() => {
+      const agentifyStopTokenDispatchCheck = true;
+      const expectedEpoch = ${epoch};
+      const expectedToken = ${token};
+      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const currentEpoch = Number(state?.epoch);
+      const retiredEpoch = Number(state?.retiredEpoch);
+      return {
+        ok: true,
+        active: Number.isSafeInteger(currentEpoch) && Number.isSafeInteger(retiredEpoch) &&
+          currentEpoch === expectedEpoch && state?.token === expectedToken && retiredEpoch < expectedEpoch,
+        epoch: Number.isSafeInteger(currentEpoch) ? currentEpoch : null,
+        retiredEpoch: Number.isSafeInteger(retiredEpoch) ? retiredEpoch : null
+      };
     })()`;
   }
 
@@ -378,10 +412,46 @@ export class ChatGPTController {
   }
 
   async #activateProviderStopToken(run, signal = null) {
-    const token = run.providerStopToken;
     this.providerStopOwner = run;
+    const stateOutcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopStateReadScript(), { signal });
+    if (stateOutcome.status === 'aborted') {
+      this.#retireProviderStopOwner(run);
+      this.#scheduleProviderStopStateScript(run, { action: 'release' });
+      throw queryAbortedError(run.reason || 'user_stop');
+    }
+    const browserEpoch = stateOutcome.value?.epoch;
+    if (
+      stateOutcome.status !== 'completed' ||
+      stateOutcome.value?.ok !== true ||
+      !Number.isSafeInteger(browserEpoch) ||
+      browserEpoch < 0
+    ) {
+      this.#retireProviderStopOwner(run);
+      this.#scheduleProviderStopStateScript(run, { action: 'release' });
+      const error = new Error('provider_stop_token_state_unavailable');
+      error.data = {
+        phase: 'read',
+        status: stateOutcome.status,
+        timeoutMs: stateOutcome.status === 'timeout' ? PROVIDER_STOP_TOKEN_ACTIVATION_TIMEOUT_MS : undefined
+      };
+      throw error;
+    }
+    if (this.providerStopEpoch >= Number.MAX_SAFE_INTEGER || browserEpoch >= Number.MAX_SAFE_INTEGER) {
+      this.#retireProviderStopOwner(run);
+      this.#scheduleProviderStopStateScript(run, { action: 'release' });
+      throw new Error('provider_stop_token_epoch_exhausted');
+    }
+    this.providerStopEpoch = Math.max(this.providerStopEpoch, browserEpoch) + 1;
+    run.providerStopEpoch = this.providerStopEpoch;
     const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopStateScript(run, { action: 'activate' }), { signal });
-    if (outcome.status === 'completed' && outcome.value?.ok === true) return outcome.value;
+    const activation = outcome.value;
+    if (
+      outcome.status === 'completed' &&
+      activation?.ok === true &&
+      activation.applied === true &&
+      activation.epoch === run.providerStopEpoch &&
+      activation.token === run.providerStopToken
+    ) return activation;
     this.#retireProviderStopOwner(run);
     this.#scheduleProviderStopStateScript(run, { action: 'release' });
     if (outcome.status === 'aborted') throw queryAbortedError(run.reason || 'user_stop');
@@ -391,7 +461,38 @@ export class ChatGPTController {
       throw error;
     }
     if (outcome.status === 'failed') throw outcome.error;
-    throw new Error('provider_stop_token_activation_failed');
+    const error = new Error('provider_stop_token_not_active');
+    error.data = {
+      phase: 'activation',
+      applied: activation?.applied === true,
+      epoch: Number.isSafeInteger(activation?.epoch) ? activation.epoch : null
+    };
+    throw error;
+  }
+
+  async #verifyProviderStopTokenBeforeDispatch() {
+    const run = this.currentRun;
+    const expectedEpoch = Number(run?.providerStopEpoch) || 0;
+    const outcome = run
+      ? await this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchCheckScript(run), { signal: run.signal })
+      : { status: 'failed', error: new Error('missing_provider_stop_run') };
+    const result = outcome.value;
+    if (
+      outcome.status === 'completed' &&
+      result?.ok === true &&
+      result.active === true &&
+      result.epoch === expectedEpoch &&
+      Number.isSafeInteger(result.retiredEpoch) &&
+      result.retiredEpoch < expectedEpoch
+    ) return result;
+    const error = new Error('provider_stop_token_not_active');
+    error.data = {
+      phase: 'dispatch',
+      status: outcome.status,
+      epoch: Number.isSafeInteger(result?.epoch) ? result.epoch : null,
+      retiredEpoch: Number.isSafeInteger(result?.retiredEpoch) ? result.retiredEpoch : null
+    };
+    throw error;
   }
 
   #releaseProviderStopToken(run) {
@@ -573,7 +674,7 @@ export class ChatGPTController {
   }
 
   async detectChallenge() {
-    const result = await this.#eval(`(() => {
+    return await this.#eval(`(() => {
       const url = location.href || '';
       const title = document.title || '';
       const readyState = document.readyState || '';
@@ -854,8 +955,10 @@ export class ChatGPTController {
     }
   }
 
-  async #clickAt(x, y, { onBeforeMouseDown = null } = {}) {
+  async #clickAt(x, y, { onBeforeMouseDown = null, onBeforeMouseDownAsync = null } = {}) {
     await this.#moveMouseTo(x, y);
+    this.#throwIfStopRequested();
+    await onBeforeMouseDownAsync?.();
     this.#throwIfStopRequested();
     onBeforeMouseDown?.();
     await this.page.mouseDown(x, y, { button: 'left', clickCount: 1 });
@@ -1136,6 +1239,8 @@ export class ChatGPTController {
 
   async #tryChatGPTExactSubmissionFallback({ sendBaseline, action }) {
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const dispatchEpoch = Number(this.currentRun?.providerStopEpoch) || 0;
+    const dispatchToken = JSON.stringify(this.currentRun?.providerStopToken || null);
     const fallbackBaselineName = action === 'dom_click' ? 'clickFallbackBaselineText' : 'submitFallbackBaselineText';
     const fallbackBaselineText = String(sendBaseline?.activePromptText || '').replace(/\s+/g, ' ').trim();
     const actionCode = action === 'dom_click'
@@ -1159,7 +1264,7 @@ export class ChatGPTController {
               return { attempted: false, lastFallbackResult: 'request_submit_without_button_failed' };
             }
           }`;
-    return await this.#eval(`(() => {
+    const result = await this.#eval(`(() => {
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
       if (!isChatGPT) return { attempted: false, lastFallbackResult: 'not_chatgpt' };
@@ -1223,6 +1328,18 @@ export class ChatGPTController {
       if (normalizeText(activePromptText) !== ${fallbackBaselineName}) {
         return { attempted: false, lastFallbackResult: 'prompt_changed' };
       }
+      const providerStopState = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const providerStopEpoch = Number(providerStopState?.epoch);
+      const providerStopRetiredEpoch = Number(providerStopState?.retiredEpoch);
+      if (
+        !Number.isSafeInteger(providerStopEpoch) ||
+        !Number.isSafeInteger(providerStopRetiredEpoch) ||
+        providerStopEpoch !== ${dispatchEpoch} ||
+        providerStopState?.token !== ${dispatchToken} ||
+        providerStopRetiredEpoch >= ${dispatchEpoch}
+      ) return { attempted: false, providerStopTokenMismatch: true, lastFallbackResult: 'provider_stop_token_mismatch' };
       const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
       const chatgptStopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"]';
       let chatgptComposer = activePrompt.closest('form') || null;
@@ -1237,6 +1354,12 @@ export class ChatGPTController {
       if (normalStop) return { attempted: false, lastFallbackResult: 'normal_stop_visible' };
       ${actionCode}
     })()`);
+    if (result?.providerStopTokenMismatch) {
+      const error = new Error('provider_stop_token_not_active');
+      error.data = { phase: 'dispatch', reason: result.lastFallbackResult };
+      throw error;
+    }
+    return result;
   }
 
   async #clickSend({ timeoutMs = 5_000 } = {}) {
@@ -1451,6 +1574,7 @@ export class ChatGPTController {
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy, {
+        onBeforeMouseDownAsync: () => this.#verifyProviderStopTokenBeforeDispatch(),
         onBeforeMouseDown: () => {
           this.#throwIfStopRequested();
           this.#markMessageDispatchStarted();
@@ -1465,6 +1589,7 @@ export class ChatGPTController {
     }
 
     if (!sent && res?.isChatGPT && coordinateClickAttempted) {
+      await this.#verifyProviderStopTokenBeforeDispatch();
       const domFallback = await this.#tryChatGPTExactSubmissionFallback({
         sendBaseline: res?.sendBaseline,
         action: 'dom_click'
@@ -1480,6 +1605,7 @@ export class ChatGPTController {
       }
 
       if (!sent && domClickAttempted) {
+        await this.#verifyProviderStopTokenBeforeDispatch();
         const submitFallback = await this.#tryChatGPTExactSubmissionFallback({
           sendBaseline: res?.sendBaseline,
           action: 'request_submit'
@@ -1498,9 +1624,22 @@ export class ChatGPTController {
 
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
       this.#throwIfStopRequested();
+      await this.#verifyProviderStopTokenBeforeDispatch();
       this.#markMessageDispatchStarted();
-      await this.#eval(`(() => {
+      const dispatchResult = await this.#eval(`(() => {
         const host = location.hostname || '';
+        const dispatchState = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+          ? globalThis.__agentifyProviderStopState
+          : null;
+        const dispatchEpoch = Number(dispatchState?.epoch);
+        const dispatchRetiredEpoch = Number(dispatchState?.retiredEpoch);
+        if (
+          !Number.isSafeInteger(dispatchEpoch) ||
+          !Number.isSafeInteger(dispatchRetiredEpoch) ||
+          dispatchEpoch !== ${Number(this.currentRun?.providerStopEpoch) || 0} ||
+          dispatchState?.token !== ${JSON.stringify(this.currentRun?.providerStopToken || null)} ||
+          dispatchRetiredEpoch >= ${Number(this.currentRun?.providerStopEpoch) || 0}
+        ) return { providerStopTokenMismatch: true };
         const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
         const chatgptSendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
         const visible = (n) => {
@@ -1544,6 +1683,12 @@ export class ChatGPTController {
         }
         return false;
       })()`);
+      if (dispatchResult?.providerStopTokenMismatch) {
+        if (this.currentRun) this.currentRun.messageDispatchStarted = false;
+        const error = new Error('provider_stop_token_not_active');
+        error.data = { phase: 'dispatch', reason: 'provider_stop_token_mismatch' };
+        throw error;
+      }
       sent = await this.#waitForSendSignal({
         timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1400,
         pollMs: 120,
@@ -1572,6 +1717,7 @@ export class ChatGPTController {
         this.#throwIfStopRequested();
         await sleep(jitter(25, 90));
         this.#throwIfStopRequested();
+        await this.#verifyProviderStopTokenBeforeDispatch();
         this.#markMessageDispatchStarted();
         await this.#sendKey(key, { modifiers });
         sent = await this.#waitForSendSignal({
@@ -2724,7 +2870,7 @@ export class ChatGPTController {
     const run = {
       kind: 'query',
       operationId: operationId ? String(operationId) : null,
-      providerStopEpoch: ++this.providerStopEpoch,
+      providerStopEpoch: 0,
       providerStopToken: this.#newProviderStopToken(),
       providerStopRetired: false,
       requested: false,
@@ -2735,14 +2881,16 @@ export class ChatGPTController {
       expectedFileNames,
       promptTyped: false,
       messageDispatchStarted: false,
-      userTurnBaseline: null
+      userTurnBaseline: null,
+      signal
     };
     this.currentRun = run;
     const detachRunSignal = this.#bindRunSignal(run, signal);
     try {
-      await this.#activateProviderStopToken(run, signal);
       this.#throwIfStopRequested();
       await this.ensureReady({ timeoutMs });
+      this.#throwIfStopRequested();
+      await this.#activateProviderStopToken(run, signal);
       this.#throwIfStopRequested();
       run.promptTyped = true;
       const typed = await this.#typePrompt(prompt);
@@ -2799,7 +2947,7 @@ export class ChatGPTController {
       const run = {
         kind: 'send',
         operationId: operationId ? String(operationId) : null,
-        providerStopEpoch: ++this.providerStopEpoch,
+        providerStopEpoch: 0,
         providerStopToken: this.#newProviderStopToken(),
         providerStopRetired: false,
         requested: false,
@@ -2810,14 +2958,16 @@ export class ChatGPTController {
         expectedFileNames: [],
         promptTyped: false,
         messageDispatchStarted: false,
-        userTurnBaseline: null
+        userTurnBaseline: null,
+        signal
       };
       this.currentRun = run;
       const detachRunSignal = this.#bindRunSignal(run, signal);
       try {
-        await this.#activateProviderStopToken(run, signal);
         this.#throwIfStopRequested();
         await this.ensureReady({ timeoutMs });
+        this.#throwIfStopRequested();
+        await this.#activateProviderStopToken(run, signal);
         this.#throwIfStopRequested();
         run.promptTyped = true;
         const typed = await this.#typePrompt(prompt);

@@ -9,12 +9,17 @@ import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
 
+const MAX_RESPONSE_BYTES = 1_000_000;
+const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
+const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
+const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
+
 function isLoopback(remoteAddress) {
   const a = String(remoteAddress || '');
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
-function sendJson(res, code, body, { maxBytes = Number.POSITIVE_INFINITY } = {}) {
+function sendJson(res, code, body, { maxBytes = MAX_RESPONSE_BYTES } = {}) {
   let data = JSON.stringify(body);
   if (Buffer.byteLength(data, 'utf8') > maxBytes) {
     code = 413;
@@ -28,6 +33,68 @@ function sendJson(res, code, body, { maxBytes = Number.POSITIVE_INFINITY } = {})
     'access-control-allow-methods': 'GET,POST,OPTIONS'
   });
   res.end(data);
+}
+
+function boundedAttachmentName(value) {
+  return String(value || '').trim().replace(/^.*[\\/]/u, '').slice(0, MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH);
+}
+
+function boundedAttachmentNameList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map(boundedAttachmentName)
+    .filter(Boolean)
+    .slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS);
+}
+
+function boundedAttachmentErrorList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => /^[a-z][a-z0-9_]*(?::[0-9]+)?$/u.test(item))
+    .slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS);
+}
+
+function sanitizeAttachmentDiagnostics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const states = (Array.isArray(data.attachmentStates) ? data.attachmentStates : []).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS).map((state) => ({
+    sourceFileName: boundedAttachmentName(state?.sourceFileName || state?.fileName),
+    displayName: boundedAttachmentName(state?.displayName),
+    matched: !!(state?.matched ?? state?.found),
+    matchKind: state?.matchKind === 'exact' || state?.matchKind === 'renamed' ? state.matchKind : null,
+    pending: !!state?.pending,
+    failed: !!state?.failed
+  }));
+  const cleanup = data.cleanup && typeof data.cleanup === 'object'
+    ? {
+        status: ['cleared', 'failed', 'skipped'].includes(data.cleanup.status) ? data.cleanup.status : 'failed',
+        reason: String(data.cleanup.reason || '').replace(/[\r\n\t]+/gu, ' ').trim().slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH),
+        selectedFileNames: boundedAttachmentNameList(data.cleanup.selectedFileNames),
+        cardDisplayNames: boundedAttachmentNameList(data.cleanup.cardDisplayNames),
+        mappingErrors: boundedAttachmentErrorList(data.cleanup.mappingErrors),
+        cardCount: Number.isFinite(Number(data.cleanup.cardCount)) ? Math.max(0, Math.min(MAX_ATTACHMENT_DIAGNOSTIC_ITEMS, Number(data.cleanup.cardCount))) : 0,
+        promptTextLength: Number.isFinite(Number(data.cleanup.promptTextLength)) ? Math.max(0, Math.min(200_000, Number(data.cleanup.promptTextLength))) : 0,
+        userTurnCount: Number.isFinite(Number(data.cleanup.userTurnCount)) ? Math.max(0, Math.min(200_000, Number(data.cleanup.userTurnCount))) : 0
+      }
+    : null;
+  return {
+    expectedFileNames: boundedAttachmentNameList(data.expectedFileNames),
+    selectedFileNames: boundedAttachmentNameList(data.selectedFileNames),
+    cardDisplayNames: boundedAttachmentNameList(data.cardDisplayNames),
+    fileCount: Math.max(0, Math.min(MAX_ATTACHMENT_DIAGNOSTIC_ITEMS, Number(data.fileCount) || 0)),
+    cardCount: Math.max(0, Math.min(MAX_ATTACHMENT_DIAGNOSTIC_ITEMS, Number(data.cardCount) || 0)),
+    mappingComplete: !!data.mappingComplete,
+    mappingErrors: boundedAttachmentErrorList(data.mappingErrors),
+    attachmentStates: states,
+    missingFileNames: boundedAttachmentNameList(data.missingFileNames),
+    pendingFileNames: boundedAttachmentNameList(data.pendingFileNames),
+    failedFileNames: boundedAttachmentNameList(data.failedFileNames),
+    promptTextLength: Math.max(0, Math.min(200_000, Number(data.promptTextLength) || 0)),
+    hasSendButton: !!data.hasSendButton,
+    sendDisabled: !!data.sendDisabled,
+    busy: !!data.busy,
+    elapsedMs: Math.max(0, Math.min(120_000, Number(data.elapsedMs) || 0)),
+    timeoutMs: Math.max(0, Math.min(120_000, Number(data.timeoutMs) || 0)),
+    ...(cleanup ? { cleanup } : {})
+  };
 }
 
 async function parseBody(req, { maxBytes = 2_000_000 } = {}) {
@@ -53,7 +120,7 @@ function authOk(req, token) {
   return hdr.slice('Bearer '.length).trim() === token;
 }
 
-function mapErrorToHttp(error) {
+export function mapErrorToHttp(error) {
   const msg = String(error?.message || '');
   if (msg === 'body_too_large') return { code: 413, body: { error: 'body_too_large' } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
@@ -90,6 +157,11 @@ function mapErrorToHttp(error) {
   if (msg === 'max_tabs_reached') return { code: 409, body: { error: 'max_tabs_reached' } };
   if (msg === 'rate_limited') return { code: 429, body: { error: 'rate_limited', ...(error?.data || {}) } };
   if (msg === 'query_aborted') return { code: 409, body: { error: 'query_aborted', data: error?.data || null } };
+  if (msg === 'attachment_upload_timeout') return { code: 408, body: { error: 'attachment_upload_timeout', data: sanitizeAttachmentDiagnostics(error?.data) } };
+  if (msg === 'attachment_upload_failed') return { code: 422, body: { error: 'attachment_upload_failed', data: sanitizeAttachmentDiagnostics(error?.data) } };
+  if (msg === 'chatgpt_file_input_state_conflict') return { code: 409, body: { error: 'chatgpt_file_input_state_conflict', data: sanitizeAttachmentDiagnostics(error?.data) } };
+  if (msg === 'chatgpt_file_input_clear_failed') return { code: 409, body: { error: 'chatgpt_file_input_clear_failed', data: sanitizeAttachmentDiagnostics(error?.data) } };
+  if (msg === 'chatgpt_file_input_clear_timeout') return { code: 408, body: { error: 'chatgpt_file_input_clear_timeout', data: sanitizeAttachmentDiagnostics(error?.data) } };
   if (msg === 'timeout_waiting_for_prompt') return { code: 408, body: { error: 'timeout_waiting_for_prompt', data: error?.data || null } };
   if (msg === 'timeout_waiting_for_response') return { code: 408, body: { error: 'timeout_waiting_for_response', data: error?.data || null } };
   if (msg === 'artifacts_folder_open_failed') return { code: 500, body: { error: 'artifacts_folder_open_failed', data: error?.data || null } };
@@ -585,6 +657,24 @@ export function startHttpApi({
         detail: 'The provider did not finish responding in time.'
       };
     }
+    if (message === 'attachment_upload_timeout') {
+      return {
+        ...base,
+        status: 'error',
+        label: 'Attachment upload timed out',
+        detail: 'Attachment upload did not become ready before the bounded timeout.',
+        attachmentDiagnostics: sanitizeAttachmentDiagnostics(detail)
+      };
+    }
+    if (message === 'attachment_upload_failed') {
+      return {
+        ...base,
+        status: 'error',
+        label: 'Attachment upload failed',
+        detail: 'ChatGPT reported that an attachment upload failed.',
+        attachmentDiagnostics: sanitizeAttachmentDiagnostics(detail)
+      };
+    }
     if (message === 'rate_limited') {
       return {
         ...base,
@@ -857,6 +947,7 @@ export function startHttpApi({
         };
         reserveScope(scope, op);
         let tabId = null;
+        let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           assertTabNotBusy(tabId);
@@ -897,6 +988,7 @@ export function startHttpApi({
             });
             checkAndConsumeQueryBudget({ tabId, governor });
             inflight.queries += 1;
+            inflightReserved = true;
             const controller = tabs.getControllerById(tabId);
             const result = await runExclusive(controller, async () =>
               controller.query({
@@ -929,7 +1021,7 @@ export function startHttpApi({
             throw error;
           } finally {
             clearActiveQuery(tabId, op.id);
-            inflight.queries = Math.max(0, inflight.queries - 1);
+            if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
           }
         } finally {
           clearScope(scope, op.id);
@@ -962,6 +1054,7 @@ export function startHttpApi({
         };
         reserveScope(scope, op);
         let tabId = null;
+        let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           assertTabNotBusy(tabId);
@@ -969,15 +1062,14 @@ export function startHttpApi({
           setActiveQuery(tabId, op);
           checkAndConsumeQueryBudget({ tabId, governor });
           inflight.queries += 1;
+          inflightReserved = true;
           const controller = tabs.getControllerById(tabId);
-          const result = await runExclusive(controller, async () =>
-            controller.send({
-              text,
-              timeoutMs,
-              stopAfterSend,
-              onProgress: (patch) => patchActiveQuery(tabId, patch)
-            })
-          );
+          const result = await controller.send({
+            text,
+            timeoutMs,
+            stopAfterSend,
+            onProgress: (patch) => patchActiveQuery(tabId, patch)
+          });
           setLastOutcome(tabId, {
             status: 'success',
             label: 'Sent',
@@ -994,7 +1086,7 @@ export function startHttpApi({
         } finally {
           if (tabId) clearActiveQuery(tabId, op.id);
           clearScope(scope, op.id);
-          inflight.queries = Math.max(0, inflight.queries - 1);
+          if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
         }
       }
 

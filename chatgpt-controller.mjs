@@ -5,6 +5,9 @@ import crypto from 'node:crypto';
 export const MAX_CONVERSATION_TURNS = 200;
 export const MAX_CONVERSATION_TURN_CHARS = 200_000;
 export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
+const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
+const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
+const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
 
 function normalizeConversationText(value) {
   return String(value || '')
@@ -36,17 +39,119 @@ function jitter(minMs, maxMs) {
 }
 
 export function isChatGPTAttachmentCardDisplayName(fileName, displayName) {
-  const sourceName = String(fileName || '').trim();
-  const cardName = String(displayName || '').trim();
-  if (sourceName.toLocaleLowerCase() === cardName.toLocaleLowerCase()) return true;
-  const dot = sourceName.lastIndexOf('.');
-  const stem = dot <= 0 ? sourceName : sourceName.slice(0, dot);
-  const extension = dot <= 0 ? '' : sourceName.slice(dot);
+  const result = mapChatGPTAttachmentCardNames([fileName], [displayName]);
+  return result.mappingComplete && result.mapping[0]?.matched === true;
+}
+
+export function mapChatGPTAttachmentCardNames(selectedFileNames, cardDisplayNames) {
+  const selected = (Array.isArray(selectedFileNames) ? selectedFileNames : []).map((value) => String(value || '').trim());
+  const cards = (Array.isArray(cardDisplayNames) ? cardDisplayNames : []).map((value) => String(value || '').trim());
+  const normalize = (value) => String(value || '').toLocaleLowerCase();
   const escapeRegExp = (value) => String(value || '').replace(/[|\\{}()[\]^$+*?.]/g, '\\$&');
-  const match = new RegExp(`^${escapeRegExp(stem)}\\(([0-9]+)\\)${escapeRegExp(extension)}$`, 'i').exec(cardName);
-  if (!match) return false;
-  const numericSuffix = match[1].replace(/^0+/, '') || '0';
-  return numericSuffix !== '0' && numericSuffix !== '1';
+  const isRenamedAlias = (sourceName, cardName) => {
+    const source = String(sourceName || '').trim();
+    const card = String(cardName || '').trim();
+    if (!source || !card || normalize(source) === normalize(card)) return false;
+    const dot = source.lastIndexOf('.');
+    const stem = dot <= 0 ? source : source.slice(0, dot);
+    const extension = dot <= 0 ? '' : source.slice(dot);
+    const match = new RegExp(`^${escapeRegExp(stem)}\\(([0-9]+)\\)${escapeRegExp(extension)}$`, 'i').exec(card);
+    if (!match) return false;
+    return (match[1].replace(/^0+/u, '') || '0') !== '0';
+  };
+  const mapping = selected.map((sourceFileName) => ({
+    sourceFileName,
+    displayName: '',
+    matched: false,
+    matchKind: null,
+    cardIndex: null
+  }));
+  const usedCards = new Set();
+  const mappingErrors = [];
+
+  for (let selectedIndex = 0; selectedIndex < selected.length; selectedIndex += 1) {
+    const exactCardIndex = cards.findIndex((cardName, cardIndex) => !usedCards.has(cardIndex) && normalize(cardName) === normalize(selected[selectedIndex]));
+    if (exactCardIndex < 0) continue;
+    usedCards.add(exactCardIndex);
+    mapping[selectedIndex] = {
+      sourceFileName: selected[selectedIndex],
+      displayName: cards[exactCardIndex],
+      matched: true,
+      matchKind: 'exact',
+      cardIndex: exactCardIndex
+    };
+  }
+
+  const remainingSelected = mapping
+    .map((entry, selectedIndex) => entry.matched ? null : selectedIndex)
+    .filter((selectedIndex) => selectedIndex !== null);
+  const remainingCards = cards
+    .map((_, cardIndex) => usedCards.has(cardIndex) ? null : cardIndex)
+    .filter((cardIndex) => cardIndex !== null);
+  const candidates = new Map(remainingSelected.map((selectedIndex) => [
+    selectedIndex,
+    remainingCards.filter((cardIndex) => isRenamedAlias(selected[selectedIndex], cards[cardIndex]))
+  ]));
+  const matching = new Map();
+  const findMatching = (blockedEdge = null) => {
+    const cardToSelected = new Map();
+    const visit = (selectedIndex, seenCards) => {
+      for (const cardIndex of candidates.get(selectedIndex) || []) {
+        if (blockedEdge && blockedEdge.selectedIndex === selectedIndex && blockedEdge.cardIndex === cardIndex) continue;
+        if (seenCards.has(cardIndex)) continue;
+        seenCards.add(cardIndex);
+        const prior = cardToSelected.get(cardIndex);
+        if (prior === undefined || visit(prior, seenCards)) {
+          cardToSelected.set(cardIndex, selectedIndex);
+          return true;
+        }
+      }
+      return false;
+    };
+    for (const selectedIndex of remainingSelected) {
+      if (!visit(selectedIndex, new Set())) return null;
+    }
+    return cardToSelected;
+  };
+  const aliasMatching = findMatching();
+  if (remainingSelected.length > 0 && !aliasMatching) {
+    for (const selectedIndex of remainingSelected) {
+      if (!(candidates.get(selectedIndex) || []).length) mappingErrors.push(`missing_card:${selectedIndex}`);
+    }
+    if (!mappingErrors.length) mappingErrors.push('mapping_incomplete');
+  } else if (aliasMatching && remainingSelected.length > 0) {
+    for (const [cardIndex, selectedIndex] of aliasMatching.entries()) matching.set(selectedIndex, cardIndex);
+    for (const [selectedIndex, cardIndex] of matching.entries()) {
+      mapping[selectedIndex] = {
+        sourceFileName: selected[selectedIndex],
+        displayName: cards[cardIndex],
+        matched: true,
+        matchKind: 'renamed',
+        cardIndex
+      };
+    }
+    const matchingBySelected = new Map([...aliasMatching.entries()].map(([cardIndex, selectedIndex]) => [selectedIndex, cardIndex]));
+    for (const [cardIndex, selectedIndex] of aliasMatching.entries()) {
+      const alternative = findMatching({ selectedIndex, cardIndex });
+      if (!alternative) continue;
+      const alternativeBySelected = new Map([...alternative.entries()].map(([alternativeCardIndex, alternativeSelectedIndex]) => [alternativeSelectedIndex, alternativeCardIndex]));
+      const changesAName = remainingSelected.some((candidateSelectedIndex) =>
+        normalize(cards[matchingBySelected.get(candidateSelectedIndex)]) !== normalize(cards[alternativeBySelected.get(candidateSelectedIndex)])
+      );
+      if (changesAName) {
+        mappingErrors.push('mapping_ambiguous');
+        break;
+      }
+    }
+  }
+
+  if (selected.length !== cards.length) mappingErrors.push(selected.length < cards.length ? 'extra_card' : 'missing_card');
+  const mappingComplete = selected.length === cards.length && mappingErrors.length === 0 && mapping.every((entry) => entry.matched);
+  return {
+    mapping,
+    mappingComplete,
+    mappingErrors: [...new Set(mappingErrors)].slice(0, 50)
+  };
 }
 
 export function hasSameChatGPTAttachmentFileNameMultiset(expectedFileNames, selectedFileNames) {
@@ -56,6 +161,40 @@ export function hasSameChatGPTAttachmentFileNameMultiset(expectedFileNames, sele
   const expected = normalizeFileNames(expectedFileNames);
   const selected = normalizeFileNames(selectedFileNames);
   return expected.length === selected.length && expected.every((fileName, index) => fileName === selected[index]);
+}
+
+function boundedAttachmentName(value) {
+  const text = String(value || '').trim().replace(/^.*[\\/]/u, '');
+  return text.slice(0, MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH);
+}
+
+function boundedAttachmentNameList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map(boundedAttachmentName)
+    .filter(Boolean)
+    .slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS);
+}
+
+function boundedAttachmentStates(values) {
+  return (Array.isArray(values) ? values : []).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS).map((state) => ({
+    sourceFileName: boundedAttachmentName(state?.sourceFileName || state?.fileName),
+    displayName: boundedAttachmentName(state?.displayName),
+    matched: !!(state?.matched ?? state?.found),
+    matchKind: state?.matchKind === 'exact' || state?.matchKind === 'renamed' ? state.matchKind : null,
+    pending: !!state?.pending,
+    failed: !!state?.failed
+  }));
+}
+
+function boundedAttachmentError(value) {
+  return String(value || '').replace(/[\r\n\t]+/gu, ' ').trim().slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH);
+}
+
+function boundedAttachmentErrorList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => /^[a-z][a-z0-9_]*(?::[0-9]+)?$/u.test(item))
+    .slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS);
 }
 
 function blockedTitle(kind) {
@@ -461,6 +600,10 @@ export class ChatGPTController {
     throw err;
   }
 
+  #markMessageDispatchStarted() {
+    if (this.currentRun) this.currentRun.messageDispatchStarted = true;
+  }
+
   async #clickVisibleStop() {
     const stopSel = JSON.stringify(this.selectors.stopButton);
     return await this.#eval(`(() => {
@@ -574,7 +717,21 @@ export class ChatGPTController {
       if (!el) return { ok:false, error:'missing_prompt_textarea' };
       el.focus();
       const r = el.getBoundingClientRect();
-      return { ok:true, rect: { x: r.x, y: r.y, w: r.width, h: r.height } };
+      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+      const lastUserTurn = userTurns[userTurns.length - 1] || null;
+      const lastUserId = lastUserTurn
+        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')]
+          .map((value) => String(value || '').trim()).find(Boolean) || ''
+        : '';
+      return {
+        ok:true,
+        rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+        userTurnBaseline: {
+          count: userTurns.length,
+          lastId: lastUserId,
+          lastText: String(lastUserTurn?.innerText || '').replace(/\\s+/g, ' ').trim()
+        }
+      };
     })()`);
     if (!ok?.ok) {
       const err = new Error(ok?.error || 'type_failed');
@@ -596,6 +753,7 @@ export class ChatGPTController {
     await this.#sendKey('Backspace');
     await sleep(jitter(25, 80));
     await this.#typeHuman(prompt);
+    return ok;
   }
 
   async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120, sendBaseline = null } = {}) {
@@ -1055,6 +1213,7 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
+      this.#markMessageDispatchStarted();
       await this.#clickAt(cx, cy);
       coordinateClickAttempted = true;
       sent = await this.#waitForSendSignal({
@@ -1098,6 +1257,7 @@ export class ChatGPTController {
 
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
       this.#throwIfStopRequested();
+      this.#markMessageDispatchStarted();
       await this.#eval(`(() => {
         const host = location.hostname || '';
         const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
@@ -1259,15 +1419,9 @@ export class ChatGPTController {
         .map((fileName) => String(fileName || '').trim().toLocaleLowerCase())
         .sort();
       const sameFileNames = (left, right) => left.length === right.length && left.every((fileName, index) => fileName === right[index]);
-      const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        lastModified: file.lastModified,
-        index
-      }));
-      const selectedFileNames = selectedFiles.map((file) => file.name);
-      const normalizedExpectedFileNames = normalizeFileNames(expectedFileNames);
+       const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({ name: file.name, index }));
+       const selectedFileNames = selectedFiles.map((file) => file.name);
+       const normalizedExpectedFileNames = normalizeFileNames(expectedFileNames);
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
       const visibleCirclePending = (card) => Array.from(card.querySelectorAll('svg circle[stroke-dasharray]')).some((circle) => visible(circle) || visible(circle.closest('svg')));
       const visiblePending = (card) => (
@@ -1284,30 +1438,28 @@ export class ChatGPTController {
         ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard)
         : [];
       const cardDisplayNames = fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim());
-      const displayNameMatches = ${isChatGPTAttachmentCardDisplayName.toString()};
-      const selectionMatchesExpected = sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames);
-      const fileCount = selectedFiles.length;
-      const cardCount = fileCards.length;
-      const countsMatch = fileCount === cardCount;
-      const mappingErrors = [];
-      if (!selectionMatchesExpected) mappingErrors.push('file_selection_mismatch');
-      if (!countsMatch) mappingErrors.push('file_card_count_mismatch');
-      const canMapByIndex = selectionMatchesExpected && countsMatch;
-      const fileStates = selectedFiles.map((file, index) => {
-        const card = canMapByIndex ? fileCards[index] || null : null;
-        const displayName = card ? String(card.getAttribute('aria-label') || '').trim() : '';
-        const displayNameValid = !!card && displayNameMatches(file.name, displayName);
-        if (card && !displayNameValid) mappingErrors.push('display_name_mismatch:' + index);
-        return {
-          fileName: file.name,
-          displayName,
-          found: !!card,
-          displayNameValid,
-          pending: !!card && visiblePending(card),
-          failed: !!card && visibleFailed(card)
-        };
-      });
-      const mappingComplete = selectionMatchesExpected && countsMatch && fileStates.every((state) => state.found && state.displayNameValid);
+       const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+       const selectionMatchesExpected = sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames);
+       const fileCount = selectedFiles.length;
+       const cardCount = fileCards.length;
+       const countsMatch = fileCount === cardCount;
+       const mappingErrors = Array.isArray(mappingResult.mappingErrors) ? [...mappingResult.mappingErrors] : [];
+       if (!selectionMatchesExpected) mappingErrors.push('file_selection_mismatch');
+       if (!countsMatch) mappingErrors.push('file_card_count_mismatch');
+       const fileStates = selectedFiles.map((file, index) => {
+         const mapped = mappingResult.mapping?.[index] || {};
+         const card = mapped.cardIndex == null ? null : fileCards[mapped.cardIndex] || null;
+         const displayName = String(mapped.displayName || (card?.getAttribute('aria-label') || '')).trim();
+         return {
+           sourceFileName: file.name,
+           displayName,
+           matched: !!mapped.matched && !!card,
+           matchKind: mapped.matchKind || null,
+           pending: !!card && visiblePending(card),
+           failed: !!card && visibleFailed(card)
+         };
+       });
+       const mappingComplete = selectionMatchesExpected && countsMatch && !!mappingResult.mappingComplete && fileStates.every((state) => state.matched);
       const inputState = {
         isChatGPT: true,
         opened: false,
@@ -1672,11 +1824,41 @@ export class ChatGPTController {
   async #waitForAttachmentsReady({ timeoutMs, expectedFileNames = [] }) {
     const maxWaitMs = Math.min(120_000, Math.max(0, Number(timeoutMs) || 0));
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
-    const requiredFileNames = expectedFileNames.map((file) => path.basename(String(file || '')).trim()).filter(Boolean);
+    const requiredFileNames = boundedAttachmentNameList(expectedFileNames.map((file) => path.basename(String(file || '')).trim()));
     const requiredFileNamesJson = JSON.stringify(requiredFileNames);
     const start = Date.now();
     let last = null;
     let consecutiveReadyPolls = 0;
+    let lastProgressSignature = '';
+    let lastProgressAt = 0;
+
+    const emitAttachmentProgress = async () => {
+      const diagnostics = this.#attachmentReadinessErrorData(last, requiredFileNames, {
+        elapsedMs: Date.now() - start,
+        timeoutMs: maxWaitMs
+      });
+      const attachmentStates = diagnostics.attachmentStates;
+      const readyCount = attachmentStates.filter((state) => state.matched && !state.pending && !state.failed).length;
+      const pendingCount = attachmentStates.filter((state) => state.pending).length;
+      const failedCount = attachmentStates.filter((state) => state.failed).length;
+      const progress = {
+        phase: 'uploading_files',
+        attachmentCount: attachmentStates.length,
+        readyCount,
+        pendingCount,
+        failedCount,
+        mappingComplete: diagnostics.mappingComplete,
+        attachmentStates
+      };
+      const signature = JSON.stringify(progress);
+      const now = Date.now();
+      if (signature !== lastProgressSignature || now - lastProgressAt >= 250) {
+        lastProgressSignature = signature;
+        lastProgressAt = now;
+        await this.#emitProgress(progress);
+      }
+      return diagnostics;
+    };
 
     while (true) {
       this.#throwIfStopRequested();
@@ -1753,46 +1935,38 @@ export class ChatGPTController {
         const uploadInputs = composer ? Array.from(composer.querySelectorAll('input#upload-files[type="file"]')) : [];
         const pageUploadInputCount = document.querySelectorAll('#upload-files').length;
         const uploadInput = uploadInputs[0] || null;
-        const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          lastModified: file.lastModified,
-          index
-        }));
+        const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({ name: file.name, index }));
         const selectedFileNames = selectedFiles.map((file) => file.name);
         const inputIsUnique = uploadInputs.length === 1 && pageUploadInputCount === 1;
         const selectionMatchesExpected = inputIsUnique && sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(expectedFileNames));
         const fileCount = selectedFiles.length;
         const cardCount = fileCards.length;
         const countsMatch = fileCount === cardCount;
-        const mappingErrors = [];
+        const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+        const mappingErrors = Array.isArray(mappingResult.mappingErrors) ? [...mappingResult.mappingErrors] : [];
         if (!inputIsUnique) mappingErrors.push('upload_input_not_unique');
         if (!selectionMatchesExpected) mappingErrors.push('file_selection_mismatch');
         if (!countsMatch) mappingErrors.push('file_card_count_mismatch');
-        const displayNameMatches = ${isChatGPTAttachmentCardDisplayName.toString()};
-        const canMapByIndex = selectionMatchesExpected && countsMatch;
         const fileStates = selectedFiles.map((file, index) => {
-          const card = canMapByIndex ? fileCards[index] || null : null;
-          const displayName = card ? String(card.getAttribute('aria-label') || '').trim() : '';
-          const displayNameValid = !!card && displayNameMatches(file.name, displayName);
-          if (card && !displayNameValid) mappingErrors.push('display_name_mismatch:' + index);
+          const mapped = mappingResult.mapping?.[index] || {};
+          const card = mapped.cardIndex == null ? null : fileCards[mapped.cardIndex] || null;
+          const displayName = String(mapped.displayName || (card?.getAttribute('aria-label') || '')).trim();
           return {
-            fileName: file.name,
+            sourceFileName: file.name,
             displayName,
-            found: !!card,
-            displayNameValid,
+            matched: !!mapped.matched && !!card,
+            matchKind: mapped.matchKind || null,
             pending: !!card && visiblePending(card),
             failed: !!card && visibleFailed(card)
           };
         });
-        const mappingComplete = selectionMatchesExpected && countsMatch && fileStates.every((state) => state.found && state.displayNameValid);
-        const observedFileNames = fileStates.filter((state) => state.found && state.displayNameValid).map((state) => state.fileName);
-        const observedDisplayNames = fileStates.filter((state) => state.found && state.displayNameValid).map((state) => state.displayName);
-        const missingFileNames = fileStates.filter((state) => !state.found).map((state) => state.fileName);
-        const pendingFileNames = fileStates.filter((state) => state.pending).map((state) => state.fileName);
-        const failedFileNames = fileStates.filter((state) => state.failed).map((state) => state.fileName);
-        const attachmentReady = promptText.length > 0 && mappingComplete && fileStates.every((state) => state.found && state.displayNameValid && !state.pending && !state.failed) && !busy && !!send && !disabled(send);
+        const mappingComplete = selectionMatchesExpected && countsMatch && !!mappingResult.mappingComplete && fileStates.every((state) => state.matched);
+        const observedFileNames = fileStates.filter((state) => state.matched).map((state) => state.sourceFileName);
+        const observedDisplayNames = fileStates.filter((state) => state.matched).map((state) => state.displayName);
+        const missingFileNames = fileStates.filter((state) => !state.matched).map((state) => state.sourceFileName);
+        const pendingFileNames = fileStates.filter((state) => state.pending).map((state) => state.sourceFileName);
+        const failedFileNames = fileStates.filter((state) => state.failed).map((state) => state.sourceFileName);
+        const attachmentReady = promptText.length > 0 && mappingComplete && fileStates.every((state) => state.matched && !state.pending && !state.failed) && !busy && !!send && !disabled(send);
         return {
           isChatGPT: true,
           conditionsReady: attachmentReady,
@@ -1809,6 +1983,7 @@ export class ChatGPTController {
           mappingComplete,
           mappingErrors,
           fileStates,
+          attachmentStates: fileStates,
           observedFileNames,
           observedDisplayNames,
           missingFileNames,
@@ -1823,9 +1998,10 @@ export class ChatGPTController {
       })()`);
 
       if (!last?.isChatGPT) return;
+      const diagnostics = await emitAttachmentProgress();
       if (Array.isArray(last?.failedFileNames) && last.failedFileNames.length > 0) {
         const err = new Error('attachment_upload_failed');
-        err.data = this.#attachmentReadinessErrorData(last, requiredFileNames);
+        err.data = diagnostics;
         throw err;
       }
       const missingFileNames = Array.isArray(last?.missingFileNames) ? last.missingFileNames : [];
@@ -1844,11 +2020,14 @@ export class ChatGPTController {
     }
 
     const err = new Error('attachment_upload_timeout');
-    err.data = this.#attachmentReadinessErrorData(last, requiredFileNames);
+    err.data = this.#attachmentReadinessErrorData(last, requiredFileNames, {
+      elapsedMs: Date.now() - start,
+      timeoutMs: maxWaitMs
+    });
     throw err;
   }
 
-  #attachmentReadinessErrorData(last, expectedFileNames) {
+  #attachmentReadinessErrorData(last, expectedFileNames, { elapsedMs = 0, timeoutMs = 0 } = {}) {
     const observedFileNames = Array.isArray(last?.observedFileNames) ? last.observedFileNames : [];
     const observedCounts = new Map();
     for (const fileName of observedFileNames) {
@@ -1864,25 +2043,150 @@ export class ChatGPTController {
           observedCounts.set(normalized, observed - 1);
           return false;
         });
+    const attachmentStates = boundedAttachmentStates(last?.attachmentStates || last?.fileStates);
     return {
-      expectedFileNames,
-      observedFileNames,
-      observedDisplayNames: Array.isArray(last?.observedDisplayNames) ? last.observedDisplayNames : [],
-      selectedFileNames: Array.isArray(last?.selectedFileNames) ? last.selectedFileNames : [],
-      cardDisplayNames: Array.isArray(last?.cardDisplayNames) ? last.cardDisplayNames : [],
+      expectedFileNames: boundedAttachmentNameList(expectedFileNames),
+      observedFileNames: boundedAttachmentNameList(observedFileNames),
+      observedDisplayNames: boundedAttachmentNameList(last?.observedDisplayNames),
+      selectedFileNames: boundedAttachmentNameList(last?.selectedFileNames),
+      cardDisplayNames: boundedAttachmentNameList(last?.cardDisplayNames),
       fileCount: Number(last?.fileCount) || 0,
       cardCount: Number(last?.cardCount) || 0,
       countsMatch: !!last?.countsMatch,
       mappingComplete: !!last?.mappingComplete,
-      mappingErrors: Array.isArray(last?.mappingErrors) ? last.mappingErrors : [],
-      missingFileNames,
-      pendingFileNames: Array.isArray(last?.pendingFileNames) ? last.pendingFileNames : [],
-      failedFileNames: Array.isArray(last?.failedFileNames) ? last.failedFileNames : [],
+      mappingErrors: boundedAttachmentErrorList(last?.mappingErrors),
+      attachmentStates,
+      missingFileNames: boundedAttachmentNameList(missingFileNames),
+      pendingFileNames: boundedAttachmentNameList(last?.pendingFileNames),
+      failedFileNames: boundedAttachmentNameList(last?.failedFileNames),
       promptTextLength: Number(last?.promptTextLength) || 0,
       hasSendButton: !!last?.hasSendButton,
       sendDisabled: !!last?.sendDisabled,
-      busy: !!last?.busy
+      busy: !!last?.busy,
+      elapsedMs: Math.max(0, Math.min(120_000, Number(elapsedMs) || 0)),
+      timeoutMs: Math.max(0, Math.min(120_000, Number(timeoutMs) || 0))
     };
+  }
+
+  async #cleanupUnsentDraft({ prompt, expectedFileNames = [], userTurnBaseline = null } = {}) {
+    if (!userTurnBaseline || !Number.isFinite(Number(userTurnBaseline.count))) {
+      return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
+    }
+    const promptJson = JSON.stringify(String(prompt || '').slice(0, 200_000));
+    const expectedFileNamesJson = JSON.stringify(boundedAttachmentNameList(expectedFileNames));
+    const baselineJson = JSON.stringify({
+      count: Math.max(0, Number(userTurnBaseline.count) || 0),
+      lastId: boundedAttachmentError(userTurnBaseline.lastId),
+      lastText: boundedAttachmentError(userTurnBaseline.lastText)
+    });
+    const result = await this.#eval(`(async () => {
+      const agentifyAttachmentCleanup = true;
+      const expectedPrompt = ${promptJson};
+      const expectedFileNames = ${expectedFileNamesJson};
+      const baseline = ${baselineJson};
+      const safeName = (value) => String(value || '').trim().replace(/^.*[\\\\/]/u, '').slice(0, 256);
+      const names = (values) => (Array.isArray(values) ? values : []).map(safeName).filter(Boolean).slice(0, 50);
+      const normalize = (value) => String(value || '').trim().toLocaleLowerCase();
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const editable = (node) => {
+        if (!node || !visible(node)) return false;
+        if (node.matches('textarea, input')) return !node.disabled && !node.readOnly;
+        return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+      };
+      const promptScore = (node) => {
+        const rect = node.getBoundingClientRect();
+        const label = [node.getAttribute('aria-label') || '', node.getAttribute('placeholder') || '', node.getAttribute('name') || '', node.getAttribute('id') || '', node.getAttribute('data-testid') || ''].join(' ').toLowerCase();
+        let score = 0;
+        if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+        if (node.matches('textarea')) score += 50;
+        if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') score += 35;
+        if (node.getAttribute('role') === 'textbox') score += 25;
+        if (rect.width >= 260 && rect.height >= 26) score += 20;
+        score += Math.min(180, Math.max(0, (rect.width * rect.height) / 2500));
+        score += Math.max(0, rect.y / 8);
+        return score;
+      };
+      const promptCandidates = Array.from(document.querySelectorAll(${JSON.stringify(this.selectors.promptTextarea)}));
+      const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+      const candidates = [];
+      const seen = new Set();
+      for (const node of [...promptCandidates, ...fallback]) {
+        if (!node || seen.has(node) || !editable(node)) continue;
+        seen.add(node);
+        candidates.push(node);
+      }
+      if (candidates.length !== 1) return { ok: false, reason: 'active_composer_not_unique', promptCount: candidates.length };
+      const promptNode = candidates[0];
+      let composer = promptNode.closest('form') || null;
+      const sendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
+      const stopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="生成を停止する"], button[aria-label="生成を停止"], button[aria-label="停止"]';
+      for (let node = promptNode.parentElement || null; !composer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+        if (node.querySelector(sendSel) || node.querySelector(stopSel)) composer = node;
+      }
+      if (!composer) return { ok: false, reason: 'active_composer_not_found' };
+      const promptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
+      if (promptText !== expectedPrompt) return { ok: false, reason: 'prompt_changed', promptTextLength: promptText.trim().length };
+      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+      const lastUserTurn = userTurns[userTurns.length - 1] || null;
+      const lastUserId = lastUserTurn
+        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')].map((value) => String(value || '').trim()).find(Boolean) || ''
+        : '';
+      const lastUserText = String(lastUserTurn?.innerText || '').replace(/\\s+/g, ' ').trim();
+      const baselineChanged = userTurns.length !== baseline.count || (baseline.lastId && lastUserId && baseline.lastId !== lastUserId) || (!baseline.lastId && lastUserText !== baseline.lastText);
+      if (baselineChanged) return { ok: false, reason: 'user_turn_added', userTurnCount: userTurns.length };
+      const uploadInputs = Array.from(composer.querySelectorAll('input#upload-files[type="file"]'));
+      const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
+      const uploadInput = uploadInputs[0] || null;
+      const selectedFileNames = names(Array.from(uploadInput?.files || []).map((file) => file.name));
+      const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')));
+      const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard);
+      const cardDisplayNames = names(fileCards.map((card) => card.getAttribute('aria-label') || ''));
+      const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+      const selectedMatches = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, selectedFileNames);
+      if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || !selectedMatches || !mappingResult.mappingComplete) {
+        return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
+      }
+      for (const card of fileCards) {
+        const remove = Array.from(card.querySelectorAll('button[aria-label], [role="button"][aria-label]')).find((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')) && visible(button));
+        if (!remove) return { ok: false, reason: 'attachment_remove_button_missing', cardDisplayNames };
+        try { remove.click(); } catch (error) { return { ok: false, reason: 'attachment_remove_failed', error: String(error?.message || error).slice(0, 160), cardDisplayNames }; }
+      }
+      const nativeValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (!nativeValueSetter) return { ok: false, reason: 'missing_native_value_setter' };
+      try {
+        nativeValueSetter.call(uploadInput, '');
+        uploadInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        uploadInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      } catch (error) {
+        return { ok: false, reason: 'file_input_clear_failed', error: String(error?.message || error).slice(0, 160) };
+      }
+      try {
+        if (promptNode.matches('textarea, input')) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (!setter) return { ok: false, reason: 'prompt_clear_setter_missing' };
+          setter.call(promptNode, '');
+        } else {
+          promptNode.textContent = '';
+        }
+        promptNode.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'deleteContentBackward', data: null }));
+        promptNode.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      } catch (error) {
+        return { ok: false, reason: 'prompt_clear_failed', error: String(error?.message || error).slice(0, 160) };
+      }
+      const finalSelectedFileNames = names(Array.from(uploadInput.files || []).map((file) => file.name));
+      const finalCardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).length;
+      const finalPromptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
+      const finalUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+      const cleared = finalSelectedFileNames.length === 0 && finalCardCount === 0 && finalPromptText.trim() === '' && finalUserTurns.length === baseline.count;
+      return { ok: cleared, reason: cleared ? null : 'cleanup_revalidation_failed', selectedFileNames: finalSelectedFileNames, cardCount: finalCardCount, promptTextLength: finalPromptText.trim().length, userTurnCount: finalUserTurns.length };
+    })()`);
+    if (result?.ok) return { status: 'cleared', selectedFileNames: [], cardCount: 0, promptTextLength: 0 };
+    return { status: 'failed', ...(result || { reason: 'cleanup_no_result' }) };
   }
 
   async #captureChatGPTAssistantBaseline() {
@@ -2122,11 +2426,25 @@ export class ChatGPTController {
   async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
-    const run = { kind: 'query', requested: false, requestedAt: null, reason: null, onProgress };
+    const expectedFileNames = (Array.isArray(attachments) ? attachments : []).map((file) => boundedAttachmentName(path.basename(String(file || '')))).filter(Boolean);
+    const run = {
+      kind: 'query',
+      requested: false,
+      requestedAt: null,
+      reason: null,
+      onProgress,
+      prompt,
+      expectedFileNames,
+      promptTyped: false,
+      messageDispatchStarted: false,
+      userTurnBaseline: null
+    };
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs });
-      await this.#typePrompt(prompt);
+      const typed = await this.#typePrompt(prompt);
+      run.userTurnBaseline = typed?.userTurnBaseline || null;
+      run.promptTyped = true;
       if (attachments?.length) {
         const attachedFiles = await this.#attachFiles(attachments);
         await this.#waitForAttachmentsReady({
@@ -2137,6 +2455,29 @@ export class ChatGPTController {
       const baseline = await this.#captureChatGPTAssistantBaseline();
       await this.#clickSend({ timeoutMs });
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
+    } catch (error) {
+      if (run.promptTyped && !run.messageDispatchStarted) {
+        try {
+          error.data = {
+            ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+            cleanup: await this.#cleanupUnsentDraft({
+              prompt,
+              expectedFileNames,
+              userTurnBaseline: run.userTurnBaseline
+            })
+          };
+        } catch (cleanupError) {
+          error.data = {
+            ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+            cleanup: {
+              status: 'failed',
+              reason: boundedAttachmentError(cleanupError?.message || cleanupError),
+              diagnostic: cleanupError?.data && typeof cleanupError.data === 'object' ? cleanupError.data : null
+            }
+          };
+        }
+      }
+      throw error;
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

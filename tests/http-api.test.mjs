@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { startHttpApi } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
 
 async function req({ port, token, method, pth, body, headers = {} }) {
   const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
@@ -271,6 +271,194 @@ test('http-api: same-tab query/send requests are rejected while a run is already
   const st2 = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
   assert.equal(st2.res.status, 200);
   assert.equal(st2.data.runtime?.activeQueries?.length, 0);
+});
+
+test('http-api: /send calls the mutex-owning controller directly and completes once within a bound', async (t) => {
+  let mutexDepth = 0;
+  let sendCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => {
+      if (mutexDepth > 0) throw new Error('nested_mutex');
+      mutexDepth += 1;
+      try { return await fn(); } finally { mutexDepth -= 1; }
+    },
+    send: async ({ text }) => controller.runExclusive(async () => {
+      sendCalls += 1;
+      return { ok: true, text };
+    })
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const response = await Promise.race([
+    req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'one send' } }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('send_route_bound_exceeded')), 1_000))
+  ]);
+  assert.equal(response.res.status, 200);
+  assert.equal(response.data.result.text, 'one send');
+  assert.equal(sendCalls, 1);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  assert.equal(status.data.runtime.activeQueries.length, 0);
+});
+
+test('http-api: stopped /send releases every runtime guard and the next send succeeds', async (t) => {
+  let firstSend = true;
+  let releaseFirst = null;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    send: async () => {
+      if (!firstSend) return { ok: true, attempt: 2 };
+      await new Promise((_, reject) => { releaseFirst = () => reject(Object.assign(new Error('query_aborted'), { data: { reason: 'user_stop' } })); });
+      return { ok: true, attempt: 1 };
+    },
+    requestStop: async () => {
+      firstSend = false;
+      releaseFirst?.();
+      return { ok: true, requested: true, clicked: false };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const first = req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'stop this send' } });
+  const deadline = Date.now() + 1_000;
+  let active = null;
+  while (!active && Date.now() < deadline) {
+    const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+    active = status.data.activeQuery;
+    if (!active) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(active?.kind, 'send');
+  const queryWhileSend = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'blocked by send' } });
+  assert.equal(queryWhileSend.res.status, 409);
+  assert.equal(queryWhileSend.data.error, 'tab_busy');
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: {} });
+  assert.equal(stop.res.status, 200);
+  const firstResponse = await first;
+  assert.equal(firstResponse.res.status, 409);
+  assert.equal(firstResponse.data.error, 'query_aborted');
+  const afterStop = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(afterStop.data.activeQuery, null);
+  assert.equal(afterStop.data.runtime.inflightQueries, 0);
+  assert.equal(afterStop.data.runtime.activeQueries.length, 0);
+  const repeatedStop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: {} });
+  assert.equal(repeatedStop.res.status, 200);
+  assert.equal(repeatedStop.data.runtime.inflightQueries, 0);
+  assert.equal(repeatedStop.data.runtime.activeQueries.length, 0);
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'next send' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(next.data.result.attempt, 2);
+});
+
+test('http-api: attachment errors map to bounded HTTP responses and persist safe last outcomes', async (t) => {
+  let nextError = 'attachment_upload_timeout';
+  const diagnostic = {
+    expectedFileNames: ['C:\\private\\task-contract.json'],
+    selectedFileNames: ['C:\\private\\task-contract.json'],
+    cardDisplayNames: ['task-contract(1).json'],
+    fileCount: 1,
+    cardCount: 1,
+    mappingComplete: false,
+    mappingErrors: ['mapping_ambiguous', 'secret-token-should-not-escape'],
+    attachmentStates: [{ sourceFileName: 'C:\\private\\task-contract.json', displayName: 'task-contract(1).json', matched: true, matchKind: 'renamed', pending: true, failed: false, content: 'secret', token: 'secret' }],
+    missingFileNames: [],
+    pendingFileNames: ['C:\\private\\task-contract.json'],
+    failedFileNames: [],
+    promptTextLength: 32,
+    hasSendButton: true,
+    sendDisabled: false,
+    busy: false,
+    elapsedMs: 250,
+    timeoutMs: 500,
+    cleanup: { status: 'cleared', reason: 'safe cleanup', selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  };
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => { throw Object.assign(new Error(nextError), { data: diagnostic }); }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const timeout = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'timeout fixture' } });
+  assert.equal(timeout.res.status, 408);
+  assert.equal(timeout.data.error, 'attachment_upload_timeout');
+  assert.equal(timeout.data.data.expectedFileNames[0], 'task-contract.json');
+  assert.equal(timeout.data.data.attachmentStates[0].sourceFileName, 'task-contract.json');
+  assert.equal(JSON.stringify(timeout.data).includes('private'), false);
+  assert.equal(JSON.stringify(timeout.data).includes('secret-token'), false);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.runtime.lastOutcomes[0].label, 'Attachment upload timed out');
+  assert.equal(status.data.runtime.lastOutcomes[0].attachmentDiagnostics.cleanup.status, 'cleared');
+
+  nextError = 'attachment_upload_failed';
+  const failed = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'failure fixture' } });
+  assert.equal(failed.res.status, 422);
+  assert.equal(failed.data.error, 'attachment_upload_failed');
+  const failedStatus = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(failedStatus.data.runtime.lastOutcomes[0].label, 'Attachment upload failed');
+});
+
+test('http-api: attachment state conflict and clear errors keep explicit status mappings', () => {
+  const cases = [
+    ['chatgpt_file_input_state_conflict', 409],
+    ['chatgpt_file_input_clear_failed', 409],
+    ['chatgpt_file_input_clear_timeout', 408]
+  ];
+  for (const [code, expectedStatus] of cases) {
+    const mapped = mapErrorToHttp(Object.assign(new Error(code), { data: { expectedFileNames: ['file.json'] } }));
+    assert.equal(mapped.code, expectedStatus);
+    assert.equal(mapped.body.error, code);
+    assert.equal(mapped.body.data.expectedFileNames[0], 'file.json');
+  }
 });
 
 test('http-api: status invalid tabId returns 404', async (t) => {

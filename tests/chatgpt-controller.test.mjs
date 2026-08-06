@@ -7,7 +7,8 @@ import test from 'node:test';
 import {
   ChatGPTController,
   hasSameChatGPTAttachmentFileNameMultiset,
-  isChatGPTAttachmentCardDisplayName
+  isChatGPTAttachmentCardDisplayName,
+  mapChatGPTAttachmentCardNames
 } from '../chatgpt-controller.mjs';
 
 const selectors = {
@@ -43,12 +44,17 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onSetFileInputFiles = null }) {
+function createPage({ events, onEvaluate, onSetFileInputFiles = null, includeUserTurnBaseline = false }) {
   return {
     async navigate() {},
     async evaluate(js) {
       const basic = basicEvaluation(js);
-      if (basic !== undefined) return basic;
+      if (basic !== undefined) {
+        if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
+          return { ...basic, userTurnBaseline: { count: 0, lastId: '', lastText: '' } };
+        }
+        return basic;
+      }
       return await onEvaluate(js);
     },
     async getUrl() {
@@ -1355,21 +1361,24 @@ async function withTempAttachments(names, fn) {
 }
 
 function attachmentCardSnapshot(fileStates, { observedFileNames, promptTextLength = 12, hasSendButton = true, sendDisabled = false, busy = false, conditionsReady = true, mappingComplete = true, mappingErrors = [] } = {}) {
+  const sourceName = (state) => state.sourceFileName || state.fileName;
+  const matched = (state) => state.matched ?? state.found;
   return {
     isChatGPT: true,
     fileStates,
-    observedFileNames: observedFileNames || fileStates.filter((state) => state.found).map((state) => state.fileName),
-    observedDisplayNames: fileStates.filter((state) => state.found && state.displayNameValid !== false).map((state) => state.displayName || state.fileName),
-    selectedFileNames: fileStates.map((state) => state.fileName),
-    cardDisplayNames: fileStates.filter((state) => state.found).map((state) => state.displayName || state.fileName),
+    attachmentStates: fileStates,
+    observedFileNames: observedFileNames || fileStates.filter(matched).map(sourceName),
+    observedDisplayNames: fileStates.filter((state) => matched(state) && state.displayNameValid !== false).map((state) => state.displayName || sourceName(state)),
+    selectedFileNames: fileStates.map(sourceName),
+    cardDisplayNames: fileStates.filter(matched).map((state) => state.displayName || sourceName(state)),
     fileCount: fileStates.length,
-    cardCount: fileStates.filter((state) => state.found).length,
-    countsMatch: fileStates.length === fileStates.filter((state) => state.found).length,
+    cardCount: fileStates.filter(matched).length,
+    countsMatch: fileStates.length === fileStates.filter(matched).length,
     mappingComplete,
     mappingErrors,
-    missingFileNames: fileStates.filter((state) => !state.found).map((state) => state.fileName),
-    pendingFileNames: fileStates.filter((state) => state.pending).map((state) => state.fileName),
-    failedFileNames: fileStates.filter((state) => state.failed).map((state) => state.fileName),
+    missingFileNames: fileStates.filter((state) => !matched(state)).map(sourceName),
+    pendingFileNames: fileStates.filter((state) => state.pending).map(sourceName),
+    failedFileNames: fileStates.filter((state) => state.failed).map(sourceName),
     promptTextLength,
     hasSendButton,
     sendDisabled,
@@ -1814,6 +1823,7 @@ test('chatgpt-controller: treats reordered duplicate basenames as a stale same-f
 test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attachment card display names', () => {
   const accepted = [
     ['foo.txt', 'foo.txt'],
+    ['foo.txt', 'foo(1).txt'],
     ['foo.txt', 'foo(2).txt'],
     ['foo.txt', 'foo(15).txt'],
     ['foo(2).txt', 'foo(2).txt'],
@@ -1825,7 +1835,9 @@ test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attac
   const rejected = [
     ['foo.txt', 'foo (2).txt'],
     ['foo.txt', 'foo-2.txt'],
-    ['foo.txt', 'foo(1).txt'],
+    ['foo.txt', 'foo(0).txt'],
+    ['foo.txt', 'foo(-1).txt'],
+    ['foo.txt', 'foo().txt'],
     ['foo.txt', 'bar(2).txt'],
     ['foo.txt', 'foo(2).md']
   ];
@@ -1836,6 +1848,217 @@ test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attac
   for (const [fileName, displayName] of rejected) {
     assert.equal(isChatGPTAttachmentCardDisplayName(fileName, displayName), false, `${fileName} -> ${displayName}`);
   }
+});
+
+test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one multiset', () => {
+  const cases = [
+    [['file.json'], ['file.json']],
+    [['file.json'], ['file(1).json']],
+    [['file.json'], ['file(2).json']],
+    [['file.patch'], ['file(12).patch']],
+    [['a.json', 'b.json'], ['b.json', 'a.json']],
+    [['a.json', 'b.json', 'c.json', 'd.json', 'e.json', 'f.json', 'g.json'], ['c.json', 'g.json', 'a.json', 'f.json', 'd.json', 'b.json', 'e.json']],
+    [['file.json', 'file.json'], ['file.json', 'file(1).json']],
+    [['file.json', 'file(1).json'], ['file(2).json', 'file(1).json']],
+    [['FILE.JSON'], ['file.json']]
+  ];
+  for (const [selected, cards] of cases) {
+    const result = mapChatGPTAttachmentCardNames(selected, cards);
+    assert.equal(result.mappingComplete, true, `${selected.join(',')} -> ${cards.join(',')}`);
+    assert.equal(result.mapping.length, selected.length);
+  }
+  assert.deepEqual(mapChatGPTAttachmentCardNames(['file.json'], ['file(0).json']).mappingErrors, ['missing_card:0']);
+  assert.equal(mapChatGPTAttachmentCardNames(['file.json'], ['file(1).patch']).mappingComplete, false);
+  assert.equal(mapChatGPTAttachmentCardNames(['file.json'], ['file.json', 'extra.txt']).mappingComplete, false);
+  assert.equal(mapChatGPTAttachmentCardNames(['file.json', 'other.json'], ['file.json']).mappingComplete, false);
+  assert.equal(mapChatGPTAttachmentCardNames(['file.json'], ['file(1).json', 'file(2).json']).mappingComplete, false);
+  assert.equal(mapChatGPTAttachmentCardNames(['file.json', 'file(1).json'], ['file(1).json', 'file(2).json']).mapping[1].matchKind, 'exact');
+});
+
+test('chatgpt-controller: seven-file attachment readiness succeeds with reordered renamed cards and bounded progress', async () => {
+  const selected = [
+    'task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'changed-files.json',
+    'commits.txt',
+    'verification.json',
+    'worker-last-message.txt'
+  ];
+  const cards = [
+    'worker-last-message(1).txt',
+    'verification(1).json',
+    'commits(1).txt',
+    'changed-files(1).json',
+    'changes(1).patch',
+    'repository-state(2).json',
+    'task-contract(1).json'
+  ];
+  await withTempAttachments(selected, async (files) => {
+    const events = [];
+    let attachmentPolls = 0;
+    const progress = [];
+    const mapping = mapChatGPTAttachmentCardNames(selected, cards);
+    const { page } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => {
+        attachmentPolls += 1;
+        const attachmentStates = mapping.mapping.map((entry) => ({
+          sourceFileName: entry.sourceFileName,
+          displayName: entry.displayName,
+          matched: entry.matched,
+          matchKind: entry.matchKind,
+          pending: false,
+          failed: false
+        }));
+        return {
+          isChatGPT: true,
+          conditionsReady: true,
+          expectedFileNames: selected,
+          selectedFileNames: selected,
+          cardDisplayNames: cards,
+          fileCount: selected.length,
+          cardCount: cards.length,
+          countsMatch: true,
+          mappingComplete: true,
+          mappingErrors: [],
+          attachmentStates,
+          missingFileNames: [],
+          pendingFileNames: [],
+          failedFileNames: [],
+          promptTextLength: 22,
+          hasSendButton: true,
+          sendDisabled: false,
+          busy: false
+        };
+      }
+    });
+    const result = await createController(page).query({
+      prompt: 'seven synthetic attachments',
+      attachments: files,
+      timeoutMs: 5_000,
+      onProgress: (patch) => progress.push(patch)
+    });
+    assert.equal(result.text, 'uploaded');
+    assert.equal(attachmentPolls, 2);
+    assert.equal(events.includes('normal-send-click'), true);
+    assert.equal(progress.some((patch) => patch.phase === 'uploading_files' && patch.attachmentCount === 7 && patch.readyCount === 7 && patch.pendingCount === 0 && patch.failedCount === 0 && patch.mappingComplete === true), true);
+    const attachmentProgress = progress.find((patch) => patch.phase === 'uploading_files' && Array.isArray(patch.attachmentStates));
+    assert.equal(attachmentProgress?.attachmentStates?.every((state) => !('absolutePath' in state) && !('content' in state) && !('token' in state)), true);
+  });
+});
+
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult }) {
+  let cleanupScript = '';
+  const page = createPage({
+    events,
+    includeUserTurnBaseline: true,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'cleanup-answer', txt: 'cleanup-answer' });
+      if (js.includes('const chatgptUploadInputs')) return { isChatGPT: true, inputReady: true };
+      if (js.includes('const agentifyAttachmentCleanup')) {
+        cleanupScript = js;
+        events.push('cleanup-draft');
+        return cleanupResult;
+      }
+      if (js.includes('const expectedFileNames')) return attachmentState;
+      if (isClickSendEvaluation(js)) {
+        events.push('normal-send-click');
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('const stop = Array.from')) return false;
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  return { page, cleanupScript: () => cleanupScript };
+}
+
+test('chatgpt-controller: attachment timeout clears the unsent draft without adding a user turn', async () => {
+  await withTempAttachments(['timeout.txt'], async ([attachment]) => {
+    const events = [];
+    const { page, cleanupScript } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'timeout.txt', found: true, pending: true, failed: false }], { promptTextLength: 10, conditionsReady: false }),
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+    });
+    await assert.rejects(
+      createController(page).query({ prompt: 'clear timeout draft', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data.cleanup.status === 'cleared'
+    );
+    assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+    assert.match(cleanupScript(), /remove\.click\(\)/u);
+    assert.match(cleanupScript(), /nativeValueSetter\.call\(uploadInput, ''\)/u);
+    assert.match(cleanupScript(), /finalCardCount/u);
+  });
+});
+
+test('chatgpt-controller: stop during attachment wait aborts quickly and clears the draft', async () => {
+  await withTempAttachments(['stop.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'stop.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+    });
+    const controller = createController(page);
+    const queryPromise = controller.query({ prompt: 'stop while uploading', attachments: [attachment], timeoutMs: 5_000 });
+    const waitDeadline = Date.now() + 1_000;
+    while (!events.includes('files-selector:#upload-files') && Date.now() < waitDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(events.includes('files-selector:#upload-files'), true);
+    await controller.requestStop();
+    await assert.rejects(queryPromise, (error) => error.message === 'query_aborted' && error.data?.cleanup?.status === 'cleared');
+    assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+  });
+});
+
+test('chatgpt-controller: explicit attachment failure clears the unsent draft', async () => {
+  await withTempAttachments(['failed-cleanup.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'failed-cleanup.txt', found: true, pending: false, failed: true }]),
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+    });
+    await assert.rejects(
+      createController(page).query({ prompt: 'clear explicit failure', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => error.message === 'attachment_upload_failed' && error.data.cleanup.status === 'cleared'
+    );
+    assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+  });
+});
+
+test('chatgpt-controller: cleanup failure preserves the original error code and diagnostic', async () => {
+  await withTempAttachments(['cleanup-failure.txt'], async ([attachment]) => {
+    const { page } = createAttachmentCleanupPage({
+      events: [],
+      attachmentState: attachmentCardSnapshot([{ fileName: 'cleanup-failure.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: { ok: false, reason: 'prompt_changed', promptTextLength: 12, userTurnCount: 0 }
+    });
+    await assert.rejects(
+      createController(page).query({ prompt: 'preserve original error', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data.cleanup.status === 'failed' && error.data.cleanup.reason === 'prompt_changed'
+    );
+  });
+});
+
+test('chatgpt-controller: send-started failure never auto-clears the composer', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const agentifyAttachmentCleanup')) throw new Error('cleanup_must_not_run');
+      if (isClickSendEvaluation(js)) return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      if (js.includes('const chatgptUserTurns')) return { isChatGPT: true, userCount: 0, lastUserId: '', lastUserText: '', activePromptText: 'send-started', activePromptTextLength: 12, hasNormalSend: true, normalStopVisible: false };
+      if (js.includes('const clickFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'normal_send_not_found' };
+      if (js.includes('const submitFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'active_composer_form_not_found' };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  await assert.rejects(createController(page).send({ text: 'send-started', timeoutMs: 20 }), /send_not_triggered/u);
+  assert.equal(events.includes('cleanup-draft'), false);
 });
 
 test('chatgpt-controller: reuses a completed renamed ChatGPT card mapped from the active FileList', async () => {

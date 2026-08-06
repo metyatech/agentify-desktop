@@ -1948,7 +1948,7 @@ test('chatgpt-controller: seven-file attachment readiness succeeds with reordere
   });
 });
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult }) {
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true }) {
   let cleanupScript = '';
   const page = createPage({
     events,
@@ -1965,7 +1965,8 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult })
       }
       if (js.includes('const expectedFileNames')) return attachmentState;
       if (isClickSendEvaluation(js)) {
-        events.push('normal-send-click');
+        if (sendResult) return sendResult;
+        if (recordSendEvaluation) events.push('normal-send-click');
         return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
       }
       if (js.includes('const stop = Array.from')) return false;
@@ -2059,6 +2060,127 @@ test('chatgpt-controller: send-started failure never auto-clears the composer', 
   });
   await assert.rejects(createController(page).send({ text: 'send-started', timeoutMs: 20 }), /send_not_triggered/u);
   assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: send stop after typing clears the unsent draft before dispatch', async () => {
+  const events = [];
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+    recordSendEvaluation: false
+  });
+  const controller = createController(page);
+  const sendPromise = controller.send({ text: 'stop before send', timeoutMs: 5_000 });
+  const deadline = Date.now() + 1_000;
+  while (!events.includes('text:stop before send') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(events.includes('text:stop before send'), true);
+  await controller.requestStop();
+  await assert.rejects(sendPromise, (error) => error.message === 'query_aborted' && error.data?.cleanup?.status === 'cleared');
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: pre-aborted send does not type and abort listener is scoped to its run', async () => {
+  const events = [];
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+    recordSendEvaluation: false
+  });
+  const signalController = new AbortController();
+  signalController.abort();
+  const controller = createController(page);
+  await assert.rejects(
+    controller.send({ text: 'must not type', signal: signalController.signal }),
+    (error) => error.message === 'query_aborted'
+  );
+  await assert.rejects(
+    controller.query({ prompt: 'must not query', signal: signalController.signal }),
+    (error) => error.message === 'query_aborted'
+  );
+  assert.equal(events.some((event) => event.startsWith('text:')), false);
+});
+
+test('chatgpt-controller: signal abort during mouse movement clears the unsent send draft before mouseDown', async () => {
+  const events = [];
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+    recordSendEvaluation: false
+  });
+  let releaseMovement = null;
+  page.moveMouse = async () => {
+    if (events.includes('text:signal movement')) await new Promise((resolve) => { releaseMovement = resolve; });
+  };
+  const signalController = new AbortController();
+  const sendPromise = createController(page).send({ text: 'signal movement', signal: signalController.signal, timeoutMs: 5_000 });
+  const deadline = Date.now() + 1_000;
+  while (!releaseMovement && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(typeof releaseMovement, 'function');
+  signalController.abort();
+  releaseMovement();
+  await assert.rejects(sendPromise, (error) => error.message === 'query_aborted' && error.data?.cleanup?.status === 'cleared');
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: send timeout after typing clears the unsent draft', async () => {
+  const events = [];
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    sendResult: { ok: false, error: 'timeout_waiting_for_prompt', kind: 'blocked' },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  await assert.rejects(
+    createController(page).send({ text: 'timeout before send', timeoutMs: 20 }),
+    (error) => error.message === 'timeout_waiting_for_prompt' && error.data?.cleanup?.status === 'cleared'
+  );
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: stop during mouse movement clears a query draft without mouseDown', async () => {
+  const events = [];
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+    recordSendEvaluation: false
+  });
+  let releaseMovement = null;
+  page.moveMouse = async () => {
+    if (events.includes('text:movement stop')) await new Promise((resolve) => { releaseMovement = resolve; });
+  };
+  const controller = createController(page);
+  const queryPromise = controller.query({ prompt: 'movement stop', timeoutMs: 5_000 });
+  const deadline = Date.now() + 1_000;
+  while (!releaseMovement && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(typeof releaseMovement, 'function');
+  await controller.requestStop();
+  releaseMovement();
+  await assert.rejects(queryPromise, (error) => error.message === 'query_aborted' && error.data?.cleanup?.status === 'cleared');
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: cleanup settle timeout preserves the original error and bounded diagnostic', async () => {
+  await withTempAttachments(['settle-timeout.txt'], async ([attachment]) => {
+    const { page, cleanupScript } = createAttachmentCleanupPage({
+      events: [],
+      attachmentState: attachmentCardSnapshot([{ fileName: 'settle-timeout.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: { ok: false, reason: 'cleanup_settle_timeout', cleanupTimeoutMs: 1_500, selectedFileNames: ['settle-timeout.txt'], cardCount: 1, promptTextLength: 14, userTurnCount: 0 }
+    });
+    await assert.rejects(
+      createController(page).query({ prompt: 'preserve settle failure', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data?.cleanup?.status === 'failed' && error.data.cleanup.reason === 'cleanup_settle_timeout'
+    );
+    assert.match(cleanupScript(), /cleanup_settle_timeout/u);
+    assert.match(cleanupScript(), /setTimeout/u);
+    assert.match(cleanupScript(), /cleanupTimeoutMs: 1500/u);
+  });
 });
 
 test('chatgpt-controller: reuses a completed renamed ChatGPT card mapped from the active FileList', async () => {

@@ -384,6 +384,236 @@ test('http-api: stopped /send releases every runtime guard and the next send suc
   assert.equal(next.data.result.attempt, 2);
 });
 
+test('http-api: stop during context preparation aborts before controller query and releases runtime state', async (t) => {
+  let prepStartedResolve;
+  const prepStarted = new Promise((resolve) => { prepStartedResolve = resolve; });
+  let prepareCalls = 0;
+  let queryCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      queryCalls += 1;
+      return { text: 'must not run', codeBlocks: [], meta: {} };
+    },
+    requestStop: async () => ({ ok: true, requested: true, clicked: false })
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    prepareQueryContextFn: async ({ signal }) => {
+      prepareCalls += 1;
+      if (prepareCalls === 1) {
+        prepStartedResolve();
+        await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      }
+      return { prompt: 'prepared', attachments: [], context: { roots: [] } };
+    },
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'preparing context' } });
+  await prepStarted;
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: {} });
+  const queryResponse = await query;
+  assert.equal(stop.res.status, 200);
+  assert.equal(stop.data.requested, true);
+  assert.equal(queryResponse.res.status, 409);
+  assert.equal(queryResponse.data.error, 'query_aborted');
+  assert.equal(queryCalls, 0);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'next query' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(prepareCalls, 2);
+});
+
+test('http-api: stop while query waits for controller mutex prevents query start after mutex release', async (t) => {
+  let mutexEnteredResolve;
+  const mutexEntered = new Promise((resolve) => { mutexEnteredResolve = resolve; });
+  let releaseMutex;
+  let holdMutex = true;
+  let queryCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => {
+      if (holdMutex) {
+        mutexEnteredResolve();
+        await new Promise((resolve) => { releaseMutex = resolve; });
+      }
+      return await fn();
+    },
+    query: async () => {
+      queryCalls += 1;
+      return { text: 'query ran', codeBlocks: [], meta: {} };
+    },
+    requestStop: async () => ({ ok: true, requested: false, clicked: false })
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'mutex wait' } });
+  await mutexEntered;
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: {} });
+  releaseMutex();
+  const queryResponse = await query;
+  assert.equal(stop.res.status, 200);
+  assert.equal(queryResponse.res.status, 409);
+  assert.equal(queryResponse.data.error, 'query_aborted');
+  assert.equal(queryCalls, 0);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  holdMutex = false;
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'query after mutex stop' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(queryCalls, 1);
+});
+
+test('http-api: stop while send waits for its mutex prevents send input and permits the next send', async (t) => {
+  let sendEnteredResolve;
+  const sendEntered = new Promise((resolve) => { sendEnteredResolve = resolve; });
+  let releaseSend;
+  let firstSend = true;
+  let sendCalls = 0;
+  const controller = {
+    send: async ({ signal }) => {
+      if (firstSend) {
+        sendEnteredResolve();
+        await new Promise((resolve) => { releaseSend = resolve; });
+        if (signal.aborted) throw Object.assign(new Error('query_aborted'), { data: { reason: 'user_stop' } });
+      }
+      sendCalls += 1;
+      return { ok: true, attempt: sendCalls };
+    },
+    requestStop: async () => ({ ok: true, requested: false, clicked: false })
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const first = req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'send mutex wait' } });
+  await sendEntered;
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: {} });
+  releaseSend();
+  const firstResponse = await first;
+  assert.equal(stop.res.status, 200);
+  assert.equal(firstResponse.res.status, 409);
+  assert.equal(firstResponse.data.error, 'query_aborted');
+  assert.equal(sendCalls, 0);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  firstSend = false;
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'send after stop' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(next.data.result.attempt, 1);
+});
+
+test('http-api: stop during tab resolution prevents the later controller start', async (t) => {
+  let ensureStartedResolve;
+  const ensureStarted = new Promise((resolve) => { ensureStartedResolve = resolve; });
+  let releaseEnsure;
+  let hasTab = false;
+  let queryCalls = 0;
+  let requestStopCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      queryCalls += 1;
+      return { text: 'query ran', codeBlocks: [], meta: {} };
+    },
+    requestStop: async () => {
+      requestStopCalls += 1;
+      return { ok: true, requested: false, clicked: false };
+    }
+  };
+  const tabs = {
+    listTabs: () => hasTab ? [{ id: 't0', key: 'resolve-me', vendorId: 'chatgpt' }] : [],
+    ensureTab: async () => {
+      ensureStartedResolve();
+      await new Promise((resolve) => { releaseEnsure = resolve; });
+      hasTab = true;
+      return 't0';
+    },
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'resolve-me', prompt: 'tab resolution wait' } });
+  await ensureStarted;
+  const stop = await req({ port, token: 'secret', method: 'POST', pth: '/query/stop', body: { key: 'resolve-me' } });
+  releaseEnsure();
+  const queryResponse = await query;
+  assert.equal(stop.res.status, 200);
+  assert.equal(stop.data.requested, true);
+  assert.equal(queryResponse.res.status, 409);
+  assert.equal(queryResponse.data.error, 'query_aborted');
+  assert.equal(queryCalls, 0);
+  assert.equal(requestStopCalls, 0);
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  const next = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'resolve-me', prompt: 'after resolution stop' } });
+  assert.equal(next.res.status, 200);
+  assert.equal(queryCalls, 1);
+});
+
 test('http-api: attachment errors map to bounded HTTP responses and persist safe last outcomes', async (t) => {
   let nextError = 'attachment_upload_timeout';
   const diagnostic = {

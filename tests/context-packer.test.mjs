@@ -79,6 +79,15 @@ test('context-packer: rejects missing explicit attachments early', async () => {
   );
 });
 
+test('context-packer: abort signal stops preparation before filesystem work', async () => {
+  const signalController = new AbortController();
+  signalController.abort();
+  await assert.rejects(
+    prepareQueryContext({ prompt: 'must not prepare', contextPaths: ['.'], signal: signalController.signal }),
+    (error) => error.message === 'query_aborted'
+  );
+});
+
 test('context-packer: skips symlinked files and directories from context paths', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-context-symlink-'));
   const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-context-outside-'));

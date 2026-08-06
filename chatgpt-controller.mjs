@@ -8,6 +8,8 @@ export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
+const UNSENT_DRAFT_CLEANUP_TIMEOUT_MS = 1_500;
+const UNSENT_DRAFT_CLEANUP_POLL_MS = 50;
 
 function normalizeConversationText(value) {
   return String(value || '')
@@ -36,6 +38,16 @@ function jitter(minMs, maxMs) {
   const min = Math.max(0, Number(minMs) || 0);
   const max = Math.max(min, Number(maxMs) || 0);
   return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+function queryAbortedError(reason = 'user_stop') {
+  const error = new Error('query_aborted');
+  error.data = { reason };
+  return error;
+}
+
+function throwIfSignalAborted(signal) {
+  if (signal?.aborted) throw queryAbortedError();
 }
 
 export function isChatGPTAttachmentCardDisplayName(fileName, displayName) {
@@ -592,12 +604,22 @@ export class ChatGPTController {
 
   #throwIfStopRequested() {
     if (!this.currentRun?.requested) return;
-    const err = new Error('query_aborted');
-    err.data = {
-      reason: this.currentRun.reason || 'user_stop',
-      requestedAt: this.currentRun.requestedAt || null
-    };
+    const err = queryAbortedError(this.currentRun.reason || 'user_stop');
+    err.data.requestedAt = this.currentRun.requestedAt || null;
     throw err;
+  }
+
+  #bindRunSignal(run, signal) {
+    if (!signal) return () => {};
+    const onAbort = () => {
+      if (this.currentRun !== run) return;
+      run.requested = true;
+      run.requestedAt = Date.now();
+      run.reason = 'user_stop';
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    return () => signal.removeEventListener('abort', onAbort);
   }
 
   #markMessageDispatchStarted() {
@@ -653,8 +675,10 @@ export class ChatGPTController {
     }
   }
 
-  async #clickAt(x, y) {
+  async #clickAt(x, y, { onBeforeMouseDown = null } = {}) {
     await this.#moveMouseTo(x, y);
+    this.#throwIfStopRequested();
+    onBeforeMouseDown?.();
     await this.page.mouseDown(x, y, { button: 'left', clickCount: 1 });
     await sleep(jitter(20, 60));
     await this.page.mouseUp(x, y, { button: 'left', clickCount: 1 });
@@ -738,6 +762,7 @@ export class ChatGPTController {
       err.data = ok;
       throw err;
     }
+    if (this.currentRun) this.currentRun.userTurnBaseline = ok.userTurnBaseline || null;
 
     // Human-like click + select-all + type.
     if (ok?.rect?.w > 0 && ok?.rect?.h > 0) {
@@ -753,6 +778,7 @@ export class ChatGPTController {
     await this.#sendKey('Backspace');
     await sleep(jitter(25, 80));
     await this.#typeHuman(prompt);
+    this.#throwIfStopRequested();
     return ok;
   }
 
@@ -1213,8 +1239,12 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
-      this.#markMessageDispatchStarted();
-      await this.#clickAt(cx, cy);
+      await this.#clickAt(cx, cy, {
+        onBeforeMouseDown: () => {
+          this.#throwIfStopRequested();
+          this.#markMessageDispatchStarted();
+        }
+      });
       coordinateClickAttempted = true;
       sent = await this.#waitForSendSignal({
         timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 2200,
@@ -1330,6 +1360,8 @@ export class ChatGPTController {
       for (const [key, modifiers] of combos) {
         this.#throwIfStopRequested();
         await sleep(jitter(25, 90));
+        this.#throwIfStopRequested();
+        this.#markMessageDispatchStarted();
         await this.#sendKey(key, { modifiers });
         sent = await this.#waitForSendSignal({
           timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1500,
@@ -2178,14 +2210,36 @@ export class ChatGPTController {
       } catch (error) {
         return { ok: false, reason: 'prompt_clear_failed', error: String(error?.message || error).slice(0, 160) };
       }
-      const finalSelectedFileNames = names(Array.from(uploadInput.files || []).map((file) => file.name));
-      const finalCardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).length;
-      const finalPromptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
-      const finalUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-      const cleared = finalSelectedFileNames.length === 0 && finalCardCount === 0 && finalPromptText.trim() === '' && finalUserTurns.length === baseline.count;
-      return { ok: cleared, reason: cleared ? null : 'cleanup_revalidation_failed', selectedFileNames: finalSelectedFileNames, cardCount: finalCardCount, promptTextLength: finalPromptText.trim().length, userTurnCount: finalUserTurns.length };
+      const readSettledState = () => {
+        const currentUploadInput = Array.from(composer.querySelectorAll('input#upload-files[type="file"]'))[0] || uploadInput;
+        const selectedFileNames = names(Array.from(currentUploadInput?.files || []).map((file) => file.name));
+        const cardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).length;
+        const promptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
+        const userTurnCount = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')).length;
+        return {
+          selectedFileNames,
+          cardCount,
+          promptTextLength: promptText.trim().length,
+          userTurnCount,
+          cleared: selectedFileNames.length === 0 && cardCount === 0 && promptText.trim() === '' && userTurnCount === baseline.count
+        };
+      };
+      const settleStartedAt = Date.now();
+      let settled = readSettledState();
+      while (!settled.cleared && Date.now() - settleStartedAt < ${UNSENT_DRAFT_CLEANUP_TIMEOUT_MS}) {
+        await new Promise((resolve) => setTimeout(resolve, ${UNSENT_DRAFT_CLEANUP_POLL_MS}));
+        settled = readSettledState();
+      }
+      const finalCardCount = settled.cardCount;
+      return {
+        ok: settled.cleared,
+        reason: settled.cleared ? null : 'cleanup_settle_timeout',
+        cleanupTimeoutMs: ${UNSENT_DRAFT_CLEANUP_TIMEOUT_MS},
+        ...settled,
+        cardCount: finalCardCount
+      };
     })()`);
-    if (result?.ok) return { status: 'cleared', selectedFileNames: [], cardCount: 0, promptTextLength: 0 };
+    if (result?.ok) return { status: 'cleared', selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: result.userTurnCount };
     return { status: 'failed', ...(result || { reason: 'cleanup_no_result' }) };
   }
 
@@ -2423,9 +2477,10 @@ export class ChatGPTController {
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null } = {}) {
+  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, signal = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
+    throwIfSignalAborted(signal);
     const expectedFileNames = (Array.isArray(attachments) ? attachments : []).map((file) => boundedAttachmentName(path.basename(String(file || '')))).filter(Boolean);
     const run = {
       kind: 'query',
@@ -2440,11 +2495,15 @@ export class ChatGPTController {
       userTurnBaseline: null
     };
     this.currentRun = run;
+    const detachRunSignal = this.#bindRunSignal(run, signal);
     try {
+      this.#throwIfStopRequested();
       await this.ensureReady({ timeoutMs });
+      this.#throwIfStopRequested();
+      run.promptTyped = true;
       const typed = await this.#typePrompt(prompt);
       run.userTurnBaseline = typed?.userTurnBaseline || null;
-      run.promptTyped = true;
+      this.#throwIfStopRequested();
       if (attachments?.length) {
         const attachedFiles = await this.#attachFiles(attachments);
         await this.#waitForAttachmentsReady({
@@ -2479,21 +2538,41 @@ export class ChatGPTController {
       }
       throw error;
     } finally {
+      detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;
     }
   }
 
-  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null } = {}) {
+  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
+    throwIfSignalAborted(signal);
 
     return await this.mutex.run(async () => {
-      const run = { kind: 'send', requested: false, requestedAt: null, reason: null, onProgress };
+      throwIfSignalAborted(signal);
+      const run = {
+        kind: 'send',
+        requested: false,
+        requestedAt: null,
+        reason: null,
+        onProgress,
+        prompt,
+        expectedFileNames: [],
+        promptTyped: false,
+        messageDispatchStarted: false,
+        userTurnBaseline: null
+      };
       this.currentRun = run;
+      const detachRunSignal = this.#bindRunSignal(run, signal);
       try {
+        this.#throwIfStopRequested();
         await this.ensureReady({ timeoutMs });
-        await this.#typePrompt(prompt);
+        this.#throwIfStopRequested();
+        run.promptTyped = true;
+        const typed = await this.#typePrompt(prompt);
+        run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+        this.#throwIfStopRequested();
         await this.#clickSend({ timeoutMs });
 
         if (stopAfterSend) {
@@ -2507,7 +2586,31 @@ export class ChatGPTController {
         }
 
         return { ok: true };
+      } catch (error) {
+        if (run.promptTyped && !run.messageDispatchStarted) {
+          try {
+            error.data = {
+              ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+              cleanup: await this.#cleanupUnsentDraft({
+                prompt,
+                expectedFileNames: run.expectedFileNames,
+                userTurnBaseline: run.userTurnBaseline
+              })
+            };
+          } catch (cleanupError) {
+            error.data = {
+              ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+              cleanup: {
+                status: 'failed',
+                reason: boundedAttachmentError(cleanupError?.message || cleanupError),
+                diagnostic: cleanupError?.data && typeof cleanupError.data === 'object' ? cleanupError.data : null
+              }
+            };
+          }
+        }
+        throw error;
       } finally {
+        detachRunSignal();
         if (this.currentRun === run) this.currentRun = null;
       }
     });

@@ -58,6 +58,13 @@ function normalizeAbsoluteInputPath(value, { cwd = process.cwd() } = {}) {
   return path.isAbsolute(raw) ? raw : path.resolve(cwd, raw);
 }
 
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('query_aborted');
+  error.data = { reason: 'user_stop' };
+  throw error;
+}
+
 function displayPath(filePath) {
   return String(filePath || '').replace(/\\/g, '/');
 }
@@ -131,8 +138,9 @@ async function readSample(filePath, maxBytes) {
   }
 }
 
-async function assertExistingFileList(paths, { errorName, cwd = process.cwd() } = {}) {
+async function assertExistingFileList(paths, { errorName, cwd = process.cwd(), signal = null } = {}) {
   for (const item of Array.isArray(paths) ? paths : []) {
+    throwIfAborted(signal);
     const abs = normalizeAbsoluteInputPath(item, { cwd });
     if (!abs) continue;
     try {
@@ -164,7 +172,8 @@ function sampleLooksText(buf) {
   return weird / buf.length < 0.08;
 }
 
-async function walkPath(absPath, out, { maxFiles }) {
+async function walkPath(absPath, out, { maxFiles, signal = null }) {
+  throwIfAborted(signal);
   if (out.length >= maxFiles) return;
   const st = await fs.lstat(absPath);
   if (st.isSymbolicLink()) return;
@@ -174,7 +183,7 @@ async function walkPath(absPath, out, { maxFiles }) {
     for (const entry of entries) {
       if (out.length >= maxFiles) break;
       if ((entry.isDirectory() || entry.isSymbolicLink()) && IGNORE_DIRS.has(entry.name)) continue;
-      await walkPath(path.join(absPath, entry.name), out, { maxFiles });
+      await walkPath(path.join(absPath, entry.name), out, { maxFiles, signal });
     }
     return;
   }
@@ -235,15 +244,17 @@ export async function prepareQueryContext({
   maxChunksPerFile = 3,
   maxInlineFiles = 18,
   maxAttachmentFiles = 10,
-  maxBinaryAttachmentBytes = 12 * 1024 * 1024
+  maxBinaryAttachmentBytes = 12 * 1024 * 1024,
+  signal = null
 } = {}) {
+  throwIfAborted(signal);
   const basePrompt = String(prompt || '');
   const basePrefix = String(promptPrefix || '').trim();
   const explicitAttachments = Array.isArray(attachments)
     ? attachments.map((p) => normalizeAbsoluteInputPath(p, { cwd })).filter(Boolean)
     : [];
   const inputs = Array.isArray(contextPaths) ? contextPaths.map((p) => String(p || '').trim()).filter(Boolean) : [];
-  await assertExistingFileList(explicitAttachments, { errorName: 'missing_attachment_path', cwd });
+  await assertExistingFileList(explicitAttachments, { errorName: 'missing_attachment_path', cwd, signal });
   if (!inputs.length && !basePrefix) {
     const context = {
       roots: [],
@@ -271,10 +282,11 @@ export async function prepareQueryContext({
   const roots = [];
   const files = [];
   for (const item of inputs) {
+    throwIfAborted(signal);
     const abs = path.resolve(cwd, item);
     roots.push({ input: item, path: abs });
     try {
-      await walkPath(abs, files, { maxFiles });
+      await walkPath(abs, files, { maxFiles, signal });
     } catch (error) {
       if (error && error.code === 'ENOENT') {
         const err = new Error('missing_context_path');
@@ -298,6 +310,7 @@ export async function prepareQueryContext({
   let usedChars = 0;
 
   for (const file of files) {
+    throwIfAborted(signal);
     const rel = roots.length ? path.relative(path.dirname(roots[0].path), file.absPath) : path.basename(file.absPath);
     const named = displayPath(rel && !rel.startsWith('..') ? rel : path.basename(file.absPath));
     if (looksBinaryByName(file.absPath)) {

@@ -523,7 +523,8 @@ export function startHttpApi({
   onScanWatchFolder,
   getStatus,
   getSettings,
-  onRuntimeChanged
+  onRuntimeChanged,
+  prepareQueryContextFn = prepareQueryContext
 }) {
   const tokenRef = typeof token === 'string' ? { current: token } : token;
 
@@ -531,6 +532,7 @@ export function startHttpApi({
   const inflight = { queries: 0 };
   const activeQueries = new Map(); // tabId -> runtime status
   const activeScopes = new Map(); // request scope -> runtime status
+  const operationControls = new Map(); // operation id -> private cancellation control
   const lastOutcomes = new Map(); // tabId -> last finished outcome
   const lastQueryAt = new Map(); // tabId -> ms
   let lastAnyQueryAt = 0;
@@ -715,6 +717,35 @@ export function startHttpApi({
     } catch {}
   };
 
+  const createOperationControl = (op) => {
+    const abortController = new AbortController();
+    operationControls.set(op.id, { abortController, op, tabId: null, scope: op.scope });
+    return abortController;
+  };
+
+  const bindOperationTab = (op, tabId) => {
+    const control = operationControls.get(op.id);
+    if (control) control.tabId = tabId || null;
+  };
+
+  const clearOperationControl = (op) => {
+    if (op?.id) operationControls.delete(op.id);
+  };
+
+  const operationAbortedError = (op) => {
+    const error = new Error('query_aborted');
+    error.data = {
+      reason: op?.stopReason || 'user_stop',
+      requestedAt: op?.stopRequestedAt || null
+    };
+    return error;
+  };
+
+  const throwIfOperationActive = (op) => {
+    const control = operationControls.get(op?.id);
+    if (op?.stopRequested || control?.abortController.signal.aborted) throw operationAbortedError(op);
+  };
+
   const setActiveQuery = (tabId, item) => {
     if (!tabId || !item) return;
     activeQueries.set(tabId, { ...item, updatedAt: Date.now() });
@@ -758,6 +789,7 @@ export function startHttpApi({
   const reserveScope = (scope, item) => {
     if (!scope || !item) return;
     activeScopes.set(scope, { ...item });
+    emitRuntimeChanged();
   };
 
   const clearScope = (scope, expectedId = null) => {
@@ -766,6 +798,7 @@ export function startHttpApi({
     if (!current) return;
     if (expectedId && current.id !== expectedId) return;
     activeScopes.delete(scope);
+    emitRuntimeChanged();
   };
 
   const patchActiveQuery = (tabId, patch) => {
@@ -789,6 +822,57 @@ export function startHttpApi({
     if (expectedId && current.id !== expectedId) return;
     activeQueries.delete(tabId);
     emitRuntimeChanged();
+  };
+
+  const operationForStop = ({ body, tabId = null } = {}) => {
+    const scoped = activeScopes.get(requestScopeForBody(body || {}));
+    const current = scoped || (tabId ? activeQueries.get(tabId) : null);
+    if (!current) return null;
+    const control = operationControls.get(current.id);
+    if (!control) return null;
+    return { op: control.op, control };
+  };
+
+  const stopOperation = async ({ operation = null, requestedTabId = null } = {}) => {
+    if (!operation) {
+      return {
+        ok: true,
+        tabId: requestedTabId,
+        requested: false,
+        clicked: false,
+        activeQuery: requestedTabId ? activeQueries.get(requestedTabId) || null : null,
+        runtime: runtimeSnapshot()
+      };
+    }
+
+    const { op, control } = operation;
+    const stopRequestedAt = Date.now();
+    op.stopRequested = true;
+    op.stopRequestedAt = stopRequestedAt;
+    op.stopReason = 'user_stop';
+    const activeTabId = control.tabId || op.tabId || null;
+    const responseTabId = activeTabId || requestedTabId || null;
+    const active = activeTabId
+      ? patchActiveQuery(activeTabId, { stopRequested: true, stopRequestedAt, stopReason: 'user_stop' })
+      : null;
+    const scoped = activeScopes.get(op.scope);
+    if (scoped?.id === op.id) {
+      activeScopes.set(op.scope, { ...scoped, stopRequested: true, stopRequestedAt, stopReason: 'user_stop' });
+      emitRuntimeChanged();
+    }
+    control.abortController.abort();
+    const controller = activeTabId ? tabs.getControllerById(activeTabId) : null;
+    const stopped = typeof controller?.requestStop === 'function'
+      ? await controller.requestStop({ reason: 'user_stop' })
+      : { ok: true, requested: false, clicked: false };
+    return {
+      ok: true,
+      tabId: responseTabId,
+      requested: true,
+      clicked: !!stopped?.clicked,
+      activeQuery: activeTabId ? activeQueries.get(activeTabId) || active || null : null,
+      runtime: runtimeSnapshot()
+    };
   };
 
   const server = http.createServer(async (req, res) => {
@@ -941,29 +1025,37 @@ export function startHttpApi({
           phase: 'resolving_tab',
           stopRequested: false,
           stopRequestedAt: null,
+          stopReason: null,
           blocked: false,
           blockedKind: null,
           scope
         };
+        const abortController = createOperationControl(op);
+        const signal = abortController.signal;
         reserveScope(scope, op);
         let tabId = null;
         let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
+          bindOperationTab(op, tabId);
+          throwIfOperationActive(op);
           assertTabNotBusy(tabId);
           op.tabId = tabId;
           setActiveQuery(tabId, op);
+          throwIfOperationActive(op);
           const tabMeta = getTabMeta(tabs, tabId);
           const vendorBudget = contextBudgetForVendor(tabMeta?.vendorId || 'chatgpt');
           try {
             patchActiveQuery(tabId, { phase: 'preparing_context', blocked: false, blockedKind: null });
             const bundle = bundleName ? await getBundle(stateDir, bundleName) : null;
+            throwIfOperationActive(op);
             if (bundleName && !bundle) {
               const err = new Error('bundle_not_found');
               err.data = { name: bundleName };
               throw err;
             }
             const merged = mergeQueryInputs({ bundle, promptPrefix, attachments, contextPaths });
+            throwIfOperationActive(op);
             const effectiveBudget = {
               maxContextChars: positiveIntOr(body.maxContextChars, vendorBudget.maxContextChars, 500_000),
               maxFiles: positiveIntOr(body.maxContextFiles, vendorBudget.maxFiles, 500),
@@ -973,7 +1065,8 @@ export function startHttpApi({
               maxInlineFiles: positiveIntOr(body.maxContextInlineFiles, vendorBudget.maxInlineFiles, 100),
               maxAttachmentFiles: positiveIntOr(body.maxContextAttachments, vendorBudget.maxAttachmentFiles, 50)
             };
-            const packed = await prepareQueryContext({
+            throwIfOperationActive(op);
+            const packed = await prepareQueryContextFn({
               prompt,
               promptPrefix: merged.promptPrefix,
               attachments: merged.attachments,
@@ -984,20 +1077,25 @@ export function startHttpApi({
               maxChunkChars: effectiveBudget.maxChunkChars,
               maxChunksPerFile: effectiveBudget.maxChunksPerFile,
               maxInlineFiles: effectiveBudget.maxInlineFiles,
-              maxAttachmentFiles: effectiveBudget.maxAttachmentFiles
+              maxAttachmentFiles: effectiveBudget.maxAttachmentFiles,
+              signal
             });
+            throwIfOperationActive(op);
             checkAndConsumeQueryBudget({ tabId, governor });
             inflight.queries += 1;
             inflightReserved = true;
+            throwIfOperationActive(op);
             const controller = tabs.getControllerById(tabId);
-            const result = await runExclusive(controller, async () =>
-              controller.query({
+            const result = await runExclusive(controller, async () => {
+              throwIfOperationActive(op);
+              return await controller.query({
                 prompt: packed.prompt,
                 attachments: packed.attachments,
                 timeoutMs,
+                signal,
                 onProgress: (patch) => patchActiveQuery(tabId, patch)
-              })
-            );
+              });
+            });
             setLastOutcome(tabId, {
               status: 'success',
               label: 'Response received',
@@ -1025,6 +1123,7 @@ export function startHttpApi({
           }
         } finally {
           clearScope(scope, op.id);
+          clearOperationControl(op);
         }
       }
 
@@ -1048,26 +1147,34 @@ export function startHttpApi({
           phase: 'resolving_tab',
           stopRequested: false,
           stopRequestedAt: null,
+          stopReason: null,
           blocked: false,
           blockedKind: null,
           scope
         };
+        const abortController = createOperationControl(op);
+        const signal = abortController.signal;
         reserveScope(scope, op);
         let tabId = null;
         let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
+          bindOperationTab(op, tabId);
+          throwIfOperationActive(op);
           assertTabNotBusy(tabId);
           op.tabId = tabId;
           setActiveQuery(tabId, op);
+          throwIfOperationActive(op);
           checkAndConsumeQueryBudget({ tabId, governor });
           inflight.queries += 1;
           inflightReserved = true;
+          throwIfOperationActive(op);
           const controller = tabs.getControllerById(tabId);
           const result = await controller.send({
             text,
             timeoutMs,
             stopAfterSend,
+            signal,
             onProgress: (patch) => patchActiveQuery(tabId, patch)
           });
           setLastOutcome(tabId, {
@@ -1086,6 +1193,7 @@ export function startHttpApi({
         } finally {
           if (tabId) clearActiveQuery(tabId, op.id);
           clearScope(scope, op.id);
+          clearOperationControl(op);
           if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
         }
       }
@@ -1098,22 +1206,14 @@ export function startHttpApi({
           (body?.vendorId ? String(body.vendorId).trim() : '') ||
           (body?.model ? String(body.model).trim() : '')
         );
-        const tabId = hasScopedTab
-          ? await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors })
-          : defaultTabId;
-        const active = patchActiveQuery(tabId, { stopRequested: true, stopRequestedAt: Date.now() }) || null;
-        const controller = tabs.getControllerById(tabId);
-        const stopped = typeof controller?.requestStop === 'function'
-          ? await controller.requestStop({ reason: 'user_stop' })
-          : { ok: true, requested: false, clicked: false };
-        return sendJson(res, 200, {
-          ok: true,
-          tabId,
-          requested: !!stopped?.requested || !!active,
-          clicked: !!stopped?.clicked,
-          activeQuery: activeQueries.get(tabId) || active || null,
-          runtime: runtimeSnapshot()
-        });
+        let requestedTabId = body?.tabId ? String(body.tabId).trim() : null;
+        let operation = operationForStop({ body, tabId: requestedTabId });
+        if (!operation && hasScopedTab) {
+          requestedTabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+          operation = operationForStop({ body, tabId: requestedTabId });
+        }
+        if (!requestedTabId && !operation) requestedTabId = defaultTabId;
+        return sendJson(res, 200, await stopOperation({ operation, requestedTabId }));
       }
 
       if (url.pathname === '/read-page' && req.method === 'POST') {
@@ -1294,19 +1394,10 @@ export function startHttpApi({
 
   server.getRuntimeState = () => runtimeSnapshot();
   server.stopActiveQuery = async ({ tabId }) => {
-    const active = patchActiveQuery(tabId, { stopRequested: true, stopRequestedAt: Date.now() }) || null;
-    const controller = tabs.getControllerById(tabId);
-    const stopped = typeof controller?.requestStop === 'function'
-      ? await controller.requestStop({ reason: 'user_stop' })
-      : { ok: true, requested: false, clicked: false };
-    return {
-      ok: true,
-      tabId,
-      requested: !!stopped?.requested || !!active,
-      clicked: !!stopped?.clicked,
-      activeQuery: activeQueries.get(tabId) || active || null,
-      runtime: runtimeSnapshot()
-    };
+    return await stopOperation({
+      operation: operationForStop({ body: { tabId }, tabId }),
+      requestedTabId: tabId
+    });
   };
 
   return new Promise((resolve, reject) => {

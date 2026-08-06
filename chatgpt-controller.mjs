@@ -14,6 +14,8 @@ const PROVIDER_STOP_TOKEN_ACTIVATION_TIMEOUT_MS = 1_000;
 const PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS = 500;
 const PROVIDER_STOP_RETRY_TIMEOUT_MS = 800;
 const PROVIDER_STOP_RETRY_POLL_MS = 75;
+const PROVIDER_STOP_RELEASE_RETRY_MAX = 3;
+const PROVIDER_STOP_RELEASE_RETRY_POLL_MS = 50;
 
 let latestProviderStopGeneration = 0;
 
@@ -436,40 +438,78 @@ export class ChatGPTController {
         ok: true,
         active: Number.isSafeInteger(currentGeneration) && Number.isSafeInteger(currentSequence) && Number.isSafeInteger(retiredSequence) &&
           currentGeneration === expectedGeneration && currentSequence === expectedSequence && state?.token === expectedToken && state?.stopRequested !== true &&
-          retiredSequence < expectedSequence && ['pending', 'dispatching', 'dispatched'].includes(dispatchState),
+          retiredSequence < expectedSequence && ['pending', 'claimed', 'dispatching', 'dispatched'].includes(dispatchState),
         generation: Number.isSafeInteger(currentGeneration) ? currentGeneration : null,
         sequence: Number.isSafeInteger(currentSequence) ? currentSequence : null,
         retiredSequence: Number.isSafeInteger(retiredSequence) ? retiredSequence : null,
-        dispatchState: ['pending', 'dispatching', 'dispatched', 'cancelled'].includes(dispatchState) ? dispatchState : 'unknown'
+        dispatchState: ['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled'].includes(dispatchState) ? dispatchState : 'unknown'
       };
     })()`;
   }
 
   #scheduleProviderStopStateScriptNow(run, { action = 'release' } = {}) {
-    const evaluation = Promise.resolve()
-      .then(() => this.#eval(this.#providerStopStateScript(run, { action })));
+    const evaluation = this.#boundedProviderStopStateEvaluation(this.#providerStopStateScript(run, { action }), {
+      signal: null,
+      timeoutMs: PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS
+    });
     evaluation.catch(() => {});
-    const timeout = new Promise((resolve) => setTimeout(resolve, PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS));
-    Promise.race([evaluation, timeout]).catch(() => {});
+    return evaluation;
   }
 
   #scheduleProviderStopStateScript(run, { action = 'release' } = {}) {
     if (action !== 'release' || !run) {
-      this.#scheduleProviderStopStateScriptNow(run, { action });
-      return;
+      return this.#scheduleProviderStopStateScriptNow(run, { action });
     }
-    if (run.providerStopReleaseScheduled) return;
+    run.providerStopReleaseRequested = true;
+    if (run.providerStopReleaseScheduled) return run.providerStopReleaseAttempt;
+    const stopAttempt = run.providerStopStopCleanupAttempt || run.providerStopStopAttempt;
+    if (stopAttempt) {
+      if (run.providerStopReleaseWait === stopAttempt) return run.providerStopReleaseWait;
+      run.providerStopReleaseWait = stopAttempt;
+      Promise.resolve(stopAttempt).then(
+        () => {
+          if (run.providerStopReleaseWait !== stopAttempt) return;
+          run.providerStopReleaseWait = null;
+          this.#scheduleProviderStopStateScript(run, { action });
+        },
+        () => {
+          if (run.providerStopReleaseWait !== stopAttempt) return;
+          run.providerStopReleaseWait = null;
+          this.#scheduleProviderStopStateScript(run, { action });
+        }
+      ).catch(() => {});
+      return stopAttempt;
+    }
     run.providerStopReleaseScheduled = true;
-    const release = () => this.#scheduleProviderStopStateScriptNow(run, { action });
-    const stopAttempt = run.providerStopStopAttempt;
-    if (!stopAttempt) {
-      release();
-      return;
-    }
-    Promise.resolve(stopAttempt).then(release, release).catch(() => {});
+    const release = this.#releaseProviderStopStateWithRetry(run, { action });
+    run.providerStopReleaseAttempt = release;
+    release.catch(() => {});
+    return release;
   }
 
-  async #boundedProviderStopStateEvaluation(js, { signal = null } = {}) {
+  async #releaseProviderStopStateWithRetry(run, { action = 'release', attempt = 0 } = {}) {
+    const outcome = await this.#scheduleProviderStopStateScriptNow(run, { action });
+    const retryable = outcome.status === 'timeout' || (outcome.status === 'completed' && outcome.value?.deferred === true);
+    if (!retryable || attempt >= PROVIDER_STOP_RELEASE_RETRY_MAX) return outcome;
+    await sleep(PROVIDER_STOP_RELEASE_RETRY_POLL_MS);
+    return await this.#releaseProviderStopStateWithRetry(run, { action, attempt: attempt + 1 });
+  }
+
+  #scheduleProviderStopStopCancellation(run) {
+    if (!run || run.providerStopStopCleanupAttempt) return run?.providerStopStopCleanupAttempt || null;
+    const cleanup = this.#boundedProviderStopStateEvaluation(this.#providerStopStopCancellationScript(run), {
+      signal: null,
+      timeoutMs: PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS
+    });
+    run.providerStopStopCleanupAttempt = cleanup;
+    cleanup.then(
+      () => { if (run.providerStopStopCleanupAttempt === cleanup) run.providerStopStopCleanupAttempt = null; },
+      () => { if (run.providerStopStopCleanupAttempt === cleanup) run.providerStopStopCleanupAttempt = null; }
+    ).catch(() => {});
+    return cleanup;
+  }
+
+  async #boundedProviderStopStateEvaluation(js, { signal = null, timeoutMs = PROVIDER_STOP_TOKEN_ACTIVATION_TIMEOUT_MS } = {}) {
     if (signal?.aborted) return { status: 'aborted' };
     let timer = null;
     let abortHandler = null;
@@ -484,7 +524,7 @@ export class ChatGPTController {
         if (abortHandler) signal?.removeEventListener('abort', abortHandler);
         resolve(result);
       };
-      timer = setTimeout(() => finish({ status: 'timeout' }), PROVIDER_STOP_TOKEN_ACTIVATION_TIMEOUT_MS);
+      timer = setTimeout(() => finish({ status: 'timeout' }), timeoutMs);
       abortHandler = () => finish({ status: 'aborted' });
       signal?.addEventListener('abort', abortHandler, { once: true });
       rawEvaluation.then(
@@ -512,7 +552,7 @@ export class ChatGPTController {
       const exact = currentGeneration === ${generation} && currentSequence === ${sequence} && state?.token === ${token} && retiredSequence < ${sequence};
       return {
         ok: true,
-        state: exact && ['pending', 'dispatching', 'dispatched', 'cancelled'].includes(dispatchState) ? dispatchState : 'mismatch',
+        state: exact && ['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled'].includes(dispatchState) ? dispatchState : 'mismatch',
         generation: Number.isSafeInteger(currentGeneration) ? currentGeneration : null,
         sequence: Number.isSafeInteger(currentSequence) ? currentSequence : null,
         retiredSequence: Number.isSafeInteger(retiredSequence) ? retiredSequence : null
@@ -535,13 +575,60 @@ export class ChatGPTController {
       const dispatchState = state?.dispatch?.state;
       const exact = Number(state?.generation) === expectedGeneration && Number(state?.sequence) === expectedSequence &&
         state?.token === expectedToken && state?.stopRequested !== true && Number(state?.retiredSequence) < expectedSequence;
-      const canClaim = exact && (dispatchState === 'pending' || (${allowRetry ? 'true' : 'false'} && ['dispatching', 'dispatched'].includes(dispatchState)));
+      const canClaim = exact && (dispatchState === 'pending' || (${allowRetry ? 'true' : 'false'} && ['claimed', 'dispatching', 'dispatched'].includes(dispatchState)));
       if (!canClaim) return { ok: true, claimed: false, state: exact ? dispatchState || 'unknown' : 'mismatch' };
       globalThis.__agentifyProviderStopState = {
         ...state,
-        dispatch: { generation: expectedGeneration, sequence: expectedSequence, state: 'dispatching' }
+        dispatch: { generation: expectedGeneration, sequence: expectedSequence, state: 'claimed' }
       };
-      return { ok: true, claimed: true, state: 'dispatching' };
+      return { ok: true, claimed: true, state: 'claimed' };
+    })()`;
+  }
+
+  #providerStopDispatchStartScript(run) {
+    const generation = this.#providerStopGeneration(run);
+    const sequence = this.#providerStopSequence(run);
+    const token = JSON.stringify(run.providerStopToken);
+    return `(() => {
+      const agentifyStopTokenDispatchStart = true;
+      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const exact = Number(state?.generation) === ${generation} && Number(state?.sequence) === ${sequence} &&
+        state?.token === ${token} && Number(state?.retiredSequence) < ${sequence};
+      if (exact && state?.stopRequested !== true && state?.dispatch?.state === 'claimed') {
+        globalThis.__agentifyProviderStopState = {
+          ...state,
+          dispatch: { generation: ${generation}, sequence: ${sequence}, state: 'dispatching' }
+        };
+        return { ok: true, started: true, state: 'dispatching' };
+      }
+      return { ok: true, started: false, state: exact ? state?.dispatch?.state || 'unknown' : 'mismatch' };
+    })()`;
+  }
+
+  #providerStopDispatchRollbackScript(run) {
+    const generation = this.#providerStopGeneration(run);
+    const sequence = this.#providerStopSequence(run);
+    const token = JSON.stringify(run.providerStopToken);
+    return `(() => {
+      const agentifyStopTokenDispatchRollback = true;
+      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const exact = Number(state?.generation) === ${generation} && Number(state?.sequence) === ${sequence} &&
+        state?.token === ${token} && Number(state?.retiredSequence) < ${sequence};
+      if (!exact) return { ok: true, rolledBack: false, state: 'mismatch' };
+      if (state?.dispatch?.state !== 'claimed') return { ok: true, rolledBack: false, state: state?.dispatch?.state || 'unknown' };
+      globalThis.__agentifyProviderStopState = {
+        ...state,
+        stopRequested: true,
+        stopClicked: false,
+        stopWatcherActive: false,
+        retiredSequence: Math.max(Number(state.retiredSequence) || 0, ${sequence}),
+        dispatch: { generation: ${generation}, sequence: ${sequence}, state: 'cancelled' }
+      };
+      return { ok: true, rolledBack: true, state: 'cancelled' };
     })()`;
   }
 
@@ -586,7 +673,7 @@ export class ChatGPTController {
       if (!isExact(state)) return { ok: true, state: 'mismatch', clicked: false };
       const dispatchState = state?.dispatch?.state;
       if (state.stopClicked === true) return { ok: true, state: dispatchState || 'unknown', clicked: false, reason: 'provider_stop_already_clicked' };
-      if (dispatchState === 'pending') {
+      if (['pending', 'claimed'].includes(dispatchState)) {
         globalThis.__agentifyProviderStopState = {
           ...state,
           stopRequested: true,
@@ -620,6 +707,9 @@ export class ChatGPTController {
       const tryClick = () => {
         const current = readState();
         if (!isExact(current)) return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        if (current.stopRequested !== true || current.stopWatcherActive !== true) {
+          return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_cancelled' };
+        }
         if (current.stopClicked === true) return { ok: true, state: dispatchState, clicked: false, reason: 'provider_stop_already_clicked' };
         const stop = Array.from(document.querySelectorAll(${stopSel})).find(visible);
         if (!stop) return null;
@@ -642,6 +732,30 @@ export class ChatGPTController {
     })()`;
   }
 
+  #providerStopStopCancellationScript(run) {
+    const generation = this.#providerStopGeneration(run);
+    const sequence = this.#providerStopSequence(run);
+    const token = JSON.stringify(run.providerStopToken);
+    return `(() => {
+      const agentifyStopTokenStopCancellation = true;
+      const state = globalThis.__agentifyProviderStopState && typeof globalThis.__agentifyProviderStopState === 'object'
+        ? globalThis.__agentifyProviderStopState
+        : null;
+      const exact = Number(state?.generation) === ${generation} && Number(state?.sequence) === ${sequence} &&
+        state?.token === ${token} && Number(state?.retiredSequence) < ${sequence};
+      if (!exact) return { ok: true, state: 'mismatch', cancelled: false, terminal: true };
+      if (state.stopWatcherActive !== true) return { ok: true, state: state?.dispatch?.state || 'unknown', cancelled: false, terminal: true };
+      globalThis.__agentifyProviderStopState = {
+        ...state,
+        stopRequested: true,
+        stopClicked: false,
+        stopWatcherActive: false,
+        retiredSequence: Math.max(Number(state.retiredSequence) || 0, ${sequence})
+      };
+      return { ok: true, state: state?.dispatch?.state || 'unknown', cancelled: true, terminal: true };
+    })()`;
+  }
+
   #providerStopDispatchError(phase, reason = 'provider_stop_token_not_active') {
     const error = new Error(reason);
     error.data = { phase };
@@ -656,7 +770,7 @@ export class ChatGPTController {
       run.messageDispatchStarted = true;
       return state;
     }
-    if (state !== 'pending' && state !== 'cancelled') run.dispatchStateUnknown = true;
+    if (!['pending', 'claimed', 'cancelled'].includes(state)) run.dispatchStateUnknown = true;
     return state;
   }
 
@@ -664,8 +778,13 @@ export class ChatGPTController {
     const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchClaimScript(run, { allowRetry }), { signal: run.signal });
     if (outcome.status === 'aborted') throw queryAbortedError(run.reason || 'user_stop');
     if (outcome.status === 'completed' && outcome.value?.ok === true && outcome.value.claimed === true) {
-      run.messageDispatchStarted = true;
-      run.dispatchState = 'dispatching';
+      const providerStopAlreadyCancelled = run.requested && run.dispatchState === 'cancelled';
+      run.dispatchState = 'claimed';
+      if (run.requested) {
+        if (providerStopAlreadyCancelled) run.dispatchState = 'cancelled';
+        else await this.#rollbackProviderStopDispatch(run);
+        throw queryAbortedError(run.reason || 'user_stop');
+      }
       return outcome.value;
     }
     const state = outcome.status === 'completed' && outcome.value?.ok === true ? outcome.value.state : await this.#reconcileProviderStopDispatch(run);
@@ -674,6 +793,32 @@ export class ChatGPTController {
     if (state !== 'dispatching' && state !== 'dispatched') throw this.#providerStopDispatchError('dispatch', 'provider_stop_dispatch_unknown');
     run.messageDispatchStarted = true;
     return { ok: true, claimed: false, state };
+  }
+
+  async #rollbackProviderStopDispatch(run) {
+    if (!run || run.dispatchState !== 'claimed') return { ok: true, rolledBack: false, state: run?.dispatchState || 'unknown' };
+    const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchRollbackScript(run), { signal: null });
+    if (outcome.status === 'completed' && outcome.value?.ok === true) {
+      run.dispatchState = outcome.value.state;
+      if (outcome.value.rolledBack === true) run.dispatchStateUnknown = false;
+      else run.dispatchStateUnknown = true;
+      return outcome.value;
+    }
+    await this.#reconcileProviderStopDispatch(run);
+    return { ok: false, rolledBack: false, state: run.dispatchState || 'unknown' };
+  }
+
+  #beginProviderStopDispatch(run) {
+    if (!run || this.currentRun !== run || run.providerStopRetired || run.requested || run.dispatchState !== 'claimed') return false;
+    run.messageDispatchStarted = true;
+    run.dispatchState = 'dispatching';
+    const startEvaluation = this.#boundedProviderStopStateEvaluation(this.#providerStopDispatchStartScript(run), {
+      signal: null,
+      timeoutMs: PROVIDER_STOP_TOKEN_RELEASE_TIMEOUT_MS
+    });
+    run.providerStopDispatchStartAttempt = startEvaluation;
+    startEvaluation.catch(() => {});
+    return true;
   }
 
   async #completeProviderStopDispatch(run) {
@@ -691,6 +836,7 @@ export class ChatGPTController {
     const attempt = (async () => {
       const outcome = await this.#boundedProviderStopStateEvaluation(this.#providerStopStopScript(run), { signal: null });
       if (outcome.status !== 'completed' || outcome.value?.ok !== true) {
+        if (outcome.status === 'timeout' || outcome.status === 'failed') this.#scheduleProviderStopStopCancellation(run);
         run.dispatchStateUnknown = true;
         return { ok: false, state: 'unknown', clicked: false, reason: 'provider_stop_state_unknown' };
       }
@@ -807,13 +953,13 @@ export class ChatGPTController {
       result.sequence === expectedSequence &&
       Number.isSafeInteger(result.retiredSequence) &&
       result.retiredSequence < expectedSequence &&
-      ['pending', 'dispatching', 'dispatched'].includes(result.dispatchState)
+      ['pending', 'claimed', 'dispatching', 'dispatched'].includes(result.dispatchState)
     ) return result;
     const error = new Error('provider_stop_token_not_active');
     error.data = {
       phase: 'dispatch',
       status: outcome.status,
-      dispatchState: ['pending', 'dispatching', 'dispatched', 'cancelled'].includes(result?.dispatchState) ? result.dispatchState : 'unknown'
+      dispatchState: ['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled'].includes(result?.dispatchState) ? result.dispatchState : 'unknown'
     };
     throw error;
   }
@@ -1651,10 +1797,10 @@ export class ChatGPTController {
         providerStopRetiredSequence < ${dispatchSequence};
       const canClaimDispatch = exactProviderStopState && (
         providerStopDispatchState === 'pending' ||
-        (${allowRetry ? 'true' : 'false'} && ['dispatching', 'dispatched'].includes(providerStopDispatchState))
+        (${allowRetry ? 'true' : 'false'} && ['claimed', 'dispatching', 'dispatched'].includes(providerStopDispatchState))
       );
       if (!canClaimDispatch) return { attempted: false, providerStopDispatchUnavailable: true, dispatchState: exactProviderStopState ? providerStopDispatchState || 'unknown' : 'mismatch', lastFallbackResult: 'provider_stop_token_not_active' };
-      const claimedFromPending = providerStopDispatchState === 'pending';
+      const claimedFromPending = ['pending', 'claimed'].includes(providerStopDispatchState);
       globalThis.__agentifyProviderStopState = {
         ...providerStopState,
         dispatch: { generation: ${dispatchGeneration}, sequence: ${dispatchSequence}, state: 'dispatching' }
@@ -1673,7 +1819,7 @@ export class ChatGPTController {
         if (claimedFromPending) {
           globalThis.__agentifyProviderStopState = {
             ...globalThis.__agentifyProviderStopState,
-            dispatch: { generation: ${dispatchGeneration}, sequence: ${dispatchSequence}, state: 'pending' }
+            dispatch: { generation: ${dispatchGeneration}, sequence: ${dispatchSequence}, state: providerStopDispatchState === 'claimed' ? 'claimed' : 'pending' }
           };
         }
         return actionResult;
@@ -1916,7 +2062,9 @@ export class ChatGPTController {
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy, {
         onBeforeMouseDownAsync: () => this.#claimProviderStopDispatch(this.currentRun),
-        onBeforeMouseDown: () => this.#throwIfStopRequested()
+        onBeforeMouseDown: () => {
+          if (!this.#beginProviderStopDispatch(this.currentRun)) throw this.#providerStopDispatchError('dispatch');
+        }
       });
       coordinateClickAttempted = true;
       await this.#completeProviderStopDispatch(this.currentRun);
@@ -2091,6 +2239,7 @@ export class ChatGPTController {
         await this.#claimProviderStopDispatch(this.currentRun, { allowRetry: true });
         this.#throwIfStopRequested();
         try {
+          if (!this.#beginProviderStopDispatch(this.currentRun)) throw this.#providerStopDispatchError('dispatch');
           await this.#sendKey(key, { modifiers });
           await this.#completeProviderStopDispatch(this.currentRun);
         } catch (error) {

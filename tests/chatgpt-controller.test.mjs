@@ -56,19 +56,31 @@ function basicEvaluation(js) {
 
 function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   const defaultStopTokenEvaluation = (js) => {
-    if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
-    const epoch = Number(/const (?:epoch|expectedEpoch) = ([0-9]+)/u.exec(js)?.[1] || 0);
+    if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
+    const generation = Number(/const (?:generation|expectedGeneration) = ([0-9]+)/u.exec(js)?.[1] || 0);
+    const sequence = Number(/const (?:sequence|expectedSequence) = ([0-9]+)/u.exec(js)?.[1] || 0);
     if (js.includes('agentifyStopTokenActivation')) {
       const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-      return { ok: true, applied: true, epoch, token };
+      return { ok: true, applied: true, generation, sequence, token };
     }
-    if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, epoch, retiredEpoch: 0 };
+    if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, generation, sequence, retiredSequence: 0, dispatchState: 'pending' };
+    if (js.includes('agentifyStopTokenDispatchClaim')) return { ok: true, claimed: true, state: 'dispatching' };
+    if (js.includes('agentifyStopTokenDispatchComplete')) return { ok: true, state: 'dispatched' };
+    if (js.includes('agentifyStopTokenDispatchRead')) return { ok: true, state: 'dispatching' };
     return { ok: true };
   };
   return {
     async navigate() {},
     async evaluate(js) {
-      if (js.includes('agentifyStopTokenLifecycle') || js.includes('agentifyStopTokenStateRead') || js.includes('agentifyStopTokenDispatchCheck')) {
+      if (js.includes('agentifyStopTokenStop')) {
+        const customStop = await onStopTokenEvaluate?.(js);
+        if (customStop !== undefined) return customStop;
+        const fallbackStop = await onEvaluate(js);
+        if (fallbackStop === true) return { ok: true, state: 'dispatched', clicked: true, reason: 'provider_stop_clicked' };
+        if (fallbackStop === false) return { ok: true, state: 'cancelled', cancelled: true, clicked: false };
+        return fallbackStop;
+      }
+      if (js.includes('agentifyStopTokenLifecycle') || js.includes('agentifyStopTokenStateRead') || js.includes('agentifyStopTokenDispatchCheck') || js.includes('agentifyStopTokenDispatchClaim') || js.includes('agentifyStopTokenDispatchComplete') || js.includes('agentifyStopTokenDispatchRead')) {
         return await onStopTokenEvaluate?.(js) ?? defaultStopTokenEvaluation(js);
       }
       const basicOverride = await onBasicEvaluate?.(js);
@@ -2170,7 +2182,7 @@ async function evaluateCleanupScript(js, dom) {
   });
 }
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null }) {
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null, onEvaluateExtra = null }) {
   let cleanupScript = '';
   const page = createPage({
     events,
@@ -2180,6 +2192,8 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
     onInsertText,
     onStopTokenEvaluate,
     onEvaluate: async (js) => {
+      const extra = await onEvaluateExtra?.(js);
+      if (extra !== undefined) return extra;
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
       if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'cleanup-answer', txt: 'cleanup-answer' });
@@ -2202,6 +2216,118 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
     }
   });
   return { page, cleanupScript: () => cleanupScript };
+}
+
+function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic', actionGate = null, claimGate = null, onActionStarted = null, onClaimStarted = null, actionError = null, cleanupResult = null, markDispatchingBeforeActionGate = false }) {
+  let browserState = { generation: 0, sequence: 0, token: null, stopRequested: false, retiredSequence: 0, dispatch: null };
+  let actionCount = 0;
+  let providerStopCount = 0;
+  const parseLifecycle = (js) => ({
+    generation: Number(/(?:const generation = |dispatch: \{ generation: )([0-9]+)/u.exec(js)?.[1] || 0),
+    sequence: Number(/(?:const sequence = |sequence: )([0-9]+)/u.exec(js)?.[1] || 0),
+    token: JSON.parse((/(?:const token = |state\?\.token === )("[0-9a-f]+")/u.exec(js)?.[1]) || 'null')
+  });
+  const parseExpected = (js) => ({
+    generation: Number(/const expectedGeneration = ([0-9]+)/u.exec(js)?.[1] || 0),
+    sequence: Number(/const expectedSequence = ([0-9]+)/u.exec(js)?.[1] || 0),
+    token: JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null')
+  });
+  const exact = ({ generation, sequence, token }) => browserState.generation === generation && browserState.sequence === sequence && browserState.token === token;
+  const pageResult = { actionCount: () => actionCount, providerStopCount: () => providerStopCount, state: () => browserState };
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult,
+    recordSendEvaluation: false,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStop')) {
+        const expected = parseExpected(js);
+        if (!exact(expected) || browserState.stopRequested) return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        if (browserState.dispatch?.state === 'pending') {
+          browserState = { ...browserState, stopRequested: true, retiredSequence: expected.sequence, dispatch: { generation: expected.generation, sequence: expected.sequence, state: 'cancelled' } };
+          return { ok: true, state: 'cancelled', cancelled: true, clicked: false };
+        }
+        if (!['dispatching', 'dispatched'].includes(browserState.dispatch?.state)) return { ok: true, state: 'mismatch', clicked: false };
+        browserState = { ...browserState, stopRequested: true };
+        providerStopCount += 1;
+        return { ok: true, state: browserState.dispatch.state, clicked: true, reason: 'provider_stop_clicked' };
+      }
+      if (js.includes('agentifyStopTokenStateRead')) return {
+        ok: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || null
+      };
+      if (js.includes('agentifyStopTokenActivation')) {
+        const lifecycle = parseLifecycle(js);
+        browserState = { generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token, stopRequested: false, retiredSequence: 0, dispatch: { generation: lifecycle.generation, sequence: lifecycle.sequence, state: 'pending' } };
+        return { ok: true, applied: true, generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token };
+      }
+      if (js.includes('agentifyStopTokenDispatchCheck')) {
+        const expected = parseExpected(js);
+        return {
+          ok: true,
+          active: exact(expected) && !browserState.stopRequested && browserState.retiredSequence < expected.sequence && ['pending', 'dispatching', 'dispatched'].includes(browserState.dispatch?.state),
+          generation: browserState.generation,
+          sequence: browserState.sequence,
+          retiredSequence: browserState.retiredSequence,
+          dispatchState: browserState.dispatch?.state || 'unknown'
+        };
+      }
+      if (js.includes('agentifyStopTokenDispatchClaim')) {
+        onClaimStarted?.();
+        if (claimGate) await claimGate;
+        const expected = parseExpected(js);
+        if (!exact(expected) || browserState.stopRequested || browserState.retiredSequence >= expected.sequence) return { ok: true, claimed: false, state: browserState.dispatch?.state || 'mismatch' };
+        browserState = { ...browserState, dispatch: { generation: expected.generation, sequence: expected.sequence, state: 'dispatching' } };
+        return { ok: true, claimed: true, state: 'dispatching' };
+      }
+      if (js.includes('agentifyStopTokenDispatchComplete')) {
+        const lifecycle = parseLifecycle(js);
+        if (exact(lifecycle) && !browserState.stopRequested && browserState.dispatch?.state === 'dispatching') {
+          browserState = { ...browserState, dispatch: { generation: lifecycle.generation, sequence: lifecycle.sequence, state: 'dispatched' } };
+          return { ok: true, state: 'dispatched' };
+        }
+        return { ok: true, state: exact(lifecycle) ? browserState.dispatch?.state || 'unknown' : 'mismatch' };
+      }
+      if (js.includes('agentifyStopTokenDispatchRead')) return {
+        ok: true,
+        state: exact(parseLifecycle(js)) && ['pending', 'dispatching', 'dispatched', 'cancelled'].includes(browserState.dispatch?.state) ? browserState.dispatch.state : 'mismatch'
+      };
+      if (js.includes('agentifyStopTokenRelease')) {
+        const lifecycle = parseLifecycle(js);
+        if (exact(lifecycle)) browserState = { ...browserState, token: null, retiredSequence: Math.max(browserState.retiredSequence, lifecycle.sequence), dispatch: { generation: lifecycle.generation, sequence: lifecycle.sequence, state: ['dispatching', 'dispatched'].includes(browserState.dispatch?.state) ? browserState.dispatch.state : 'cancelled' } };
+      }
+      return { ok: true };
+    },
+    onEvaluateExtra: async (js) => {
+      if (js.includes('const agentifyStopTokenDispatchAction')) {
+        if (actionMode === 'none') return { attempted: false, state: 'pending' };
+        if ((actionMode === 'dom') !== js.includes('clickFallbackBaselineText')) return { attempted: false, state: 'pending' };
+        if (markDispatchingBeforeActionGate && actionError) {
+          actionCount += 1;
+          browserState = { ...browserState, dispatch: { generation: browserState.generation, sequence: browserState.sequence, state: 'dispatched' } };
+          await onActionStarted?.();
+          if (actionGate) await actionGate;
+          throw actionError;
+        }
+        if (markDispatchingBeforeActionGate) browserState = { ...browserState, dispatch: { generation: browserState.generation, sequence: browserState.sequence, state: 'dispatching' } };
+        await onActionStarted?.();
+        if (actionGate) await actionGate;
+        if (browserState.stopRequested) return { attempted: false, providerStopDispatchUnavailable: true, dispatchState: browserState.dispatch?.state || 'cancelled', state: browserState.dispatch?.state || 'cancelled' };
+        actionCount += 1;
+        browserState = { ...browserState, dispatch: { generation: browserState.generation, sequence: browserState.sequence, state: 'dispatched' } };
+        if (actionError) throw actionError;
+        return { attempted: true, dispatchClaimed: true, dispatchState: 'dispatched' };
+      }
+      if (isClickSendEvaluation(js)) return sendResult;
+      if (js.includes('normalStopVisible')) return { isChatGPT: true, userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'pending dispatch', activePromptTextDigest: userTurnDigestForTest('pending dispatch'), activePromptTextLength: 17, hasNormalSend: false, normalStopVisible: false };
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: false, promptLen: 1 };
+      return undefined;
+    }
+  });
+  return { page, ...pageResult };
 }
 
 test('chatgpt-controller: attachment timeout clears the unsent draft without adding a user turn', async () => {
@@ -2536,7 +2662,7 @@ test('chatgpt-controller: requestStop protects foreign and manual runs from prov
 test('chatgpt-controller: a retired provider stop cannot click after a held page evaluation resumes', async () => {
   const events = [];
   const providerStopToken = 'a'.repeat(64);
-  let browserState = { epoch: 1, token: providerStopToken, retiredEpoch: 0 };
+  let browserState = { generation: 1, sequence: 1, token: providerStopToken, retiredSequence: 0, dispatch: { generation: 1, sequence: 1, state: 'dispatched' } };
   let providerStopClicks = 0;
   let stopEvaluationStarted;
   const stopStarted = new Promise((resolve) => { stopEvaluationStarted = resolve; });
@@ -2546,34 +2672,36 @@ test('chatgpt-controller: a retired provider stop cannot click after a held page
     events,
     onStopTokenEvaluate: async (js) => {
       const tokenMatch = /const token = ("[0-9a-f]+")/u.exec(js);
-      const epochMatch = /const epoch = ([0-9]+)/u.exec(js);
+      const generationMatch = /const generation = ([0-9]+)/u.exec(js);
+      const sequenceMatch = /const sequence = ([0-9]+)/u.exec(js);
       const token = tokenMatch ? JSON.parse(tokenMatch[1]) : null;
-      const epoch = epochMatch ? Number(epochMatch[1]) : 0;
+      const generation = generationMatch ? Number(generationMatch[1]) : 0;
+      const sequence = sequenceMatch ? Number(sequenceMatch[1]) : 0;
       if (js.includes('agentifyStopTokenRelease')) {
-        browserState = {
-          ...browserState,
-          retiredEpoch: Math.max(browserState.retiredEpoch, epoch),
-          token: browserState.epoch === epoch && browserState.token === token ? null : browserState.token
-        };
+        if (browserState.generation === generation && browserState.sequence === sequence && browserState.token === token) {
+          browserState = { ...browserState, retiredSequence: Math.max(browserState.retiredSequence, sequence), token: null };
+        }
+      }
+      if (js.includes('agentifyStopTokenStop')) {
+        stopEvaluationStarted();
+        await release;
+        if (browserState.generation !== generation || browserState.sequence !== sequence || browserState.token !== token) {
+          return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        }
+        providerStopClicks += 1;
+        return { ok: true, state: 'dispatched', clicked: true, reason: 'provider_stop_clicked' };
       }
       return { ok: true };
     },
     onEvaluate: async (js) => {
-      if (js.includes('const expectedToken')) {
-        const epoch = Number(/const expectedEpoch = ([0-9]+)/u.exec(js)[1]);
-        const token = JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)[1]);
-        stopEvaluationStarted();
-        await release;
-        if (browserState.epoch !== epoch || browserState.token !== token) return { clicked: false, reason: 'provider_stop_token_mismatch' };
-        providerStopClicks += 1;
-        return { clicked: true, reason: 'provider_stop_clicked' };
-      }
       throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     }
   });
   const controller = createController(page);
   const run = {
     operationId: 'operation-a',
+    providerStopGeneration: 1,
+    providerStopSequence: 1,
     providerStopEpoch: 1,
     providerStopToken,
     providerStopRetired: false,
@@ -2604,7 +2732,7 @@ test('chatgpt-controller: activation abort is bounded and never types the prompt
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
       if (js.includes('agentifyStopTokenActivation')) {
         activationStartedResolve();
         return await new Promise(() => {});
@@ -2635,7 +2763,7 @@ test('chatgpt-controller: activation timeout returns an explicit bounded error',
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
       if (js.includes('agentifyStopTokenActivation')) {
         activationStartedResolve();
         return await new Promise(() => {});
@@ -2657,9 +2785,9 @@ test('chatgpt-controller: activation timeout returns an explicit bounded error',
   assert.equal(controller.providerStopOwner, null);
 });
 
-test('chatgpt-controller: late activation cannot overwrite a newer epoch token', async () => {
+test('chatgpt-controller: late activation cannot overwrite a newer generation fence', async () => {
   const events = [];
-  let browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+  let browserState = { generation: 0, sequence: 0, token: null, retiredSequence: 0, dispatch: null };
   let aActivationStartedResolve;
   const aActivationStarted = new Promise((resolve) => { aActivationStartedResolve = resolve; });
   let releaseAActivation;
@@ -2671,39 +2799,53 @@ test('chatgpt-controller: late activation cannot overwrite a newer epoch token',
   let releaseBActivation;
   const bActivationRelease = new Promise((resolve) => { releaseBActivation = resolve; });
   const parseLifecycle = (js) => ({
-    epoch: Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0),
+    generation: Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0),
+    sequence: Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0),
     token: JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || '""')
   });
-  const applyActivation = ({ epoch, token }) => {
-    if (browserState.epoch > epoch || browserState.retiredEpoch >= epoch) return false;
-    browserState = { epoch, token, retiredEpoch: browserState.retiredEpoch };
+  const applyActivation = ({ generation, sequence, token }) => {
+    if (generation < browserState.generation || (generation === browserState.generation && (sequence <= browserState.sequence || browserState.retiredSequence >= sequence))) return false;
+    browserState = {
+      generation,
+      sequence,
+      token,
+      retiredSequence: generation > browserState.generation ? 0 : browserState.retiredSequence,
+      dispatch: { generation, sequence, state: 'pending' }
+    };
     return true;
   };
-  const applyRelease = ({ epoch, token }) => {
-    const current = browserState;
+  const applyRelease = ({ generation, sequence, token }) => {
+    if (browserState.generation !== generation || browserState.sequence !== sequence || browserState.token !== token) return;
     browserState = {
-      ...current,
-      retiredEpoch: Math.max(current.retiredEpoch, epoch),
-      token: current.epoch === epoch && current.token === token ? null : current.token
+      ...browserState,
+      retiredSequence: Math.max(browserState.retiredSequence, sequence),
+      token: null,
+      dispatch: { generation, sequence, state: 'cancelled' }
     };
   };
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
+      if (js.includes('agentifyStopTokenStateRead')) return {
+        ok: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || null
+      };
       const lifecycle = parseLifecycle(js);
       if (js.includes('agentifyStopTokenActivation')) {
-        if (lifecycle.epoch === 1) {
+        if (lifecycle.sequence === 1) {
           aActivationStartedResolve();
           await aActivationRelease;
           const applied = applyActivation(lifecycle);
           aActivationFinishedResolve();
-          return { ok: true, applied, epoch: lifecycle.epoch, token: lifecycle.token };
+          return { ok: true, applied, generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token };
         }
         const applied = applyActivation(lifecycle);
         bActivationStartedResolve();
         await bActivationRelease;
-        return { ok: true, applied, epoch: lifecycle.epoch, token: lifecycle.token };
+        return { ok: true, applied, generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token };
       }
       if (js.includes('agentifyStopTokenRelease')) applyRelease(lifecycle);
       return { ok: true };
@@ -2723,47 +2865,373 @@ test('chatgpt-controller: late activation cannot overwrite a newer epoch token',
   const bQuery = controller.query({ prompt: 'new activation', operationId: 'activation-b', signal: bSignal.signal, timeoutMs: 5_000 });
   await bActivationStarted;
   const bToken = browserState.token;
-  assert.equal(browserState.epoch, 2);
+  assert.ok(browserState.generation >= 1);
+  assert.equal(browserState.sequence, 2);
   assert.ok(bToken);
   releaseAActivation();
   await aActivationFinished;
-  assert.equal(browserState.epoch, 2);
+  assert.equal(browserState.sequence, 2);
   assert.equal(browserState.token, bToken);
   bSignal.abort();
   releaseBActivation();
   await assert.rejects(bQuery, /query_aborted/u);
 });
 
+test('chatgpt-controller: cross-controller same-sequence activation and release preserve the newer dispatch fence', async () => {
+  const events = [];
+  let operationTokenB = null;
+  let browserState = { generation: 0, sequence: 0, token: null, stopRequested: false, retiredSequence: 0, dispatch: null };
+  let lastActivationScript = '';
+  let aActivationStartedResolve;
+  const aActivationStarted = new Promise((resolve) => { aActivationStartedResolve = resolve; });
+  let releaseAActivation;
+  const aActivationRelease = new Promise((resolve) => { releaseAActivation = resolve; });
+  let aReleaseStartedResolve;
+  const aReleaseStarted = new Promise((resolve) => { aReleaseStartedResolve = resolve; });
+  let releaseARelease;
+  const aReleaseGate = new Promise((resolve) => { releaseARelease = resolve; });
+  let bActivationStartedResolve;
+  const bActivationStarted = new Promise((resolve) => { bActivationStartedResolve = resolve; });
+  let bReleaseStartedResolve;
+  const bReleaseStarted = new Promise((resolve) => { bReleaseStartedResolve = resolve; });
+  let releaseBRelease;
+  const bReleaseGate = new Promise((resolve) => { releaseBRelease = resolve; });
+  let bReleaseFinishedResolve;
+  const bReleaseFinished = new Promise((resolve) => { bReleaseFinishedResolve = resolve; });
+  let dispatchCount = 0;
+  let providerStopCount = 0;
+
+  const parseLifecycle = (js) => ({
+    generation: Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0),
+    sequence: Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0),
+    token: JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null')
+  });
+  const applyActivation = ({ generation, sequence, token }) => {
+    if (generation < browserState.generation || (generation === browserState.generation && (sequence <= browserState.sequence || browserState.retiredSequence >= sequence))) return false;
+    browserState = {
+      generation,
+      sequence,
+      token,
+      stopRequested: false,
+      retiredSequence: generation > browserState.generation ? 0 : browserState.retiredSequence,
+      dispatch: { generation, sequence, state: 'pending' }
+    };
+    return true;
+  };
+  const applyRelease = ({ generation, sequence, token }) => {
+    if (browserState.generation !== generation || browserState.sequence !== sequence || browserState.token !== token) return;
+    browserState = {
+      ...browserState,
+      token: null,
+      retiredSequence: Math.max(browserState.retiredSequence, sequence),
+      dispatch: { generation, sequence, state: 'cancelled' }
+    };
+  };
+
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+    recordSendEvaluation: false,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStop')) {
+        const generation = Number(/const expectedGeneration = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const sequence = Number(/const expectedSequence = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const token = JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
+        if (browserState.generation !== generation || browserState.sequence !== sequence || browserState.token !== token || browserState.stopRequested) {
+          return { ok: true, state: 'mismatch', clicked: false, reason: 'provider_stop_token_mismatch' };
+        }
+        if (browserState.dispatch?.state === 'pending') {
+          browserState = { ...browserState, stopRequested: true, retiredSequence: sequence, dispatch: { generation, sequence, state: 'cancelled' } };
+          return { ok: true, state: 'cancelled', cancelled: true, clicked: false };
+        }
+        if (!['dispatching', 'dispatched'].includes(browserState.dispatch?.state)) return { ok: true, state: 'mismatch', clicked: false };
+        browserState = { ...browserState, stopRequested: true };
+        providerStopCount += 1;
+        return { ok: true, state: browserState.dispatch.state, clicked: true, reason: 'provider_stop_clicked' };
+      }
+      if (js.includes('agentifyStopTokenStateRead')) return {
+        ok: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || null
+      };
+      const lifecycle = parseLifecycle(js);
+      if (js.includes('agentifyStopTokenActivation')) {
+        lastActivationScript = js;
+        if (lifecycle.generation === 101 && !operationTokenB) operationTokenB = lifecycle.token;
+        if (lifecycle.generation === 100) {
+          aActivationStartedResolve();
+          await aActivationRelease;
+        }
+        const applied = applyActivation(lifecycle);
+        if (lifecycle.generation === 100) return { ok: true, applied, generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token };
+        bActivationStartedResolve();
+        return { ok: true, applied, generation: lifecycle.generation, sequence: lifecycle.sequence, token: lifecycle.token };
+      }
+      if (js.includes('agentifyStopTokenRelease')) {
+        if (lifecycle.generation === 100) {
+          aReleaseStartedResolve();
+          await aReleaseGate;
+        }
+        if (lifecycle.generation === 101) {
+          bReleaseStartedResolve();
+          await bReleaseGate;
+        }
+        applyRelease(lifecycle);
+        if (lifecycle.generation === 101) bReleaseFinishedResolve();
+      }
+      if (js.includes('agentifyStopTokenDispatchCheck')) return {
+        ok: true,
+        active: browserState.generation === Number(/const expectedGeneration = ([0-9]+)/u.exec(js)?.[1] || 0) && browserState.sequence === Number(/const expectedSequence = ([0-9]+)/u.exec(js)?.[1] || 0) && browserState.token === JSON.parse(/const expectedToken = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null') && !browserState.stopRequested,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || 'unknown'
+      };
+      return { ok: true };
+    },
+    onEvaluateExtra: async (js) => {
+      if (js.includes('const agentifyStopTokenDispatchAction')) {
+        dispatchCount += 1;
+        browserState = { ...browserState, dispatch: { generation: browserState.generation, sequence: browserState.sequence, state: 'dispatched' } };
+        return { attempted: true, dispatchClaimed: true, dispatchState: 'dispatched' };
+      }
+      if (isClickSendEvaluation(js)) return {
+        ok: true,
+        isChatGPT: true,
+        fallbackEnter: true,
+        host: 'chatgpt.com',
+        sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'cross-controller', activePromptTextDigest: userTurnDigestForTest('cross-controller'), activePromptTextLength: 17 }
+      };
+      if (js.includes('normalStopVisible')) return { isChatGPT: true, userCount: 1, lastUserId: 'new-turn', lastUserTextDigest: userTurnDigestForTest('cross-controller'), activePromptText: '', activePromptTextDigest: userTurnDigestForTest(''), activePromptTextLength: 0, hasNormalSend: false, normalStopVisible: true };
+      return undefined;
+    }
+  });
+
+  const controllerA = createController(page);
+  controllerA.providerStopGeneration = 100;
+  controllerA.providerStopSequence = 20;
+  const aSignal = new AbortController();
+  const aQuery = controllerA.query({ prompt: 'old controller', operationId: 'cross-a', signal: aSignal.signal, timeoutMs: 5_000 });
+  await aActivationStarted;
+  aSignal.abort();
+  await assert.rejects(aQuery, /query_aborted/u);
+
+  const controllerB = createController(page);
+  controllerB.providerStopGeneration = 101;
+  controllerB.providerStopSequence = 20;
+  const bQuery = controllerB.send({ text: 'cross-controller', operationId: 'cross-b', stopAfterSend: true, timeoutMs: 5_000 });
+  await bActivationStarted;
+  assert.equal(browserState.generation, 101);
+  assert.equal(browserState.sequence, 21);
+  assert.equal(browserState.token, operationTokenB);
+
+  const collisionToken = 'c'.repeat(64);
+  const collisionScript = lastActivationScript.replace(/const token = "[0-9a-f]+"/u, `const token = ${JSON.stringify(collisionToken)}`);
+  const collisionContext = {
+    globalThis: {
+      __agentifyProviderStopState: structuredClone(browserState)
+    }
+  };
+  const collision = vm.runInNewContext(collisionScript, collisionContext);
+  assert.equal(collision.applied, false);
+  assert.equal(browserState.token, operationTokenB);
+  assert.equal(collisionContext.globalThis.__agentifyProviderStopState.token, operationTokenB);
+
+  releaseAActivation();
+  assert.equal(browserState.generation, 101);
+  await aReleaseStarted;
+  releaseARelease();
+  await bQuery;
+  assert.equal(dispatchCount, 1);
+  assert.equal(providerStopCount, 1);
+  assert.equal(browserState.generation, 101);
+  assert.equal(browserState.sequence, 21);
+  assert.equal(browserState.token, operationTokenB);
+  await bReleaseStarted;
+  releaseBRelease();
+  await bReleaseFinished;
+  assert.equal(browserState.token, null);
+});
+
+test('chatgpt-controller: stop during a DOM click fallback prevents the retry and stops only the exact dispatch', async () => {
+  const events = [];
+  let actionStartedResolve;
+  const actionStarted = new Promise((resolve) => { actionStartedResolve = resolve; });
+  let releaseAction;
+  const actionGate = new Promise((resolve) => { releaseAction = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionMode: 'dom',
+    actionGate,
+    onActionStarted: actionStartedResolve,
+    sendResult: {
+      ok: true,
+      isChatGPT: true,
+      fallbackEnter: false,
+      host: 'chatgpt.com',
+      rect: { x: 90, y: 10, w: 20, h: 20 },
+      sendBaseline: {
+        userCount: 0,
+        lastUserId: '',
+        lastUserTextDigest: userTurnDigestForTest(''),
+        activePromptText: 'dom fallback race',
+        activePromptTextDigest: userTurnDigestForTest('dom fallback race'),
+        activePromptTextLength: 17
+      }
+    },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'dom fallback race', timeoutMs: 5_000 });
+  await actionStarted;
+  const stop = await controller.requestStop();
+  assert.equal(stop.clicked, true);
+  assert.equal(harness.providerStopCount(), 1);
+  releaseAction();
+  await assert.rejects(sendPromise, /provider_stop_token_not_active/u);
+  assert.equal(harness.actionCount(), 0);
+  assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: stop while requestSubmit dispatch is pending cancels without sending and cleans the draft', async () => {
+  const events = [];
+  let actionStartedResolve;
+  const actionStarted = new Promise((resolve) => { actionStartedResolve = resolve; });
+  let releaseAction;
+  const actionGate = new Promise((resolve) => { releaseAction = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionGate,
+    onActionStarted: actionStartedResolve,
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: true, host: 'chatgpt.com', sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'request submit race', activePromptTextDigest: userTurnDigestForTest('request submit race'), activePromptTextLength: 19 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'request submit race', timeoutMs: 5_000 });
+  await actionStarted;
+  const stop = await controller.requestStop();
+  assert.equal(stop.reason, 'before_dispatch');
+  assert.equal(stop.clicked, false);
+  assert.equal(harness.providerStopCount(), 0);
+  releaseAction();
+  await assert.rejects(sendPromise, /provider_stop_token_not_active/u);
+  assert.equal(harness.actionCount(), 0);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: stop while the keyboard fallback claim is pending sends no key and cleans the draft', async () => {
+  const events = [];
+  let claimStartedResolve;
+  const claimStarted = new Promise((resolve) => { claimStartedResolve = resolve; });
+  let releaseClaim;
+  const claimGate = new Promise((resolve) => { releaseClaim = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionMode: 'none',
+    claimGate,
+    onClaimStarted: claimStartedResolve,
+    sendResult: { ok: true, isChatGPT: false, fallbackEnter: true, host: 'example.com' },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'keyboard race', timeoutMs: 5_000 });
+  await claimStarted;
+  const stop = await controller.requestStop();
+  assert.equal(stop.reason, 'before_dispatch');
+  assert.equal(stop.clicked, false);
+  releaseClaim();
+  await assert.rejects(sendPromise, /provider_stop_token_not_active/u);
+  assert.equal(events.some((event) => event === 'key:Enter'), false);
+  assert.equal(harness.actionCount(), 0);
+  assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+});
+
+test('chatgpt-controller: dispatch response loss preserves the sent state and exact stop remains available', async () => {
+  const events = [];
+  let actionStartedResolve;
+  const actionStarted = new Promise((resolve) => { actionStartedResolve = resolve; });
+  let releaseAction;
+  const actionGate = new Promise((resolve) => { releaseAction = resolve; });
+  const harness = createDispatchRaceHarness({
+    events,
+    actionGate,
+    onActionStarted: actionStartedResolve,
+    actionError: new Error('dispatch_response_lost'),
+    markDispatchingBeforeActionGate: true,
+    sendResult: { ok: true, isChatGPT: true, fallbackEnter: true, host: 'chatgpt.com', sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'response loss', activePromptTextDigest: userTurnDigestForTest('response loss'), activePromptTextLength: 13 } },
+    cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 }
+  });
+  const controller = createController(harness.page);
+  const sendPromise = controller.send({ text: 'response loss', timeoutMs: 5_000 });
+  await actionStarted;
+  const stop = await controller.requestStop();
+  assert.equal(stop.clicked, true);
+  assert.equal(harness.providerStopCount(), 1);
+  releaseAction();
+  await assert.rejects(sendPromise, /dispatch_response_lost/u);
+  assert.equal(harness.actionCount(), 1);
+  assert.equal(events.includes('cleanup-draft'), false);
+});
+
 test('chatgpt-controller: activation follows ready after navigation state wipe and stopAfterSend uses the exact active token', async () => {
   const events = [];
-  let browserState = { epoch: 4, token: 'old-token', retiredEpoch: 0 };
-  let activationEpoch = null;
+  let browserState = { generation: 4, sequence: 4, token: 'old-token', retiredSequence: 0, dispatch: null };
+  let activationGeneration = null;
+  let activationSequence = null;
   let activationToken = null;
   const page = createPage({
     events,
     onBasicEvaluate: async (js) => {
       if (js.includes('const hasTurnstile')) {
         events.push('ready');
-        browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+        browserState = { generation: 0, sequence: 0, token: null, retiredSequence: 0, dispatch: null };
       }
       if (js.includes('missing_prompt_textarea')) events.push('prompt-ready');
     },
     onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenStop')) {
+        events.push('exact-stop');
+        return { ok: true, state: 'dispatched', clicked: true, reason: 'provider_stop_clicked' };
+      }
       if (js.includes('agentifyStopTokenStateRead')) {
         events.push('state-read');
-        return { ok: true, epoch: browserState.epoch };
+        return {
+          ok: true,
+          generation: browserState.generation,
+          sequence: browserState.sequence,
+          retiredSequence: browserState.retiredSequence,
+          dispatchState: browserState.dispatch?.state || null
+        };
       }
       if (js.includes('agentifyStopTokenActivation')) {
-        activationEpoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        activationGeneration = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        activationSequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
         activationToken = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-        browserState = { epoch: activationEpoch, token: activationToken, retiredEpoch: 0 };
+        browserState = {
+          generation: activationGeneration,
+          sequence: activationSequence,
+          token: activationToken,
+          retiredSequence: 0,
+          dispatch: { generation: activationGeneration, sequence: activationSequence, state: 'pending' }
+        };
         events.push('activation');
-        return { ok: true, applied: true, epoch: activationEpoch, token: activationToken };
+        return { ok: true, applied: true, generation: activationGeneration, sequence: activationSequence, token: activationToken };
       }
       if (js.includes('agentifyStopTokenDispatchCheck')) {
         events.push('dispatch-check');
-        const expectedEpoch = Number(/const expectedEpoch = ([0-9]+)/u.exec(js)?.[1] || 0);
-        return { ok: true, active: browserState.epoch === expectedEpoch && browserState.token === activationToken, epoch: browserState.epoch, retiredEpoch: browserState.retiredEpoch };
+        const expectedGeneration = Number(/const expectedGeneration = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const expectedSequence = Number(/const expectedSequence = ([0-9]+)/u.exec(js)?.[1] || 0);
+        return {
+          ok: true,
+          active: browserState.generation === expectedGeneration && browserState.sequence === expectedSequence && browserState.token === activationToken,
+          generation: browserState.generation,
+          sequence: browserState.sequence,
+          retiredSequence: browserState.retiredSequence,
+          dispatchState: browserState.dispatch?.state || null
+        };
       }
       return { ok: true };
     },
@@ -2785,7 +3253,8 @@ test('chatgpt-controller: activation follows ready after navigation state wipe a
   const result = await createController(page).send({ text: 'after navigation', timeoutMs: 5_000, stopAfterSend: true });
 
   assert.deepEqual(result, { ok: true });
-  assert.ok(activationEpoch >= 1);
+  assert.ok(activationGeneration >= 1);
+  assert.ok(activationSequence >= 1);
   assert.equal(activationToken?.length, 64);
   assert.ok(events.indexOf('ready') < events.indexOf('state-read'));
   assert.ok(events.indexOf('state-read') < events.indexOf('activation'));
@@ -2797,7 +3266,7 @@ test('chatgpt-controller: activation follows ready after navigation state wipe a
 test('chatgpt-controller: state wipe after prompt typing blocks every send dispatch and cleans the unsent draft', async () => {
   const events = [];
   const dom = createCleanupDom({ events, promptText: 'typed but unsent' });
-  let browserState = { epoch: 0, token: null, retiredEpoch: 0 };
+  let browserState = { generation: 0, sequence: 0, token: null, retiredSequence: 0, dispatch: null };
   const { page } = createAttachmentCleanupPage({
     events,
     attachmentState: attachmentCardSnapshot([]),
@@ -2805,17 +3274,33 @@ test('chatgpt-controller: state wipe after prompt typing blocks every send dispa
     recordSendEvaluation: false,
     cleanupDom: dom,
     onInsertText: async () => {
-      browserState = { epoch: 1, token: null, retiredEpoch: 1 };
+      browserState = { generation: 1, sequence: 1, token: null, retiredSequence: 1, dispatch: { generation: 1, sequence: 1, state: 'cancelled' } };
     },
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
+      if (js.includes('agentifyStopTokenStateRead')) return {
+        ok: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || null
+      };
+      if (js.includes('agentifyStopTokenDispatchClaim')) return { ok: true, claimed: false, state: 'mismatch' };
+      if (js.includes('agentifyStopTokenDispatchRead')) return { ok: true, state: 'mismatch' };
       if (js.includes('agentifyStopTokenActivation')) {
-        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const generation = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const sequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
         const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-        browserState = { epoch, token, retiredEpoch: 0 };
-        return { ok: true, applied: true, epoch, token };
+        browserState = { generation, sequence, token, retiredSequence: 0, dispatch: { generation, sequence, state: 'pending' } };
+        return { ok: true, applied: true, generation, sequence, token };
       }
-      if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: false, epoch: browserState.epoch, retiredEpoch: browserState.retiredEpoch };
+      if (js.includes('agentifyStopTokenDispatchCheck')) return {
+        ok: true,
+        active: false,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || 'cancelled'
+      };
       return { ok: true };
     }
   });
@@ -2836,11 +3321,12 @@ test('chatgpt-controller: applied false activation blocks prompt typing without 
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 0 };
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
       if (js.includes('agentifyStopTokenActivation')) {
-        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const generation = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const sequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
         const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-        return { ok: true, applied: false, epoch, token };
+        return { ok: true, applied: false, generation, sequence, token };
       }
       return { ok: true };
     },
@@ -2856,15 +3342,17 @@ test('chatgpt-controller: applied false activation blocks prompt typing without 
   assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
 });
 
-test('chatgpt-controller: stale browser epoch activation blocks the operation before typing', async () => {
+test('chatgpt-controller: stale browser generation activation blocks the operation before typing', async () => {
   const events = [];
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: 20 };
+      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 20, sequence: 20, retiredSequence: 20, dispatchState: 'cancelled' };
       if (js.includes('agentifyStopTokenActivation')) {
         const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-        return { ok: true, applied: false, epoch: 22, token };
+        const generation = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const sequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
+        return { ok: true, applied: false, generation, sequence, token };
       }
       return { ok: true };
     },
@@ -2900,21 +3388,42 @@ test('chatgpt-controller: browser stop state read failure blocks the operation b
   assert.deepEqual(events.filter((event) => event.startsWith('text:')), []);
 });
 
-test('chatgpt-controller: recreated controller starts above the existing browser epoch', async () => {
+test('chatgpt-controller: recreated controller starts with a newer generation fence', async () => {
   const events = [];
-  let browserState = { epoch: 20, token: null, retiredEpoch: 0 };
-  let firstOperationEpoch = null;
+  let browserState = { generation: 20, sequence: 20, token: null, retiredSequence: 20, dispatch: { generation: 20, sequence: 20, state: 'cancelled' } };
+  let firstOperationGeneration = null;
+  let firstOperationSequence = null;
   const page = createPage({
     events,
     onStopTokenEvaluate: async (js) => {
-      if (js.includes('agentifyStopTokenStateRead')) return { ok: true, epoch: browserState.epoch };
+      if (js.includes('agentifyStopTokenStateRead')) return {
+        ok: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || null
+      };
       if (js.includes('agentifyStopTokenActivation')) {
-        firstOperationEpoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        firstOperationGeneration = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        firstOperationSequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
         const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || 'null');
-        browserState = { epoch: firstOperationEpoch, token, retiredEpoch: 0 };
-        return { ok: true, applied: true, epoch: firstOperationEpoch, token };
+        browserState = {
+          generation: firstOperationGeneration,
+          sequence: firstOperationSequence,
+          token,
+          retiredSequence: 0,
+          dispatch: { generation: firstOperationGeneration, sequence: firstOperationSequence, state: 'pending' }
+        };
+        return { ok: true, applied: true, generation: firstOperationGeneration, sequence: firstOperationSequence, token };
       }
-      if (js.includes('agentifyStopTokenDispatchCheck')) return { ok: true, active: true, epoch: browserState.epoch, retiredEpoch: 0 };
+      if (js.includes('agentifyStopTokenDispatchCheck')) return {
+        ok: true,
+        active: true,
+        generation: browserState.generation,
+        sequence: browserState.sequence,
+        retiredSequence: browserState.retiredSequence,
+        dispatchState: browserState.dispatch?.state || 'pending'
+      };
       return { ok: true };
     },
     onEvaluate: async (js) => {
@@ -2928,15 +3437,23 @@ test('chatgpt-controller: recreated controller starts above the existing browser
   const result = await createController(page).send({ text: 'after recreation', timeoutMs: 5_000 });
 
   assert.deepEqual(result, { ok: true });
-  assert.ok(Number.isSafeInteger(firstOperationEpoch));
-  assert.ok(firstOperationEpoch >= 21);
+  assert.ok(Number.isSafeInteger(firstOperationGeneration));
+  assert.ok(Number.isSafeInteger(firstOperationSequence));
+  assert.ok(firstOperationGeneration > 20);
+  assert.equal(firstOperationSequence, 1);
 });
 
 test('chatgpt-controller: release is non-blocking and an old release cannot clear a newer token', async () => {
   const events = [];
   const providerStopTokenA = 'a'.repeat(64);
   const providerStopTokenB = 'b'.repeat(64);
-  let browserState = { epoch: 2, token: providerStopTokenB, retiredEpoch: 0 };
+  let browserState = {
+    generation: 2,
+    sequence: 2,
+    token: providerStopTokenB,
+    retiredSequence: 0,
+    dispatch: { generation: 2, sequence: 2, state: 'dispatched' }
+  };
   let releaseStartedResolve;
   const releaseStarted = new Promise((resolve) => { releaseStartedResolve = resolve; });
   let releaseProviderState;
@@ -2947,15 +3464,19 @@ test('chatgpt-controller: release is non-blocking and an old release cannot clea
     events,
     onStopTokenEvaluate: async (js) => {
       if (js.includes('agentifyStopTokenRelease')) {
-        const epoch = Number(/const epoch = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const generation = Number(/const generation = ([0-9]+)/u.exec(js)?.[1] || 0);
+        const sequence = Number(/const sequence = ([0-9]+)/u.exec(js)?.[1] || 0);
         const token = JSON.parse(/const token = ("[0-9a-f]+")/u.exec(js)?.[1] || '""');
         releaseStartedResolve();
         await releaseGate;
-        browserState = {
-          ...browserState,
-          retiredEpoch: Math.max(browserState.retiredEpoch, epoch),
-          token: browserState.epoch === epoch && browserState.token === token ? null : browserState.token
-        };
+        if (browserState.generation === generation && browserState.sequence === sequence && browserState.token === token) {
+          browserState = {
+            ...browserState,
+            retiredSequence: Math.max(browserState.retiredSequence, sequence),
+            token: null,
+            dispatch: { generation, sequence, state: 'cancelled' }
+          };
+        }
         releaseFinishedResolve();
       }
       return { ok: true };
@@ -2967,6 +3488,8 @@ test('chatgpt-controller: release is non-blocking and an old release cannot clea
   const controller = createController(page);
   const run = {
     operationId: 'release-a',
+    providerStopGeneration: 1,
+    providerStopSequence: 1,
     providerStopEpoch: 1,
     providerStopToken: providerStopTokenA,
     providerStopRetired: false,
@@ -2983,7 +3506,8 @@ test('chatgpt-controller: release is non-blocking and an old release cannot clea
   await releaseStarted;
   releaseProviderState();
   await releaseFinished;
-  assert.equal(browserState.epoch, 2);
+  assert.equal(browserState.generation, 2);
+  assert.equal(browserState.sequence, 2);
   assert.equal(browserState.token, providerStopTokenB);
 });
 

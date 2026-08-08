@@ -1543,8 +1543,8 @@ export class ChatGPTController {
         userTurnBaseline: {
           count: userTurns.length,
           lastId: lastUserId,
-          lastTextDigest,
-          lastText
+          lastTextDigest: lastUserTextDigest,
+          lastText: lastUserText
         }
       };
       })()`);

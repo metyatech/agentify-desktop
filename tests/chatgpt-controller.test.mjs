@@ -135,6 +135,134 @@ function createController(page) {
   return new ChatGPTController({ page, selectors });
 }
 
+function createPromptExpressionContext(userTurns = []) {
+  const focused = { value: false };
+  const prompt = {
+    tagName: 'DIV',
+    id: 'prompt-textarea',
+    innerText: '',
+    isContentEditable: true,
+    disabled: false,
+    readOnly: false,
+    getAttribute(name) {
+      return name === 'id' ? this.id : name === 'contenteditable' ? 'true' : name === 'role' ? 'textbox' : null;
+    },
+    matches(selector) {
+      return selector === '[contenteditable="true"]' || selector === '[role="textbox"]' || selector === '[contenteditable="true"], [role="textbox"]';
+    },
+    getBoundingClientRect() {
+      return { x: 12, y: 640, width: 480, height: 42 };
+    },
+    focus() {
+      focused.value = true;
+    }
+  };
+  const document = {
+    querySelectorAll(selector) {
+      if (selector === '#prompt-textarea' || selector.includes('[contenteditable="true"]') || selector.includes('[role="textbox"]')) return [prompt];
+      if (selector.includes('[data-message-author-role="user"]') || selector.includes('article[data-turn="user"]')) return userTurns;
+      return [];
+    }
+  };
+  const context = {
+    document,
+    window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+    TextEncoder,
+    Uint8Array,
+    crypto: crypto.webcrypto,
+    setTimeout,
+    clearTimeout
+  };
+  context.globalThis = context;
+  return { context, focused, prompt };
+}
+
+function createUserTurnFixture({ id = '', messageId = '', text = '' } = {}) {
+  return {
+    id,
+    innerText: text,
+    getAttribute(name) {
+      if (name === 'data-message-id') return messageId;
+      if (name === 'id') return id;
+      return null;
+    }
+  };
+}
+
+async function captureActualTypePromptEvaluation(userTurns) {
+  const events = [];
+  const progress = [];
+  const { context, focused } = createPromptExpressionContext(userTurns);
+  let expression = '';
+  let evaluationResult;
+  let evaluationError = null;
+  const page = createPage({
+    events,
+    promptEvaluationOverride: async (js) => {
+      if (!js.includes('const lastUserTextDigest')) return basicEvaluation(js);
+      expression = js;
+      try {
+        const evaluated = await vm.runInNewContext(js, context);
+        evaluationResult = structuredClone(evaluated);
+        return evaluated;
+      } catch (error) {
+        evaluationError = error;
+        throw error;
+      }
+    },
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) throw new Error('test_stop_after_type_prompt');
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: false, reason: 'test_stop_after_type_prompt' };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'actual expression prompt', onProgress: (item) => progress.push(item) }),
+    (error) => error.message === 'test_stop_after_type_prompt'
+  );
+  return { context, events, progress, expression, evaluationResult, evaluationError, focused };
+}
+
+test('chatgpt-controller: executes the actual typePrompt browser expression for a user-turn baseline', async () => {
+  const lastText = '  Existing   user turn\ntext  ';
+  const result = await captureActualTypePromptEvaluation([
+    createUserTurnFixture({ id: 'user-turn-1', messageId: 'message-1', text: lastText })
+  ]);
+
+  assert.equal(result.evaluationError, null);
+  assert.equal(result.expression.includes('lastTextDigest: lastUserTextDigest'), true);
+  assert.equal(result.expression.includes('lastText: lastUserText'), true);
+  assert.equal(result.evaluationResult.ok, true);
+  assert.equal(result.evaluationResult.userTurnBaseline.count, 1);
+  assert.equal(result.evaluationResult.userTurnBaseline.lastId, 'message-1');
+  assert.equal(result.evaluationResult.userTurnBaseline.lastText, lastText);
+  assert.equal(result.evaluationResult.userTurnBaseline.lastTextDigest, userTurnDigestForTest(lastText));
+  assert.match(result.evaluationResult.userTurnBaseline.lastTextDigest, /^[0-9a-f]{64}$/u);
+  assert.equal(result.focused.value, true);
+});
+
+test('chatgpt-controller: executes the actual typePrompt browser expression with zero user turns', async () => {
+  const result = await captureActualTypePromptEvaluation([]);
+
+  assert.equal(result.evaluationError, null);
+  assert.equal(result.evaluationResult.ok, true);
+  assert.equal(result.evaluationResult.userTurnBaseline.count, 0);
+  assert.equal(result.evaluationResult.userTurnBaseline.lastId, '');
+  assert.equal(result.evaluationResult.userTurnBaseline.lastText, '');
+  assert.equal(result.evaluationResult.userTurnBaseline.lastTextDigest, userTurnDigestForTest(''));
+  assert.match(result.evaluationResult.userTurnBaseline.lastTextDigest, /^[0-9a-f]{64}$/u);
+});
+
+test('chatgpt-controller: continues to insertText after the actual typePrompt baseline evaluation', async () => {
+  const result = await captureActualTypePromptEvaluation([
+    createUserTurnFixture({ id: 'user-turn-2', text: 'Existing user turn' })
+  ]);
+
+  assert.equal(result.progress.some((item) => item?.phase === 'typing_prompt'), true);
+  assert.deepEqual(result.events.filter((event) => event.startsWith('text:')), ['text:actual expression prompt']);
+});
+
 function createProviderStopDomPage({ state, isStopVisible, onStopTokenEvaluateExtra = null }) {
   let clickCount = 0;
   let lastStopScript = '';

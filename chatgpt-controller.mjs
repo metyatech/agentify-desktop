@@ -3509,6 +3509,9 @@ export class ChatGPTController {
     let lastSnap = null;
     let lastNewChatGPTAssistant = false;
     let lastComposerIdle = false;
+    let assistantStartedAt = null;
+    let assistantStopObserved = false;
+    const identitylessAssistantGraceMs = 5_000;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
@@ -3647,10 +3650,21 @@ export class ChatGPTController {
         (snap?.count || 0) > baselineAssistantCount ||
         (baselineAssistantId && snap?.lastAssistantId && baselineAssistantId !== snap.lastAssistantId) ||
         (baselineAssistantCount === 0 && (snap?.count || 0) >= 1);
+      if (newChatGPTAssistant && assistantStartedAt == null) assistantStartedAt = Date.now();
+      if (newChatGPTAssistant && snap?.stop) assistantStopObserved = true;
       const composerIdle =
         snap?.promptTextLength === 0 &&
         (!snap?.stop || !!snap?.hasRegenerate) &&
         (!snap?.sendPresent || !!snap?.sendEnabled);
+      // A streamed ChatGPT turn without a stable DOM identity or observed stop
+      // signal is not authoritative after the short text-stability window.
+      // Give that identityless turn a bounded settling period so hydration can
+      // finish before returning a partial assistant response.
+      const assistantCompletionSignal =
+        !!snap?.lastAssistantId ||
+        assistantStopObserved ||
+        (!!snap?.sendPresent && !!snap?.sendEnabled) ||
+        (assistantStartedAt != null && Date.now() - assistantStartedAt >= identitylessAssistantGraceMs);
       lastNewChatGPTAssistant = !!newChatGPTAssistant;
       lastComposerIdle = !!composerIdle;
       const chatGPTDone =
@@ -3659,6 +3673,7 @@ export class ChatGPTController {
         (!snap?.stop || !!snap?.hasRegenerate) &&
         composerIdle &&
         (stopGoneLongEnough || !!snap?.hasRegenerate) &&
+        assistantCompletionSignal &&
         stable &&
         txt.length > 0;
       const otherProviderDone =

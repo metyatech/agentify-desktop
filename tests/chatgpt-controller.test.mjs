@@ -1799,6 +1799,41 @@ test('chatgpt-controller: waits for stop to disappear before completing a new as
   assert.ok(responsePolls >= 4);
 });
 
+test('chatgpt-controller: waits for an identityless streamed assistant turn to settle', async () => {
+  const events = [];
+  let responsePolls = 0;
+  const partial = 'ATTACHMENT_LIFECYCLE_OK ATTACHAUTO13';
+  const complete = 'ATTACHMENT_LIFECYCLE_OK ATTACHAUTO13 TC-A TC-B RS PATCH CF VER WLM';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        responsePolls += 1;
+        return assistantSnapshot({
+          sendPresent: false,
+          sendEnabled: false,
+          promptTextLength: 0,
+          txt: responsePolls <= 8 ? partial : complete,
+          count: 1,
+          lastAssistantId: ''
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).query({ prompt: 'wait for streamed response', timeoutMs: 8_000 });
+
+  assert.equal(result.text, complete);
+  assert.ok(responsePolls >= 13);
+});
+
 test('chatgpt-controller: waits while an unsent prompt remains in the ChatGPT composer', async () => {
   const events = [];
   let responsePolls = 0;

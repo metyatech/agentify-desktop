@@ -49,6 +49,8 @@ function readyState() {
 }
 
 function basicEvaluation(js) {
+  if (js.includes('agentifyPromptTypeVerification')) return { ok: true, promptTextLength: 0 };
+  if (js.includes('agentifyPromptTypeClear')) return { ok: true, promptTextLength: 0 };
   if (js.includes('const hasTurnstile')) return readyState();
   if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
   return undefined;
@@ -135,12 +137,13 @@ function createController(page, options = {}) {
   return new ChatGPTController({ page, selectors, ...options });
 }
 
-function createPromptExpressionContext(userTurns = []) {
+function createPromptExpressionContext(userTurns = [], initialPromptText = '') {
   const focused = { value: false };
   const prompt = {
     tagName: 'DIV',
     id: 'prompt-textarea',
-    innerText: '',
+    innerText: initialPromptText,
+    textContent: initialPromptText,
     isContentEditable: true,
     disabled: false,
     readOnly: false,
@@ -349,7 +352,7 @@ function createUserTurnFixture({ id = '', messageId = '', text = '' } = {}) {
 async function captureActualTypePromptEvaluation(userTurns) {
   const events = [];
   const progress = [];
-  const { context, focused } = createPromptExpressionContext(userTurns);
+  const { context, focused, prompt: promptNode } = createPromptExpressionContext(userTurns);
   let expression = '';
   let evaluationResult;
   let evaluationError = null;
@@ -366,6 +369,16 @@ async function captureActualTypePromptEvaluation(userTurns) {
         evaluationError = error;
         throw error;
       }
+    },
+    onBasicEvaluate: async (js) => {
+      if (js.includes('agentifyPromptTypeVerification')) {
+        return await vm.runInNewContext(js, context);
+      }
+      return undefined;
+    },
+    onInsertText: async (text) => {
+      promptNode.innerText = text;
+      promptNode.textContent = text;
     },
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) throw new Error('test_stop_after_type_prompt');
@@ -418,6 +431,56 @@ test('chatgpt-controller: continues to insertText after the actual typePrompt ba
 
   assert.equal(result.progress.some((item) => item?.phase === 'typing_prompt'), true);
   assert.deepEqual(result.events.filter((event) => event.startsWith('text:')), ['text:actual expression prompt']);
+});
+
+test('chatgpt-controller: re-clears a restored composer draft when select-all input does not replace it', async () => {
+  const events = [];
+  const prompt = 'replacement prompt after restored draft';
+  const state = { text: 'restored Agentify draft', clearCount: 0 };
+  const { context, prompt: promptNode } = createPromptExpressionContext([], state.text);
+  const insertions = [];
+  const page = createPage({
+    events,
+    onBasicEvaluate: async (js) => {
+      if (js.includes('agentifyPromptTypeClear')) {
+        state.text = '';
+        state.clearCount += 1;
+        promptNode.innerText = '';
+        promptNode.textContent = '';
+        return { ok: true, promptTextLength: 0 };
+      }
+      if (js.includes('agentifyPromptTypeVerification')) {
+        const normalized = String(state.text).replace(/\s+/g, ' ').trim();
+        return { ok: normalized === prompt, promptTextLength: normalized.length };
+      }
+      return undefined;
+    },
+    promptEvaluationOverride: async (js) => {
+      if (!js.includes('const lastUserTextDigest')) return basicEvaluation(js);
+      return await vm.runInNewContext(js, context);
+    },
+    onInsertText: async (text) => {
+      insertions.push(text);
+      state.text += text;
+      promptNode.innerText = state.text;
+      promptNode.textContent = state.text;
+    },
+    onSendKey: async () => {},
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) throw new Error('test_stop_after_type_prompt');
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: false, reason: 'test_stop_after_type_prompt' };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt }),
+    (error) => error.message === 'test_stop_after_type_prompt'
+  );
+
+  assert.equal(state.clearCount, 1);
+  assert.deepEqual(insertions, [prompt, prompt]);
+  assert.equal(state.text, prompt);
 });
 
 function createProviderStopDomPage({ state, isStopVisible, onStopTokenEvaluateExtra = null }) {

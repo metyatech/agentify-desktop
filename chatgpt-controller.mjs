@@ -1592,6 +1592,77 @@ export class ChatGPTController {
     await this.#sendKey('Backspace');
     await sleep(jitter(25, 80));
     await this.#typeHuman(prompt);
+    const expectedPromptText = normalizeUserTurnText(prompt);
+    const readTypedPrompt = async () => await this.#eval(`(() => {
+      const agentifyPromptTypeVerification = true;
+      const visible = (n) => {
+        if (!n) return false;
+        const r = n.getBoundingClientRect();
+        const style = window.getComputedStyle(n);
+        return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const editable = (n) => {
+        if (!n || !visible(n)) return false;
+        if (n.matches('textarea')) return !n.disabled && !n.readOnly;
+        if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
+        return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
+      };
+      const candidates = Array.from(document.querySelectorAll(${sel}));
+      const node = editable(document.activeElement) ? document.activeElement : candidates.find(editable);
+      if (!node) return { ok: false, reason: 'prompt_not_found', promptTextLength: 0 };
+      const text = node.matches('textarea, input') ? String(node.value || '') : String(node.innerText || node.textContent || '');
+      const normalized = text.replace(/\\s+/g, ' ').trim();
+      return { ok: normalized === ${JSON.stringify(expectedPromptText)}, promptTextLength: normalized.length };
+    })()`);
+    const typedPrompt = await readTypedPrompt();
+    if (!typedPrompt?.ok) {
+      const cleared = await this.#eval(`(() => {
+        const agentifyPromptTypeClear = true;
+        const visible = (n) => {
+          if (!n) return false;
+          const r = n.getBoundingClientRect();
+          const style = window.getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const editable = (n) => {
+          if (!n || !visible(n)) return false;
+          if (n.matches('textarea')) return !n.disabled && !n.readOnly;
+          if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
+          return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
+        };
+        const node = editable(document.activeElement) ? document.activeElement : Array.from(document.querySelectorAll(${sel})).find(editable);
+        if (!node) return { ok: false, reason: 'prompt_not_found', promptTextLength: 0 };
+        try {
+          node.focus();
+          if (node.matches('textarea')) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+            if (setter) setter.call(node, ''); else node.value = '';
+          } else if (node.matches('input')) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(node, ''); else node.value = '';
+          } else {
+            node.textContent = '';
+          }
+          node.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'deleteContentBackward', data: null }));
+          node.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          return { ok: true, promptTextLength: 0 };
+        } catch (error) {
+          return { ok: false, reason: 'prompt_clear_failed', promptTextLength: 0 };
+        }
+      })()`);
+      if (!cleared?.ok) {
+        const error = new Error('type_failed');
+        error.data = { phase: 'typing_prompt', reason: cleared?.reason || 'prompt_clear_failed', expectedPromptTextLength: expectedPromptText.length, actualPromptTextLength: Number(typedPrompt?.promptTextLength) || 0 };
+        throw error;
+      }
+      await this.#typeHuman(prompt);
+      const retried = await readTypedPrompt();
+      if (!retried?.ok) {
+        const error = new Error('type_failed');
+        error.data = { phase: 'typing_prompt', reason: 'prompt_verification_mismatch', expectedPromptTextLength: expectedPromptText.length, actualPromptTextLength: Number(retried?.promptTextLength) || 0 };
+        throw error;
+      }
+    }
     this.#throwIfStopRequested();
     return ok;
   }

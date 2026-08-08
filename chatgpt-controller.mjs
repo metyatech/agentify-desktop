@@ -3511,7 +3511,7 @@ export class ChatGPTController {
     let lastComposerIdle = false;
     let assistantStartedAt = null;
     let assistantStopObserved = false;
-    const identitylessAssistantGraceMs = 5_000;
+    const identitylessAssistantGraceMs = 15_000;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();

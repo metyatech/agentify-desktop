@@ -1815,7 +1815,7 @@ test('chatgpt-controller: waits for an identityless streamed assistant turn to s
           sendPresent: false,
           sendEnabled: false,
           promptTextLength: 0,
-          txt: responsePolls <= 8 ? partial : complete,
+          txt: responsePolls <= 25 ? partial : complete,
           count: 1,
           lastAssistantId: ''
         });
@@ -1828,10 +1828,10 @@ test('chatgpt-controller: waits for an identityless streamed assistant turn to s
     }
   });
 
-  const result = await createController(page).query({ prompt: 'wait for streamed response', timeoutMs: 8_000 });
+  const result = await createController(page).query({ prompt: 'wait for streamed response', timeoutMs: 20_000 });
 
   assert.equal(result.text, complete);
-  assert.ok(responsePolls >= 13);
+  assert.ok(responsePolls >= 38);
 });
 
 test('chatgpt-controller: waits while an unsent prompt remains in the ChatGPT composer', async () => {

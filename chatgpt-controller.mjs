@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -2349,9 +2350,13 @@ export class ChatGPTController {
     await this.#emitProgress({ phase: 'uploading_files' });
     const absFiles = files.map((p) => path.resolve(p));
     for (const f of absFiles) await fs.access(f);
-    const expectedFileNames = absFiles.map((file) => path.basename(file).trim());
-    const expectedFileNamesJson = JSON.stringify(expectedFileNames);
-    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const uploadPlan = await this.#stageDuplicateAttachmentFiles(absFiles);
+    try {
+      const expectedFileNames = uploadPlan.expectedFileNames;
+      const logicalFileNames = uploadPlan.logicalFileNames;
+      const expectedFileNamesJson = JSON.stringify(expectedFileNames);
+      const logicalFileNamesJson = JSON.stringify(logicalFileNames);
+      const promptSel = JSON.stringify(this.selectors.promptTextarea);
 
     const opened = await this.#eval(`(() => {
       const host = location.hostname || '';
@@ -2410,6 +2415,8 @@ export class ChatGPTController {
       const sameFileNames = (left, right) => left.length === right.length && left.every((fileName, index) => fileName === right[index]);
        const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({ name: file.name, index }));
        const selectedFileNames = selectedFiles.map((file) => file.name);
+       const logicalFileNames = ${logicalFileNamesJson};
+       const mappingSelectedFileNames = selectedFiles.map((file, index) => logicalFileNames[index] || file.name);
        const normalizedExpectedFileNames = normalizeFileNames(expectedFileNames);
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
       const visibleCirclePending = (card) => Array.from(card.querySelectorAll('svg circle[stroke-dasharray]')).some((circle) => visible(circle) || visible(circle.closest('svg')));
@@ -2427,8 +2434,8 @@ export class ChatGPTController {
         ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard)
         : [];
       const cardDisplayNames = fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim());
-       const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
-       const selectionMatchesExpected = sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames);
+       const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+       const selectionMatchesExpected = sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames) || sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(logicalFileNames));
        const fileCount = selectedFiles.length;
        const cardCount = fileCards.length;
        const countsMatch = fileCount === cardCount;
@@ -2440,7 +2447,7 @@ export class ChatGPTController {
          const card = mapped.cardIndex == null ? null : fileCards[mapped.cardIndex] || null;
          const displayName = String(mapped.displayName || (card?.getAttribute('aria-label') || '')).trim();
          return {
-           sourceFileName: file.name,
+           sourceFileName: mappingSelectedFileNames[index] || file.name,
            displayName,
            matched: !!mapped.matched && !!card,
            matchKind: mapped.matchKind || null,
@@ -2456,6 +2463,7 @@ export class ChatGPTController {
         selectedFileNames,
         selectedFiles,
         expectedFileNames,
+        logicalFileNames,
         cardDisplayNames,
         selectionMatchesExpected,
         fileCount,
@@ -2488,7 +2496,7 @@ export class ChatGPTController {
     })()`);
 
     if (opened?.isChatGPT && opened?.inputReady) {
-      if (opened?.selectionMatchesExpected && opened?.mappingComplete) return absFiles;
+      if (opened?.selectionMatchesExpected && opened?.mappingComplete) return uploadPlan;
       if (opened?.selectionMatchesExpected && Number(opened?.cardCount) > 0) {
         const err = new Error('chatgpt_file_input_state_conflict');
         err.data = {
@@ -2517,8 +2525,8 @@ export class ChatGPTController {
           pageUploadInputCount: opened.pageUploadInputCount
         });
       }
-      await this.page.setFileInputFiles(absFiles, { selector: '#upload-files' });
-      return absFiles;
+      await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
+      return uploadPlan;
     }
 
     if (opened?.isChatGPT && opened?.inputPresent) {
@@ -2535,11 +2543,68 @@ export class ChatGPTController {
 
     if (opened?.isChatGPT) {
       await this.#waitForChatGPTFileInputOrMenu();
-      await this.page.setFileInputFiles(absFiles, { selector: '#upload-files' });
+      await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
     } else {
-      await this.page.setFileInputFiles(absFiles);
+      await this.page.setFileInputFiles(uploadPlan.files);
     }
-    return absFiles;
+    return uploadPlan;
+    } catch (error) {
+      await uploadPlan.cleanup();
+      throw error;
+    }
+  }
+
+  async #stageDuplicateAttachmentFiles(absFiles) {
+    const expectedFileNames = absFiles.map((file) => path.basename(file).trim());
+    const counts = new Map();
+    for (const fileName of expectedFileNames) {
+      const normalized = fileName.toLocaleLowerCase();
+      counts.set(normalized, (counts.get(normalized) || 0) + 1);
+    }
+    if (![...counts.values()].some((count) => count > 1)) {
+      return { files: absFiles, expectedFileNames, logicalFileNames: expectedFileNames, cleanup: async () => {} };
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-attachment-upload-'));
+    const usedNames = new Set(expectedFileNames.map((fileName) => fileName.toLocaleLowerCase()));
+    const occurrences = new Map();
+    const uploadFiles = [];
+    try {
+      for (const sourceFile of absFiles) {
+        const sourceName = path.basename(sourceFile).trim();
+        const normalized = sourceName.toLocaleLowerCase();
+        const occurrence = (occurrences.get(normalized) || 0) + 1;
+        occurrences.set(normalized, occurrence);
+        if (occurrence === 1) {
+          uploadFiles.push(sourceFile);
+          continue;
+        }
+
+        const extension = path.extname(sourceName);
+        const stem = extension ? sourceName.slice(0, -extension.length) : sourceName;
+        let suffix = occurrence - 1;
+        let transportName = `${stem}(${suffix})${extension}`;
+        while (usedNames.has(transportName.toLocaleLowerCase())) {
+          suffix += 1;
+          transportName = `${stem}(${suffix})${extension}`;
+        }
+        usedNames.add(transportName.toLocaleLowerCase());
+        const transportFile = path.join(tempDir, transportName);
+        await fs.copyFile(sourceFile, transportFile);
+        uploadFiles.push(transportFile);
+      }
+      return {
+        files: uploadFiles,
+        expectedFileNames: uploadFiles.map((file) => path.basename(file).trim()),
+        logicalFileNames: expectedFileNames,
+        cleanup: async () => {
+          await fs.rm(tempDir, { recursive: true, force: true });
+        }
+      };
+    } catch (error) {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   async #clearChatGPTFileInput({
@@ -2810,11 +2875,12 @@ export class ChatGPTController {
     throw err;
   }
 
-  async #waitForAttachmentsReady({ timeoutMs, expectedFileNames = [] }) {
+  async #waitForAttachmentsReady({ timeoutMs, expectedFileNames = [], logicalFileNames = expectedFileNames }) {
     const maxWaitMs = Math.min(120_000, Math.max(0, Number(timeoutMs) || 0));
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
     const requiredFileNames = boundedAttachmentNameList(expectedFileNames.map((file) => path.basename(String(file || '')).trim()));
     const requiredFileNamesJson = JSON.stringify(requiredFileNames);
+    const logicalFileNamesJson = JSON.stringify(boundedAttachmentNameList(logicalFileNames.map((file) => path.basename(String(file || '')).trim())));
     const start = Date.now();
     let last = null;
     let consecutiveReadyPolls = 0;
@@ -2904,6 +2970,7 @@ export class ChatGPTController {
           : String(prompt?.innerText || prompt?.textContent || '').trim();
         const busy = !!composer && Array.from(composer.querySelectorAll('[role="progressbar"], [aria-busy="true"]')).some(visible);
         const expectedFileNames = ${requiredFileNamesJson};
+        const logicalFileNames = ${logicalFileNamesJson};
         const normalizeFileName = (value) => String(value || '').trim().toLocaleLowerCase();
         const normalizeFileNames = (fileNames) => fileNames.map(normalizeFileName).sort();
         const sameFileNames = (left, right) => left.length === right.length && left.every((fileName, index) => fileName === right[index]);
@@ -2927,11 +2994,12 @@ export class ChatGPTController {
         const selectedFiles = Array.from(uploadInput?.files || []).map((file, index) => ({ name: file.name, index }));
         const selectedFileNames = selectedFiles.map((file) => file.name);
         const inputIsUnique = uploadInputs.length === 1 && pageUploadInputCount === 1;
-        const selectionMatchesExpected = inputIsUnique && sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(expectedFileNames));
+        const selectionMatchesExpected = inputIsUnique && (sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(expectedFileNames)) || sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(logicalFileNames)));
+        const mappingSelectedFileNames = selectedFiles.map((file, index) => logicalFileNames[index] || file.name);
         const fileCount = selectedFiles.length;
         const cardCount = fileCards.length;
         const countsMatch = fileCount === cardCount;
-        const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+        const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
         const mappingErrors = Array.isArray(mappingResult.mappingErrors) ? [...mappingResult.mappingErrors] : [];
         if (!inputIsUnique) mappingErrors.push('upload_input_not_unique');
         if (!selectionMatchesExpected) mappingErrors.push('file_selection_mismatch');
@@ -2941,7 +3009,7 @@ export class ChatGPTController {
           const card = mapped.cardIndex == null ? null : fileCards[mapped.cardIndex] || null;
           const displayName = String(mapped.displayName || (card?.getAttribute('aria-label') || '')).trim();
           return {
-            sourceFileName: file.name,
+            sourceFileName: mappingSelectedFileNames[index] || file.name,
             displayName,
             matched: !!mapped.matched && !!card,
             matchKind: mapped.matchKind || null,
@@ -3057,7 +3125,7 @@ export class ChatGPTController {
     };
   }
 
-  async #cleanupUnsentDraft({ prompt, expectedFileNames = [], userTurnBaseline = null } = {}) {
+  async #cleanupUnsentDraft({ prompt, expectedFileNames = [], logicalFileNames = expectedFileNames, userTurnBaseline = null } = {}) {
     if (!userTurnBaseline || !Number.isFinite(Number(userTurnBaseline.count))) {
       return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
     }
@@ -3067,6 +3135,7 @@ export class ChatGPTController {
     }
     const promptJson = JSON.stringify(String(prompt || '').slice(0, 200_000));
     const expectedFileNamesJson = JSON.stringify(boundedAttachmentNameList(expectedFileNames));
+    const logicalFileNamesJson = JSON.stringify(boundedAttachmentNameList(logicalFileNames));
     const baselineJson = JSON.stringify({
       count: normalizedUserTurnBaseline.count,
       lastId: normalizedUserTurnBaseline.lastId,
@@ -3076,6 +3145,7 @@ export class ChatGPTController {
       const agentifyAttachmentCleanup = true;
       const expectedPrompt = ${promptJson};
       const expectedFileNames = ${expectedFileNamesJson};
+      const logicalFileNames = ${logicalFileNamesJson};
       const baseline = ${baselineJson};
       const safeName = (value) => String(value || '').trim().replace(/^.*[\\\\/]/u, '').slice(0, 256);
       const names = (values) => (Array.isArray(values) ? values : []).map(safeName).filter(Boolean).slice(0, 50);
@@ -3157,8 +3227,9 @@ export class ChatGPTController {
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')));
       const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard);
       const cardDisplayNames = names(fileCards.map((card) => card.getAttribute('aria-label') || ''));
-      const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
-      const selectedMatches = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, selectedFileNames);
+      const mappingSelectedFileNames = selectedFileNames.map((fileName, index) => logicalFileNames[index] || fileName);
+      const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+      const selectedMatches = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, selectedFileNames) || (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(logicalFileNames, selectedFileNames);
       if (expectedFileNames.length === 0) {
         if (selectedFileNames.length > 0 || inputValue !== '' || fileCards.length > 0) {
           return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, inputCount: pageUploadInputs.length, inputValuePresent: inputValue !== '' };
@@ -3481,6 +3552,7 @@ export class ChatGPTController {
       onProgress,
       prompt,
       expectedFileNames,
+      logicalExpectedFileNames: expectedFileNames,
       promptTyped: false,
       messageDispatchStarted: false,
       dispatchState: null,
@@ -3492,6 +3564,7 @@ export class ChatGPTController {
     };
     this.currentRun = run;
     const detachRunSignal = this.#bindRunSignal(run, signal);
+    let uploadPlan = null;
     try {
       this.#throwIfStopRequested();
       await this.ensureReady({ timeoutMs });
@@ -3503,10 +3576,13 @@ export class ChatGPTController {
       run.userTurnBaseline = typed?.userTurnBaseline || null;
       this.#throwIfStopRequested();
       if (attachments?.length) {
-        const attachedFiles = await this.#attachFiles(attachments);
+        uploadPlan = await this.#attachFiles(attachments);
+        run.expectedFileNames = uploadPlan.expectedFileNames;
+        run.logicalExpectedFileNames = uploadPlan.logicalFileNames;
         await this.#waitForAttachmentsReady({
           timeoutMs,
-          expectedFileNames: attachedFiles.map((file) => path.basename(file))
+          expectedFileNames: uploadPlan.expectedFileNames,
+          logicalFileNames: uploadPlan.logicalFileNames
         });
       }
       const baseline = await this.#captureChatGPTAssistantBaseline();
@@ -3519,7 +3595,8 @@ export class ChatGPTController {
             ...(error?.data && typeof error.data === 'object' ? error.data : {}),
             cleanup: await this.#cleanupUnsentDraft({
               prompt,
-              expectedFileNames,
+              expectedFileNames: run.expectedFileNames,
+              logicalFileNames: run.logicalExpectedFileNames,
               userTurnBaseline: run.userTurnBaseline
             })
           };
@@ -3536,6 +3613,7 @@ export class ChatGPTController {
       }
       throw error;
     } finally {
+      await uploadPlan?.cleanup?.().catch(() => {});
       this.#releaseProviderStopToken(run);
       detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;

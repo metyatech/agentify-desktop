@@ -1804,11 +1804,12 @@ function chatgptUploadInputState({
   };
 }
 
-function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null, clearEvaluationResult = null }) {
+function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null, clearEvaluationResult = null, onSetFileInputFiles = null }) {
   let attachmentPolls = 0;
   let clearPolls = 0;
   const page = createPage({
     events,
+    onSetFileInputFiles,
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
@@ -1868,6 +1869,34 @@ test('chatgpt-controller: initial attachment sets the ordinary file once without
     await createController(page).query({ prompt: 'attach initially', attachments: [attachment], timeoutMs: 5_000 });
 
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+  });
+});
+
+test('chatgpt-controller: stages duplicate-basename uploads with unique transport names', async () => {
+  await withTempAttachments(['a/task-contract.json', 'b/task-contract.json'], async ([first, second]) => {
+    const events = [];
+    let uploadedNames = [];
+    let uploadedPaths = [];
+    const { page } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({ selectedFileNames: [] }),
+      onSetFileInputFiles: async (files) => {
+        uploadedPaths = [...files];
+        uploadedNames = files.map((file) => path.basename(file));
+      },
+      fileStateForPoll: () => attachmentCardSnapshot(
+        uploadedNames.map((fileName) => ({ fileName, found: true, pending: false, failed: false }))
+      )
+    });
+
+    await createController(page).query({ prompt: 'stage duplicate basenames', attachments: [first, second], timeoutMs: 5_000 });
+
+    assert.deepEqual(uploadedNames.length, 2);
+    assert.equal(new Set(uploadedNames.map((name) => name.toLocaleLowerCase())).size, 2);
+    assert.deepEqual(uploadedPaths[0], first);
+    assert.notDeepEqual(uploadedPaths[1], second);
+    await assert.rejects(fs.access(uploadedPaths[1]));
+    assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:2', 'files-selector:#upload-files']);
   });
 });
 

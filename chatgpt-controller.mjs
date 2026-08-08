@@ -3614,11 +3614,29 @@ export class ChatGPTController {
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
+        const providerError = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error" i]')).some((node) => {
+          if (!visible(node)) return false;
+          const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+          return text.length > 0 && text.length < 500 && /something went wrong|error generating|there was an error|try again/i.test(text);
+        });
         const assistantTurn = lastNode?.closest('section, article, [data-testid*="conversation-turn" i], [data-turn-id-container]') || lastNode;
         const assistantTerminalSignal = isChatGPT && !!assistantTurn?.querySelector('button[data-testid="copy-turn-action-button"]');
-        return { isChatGPT, stop, sendPresent, sendEnabled, promptTextLength, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate, assistantTerminalSignal };
+        return { isChatGPT, stop, sendPresent, sendEnabled, promptTextLength, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, providerError, hasContinue, hasRegenerate, assistantTerminalSignal };
       })()`);
       lastSnap = snap;
+
+      if (snap?.isChatGPT && snap?.providerError) {
+        const error = new Error('provider_response_error');
+        error.data = {
+          phase: 'waiting_for_response',
+          lastLength: String(snap?.txt || '').trim().length,
+          lastDigest: userTurnTextDigest(snap?.txt || ''),
+          lastAssistantCount: Number(snap?.count) || 0,
+          assistantTerminalSignal: false,
+          reason: 'visible_provider_error'
+        };
+        throw error;
+      }
 
       const txt = String(snap?.txt || '');
       if (txt !== last) {

@@ -880,7 +880,8 @@ function assistantSnapshot({
   lastAssistantId = '',
   hasContinue = false,
   hasRegenerate = false,
-  assistantTerminalSignal = false
+  assistantTerminalSignal = false,
+  providerError = false
 } = {}) {
   return {
     isChatGPT: true,
@@ -895,7 +896,8 @@ function assistantSnapshot({
     hasError: false,
     hasContinue,
     hasRegenerate,
-    assistantTerminalSignal
+    assistantTerminalSignal,
+    providerError
   };
 }
 
@@ -2002,6 +2004,44 @@ test('chatgpt-controller: unconfirmed ChatGPT completion is an explicit failure 
       assert.equal(error.data?.lastLength, partial.length);
       assert.equal(error.data?.lastDigest, userTurnDigestForTest(partial));
       assert.equal(error.data?.assistantTerminalSignal, false);
+      assert.equal('last' in (error.data || {}), false);
+      return true;
+    }
+  );
+});
+
+test('chatgpt-controller: visible provider error fails before response timeout', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const assistantCandidates')) {
+        return assistantSnapshot({
+          sendPresent: false,
+          sendEnabled: false,
+          promptTextLength: 0,
+          txt: '…',
+          count: 1,
+          lastAssistantId: 'error-turn',
+          providerError: true
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'surface provider error', timeoutMs: 4_000 }),
+    (error) => {
+      assert.equal(error.message, 'provider_response_error');
+      assert.equal(error.data?.phase, 'waiting_for_response');
+      assert.equal(error.data?.lastLength, 1);
+      assert.equal(error.data?.reason, 'visible_provider_error');
       assert.equal('last' in (error.data || {}), false);
       return true;
     }

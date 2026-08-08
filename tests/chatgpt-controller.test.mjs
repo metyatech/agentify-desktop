@@ -1595,6 +1595,7 @@ async function withTempAttachments(names, fn) {
   try {
     for (const name of names) {
       const file = path.join(tempDir, name);
+      await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.writeFile(file, name);
       files.push(file);
     }
@@ -2103,6 +2104,9 @@ test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one
     [['a.json', 'b.json'], ['b.json', 'a.json']],
     [['a.json', 'b.json', 'c.json', 'd.json', 'e.json', 'f.json', 'g.json'], ['c.json', 'g.json', 'a.json', 'f.json', 'd.json', 'b.json', 'e.json']],
     [['file.json', 'file.json'], ['file.json', 'file(1).json']],
+    [['file.json', 'file.json'], ['file(2).json', 'file(3).json']],
+    [['file.json', 'file.json'], ['file(3).json', 'file(2).json']],
+    [['file.json', 'file.json', 'file.json'], ['file(2).json', 'file(4).json', 'file(3).json']],
     [['file.json', 'file(1).json'], ['file(2).json', 'file(1).json']],
     [['FILE.JSON'], ['file.json']]
   ];
@@ -2116,7 +2120,21 @@ test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one
   assert.equal(mapChatGPTAttachmentCardNames(['file.json'], ['file.json', 'extra.txt']).mappingComplete, false);
   assert.equal(mapChatGPTAttachmentCardNames(['file.json', 'other.json'], ['file.json']).mappingComplete, false);
   assert.equal(mapChatGPTAttachmentCardNames(['file.json'], ['file(1).json', 'file(2).json']).mappingComplete, false);
-  assert.equal(mapChatGPTAttachmentCardNames(['file.json', 'file(1).json'], ['file(1).json', 'file(2).json']).mapping[1].matchKind, 'exact');
+  const exactAndRenamed = mapChatGPTAttachmentCardNames(['file.json', 'file.json'], ['file.json', 'file(1).json']);
+  assert.equal(exactAndRenamed.mapping[0].matchKind, 'exact');
+  assert.equal(exactAndRenamed.mapping[1].matchKind, 'renamed');
+  for (const [selected, cards] of [
+    [['file.json', 'file.json'], ['file(2).json', 'file(3).json']],
+    [['file.json', 'file.json'], ['file(3).json', 'file(2).json']],
+    [['file.json', 'file.json', 'file.json'], ['file(2).json', 'file(4).json', 'file(3).json']]
+  ]) {
+    const result = mapChatGPTAttachmentCardNames(selected, cards);
+    assert.equal(result.mappingComplete, true, `${selected.join(',')} -> ${cards.join(',')}`);
+    assert.deepEqual(result.mappingErrors, []);
+    assert.equal(result.mapping.every((entry) => entry.matched && entry.matchKind === 'renamed'), true);
+    assert.equal(new Set(result.mapping.map((entry) => entry.cardIndex)).size, cards.length);
+    assert.deepEqual(result.mapping.map((entry) => entry.displayName).sort(), cards.slice().sort());
+  }
 });
 
 test('chatgpt-controller: seven-file attachment readiness succeeds with reordered renamed cards and bounded progress', async () => {
@@ -2192,7 +2210,59 @@ test('chatgpt-controller: seven-file attachment readiness succeeds with reordere
   });
 });
 
-function createCleanupDom({ events, promptText, uploadInputCount = 0, uploadInputValue = '', pageUploadInputCount = 0, pageSelectedFileNames = [], pageUploadInputValue = '', selectedFileNames = [], cardCount = 0, userTurnTexts = [], userTurnIds = [] }) {
+test('chatgpt-controller: live seven-file duplicate-renamed shape reaches readiness and dispatch', async () => {
+  const selected = [
+    'task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'task-contract.json',
+    'worker-last-message.txt',
+    'changed-files.json',
+    'verification.json'
+  ];
+  const cards = [
+    'task-contract(3).json',
+    'repository-state(3).json',
+    'changes(3).patch',
+    'task-contract(2).json',
+    'worker-last-message(2).txt',
+    'changed-files(2).json',
+    'verification(2).json'
+  ];
+  await withTempAttachments(selected, async (files) => {
+    const events = [];
+    const mapping = mapChatGPTAttachmentCardNames(selected, cards);
+    const progress = [];
+    const { page, attachmentPolls } = createDirectUploadPage({
+      events,
+      fileStateForPoll: (poll) => attachmentCardSnapshot(mapping.mapping.map((entry) => ({
+        sourceFileName: entry.sourceFileName,
+        displayName: entry.displayName,
+        matched: entry.matched,
+        pending: false,
+        failed: false
+      })), {
+        conditionsReady: mapping.mappingComplete,
+        mappingComplete: mapping.mappingComplete,
+        mappingErrors: mapping.mappingErrors,
+        promptTextLength: 22
+      })
+    });
+    const result = await createController(page).query({
+      prompt: 'live seven-file duplicate shape',
+      attachments: files,
+      timeoutMs: 5_000,
+      onProgress: (patch) => progress.push(patch)
+    });
+    assert.equal(result.text, 'uploaded');
+    assert.equal(attachmentPolls(), 2);
+    assert.equal(events.includes('normal-send-click'), true);
+    assert.equal(progress.some((patch) => patch.phase === 'uploading_files' && patch.attachmentCount === 7 && patch.readyCount === 7 && patch.pendingCount === 0 && patch.failedCount === 0 && patch.mappingComplete === true), true);
+    assert.equal(new Set(mapping.mapping.map((entry) => entry.cardIndex)).size, 7);
+  });
+});
+
+function createCleanupDom({ events, promptText, uploadInputCount = 0, uploadInputValue = '', pageUploadInputCount = 0, pageSelectedFileNames = [], pageUploadInputValue = '', selectedFileNames = [], cardDisplayNames = [], cardCount = 0, userTurnTexts = [], userTurnIds = [] }) {
   class FakeNode {
     constructor(tagName, attributes = {}) {
       this.tagName = String(tagName || 'div').toUpperCase();
@@ -2335,7 +2405,7 @@ function createCleanupDom({ events, promptText, uploadInputCount = 0, uploadInpu
     pageUploadInputs.push(input);
   }
   for (let index = 0; index < cardCount; index += 1) {
-    const card = composer.append(new FakeNode('div', { role: 'group', 'aria-label': selectedFileNames[index] || `card-${index + 1}`, class: 'group/file-tile' }));
+    const card = composer.append(new FakeNode('div', { role: 'group', 'aria-label': cardDisplayNames[index] || selectedFileNames[index] || `card-${index + 1}`, class: 'group/file-tile' }));
     const remove = card.append(new FakeNode('button', { 'aria-label': 'Remove file' }));
     remove._onClick = () => {
       events.push('card-remove');
@@ -2918,6 +2988,42 @@ test('chatgpt-controller: attachment cleanup still removes owned input and cards
     assert.deepEqual(dom.uploadInputs[0].files, []);
     assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
     assert.equal(events.includes('card-remove'), true);
+  });
+});
+
+test('chatgpt-controller: duplicate-renamed attachment cleanup clears the owned unsent draft', async () => {
+  await withTempAttachments(['a/task-contract.json', 'b/task-contract.json'], async ([first, second]) => {
+    const events = [];
+    const dom = createCleanupDom({
+      events,
+      promptText: 'duplicate renamed attachment draft',
+      uploadInputCount: 1,
+      selectedFileNames: ['task-contract.json', 'task-contract.json'],
+      cardDisplayNames: ['task-contract(2).json', 'task-contract(3).json'],
+      cardCount: 2,
+      userTurnTexts: ['existing user turn']
+    });
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([
+        { sourceFileName: 'task-contract.json', displayName: 'task-contract(2).json', matched: true, pending: true, failed: false },
+        { sourceFileName: 'task-contract.json', displayName: 'task-contract(3).json', matched: true, pending: true, failed: false }
+      ], { conditionsReady: false }),
+      cleanupResult: null,
+      recordSendEvaluation: false,
+      cleanupDom: dom,
+      userTurnBaseline: { count: 1, lastId: '', lastTextDigest: userTurnDigestForTest('existing user turn') }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'duplicate renamed attachment draft', attachments: [first, second], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data.cleanup.status === 'cleared' && error.data.cleanup.userTurnCount === 1
+    );
+    assert.equal(dom.prompt.value, '');
+    assert.deepEqual(dom.uploadInputs[0].files, []);
+    assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
+    assert.equal(events.filter((event) => event === 'card-remove').length, 2);
+    assert.equal(events.includes('normal-send-click'), false);
   });
 });
 

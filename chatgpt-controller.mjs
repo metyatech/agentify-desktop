@@ -171,15 +171,15 @@ export function mapChatGPTAttachmentCardNames(selectedFileNames, cardDisplayName
         cardIndex
       };
     }
-    const matchingBySelected = new Map([...aliasMatching.entries()].map(([cardIndex, selectedIndex]) => [selectedIndex, cardIndex]));
     for (const [cardIndex, selectedIndex] of aliasMatching.entries()) {
       const alternative = findMatching({ selectedIndex, cardIndex });
       if (!alternative) continue;
-      const alternativeBySelected = new Map([...alternative.entries()].map(([alternativeCardIndex, alternativeSelectedIndex]) => [alternativeSelectedIndex, alternativeCardIndex]));
-      const changesAName = remainingSelected.some((candidateSelectedIndex) =>
-        normalize(cards[matchingBySelected.get(candidateSelectedIndex)]) !== normalize(cards[alternativeBySelected.get(candidateSelectedIndex)])
-      );
-      if (changesAName) {
+      const changesSourceNameClass = [...aliasMatching.entries()].some(([baselineCardIndex, baselineSelectedIndex]) => {
+        const alternativeSelectedIndex = alternative.get(baselineCardIndex);
+        return alternativeSelectedIndex !== undefined &&
+          normalize(selected[baselineSelectedIndex]) !== normalize(selected[alternativeSelectedIndex]);
+      });
+      if (changesSourceNameClass) {
         mappingErrors.push('mapping_ambiguous');
         break;
       }

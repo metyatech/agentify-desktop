@@ -84,6 +84,27 @@ test('chrome-cdp-backend: pending commands reject when websocket closes', async 
   await assert.rejects(async () => await pending, /chrome_cdp_disconnected/);
 });
 
+test('chrome-cdp-backend: pending commands reject at the bounded command deadline', async () => {
+  const ws = new MockWebSocket();
+  const conn = new ChromeCdpConnection('ws://example.test/devtools/browser/1', {
+    wsFactory: () => ws,
+    commandTimeoutMs: 20
+  });
+
+  await conn.connect();
+  const startedAt = Date.now();
+  await assert.rejects(
+    async () => await conn.send('Input.dispatchMouseEvent', { type: 'mousePressed' }),
+    (error) => {
+      assert.equal(error.message, 'chrome_cdp_command_timeout');
+      assert.deepEqual(error.data, { method: 'Input.dispatchMouseEvent' });
+      return true;
+    }
+  );
+  assert.ok(Date.now() - startedAt < 500);
+  await conn.close();
+});
+
 test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () => {
   const opts = chromeSpawnOptions();
   assert.equal(opts.stdio, 'ignore');

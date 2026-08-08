@@ -189,6 +189,8 @@ export function chromeSpawnOptions() {
   return { stdio: 'ignore' };
 }
 
+const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
+
 async function readJson(url) {
   const response = await fetch(url, { headers: { accept: 'application/json' } });
   if (!response.ok) {
@@ -198,9 +200,12 @@ async function readJson(url) {
 }
 
 export class ChromeCdpConnection {
-  constructor(wsUrl, { wsFactory } = {}) {
+  constructor(wsUrl, { wsFactory, commandTimeoutMs = DEFAULT_CDP_COMMAND_TIMEOUT_MS } = {}) {
     this.wsUrl = wsUrl;
     this.wsFactory = typeof wsFactory === 'function' ? wsFactory : (url) => new WebSocket(url);
+    this.commandTimeoutMs = Number.isFinite(Number(commandTimeoutMs)) && Number(commandTimeoutMs) > 0
+      ? Math.floor(Number(commandTimeoutMs))
+      : DEFAULT_CDP_COMMAND_TIMEOUT_MS;
     this.ws = null;
     this.connectPromise = null;
     this.connectReject = null;
@@ -299,11 +304,28 @@ export class ChromeCdpConnection {
     const payload = { id, method, params };
     if (sessionId) payload.sessionId = sessionId;
     const response = await new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      let timeoutId = null;
+      const settle = (handler, value) => {
+        if (timeoutId) clearTimeout(timeoutId);
+        handler(value);
+      };
+      this.pending.set(id, {
+        resolve: (value) => settle(resolve, value),
+        reject: (error) => settle(reject, error)
+      });
+      timeoutId = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        const error = new Error('chrome_cdp_command_timeout');
+        error.data = { method: String(method || '').slice(0, 80) };
+        pending.reject(error);
+      }, this.commandTimeoutMs);
       try {
         this.ws.send(JSON.stringify(payload));
       } catch (error) {
         this.pending.delete(id);
+        if (timeoutId) clearTimeout(timeoutId);
         reject(error);
       }
     });

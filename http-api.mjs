@@ -14,6 +14,7 @@ const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
 const PROVIDER_STOP_TIMEOUT_MS = 1_000;
+const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
 
 async function boundedProviderStop(controller, { expectedOperationId, reason = 'user_stop' } = {}) {
   if (!controller || typeof controller.requestStop !== 'function') {
@@ -138,6 +139,55 @@ function sanitizeAttachmentDiagnostics(value) {
   };
 }
 
+function sanitizeBrowserEvaluationText(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .replace(/\bfile:\/\/[^\s'"<>]+/giu, '<redacted-file-url>')
+    .replace(/\bhttps?:\/\/[^\s'"<>]+/giu, '<redacted-url>')
+    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\\\\[^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/(?:^|\s)\/(?:[^\s'"<>]+\/)+[^\s'"<>]*/gu, '$1<redacted-path>')
+    .replace(/\b(?:prompt|attachment|conversation|secret|token|nonce|session|target|objectid|expression|fixture)[-_A-Za-z0-9]{0,96}\b/giu, '<redacted-sensitive>')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '<redacted-token>')
+    .replace(/\b[A-Fa-f0-9]{32,}\b/gu, '<redacted-token>')
+    .replace(/\b(?=[A-Za-z0-9+/=_-]{24,}\b)(?=[A-Za-z0-9+/=_-]*[0-9])[A-Za-z0-9+/=_-]{24,}\b/gu, '<redacted-token>')
+    .replace(/(['"])[^'"\r\n]{1,256}\1/gu, '<redacted-value>')
+    .replace(/[?#][^\s'"<>]+/gu, '<redacted-url-part>')
+  const standardMessage = /^(Cannot read properties of (?:undefined|null)(?: \([^)]*\))?|JavaScript value is not a function|JavaScript name is not defined|Invalid or unexpected token|Unexpected token|Unexpected end of input)$/u.exec(text);
+  return (standardMessage?.[1] || 'Runtime.evaluate failed').slice(0, MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH);
+}
+
+function sanitizeBrowserEvaluationDiagnostics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const number = (item) => {
+    const parsed = Number(item);
+    return Number.isFinite(parsed) ? Math.max(0, Math.min(1_000_000, Math.trunc(parsed))) : null;
+  };
+  const browserEvaluation = {
+    kind: data.kind === 'runtime_evaluate_exception' ? data.kind : 'runtime_evaluate_exception',
+    exceptionClass: /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:Error|Exception)$/u.test(String(data.exceptionClass || '')) ? String(data.exceptionClass) : 'Error',
+    exceptionMessage: sanitizeBrowserEvaluationText(data.exceptionMessage) || 'Runtime.evaluate failed',
+    lineNumber: number(data.lineNumber),
+    columnNumber: number(data.columnNumber)
+  };
+  const cleanup = data.cleanup && typeof data.cleanup === 'object'
+    ? {
+        status: ['cleared', 'failed', 'skipped'].includes(data.cleanup.status) ? data.cleanup.status : 'failed',
+        reason: /^[a-z][a-z0-9_:-]{0,159}$/u.test(String(data.cleanup.reason || ''))
+          ? String(data.cleanup.reason)
+          : sanitizeBrowserEvaluationText(data.cleanup.reason).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH)
+      }
+    : null;
+  return {
+    phase: data.phase === 'typing_prompt' ? 'typing_prompt' : null,
+    browserEvaluation,
+    ...browserEvaluation,
+    ...(cleanup ? { cleanup } : {})
+  };
+}
+
 async function parseBody(req, { maxBytes = 2_000_000 } = {}) {
   const chunks = [];
   let total = 0;
@@ -203,6 +253,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'chatgpt_file_input_state_conflict') return { code: 409, body: { error: 'chatgpt_file_input_state_conflict', data: sanitizeAttachmentDiagnostics(error?.data) } };
   if (msg === 'chatgpt_file_input_clear_failed') return { code: 409, body: { error: 'chatgpt_file_input_clear_failed', data: sanitizeAttachmentDiagnostics(error?.data) } };
   if (msg === 'chatgpt_file_input_clear_timeout') return { code: 408, body: { error: 'chatgpt_file_input_clear_timeout', data: sanitizeAttachmentDiagnostics(error?.data) } };
+  if (msg === 'browser_evaluation_failed') return { code: 500, body: { error: 'internal_error', message: 'browser_evaluation_failed', data: sanitizeBrowserEvaluationDiagnostics(error?.data) } };
   if (msg === 'timeout_waiting_for_prompt') return { code: 408, body: { error: 'timeout_waiting_for_prompt', data: error?.data || null } };
   if (msg === 'timeout_waiting_for_response') return { code: 408, body: { error: 'timeout_waiting_for_response', data: error?.data || null } };
   if (msg === 'artifacts_folder_open_failed') return { code: 500, body: { error: 'artifacts_folder_open_failed', data: error?.data || null } };

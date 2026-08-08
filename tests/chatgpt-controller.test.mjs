@@ -54,7 +54,7 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, onBasicEvaluate = null, promptEvaluationOverride = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   const defaultStopTokenEvaluation = (js) => {
     if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
     const generation = Number(/const (?:generation|expectedGeneration) = ([0-9]+)/u.exec(js)?.[1] || 0);
@@ -91,6 +91,7 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, onInsertText =
       }
       const basicOverride = await onBasicEvaluate?.(js);
       if (basicOverride !== undefined) return basicOverride;
+      if (js.includes('missing_prompt_textarea') && promptEvaluationOverride) return await promptEvaluationOverride(js);
       const basic = basicEvaluation(js);
       if (basic !== undefined) {
         if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
@@ -2470,6 +2471,84 @@ test('chatgpt-controller: attachment timeout clears the unsent draft without add
     assert.match(cleanupScript(), /nativeValueSetter\.call\(uploadInput, ''\)/u);
     assert.match(cleanupScript(), /finalCardCount/u);
   });
+});
+
+test('chatgpt-controller: browser evaluation errors preserve diagnostics before any input or dispatch', async () => {
+  const events = [];
+  const progress = [];
+  const browserError = Object.assign(new Error('browser_evaluation_failed'), {
+    data: {
+      kind: 'runtime_evaluate_exception',
+      exceptionClass: 'TypeError',
+      exceptionMessage: 'Cannot read properties of undefined',
+      lineNumber: 17,
+      columnNumber: 9
+    }
+  });
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); },
+    promptEvaluationOverride: async () => { throw browserError; }
+  });
+
+  await assert.rejects(
+    async () => await createController(page).query({ prompt: 'diagnostic fixture', onProgress: (item) => progress.push(item) }),
+    (error) => {
+      assert.equal(error, browserError);
+      assert.equal(error.message, 'browser_evaluation_failed');
+      assert.equal(error.data.kind, 'runtime_evaluate_exception');
+      assert.equal(error.data.phase, 'typing_prompt');
+      assert.equal(error.data.exceptionClass, 'TypeError');
+      assert.equal(error.data.lineNumber, 17);
+      assert.equal(error.data.columnNumber, 9);
+      assert.deepEqual(error.data.cleanup, { status: 'skipped', reason: 'user_turn_baseline_unavailable' });
+      return true;
+    }
+  );
+  assert.equal(progress.some((item) => item?.phase === 'typing_prompt'), true);
+  assert.equal(events.some((item) => item.startsWith('text:') || item.startsWith('key:') || item.startsWith('files-set:') || item.includes('send')), false);
+});
+
+test('chatgpt-controller: explicit prompt evaluation failure keeps its meaning and phase', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); },
+    promptEvaluationOverride: async () => ({ ok: false, error: 'missing_prompt_textarea' })
+  });
+
+  await assert.rejects(
+    async () => await createController(page).query({ prompt: 'missing prompt fixture' }),
+    (error) => {
+      assert.equal(error.message, 'missing_prompt_textarea');
+      assert.equal(error.data.error, 'missing_prompt_textarea');
+      assert.equal(error.data.phase, 'typing_prompt');
+      assert.deepEqual(error.data.cleanup, { status: 'skipped', reason: 'user_turn_baseline_unavailable' });
+      return true;
+    }
+  );
+  assert.equal(events.some((item) => item.startsWith('text:') || item.startsWith('key:') || item.startsWith('files-set:') || item.includes('send')), false);
+});
+
+test('chatgpt-controller: undefined prompt evaluation reports a distinguishable type failure', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); },
+    promptEvaluationOverride: async () => undefined
+  });
+
+  await assert.rejects(
+    async () => await createController(page).query({ prompt: 'undefined evaluation fixture' }),
+    (error) => {
+      assert.equal(error.message, 'type_failed');
+      assert.equal(error.data.phase, 'typing_prompt');
+      assert.equal(error.data.reason, 'evaluation_result_unavailable');
+      assert.deepEqual(error.data.cleanup, { status: 'skipped', reason: 'user_turn_baseline_unavailable' });
+      return true;
+    }
+  );
+  assert.equal(events.some((item) => item.startsWith('text:') || item.startsWith('key:') || item.startsWith('files-set:') || item.includes('send')), false);
 });
 
 test('chatgpt-controller: stop during attachment wait aborts quickly and clears the draft', async () => {

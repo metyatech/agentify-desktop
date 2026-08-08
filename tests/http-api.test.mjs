@@ -1014,6 +1014,57 @@ test('http-api: attachment state conflict and clear errors keep explicit status 
   }
 });
 
+test('http-api: browser evaluation failures retain safe phase and diagnostics on the real handler', async (t) => {
+  const marker = 'prompt-secret-marker';
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      throw Object.assign(new Error('browser_evaluation_failed'), {
+        data: {
+          kind: 'runtime_evaluate_exception',
+          exceptionClass: 'TypeError',
+          exceptionMessage: `Cannot read ${marker} C:\\private\\fixture file:///C:/private/fixture?token=secret`,
+          lineNumber: 17,
+          columnNumber: 9,
+          phase: 'typing_prompt',
+          cleanup: { status: 'skipped', reason: 'user_turn_baseline_unavailable' }
+        }
+      });
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const response = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'diagnostic fixture' } });
+
+  assert.equal(response.res.status, 500);
+  assert.equal(response.data.error, 'internal_error');
+  assert.equal(response.data.message, 'browser_evaluation_failed');
+  assert.equal(response.data.data.kind, 'runtime_evaluate_exception');
+  assert.equal(response.data.data.phase, 'typing_prompt');
+  assert.equal(response.data.data.exceptionClass, 'TypeError');
+  assert.equal(response.data.data.lineNumber, 17);
+  assert.equal(response.data.data.columnNumber, 9);
+  assert.deepEqual(response.data.data.cleanup, { status: 'skipped', reason: 'user_turn_baseline_unavailable' });
+  assert.equal(JSON.stringify(response.data).includes(marker), false);
+  assert.equal(JSON.stringify(response.data).includes('C:\\private'), false);
+  assert.equal(JSON.stringify(response.data).includes('file://'), false);
+});
+
 test('http-api: status invalid tabId returns 404', async (t) => {
   const tabs = {
     listTabs: () => [],

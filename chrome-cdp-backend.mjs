@@ -45,6 +45,60 @@ function keyDescriptor(key) {
   };
 }
 
+const MAX_BROWSER_EVALUATION_DIAGNOSTIC_CHARS = 256;
+
+function sanitizeBrowserEvaluationText(value) {
+  let text = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!text) return '';
+
+  text = text
+    .replace(/\bfile:\/\/[^\s'"<>]+/giu, '<redacted-file-url>')
+    .replace(/\bhttps?:\/\/[^\s'"<>]+/giu, '<redacted-url>')
+    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\\\\[^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/(?:^|\s)\/(?:[^\s'"<>]+\/)+[^\s'"<>]*/gu, '$1<redacted-path>')
+    .replace(/\b(?:prompt|attachment|conversation|secret|token|nonce|session|target|objectid|expression|fixture)[-_A-Za-z0-9]{0,96}\b/giu, '<redacted-sensitive>')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '<redacted-token>')
+    .replace(/\b[A-Fa-f0-9]{32,}\b/gu, '<redacted-token>')
+    .replace(/\b(?=[A-Za-z0-9+/=_-]{24,}\b)(?=[A-Za-z0-9+/=_-]*[0-9])[A-Za-z0-9+/=_-]{24,}\b/gu, '<redacted-token>')
+    .replace(/(['"])[^'"\r\n]{1,256}\1/gu, '<redacted-value>')
+    .replace(/[?#][^\s'"<>]+/gu, '<redacted-url-part>');
+  const standardMessage = /^(Cannot read properties of (?:undefined|null)(?: \([^)]*\))?|JavaScript value is not a function|JavaScript name is not defined|Invalid or unexpected token|Unexpected token|Unexpected end of input)$/u.exec(text);
+  return (standardMessage?.[1] || 'Runtime.evaluate failed').slice(0, MAX_BROWSER_EVALUATION_DIAGNOSTIC_CHARS);
+}
+
+function sanitizeBrowserEvaluationClass(value) {
+  const match = /^\s*(?:Uncaught\s+)?([A-Za-z_$][A-Za-z0-9_$]{0,63})/u.exec(String(value ?? ''));
+  return match && /(?:Error|Exception)$/u.test(match[1]) ? match[1] : 'Error';
+}
+
+function sanitizeBrowserEvaluationNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(0, Math.min(1_000_000, Math.trunc(number)));
+}
+
+function browserEvaluationError(exceptionDetails) {
+  const description = String(exceptionDetails?.exception?.description || exceptionDetails?.text || '');
+  const firstLine = description.split(/\r?\n/u, 1)[0] || '';
+  const className = sanitizeBrowserEvaluationClass(exceptionDetails?.exception?.className || firstLine);
+  const messageMatch = /^(?:Uncaught\s+)?[A-Za-z_$][A-Za-z0-9_$]{0,63}(?:Error|Exception)?\s*:\s*(.*)$/u.exec(firstLine);
+  const exceptionMessage = sanitizeBrowserEvaluationText(messageMatch?.[1] || firstLine.replace(/^Uncaught\s+/u, '')) || 'Runtime.evaluate failed';
+  const data = {
+    kind: 'runtime_evaluate_exception',
+    exceptionClass: className,
+    exceptionMessage,
+    lineNumber: sanitizeBrowserEvaluationNumber(exceptionDetails?.lineNumber),
+    columnNumber: sanitizeBrowserEvaluationNumber(exceptionDetails?.columnNumber)
+  };
+  const error = new Error('browser_evaluation_failed');
+  error.data = data;
+  return error;
+}
+
 async function pathExists(filePath) {
   try {
     await fs.access(filePath);
@@ -349,6 +403,7 @@ class ChromeCdpPageAdapter {
       },
       this.sessionId
     );
+    if (result?.exceptionDetails) throw browserEvaluationError(result.exceptionDetails);
     return result?.result?.value;
   }
 

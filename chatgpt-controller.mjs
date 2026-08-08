@@ -1468,7 +1468,9 @@ export class ChatGPTController {
   async #typePrompt(prompt) {
     await this.#emitProgress({ phase: 'typing_prompt' });
     const sel = JSON.stringify(this.selectors.promptTextarea);
-    const ok = await this.#eval(`(async () => {
+    let ok;
+    try {
+      ok = await this.#eval(`(async () => {
       const visible = (n) => {
         const r = n.getBoundingClientRect();
         const style = window.getComputedStyle(n);
@@ -1545,10 +1547,18 @@ export class ChatGPTController {
           lastText
         }
       };
-    })()`);
+      })()`);
+    } catch (error) {
+      if (error?.message === 'browser_evaluation_failed') {
+        error.data = { ...(error.data && typeof error.data === 'object' ? error.data : {}), phase: 'typing_prompt' };
+      }
+      throw error;
+    }
     if (!ok?.ok) {
       const err = new Error(ok?.error || 'type_failed');
-      err.data = ok;
+      err.data = ok === undefined
+        ? { phase: 'typing_prompt', reason: 'evaluation_result_unavailable' }
+        : { ...(ok && typeof ok === 'object' ? ok : {}), phase: 'typing_prompt' };
       throw err;
     }
     const userTurnBaseline = normalizeUserTurnBaseline(ok.userTurnBaseline);

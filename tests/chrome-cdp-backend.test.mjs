@@ -423,6 +423,72 @@ async function createSessionWithFileInputs(selectorNodeIds) {
   return { session, calls };
 }
 
+async function createSessionWithRuntimeResult(runtimeResult) {
+  const calls = [];
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  backend.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}, sessionId) => {
+      calls.push({ method, params, sessionId });
+      if (method === 'Target.createTarget') return { targetId: 'runtime-target' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'runtime-session' };
+      if (method === 'Browser.getWindowForTarget') return {};
+      if (method === 'Runtime.evaluate') return runtimeResult;
+      return {};
+    }
+  };
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  return { session, calls };
+}
+
+test('chrome-cdp-backend: Runtime.evaluate preserves normal values and undefined', async () => {
+  const valueSession = await createSessionWithRuntimeResult({ result: { type: 'string', value: 'ok' } });
+  assert.equal(await valueSession.session.page.evaluate('1 + 1'), 'ok');
+
+  const undefinedSession = await createSessionWithRuntimeResult({ result: { type: 'undefined' } });
+  assert.equal(await undefinedSession.session.page.evaluate('void 0'), undefined);
+});
+
+test('chrome-cdp-backend: Runtime.evaluate exposes bounded sanitized exception diagnostics', async () => {
+  const marker = 'prompt-secret-marker';
+  const longHex = '0123456789abcdef'.repeat(4);
+  const { session, calls } = await createSessionWithRuntimeResult({
+    result: { type: 'undefined' },
+    exceptionDetails: {
+      text: `Uncaught TypeError: ${marker} C:\\private\\fixture\\prompt.txt file:///C:/private/fixture?token=secret https://chatgpt.com/c/abc?access_token=secret ${longHex}`,
+      lineNumber: 17,
+      columnNumber: 9,
+      exception: {
+        className: 'TypeError',
+        description: `TypeError: ${marker} C:\\private\\fixture\\prompt.txt file:///C:/private/fixture?token=secret https://chatgpt.com/c/abc?access_token=secret ${longHex}`,
+        objectId: 'session-secret-object-id'
+      }
+    }
+  });
+
+  await assert.rejects(
+    async () => await session.page.evaluate('throw new Error("prompt body")'),
+    (error) => {
+      assert.equal(error.message, 'browser_evaluation_failed');
+      assert.deepEqual(error.data.kind, 'runtime_evaluate_exception');
+      assert.equal(error.data.exceptionClass, 'TypeError');
+      assert.equal(error.data.lineNumber, 17);
+      assert.equal(error.data.columnNumber, 9);
+      assert.equal(typeof error.data.exceptionMessage, 'string');
+      assert.equal(error.data.exceptionMessage.includes(marker), false);
+      assert.equal(error.data.exceptionMessage.includes('C:\\private'), false);
+      assert.equal(error.data.exceptionMessage.includes('file://'), false);
+      assert.equal(error.data.exceptionMessage.includes('access_token'), false);
+      assert.equal(error.data.exceptionMessage.includes(longHex), false);
+      assert.equal(JSON.stringify(error.data).includes('session-secret-object-id'), false);
+      return true;
+    }
+  );
+  assert.equal(calls.some((call) => call.method === 'Input.insertText'), false);
+});
+
 test('chrome-cdp-backend: selector-targeted file input uses only the selected node', async () => {
   const { session, calls } = await createSessionWithFileInputs({
     '#upload-files': [101],

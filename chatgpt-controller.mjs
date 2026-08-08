@@ -1962,10 +1962,10 @@ export class ChatGPTController {
     const assertSendBudget = (step) => {
       if (Date.now() >= sendDeadline) throw sendTimeoutError(step);
     };
-    const evaluateSendStep = async (js, step) => {
+    const awaitSendStep = async (operation, step) => {
       assertSendBudget(step);
       const remainingMs = Math.max(1, sendDeadline - Date.now());
-      const evaluation = Promise.resolve().then(() => this.#eval(js));
+      const evaluation = Promise.resolve().then(operation);
       let timer = null;
       let settled = false;
       return await new Promise((resolve, reject) => {
@@ -1982,6 +1982,7 @@ export class ChatGPTController {
         ).catch(() => {});
       });
     };
+    const evaluateSendStep = async (js, step) => awaitSendStep(() => this.#eval(js), step);
     const waitForSendConfirmation = async () => {
       assertSendBudget('signal_wait');
       const result = await this.#waitForSendSignal({
@@ -2199,7 +2200,7 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
-      await this.#clickAt(cx, cy, {
+      await awaitSendStep(() => this.#clickAt(cx, cy, {
         onBeforeMouseDownAsync: async () => {
           const run = this.currentRun;
           await this.#claimProviderStopDispatch(run);
@@ -2208,7 +2209,7 @@ export class ChatGPTController {
         onBeforeMouseDown: () => {
           this.#commitProviderStopDispatchBeforeInput(this.currentRun);
         }
-      });
+      }), 'coordinate_click');
       coordinateClickAttempted = true;
       assertSendBudget('coordinate_click');
       await this.#completeProviderStopDispatch(this.currentRun);
@@ -2221,11 +2222,11 @@ export class ChatGPTController {
       assertSendBudget('dom_click_fallback');
       this.#throwIfStopRequested();
       await this.#verifyProviderStopTokenBeforeDispatch();
-      const domFallback = await this.#tryChatGPTExactSubmissionFallback({
+      const domFallback = await awaitSendStep(() => this.#tryChatGPTExactSubmissionFallback({
         sendBaseline: res?.sendBaseline,
         action: 'dom_click',
         allowRetry: true
-      });
+      }), 'dom_click_fallback');
       domClickAttempted = !!domFallback?.attempted;
       lastFallbackResult = domFallback?.lastFallbackResult || null;
       this.#recordSendAttemptCompleted(domClickAttempted);
@@ -2237,11 +2238,11 @@ export class ChatGPTController {
         assertSendBudget('request_submit_fallback');
         this.#throwIfStopRequested();
         await this.#verifyProviderStopTokenBeforeDispatch();
-        const submitFallback = await this.#tryChatGPTExactSubmissionFallback({
+        const submitFallback = await awaitSendStep(() => this.#tryChatGPTExactSubmissionFallback({
           sendBaseline: res?.sendBaseline,
           action: 'request_submit',
           allowRetry: true
-        });
+        }), 'request_submit_fallback');
         requestSubmitAttempted = !!submitFallback?.attempted;
         lastFallbackResult = submitFallback?.lastFallbackResult || lastFallbackResult;
         this.#recordSendAttemptCompleted(requestSubmitAttempted);

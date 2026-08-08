@@ -4936,6 +4936,35 @@ test('chatgpt-controller: bounds a stalled send discovery evaluation before resp
   assert.equal(events.includes('normal-send-click'), false);
 });
 
+test('chatgpt-controller: bounds a stalled coordinate send action before fallback', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (isClickSendEvaluation(js)) return normalChatGPTSendResult(sendBaseline({ activePromptText: 'stalled coordinate' }));
+      if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ activePromptText: 'stalled coordinate' });
+      if (js.includes('const clickFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'normal_send_not_found' };
+      if (js.includes('const submitFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'active_composer_form_not_found' };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  page.moveMouse = async (x) => {
+    if (x >= 80) await new Promise(() => {});
+  };
+  const startedAt = Date.now();
+  await assert.rejects(
+    createController(page, { sendConfirmationTimeoutMs: 20 }).send({ text: 'stalled coordinate', timeoutMs: 5_000 }),
+    (error) => {
+      assert.equal(error.message, 'send_not_triggered');
+      assert.equal(error.data.reason, 'send_confirmation_timeout');
+      assert.equal(error.data.step, 'coordinate_click');
+      return true;
+    }
+  );
+  assert.ok(Date.now() - startedAt < 500, 'stalled coordinate action must be bounded by the send budget');
+  assert.equal(events.includes('normal-send-click'), false);
+});
+
 test('chatgpt-controller: cleans a zero-turn attachment draft after unconfirmed send timeout', async () => {
   await withTempAttachments([
     'a/task-contract.json',

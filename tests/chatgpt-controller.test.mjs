@@ -1065,6 +1065,110 @@ test('chatgpt-controller: rejects an unchanged ChatGPT send state without a norm
   assert.equal(events.includes('normal-send-click'), true);
 });
 
+test('chatgpt-controller: does not treat a transient stop with a retained prompt as send confirmation', async () => {
+  await withTempAttachments([
+    'a/task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'b/task-contract.json',
+    'worker-last-message.txt',
+    'changed-files.json',
+    'verification.json'
+  ], async (attachments) => {
+    const events = [];
+    const prompt = 'long unsent draft '.repeat(40).trim();
+    const cardDisplayNames = [
+      'task-contract(2).json',
+      'repository-state(2).json',
+      'changes(2).patch',
+      'task-contract(3).json',
+      'worker-last-message(2).txt',
+      'changed-files(2).json',
+      'verification(2).json'
+    ];
+    const selectedFileNames = [
+      'task-contract.json',
+      'repository-state.json',
+      'changes.patch',
+      'task-contract.json',
+      'worker-last-message.txt',
+      'changed-files.json',
+      'verification.json'
+    ];
+    const dom = createCleanupDom({
+      events,
+      promptText: prompt,
+      uploadInputCount: 1,
+      selectedFileNames,
+      cardDisplayNames,
+      cardCount: 7,
+      userTurnTexts: ['baseline user turn']
+    });
+    let assistantEvaluations = 0;
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot(selectedFileNames.map((fileName, index) => ({
+        sourceFileName: fileName,
+        displayName: cardDisplayNames[index],
+        matched: true,
+        pending: false,
+        failed: false
+      })), { conditionsReady: true, mappingComplete: true }),
+      cleanupResult: null,
+      cleanupDom: dom,
+      userTurnBaseline: { count: 1, lastId: '', lastTextDigest: userTurnDigestForTest('baseline user turn') },
+      onEvaluateExtra: async (js) => {
+        if (isClickSendEvaluation(js)) {
+          return {
+            ...normalChatGPTSendResult(sendBaseline({ userCount: 1, lastUserText: 'baseline user turn', activePromptText: prompt })),
+            rect: { x: 90, y: 10, w: 20, h: 20 }
+          };
+        }
+        if (js.includes('const assistantCandidates')) {
+          assistantEvaluations += 1;
+          return assistantSnapshot({ count: 0, lastAssistantId: '', txt: '' });
+        }
+        if (js.includes('normalStopVisible')) {
+          return chatgptSendSignal({
+            userCount: 1,
+            lastUserId: '',
+            lastUserText: 'baseline user turn',
+            activePromptText: prompt,
+            normalStopVisible: false
+          });
+        }
+        if (js.includes('clickFallbackBaselineText')) {
+          events.push('dom-send-click');
+          return { attempted: true, lastFallbackResult: 'dom_click' };
+        }
+        if (js.includes('submitFallbackBaselineText')) {
+          events.push('requestSubmit');
+          return { attempted: true, lastFallbackResult: 'request_submit_with_button' };
+        }
+        return undefined;
+      }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt, attachments, timeoutMs: 30 }),
+      (error) => {
+        assert.equal(error.message, 'send_not_triggered');
+        assert.equal(error.data?.sendConfirmed, false);
+        assert.equal(error.data?.cleanup?.status, 'cleared');
+        return true;
+      }
+    );
+    assert.equal(assistantEvaluations, 0);
+    assert.equal(events.includes('normal-send-click'), true);
+    assert.equal(events.includes('dom-send-click'), true);
+    assert.equal(events.includes('requestSubmit'), true);
+    assert.deepEqual(dom.uploadInputs[0].files, []);
+    assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
+    assert.equal(dom.prompt.value, '');
+    assert.deepEqual(dom.document.querySelectorAll('article[data-turn="user"]').map((node) => node.innerText), ['baseline user turn']);
+  });
+});
+
 test('chatgpt-controller: checks send completion only within the active composer', async () => {
   const events = [];
   const page = createPage({
@@ -1324,7 +1428,9 @@ test('chatgpt-controller: reports every exact submission fallback when no send s
         coordinateClickAttempted: true,
         domClickAttempted: true,
         requestSubmitAttempted: true,
-        lastFallbackResult: 'request_submit_with_button'
+        lastFallbackResult: 'request_submit_with_button',
+        sendConfirmed: false,
+        cleanup: { status: 'skipped', reason: 'user_turn_baseline_unavailable' }
       });
       return true;
     }

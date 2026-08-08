@@ -1736,7 +1736,8 @@ export class ChatGPTController {
           lastUserTextDigest === baseline.activePromptTextDigest &&
           lastUserTextDigest !== baseline.lastUserTextDigest;
         const promptWasCleared = baseline.activePromptTextLength >= 1 && snap.activePromptTextLength === 0;
-        if (userCountIncreased || userIdChanged || userTextMatchesPrompt || promptWasCleared || snap.normalStopVisible) return true;
+        const normalStopConfirmsSend = snap.normalStopVisible && snap.activePromptTextLength === 0;
+        if (userCountIncreased || userIdChanged || userTextMatchesPrompt || promptWasCleared || normalStopConfirmsSend) return true;
         await sleep(pollMs);
         continue;
       }
@@ -1745,6 +1746,22 @@ export class ChatGPTController {
       await sleep(pollMs);
     }
     return false;
+  }
+
+  #recordSendConfirmation(sent) {
+    if (sent && this.currentRun) this.currentRun.sendConfirmed = true;
+    return sent;
+  }
+
+  #recordSendAttemptCompleted(completed) {
+    if (completed && this.currentRun) this.currentRun.sendAttemptCompleted = true;
+    return completed;
+  }
+
+  #canCleanupUnsentDraft(run) {
+    if (!run?.promptTyped || run.sendConfirmed || run.dispatchStateUnknown) return false;
+    if (run.requested && run.messageDispatchStarted) return false;
+    return run.sendAttemptCompleted || !run.messageDispatchStarted;
   }
 
   async #tryChatGPTExactSubmissionFallback({ sendBaseline, action, allowRetry = false }) {
@@ -2142,11 +2159,12 @@ export class ChatGPTController {
       });
       coordinateClickAttempted = true;
       await this.#completeProviderStopDispatch(this.currentRun);
-      sent = await this.#waitForSendSignal({
+      this.#recordSendAttemptCompleted(true);
+      sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
         timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 2200,
         pollMs: 120,
         sendBaseline: res?.sendBaseline
-      });
+      }));
     }
 
     if (!sent && res?.isChatGPT && coordinateClickAttempted) {
@@ -2159,12 +2177,13 @@ export class ChatGPTController {
       });
       domClickAttempted = !!domFallback?.attempted;
       lastFallbackResult = domFallback?.lastFallbackResult || null;
+      this.#recordSendAttemptCompleted(domClickAttempted);
       if (domClickAttempted) {
-        sent = await this.#waitForSendSignal({
+        sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
           timeoutMs: chatgptSignalTimeoutMs,
           pollMs: 120,
           sendBaseline: res?.sendBaseline
-        });
+        }));
       }
 
       if (!sent && domClickAttempted) {
@@ -2177,12 +2196,13 @@ export class ChatGPTController {
         });
         requestSubmitAttempted = !!submitFallback?.attempted;
         lastFallbackResult = submitFallback?.lastFallbackResult || lastFallbackResult;
+        this.#recordSendAttemptCompleted(requestSubmitAttempted);
         if (requestSubmitAttempted) {
-          sent = await this.#waitForSendSignal({
+          sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
             timeoutMs: chatgptSignalTimeoutMs,
             pollMs: 120,
             sendBaseline: res?.sendBaseline
-          });
+          }));
         }
       }
     }
@@ -2282,11 +2302,12 @@ export class ChatGPTController {
         if (dispatchResult.state !== 'pending' && dispatchResult.state !== 'cancelled' && dispatchResult.state !== 'mismatch') this.currentRun.dispatchStateUnknown = true;
         throw this.#providerStopDispatchError('dispatch');
       }
-      sent = await this.#waitForSendSignal({
+      this.#recordSendAttemptCompleted(!!dispatchResult?.dispatchClaimed);
+      sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
         timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1400,
         pollMs: 120,
         sendBaseline: res?.sendBaseline
-      });
+      }));
     }
 
     if (!sent && !res?.isChatGPT) {
@@ -2317,15 +2338,16 @@ export class ChatGPTController {
           this.#commitProviderStopDispatchBeforeInput(this.currentRun);
           await this.#sendKey(key, { modifiers });
           await this.#completeProviderStopDispatch(this.currentRun);
+          this.#recordSendAttemptCompleted(true);
         } catch (error) {
           await this.#reconcileProviderStopDispatch(this.currentRun);
           throw error;
         }
-        sent = await this.#waitForSendSignal({
+        sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
           timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1500,
           pollMs: 120,
           sendBaseline: res?.sendBaseline
-        });
+        }));
         if (sent) break;
       }
     }
@@ -2338,7 +2360,8 @@ export class ChatGPTController {
             coordinateClickAttempted,
             domClickAttempted,
             requestSubmitAttempted,
-            lastFallbackResult
+            lastFallbackResult,
+            sendConfirmed: !!this.currentRun?.sendConfirmed
           }
         : { host: res?.host || null };
       throw err;
@@ -3565,6 +3588,8 @@ export class ChatGPTController {
       dispatchStateUnknown: false,
       providerStopDispatchLease: false,
       providerStopInputStarted: false,
+      sendAttemptCompleted: false,
+      sendConfirmed: false,
       userTurnBaseline: null,
       signal
     };
@@ -3595,7 +3620,7 @@ export class ChatGPTController {
       await this.#clickSend({ timeoutMs });
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
     } catch (error) {
-      if (run.promptTyped && !run.messageDispatchStarted && !run.dispatchStateUnknown) {
+      if (this.#canCleanupUnsentDraft(run)) {
         try {
           error.data = {
             ...(error?.data && typeof error.data === 'object' ? error.data : {}),
@@ -3654,6 +3679,8 @@ export class ChatGPTController {
         dispatchStateUnknown: false,
         providerStopDispatchLease: false,
         providerStopInputStarted: false,
+        sendAttemptCompleted: false,
+        sendConfirmed: false,
         userTurnBaseline: null,
         signal
       };
@@ -3684,7 +3711,7 @@ export class ChatGPTController {
 
         return { ok: true };
       } catch (error) {
-        if (run.promptTyped && !run.messageDispatchStarted && !run.dispatchStateUnknown) {
+        if (this.#canCleanupUnsentDraft(run)) {
           try {
             error.data = {
               ...(error?.data && typeof error.data === 'object' ? error.data : {}),

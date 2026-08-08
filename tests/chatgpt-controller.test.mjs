@@ -4936,6 +4936,78 @@ test('chatgpt-controller: bounds a stalled send discovery evaluation before resp
   assert.equal(events.includes('normal-send-click'), false);
 });
 
+test('chatgpt-controller: cleans a zero-turn attachment draft after unconfirmed send timeout', async () => {
+  await withTempAttachments([
+    'a/task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'b/task-contract.json',
+    'worker-last-message.txt',
+    'changed-files.json',
+    'verification.json'
+  ], async (attachments) => {
+    const events = [];
+    const prompt = 'zero-turn attachment draft';
+    const selectedFileNames = [
+      'task-contract.json',
+      'repository-state.json',
+      'changes.patch',
+      'task-contract(1).json',
+      'worker-last-message.txt',
+      'changed-files.json',
+      'verification.json'
+    ];
+    const cardDisplayNames = [
+      'task-contract(20260808-115028).json',
+      'repository-state(20260808-115029).json',
+      'changes(20260808-115028).patch',
+      'task-contract(1)(7).json',
+      'worker-last-message(20260808-115029).txt',
+      'changed-files(20260808-115029).json',
+      'verification(20260808-115028).json'
+    ];
+    const dom = createCleanupDom({
+      events,
+      promptText: prompt,
+      uploadInputCount: 1,
+      selectedFileNames,
+      cardDisplayNames,
+      cardCount: 7,
+      userTurnTexts: []
+    });
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot(selectedFileNames.map((sourceFileName, index) => ({
+        sourceFileName,
+        displayName: cardDisplayNames[index],
+        matched: true,
+        pending: false,
+        failed: false
+      })), { conditionsReady: true, mappingComplete: true }),
+      cleanupResult: null,
+      cleanupDom: dom,
+      userTurnBaseline: { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') },
+      onEvaluateExtra: async (js) => {
+        if (isClickSendEvaluation(js)) return normalChatGPTSendResult(sendBaseline({ userCount: 0, lastUserText: '', activePromptText: prompt }));
+        if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({ userCount: 0, lastUserText: '', activePromptText: prompt, normalStopVisible: false });
+        if (js.includes('const clickFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'normal_send_not_found' };
+        if (js.includes('const submitFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'active_composer_form_not_found' };
+        return undefined;
+      }
+    });
+
+    await assert.rejects(
+      createController(page, { sendConfirmationTimeoutMs: 20 }).query({ prompt, attachments, timeoutMs: 5_000 }),
+      (error) => error.message === 'send_not_triggered' && error.data.cleanup.status === 'cleared'
+    );
+    assert.equal(dom.prompt.value, '');
+    assert.deepEqual(dom.uploadInputs[0].files, []);
+    assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
+    assert.equal(events.filter((event) => event === 'card-remove').length, 7);
+    assert.deepEqual(dom.document.querySelectorAll('article[data-turn="user"]'), []);
+  });
+});
+
 test('chatgpt-controller: send stop after typing clears the unsent draft before dispatch', async () => {
   const events = [];
   const { page } = createAttachmentCleanupPage({

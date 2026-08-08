@@ -1763,9 +1763,10 @@ export class ChatGPTController {
   }
 
   #canCleanupUnsentDraft(run) {
-    if (!run?.promptTyped || run.sendConfirmed || run.dispatchStateUnknown) return false;
+    if (!run?.promptTyped || run.sendConfirmed) return false;
+    if (run.dispatchStateUnknown && !run.sendConfirmationTimedOut) return false;
     if (run.requested && run.messageDispatchStarted) return false;
-    return run.sendAttemptCompleted || !run.messageDispatchStarted;
+    return run.sendAttemptCompleted || !run.messageDispatchStarted || run.sendConfirmationTimedOut;
   }
 
   async #tryChatGPTExactSubmissionFallback({ sendBaseline, action, allowRetry = false }) {
@@ -1948,6 +1949,7 @@ export class ChatGPTController {
     const sendConfirmationTimeoutMs = this.sendConfirmationTimeoutMs;
     const sendDeadline = Date.now() + sendConfirmationTimeoutMs;
     const sendTimeoutError = (step) => {
+      if (this.currentRun) this.currentRun.sendConfirmationTimedOut = true;
       const error = new Error('send_not_triggered');
       error.data = {
         phase: 'sending_prompt',
@@ -2392,6 +2394,7 @@ export class ChatGPTController {
     }
 
     if (!sent) {
+      if (this.currentRun) this.currentRun.sendConfirmationTimedOut = true;
       const err = new Error('send_not_triggered');
       err.data = res?.isChatGPT
         ? {
@@ -3629,6 +3632,7 @@ export class ChatGPTController {
       providerStopInputStarted: false,
       sendAttemptCompleted: false,
       sendConfirmed: false,
+      sendConfirmationTimedOut: false,
       userTurnBaseline: null,
       signal
     };
@@ -3718,9 +3722,10 @@ export class ChatGPTController {
         dispatchStateUnknown: false,
         providerStopDispatchLease: false,
         providerStopInputStarted: false,
-        sendAttemptCompleted: false,
-        sendConfirmed: false,
-        userTurnBaseline: null,
+      sendAttemptCompleted: false,
+      sendConfirmed: false,
+      sendConfirmationTimedOut: false,
+      userTurnBaseline: null,
         signal
       };
       this.currentRun = run;

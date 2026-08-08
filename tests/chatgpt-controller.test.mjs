@@ -1687,6 +1687,7 @@ test('chatgpt-controller: reports every exact submission fallback when no send s
       assert.deepEqual(error.data, {
         host: 'chatgpt.com',
         coordinateClickAttempted: true,
+        coordinateClickTimedOut: false,
         domClickAttempted: true,
         requestSubmitAttempted: true,
         lastFallbackResult: 'request_submit_with_button',
@@ -5183,6 +5184,45 @@ test('chatgpt-controller: bounds a stalled coordinate send action before fallbac
   );
   assert.ok(Date.now() - startedAt < 500, 'stalled coordinate action must be bounded by the send budget');
   assert.equal(events.includes('normal-send-click'), false);
+});
+
+test('chatgpt-controller: falls back after a coordinate timeout when dispatch never started', async () => {
+  const events = [];
+  let domClickAttempted = false;
+  const prompt = 'coordinate timeout fallback';
+  const page = createPage({
+    events,
+    onStopTokenEvaluate: async (js) => {
+      if (js.includes('agentifyStopTokenDispatchRead')) return { ok: true, state: 'pending' };
+      return undefined;
+    },
+    onEvaluate: async (js) => {
+      if (isClickSendEvaluation(js)) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+      if (js.includes('const chatgptUserTurns')) {
+        return chatgptSendSignal({
+          userCount: domClickAttempted ? 1 : 0,
+          lastUserId: domClickAttempted ? 'fallback-user' : '',
+          lastUserText: domClickAttempted ? prompt : '',
+          activePromptText: domClickAttempted ? '' : prompt
+        });
+      }
+      if (js.includes('const clickFallbackBaselineText')) {
+        events.push('dom-send-click');
+        domClickAttempted = true;
+        return { attempted: true, lastFallbackResult: 'dom_click' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  page.moveMouse = async (x) => {
+    if (x >= 80) await new Promise(() => {});
+  };
+
+  const result = await createController(page, { sendConfirmationTimeoutMs: 1_000 }).send({ text: prompt, timeoutMs: 5_000 });
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.deepEqual(events.filter((event) => event === 'dom-send-click'), ['dom-send-click']);
 });
 
 test('chatgpt-controller: cleans a zero-turn attachment draft after unconfirmed send timeout', async () => {

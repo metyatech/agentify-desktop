@@ -2041,9 +2041,12 @@ export class ChatGPTController {
     const assertSendBudget = (step) => {
       if (Date.now() >= sendDeadline) throw sendTimeoutError(step);
     };
-    const awaitSendStep = async (operation, step) => {
+    const awaitSendStep = async (operation, step, { timeoutMs = null } = {}) => {
       assertSendBudget(step);
       const remainingMs = Math.max(1, sendDeadline - Date.now());
+      const stepBudgetMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Math.min(remainingMs, Math.floor(Number(timeoutMs)))
+        : remainingMs;
       const evaluation = Promise.resolve().then(operation);
       let timer = null;
       let settled = false;
@@ -2054,7 +2057,7 @@ export class ChatGPTController {
           if (timer) clearTimeout(timer);
           handler(value);
         };
-        timer = setTimeout(() => finish(reject, sendTimeoutError(step)), remainingMs);
+        timer = setTimeout(() => finish(reject, sendTimeoutError(step)), stepBudgetMs);
         evaluation.then(
           (value) => finish(resolve, value),
           (error) => finish(reject, error)
@@ -2271,6 +2274,7 @@ export class ChatGPTController {
 
     let sent = false;
     let coordinateClickAttempted = false;
+    let coordinateClickTimedOut = false;
     let domClickAttempted = false;
     let requestSubmitAttempted = false;
     let lastFallbackResult = null;
@@ -2279,25 +2283,37 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
-      await awaitSendStep(() => this.#clickAt(cx, cy, {
-        onBeforeMouseDownAsync: async () => {
-          const run = this.currentRun;
-          await this.#claimProviderStopDispatch(run);
-          await this.#beginProviderStopDispatch(run);
-        },
-        onBeforeMouseDown: () => {
-          this.#commitProviderStopDispatchBeforeInput(this.currentRun);
-        }
-      }), 'coordinate_click');
-      coordinateClickAttempted = true;
-      assertSendBudget('coordinate_click');
-      await this.#completeProviderStopDispatch(this.currentRun);
-      assertSendBudget('dispatch_complete');
-      this.#recordSendAttemptCompleted(true);
-      sent = this.#recordSendConfirmation(await waitForSendConfirmation());
+      const fallbackReserveMs = Math.min(10_000, Math.floor(sendConfirmationTimeoutMs * 2 / 3));
+      const coordinateClickBudgetMs = Math.max(1, sendConfirmationTimeoutMs - fallbackReserveMs);
+      try {
+        await awaitSendStep(() => this.#clickAt(cx, cy, {
+          onBeforeMouseDownAsync: async () => {
+            const run = this.currentRun;
+            await this.#claimProviderStopDispatch(run);
+            await this.#beginProviderStopDispatch(run);
+          },
+          onBeforeMouseDown: () => {
+            this.#commitProviderStopDispatchBeforeInput(this.currentRun);
+          }
+        }), 'coordinate_click', { timeoutMs: coordinateClickBudgetMs });
+        coordinateClickAttempted = true;
+        assertSendBudget('coordinate_click');
+        await this.#completeProviderStopDispatch(this.currentRun);
+        assertSendBudget('dispatch_complete');
+        this.#recordSendAttemptCompleted(true);
+        sent = this.#recordSendConfirmation(await waitForSendConfirmation());
+      } catch (error) {
+        const coordinateTimeout = error?.message === 'send_not_triggered' && error?.data?.step === 'coordinate_click';
+        if (!coordinateTimeout) throw error;
+        coordinateClickTimedOut = true;
+        const dispatchState = await this.#reconcileProviderStopDispatch(this.currentRun);
+        const run = this.currentRun;
+        const dispatchStarted = run?.providerStopInputStarted || run?.messageDispatchStarted || run?.dispatchStateUnknown || ['dispatching', 'dispatched'].includes(dispatchState);
+        if (dispatchStarted || !['pending', 'cancelled'].includes(dispatchState)) throw error;
+      }
     }
 
-    if (!sent && res?.isChatGPT && coordinateClickAttempted) {
+    if (!sent && res?.isChatGPT && (coordinateClickAttempted || coordinateClickTimedOut)) {
       assertSendBudget('dom_click_fallback');
       this.#throwIfStopRequested();
       await this.#verifyProviderStopTokenBeforeDispatch();
@@ -2480,6 +2496,7 @@ export class ChatGPTController {
         ? {
             host: res?.host || null,
             coordinateClickAttempted,
+            coordinateClickTimedOut,
             domClickAttempted,
             requestSubmitAttempted,
             lastFallbackResult,

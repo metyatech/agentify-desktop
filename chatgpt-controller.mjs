@@ -3510,16 +3510,16 @@ export class ChatGPTController {
         (baselineAssistantCount === 0 && (snap?.count || 0) >= 1);
       const composerIdle =
         snap?.promptTextLength === 0 &&
-        !snap?.stop &&
+        (!snap?.stop || !!snap?.hasRegenerate) &&
         (!snap?.sendPresent || !!snap?.sendEnabled);
       lastNewChatGPTAssistant = !!newChatGPTAssistant;
       lastComposerIdle = !!composerIdle;
       const chatGPTDone =
         !!snap?.isChatGPT &&
         newChatGPTAssistant &&
-        !snap?.stop &&
+        (!snap?.stop || !!snap?.hasRegenerate) &&
         composerIdle &&
-        stopGoneLongEnough &&
+        (stopGoneLongEnough || !!snap?.hasRegenerate) &&
         stable &&
         txt.length > 0;
       const otherProviderDone =

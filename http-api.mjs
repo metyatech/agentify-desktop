@@ -833,6 +833,28 @@ export function startHttpApi({
     return error;
   };
 
+  const bindClientDisconnect = ({ req, res, abortController, operation, getController }) => {
+    let handled = false;
+    const onDisconnect = () => {
+      if (handled || res.writableEnded) return;
+      handled = true;
+      abortController.abort();
+      const controller = getController?.();
+      if (typeof controller?.requestStop === 'function') {
+        Promise.resolve(controller.requestStop({
+          reason: 'client_disconnected',
+          expectedOperationId: operation.id
+        })).catch(() => {});
+      }
+    };
+    req.once('aborted', onDisconnect);
+    res.once('close', onDisconnect);
+    return () => {
+      req.off('aborted', onDisconnect);
+      res.off('close', onDisconnect);
+    };
+  };
+
   const throwIfOperationActive = (op) => {
     const control = operationControls.get(op?.id);
     if (op?.stopRequested || control?.abortController.signal.aborted) throw operationAbortedError(op);
@@ -1128,6 +1150,13 @@ export function startHttpApi({
         reserveScope(scope, op);
         let tabId = null;
         let inflightReserved = false;
+        const detachClientDisconnect = bindClientDisconnect({
+          req,
+          res,
+          abortController,
+          operation: op,
+          getController: () => tabId ? tabs.getControllerById(tabId) : null
+        });
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           bindOperationTab(op, tabId);
@@ -1216,6 +1245,7 @@ export function startHttpApi({
             if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
           }
         } finally {
+          detachClientDisconnect();
           clearScope(scope, op.id);
           clearOperationControl(op);
         }
@@ -1251,6 +1281,13 @@ export function startHttpApi({
         reserveScope(scope, op);
         let tabId = null;
         let inflightReserved = false;
+        const detachClientDisconnect = bindClientDisconnect({
+          req,
+          res,
+          abortController,
+          operation: op,
+          getController: () => tabId ? tabs.getControllerById(tabId) : null
+        });
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           bindOperationTab(op, tabId);
@@ -1286,6 +1323,7 @@ export function startHttpApi({
           if (tabId) setLastOutcome(tabId, outcomeFromError(error, op));
           throw error;
         } finally {
+          detachClientDisconnect();
           if (tabId) clearActiveQuery(tabId, op.id);
           clearScope(scope, op.id);
           clearOperationControl(op);

@@ -216,6 +216,71 @@ test('http-api: status surfaces source, phase, blocked state, and last outcome f
   assert.equal(st2.data.runtime?.lastOutcomes?.[0]?.label, 'Response received');
 });
 
+test('http-api: aborted client request cancels the controller and releases runtime guards', async (t) => {
+  let queryStartedResolve;
+  const queryStarted = new Promise((resolve) => { queryStartedResolve = resolve; });
+  let controllerAbortObserved = false;
+  let requestStopCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async ({ signal }) => {
+      queryStartedResolve();
+      await new Promise((_, reject) => {
+        signal.addEventListener('abort', () => {
+          controllerAbortObserved = true;
+          reject(Object.assign(new Error('query_aborted'), { data: { reason: 'client_disconnected' } }));
+        }, { once: true });
+      });
+    },
+    requestStop: async () => {
+      requestStopCalls += 1;
+      return { ok: true, requested: true, clicked: false };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const abortController = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${port}/query`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer secret', 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'disconnect me' }),
+    signal: abortController.signal
+  });
+  await queryStarted;
+  abortController.abort();
+  await assert.rejects(pending);
+
+  const deadline = Date.now() + 1_000;
+  let status = null;
+  while (Date.now() < deadline) {
+    status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
+    if (!status.data.activeQuery && status.data.runtime.inflightQueries === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(controllerAbortObserved, true);
+  assert.equal(requestStopCalls, 1);
+  assert.equal(status.data.activeQuery, null);
+  assert.equal(status.data.runtime.inflightQueries, 0);
+  assert.equal(status.data.runtime.activeQueries.length, 0);
+});
+
 test('http-api: same-tab query/send requests are rejected while a run is already active', async (t) => {
   let releaseQuery = null;
   const controller = {

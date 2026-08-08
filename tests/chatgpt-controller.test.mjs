@@ -656,7 +656,8 @@ function assistantSnapshot({
   txt = '',
   count = 0,
   lastAssistantId = '',
-  hasContinue = false
+  hasContinue = false,
+  hasRegenerate = false
 } = {}) {
   return {
     isChatGPT: true,
@@ -670,7 +671,7 @@ function assistantSnapshot({
     usedFallback: false,
     hasError: false,
     hasContinue,
-    hasRegenerate: false
+    hasRegenerate
   };
 }
 
@@ -743,6 +744,46 @@ test('chatgpt-controller: treats a visible normal stop button without a send but
       return true;
     }
   );
+});
+
+test('chatgpt-controller: accepts a stable new answer when a stale stop remains beside regenerate', async () => {
+  const events = [];
+  let baselineCaptured = false;
+  let responsePolls = 0;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) {
+        baselineCaptured = true;
+        return assistantBaseline();
+      }
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        assert.equal(baselineCaptured, true);
+        responsePolls += 1;
+        return assistantSnapshot({
+          stop: true,
+          sendPresent: false,
+          sendEnabled: false,
+          promptTextLength: 0,
+          txt: 'COMPLETED-ANSWER',
+          count: 1,
+          lastAssistantId: 'new-turn',
+          hasRegenerate: true
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: true, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page).query({ prompt: 'return the completed answer', timeoutMs: 4_000 });
+
+  assert.equal(result.text, 'COMPLETED-ANSWER');
+  assert.ok(responsePolls > 1);
 });
 
 test('chatgpt-controller: waits for all attachment names in two consecutive composer polls', async () => {

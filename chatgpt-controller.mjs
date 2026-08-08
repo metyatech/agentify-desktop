@@ -17,6 +17,7 @@ const PROVIDER_STOP_RETRY_TIMEOUT_MS = 800;
 const PROVIDER_STOP_RETRY_POLL_MS = 75;
 const PROVIDER_STOP_RELEASE_RETRY_MAX = 3;
 const PROVIDER_STOP_RELEASE_RETRY_POLL_MS = 50;
+const MAX_SEND_CONFIRMATION_TIMEOUT_MS = 15_000;
 
 let latestProviderStopGeneration = 0;
 
@@ -278,7 +279,7 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, sendConfirmationTimeoutMs = MAX_SEND_CONFIRMATION_TIMEOUT_MS }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
@@ -293,6 +294,9 @@ export class ChatGPTController {
     this.providerStopOwner = null;
     this.providerStopGeneration = nextProviderStopGeneration();
     this.providerStopSequence = 0;
+    this.sendConfirmationTimeoutMs = Number.isFinite(Number(sendConfirmationTimeoutMs)) && Number(sendConfirmationTimeoutMs) > 0
+      ? Math.min(MAX_SEND_CONFIRMATION_TIMEOUT_MS, Math.floor(Number(sendConfirmationTimeoutMs)))
+      : MAX_SEND_CONFIRMATION_TIMEOUT_MS;
   }
 
   async runExclusive(fn) {
@@ -1941,7 +1945,52 @@ export class ChatGPTController {
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const chatgptSignalTimeoutMs = Math.min(5_000, Math.max(0, Number(timeoutMs) || 0));
-    const res = await this.#eval(`(async () => {
+    const sendConfirmationTimeoutMs = this.sendConfirmationTimeoutMs;
+    const sendDeadline = Date.now() + sendConfirmationTimeoutMs;
+    const sendTimeoutError = (step) => {
+      const error = new Error('send_not_triggered');
+      error.data = {
+        phase: 'sending_prompt',
+        reason: 'send_confirmation_timeout',
+        step,
+        timeoutMs: sendConfirmationTimeoutMs
+      };
+      return error;
+    };
+    const assertSendBudget = (step) => {
+      if (Date.now() >= sendDeadline) throw sendTimeoutError(step);
+    };
+    const evaluateSendStep = async (js, step) => {
+      assertSendBudget(step);
+      const remainingMs = Math.max(1, sendDeadline - Date.now());
+      const evaluation = Promise.resolve().then(() => this.#eval(js));
+      let timer = null;
+      let settled = false;
+      return await new Promise((resolve, reject) => {
+        const finish = (handler, value) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          handler(value);
+        };
+        timer = setTimeout(() => finish(reject, sendTimeoutError(step)), remainingMs);
+        evaluation.then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error)
+        ).catch(() => {});
+      });
+    };
+    const waitForSendConfirmation = async () => {
+      assertSendBudget('signal_wait');
+      const result = await this.#waitForSendSignal({
+        timeoutMs: Math.min(chatgptSignalTimeoutMs, Math.max(0, sendDeadline - Date.now())),
+        pollMs: 120,
+        sendBaseline: res?.sendBaseline
+      });
+      assertSendBudget('signal_wait');
+      return result;
+    };
+    const res = await evaluateSendStep(`(async () => {
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
       const visible = (n) => {
@@ -2131,7 +2180,7 @@ export class ChatGPTController {
         requestSubmit: !!prompt?.closest('form'),
         host
       };
-    })()`);
+    })()`, 'send_discovery');
     if (!res?.ok) {
       const err = new Error(res?.error || 'send_failed');
       err.data = res;
@@ -2144,6 +2193,7 @@ export class ChatGPTController {
     let requestSubmitAttempted = false;
     let lastFallbackResult = null;
     if (res?.rect?.w > 0 && res?.rect?.h > 0) {
+      assertSendBudget('coordinate_click');
       this.#throwIfStopRequested();
       const cx = Math.round(res.rect.x + res.rect.w / 2);
       const cy = Math.round(res.rect.y + res.rect.h / 2);
@@ -2158,16 +2208,15 @@ export class ChatGPTController {
         }
       });
       coordinateClickAttempted = true;
+      assertSendBudget('coordinate_click');
       await this.#completeProviderStopDispatch(this.currentRun);
+      assertSendBudget('dispatch_complete');
       this.#recordSendAttemptCompleted(true);
-      sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
-        timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 2200,
-        pollMs: 120,
-        sendBaseline: res?.sendBaseline
-      }));
+      sent = this.#recordSendConfirmation(await waitForSendConfirmation());
     }
 
     if (!sent && res?.isChatGPT && coordinateClickAttempted) {
+      assertSendBudget('dom_click_fallback');
       this.#throwIfStopRequested();
       await this.#verifyProviderStopTokenBeforeDispatch();
       const domFallback = await this.#tryChatGPTExactSubmissionFallback({
@@ -2179,14 +2228,11 @@ export class ChatGPTController {
       lastFallbackResult = domFallback?.lastFallbackResult || null;
       this.#recordSendAttemptCompleted(domClickAttempted);
       if (domClickAttempted) {
-        sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
-          timeoutMs: chatgptSignalTimeoutMs,
-          pollMs: 120,
-          sendBaseline: res?.sendBaseline
-        }));
+        sent = this.#recordSendConfirmation(await waitForSendConfirmation());
       }
 
       if (!sent && domClickAttempted) {
+        assertSendBudget('request_submit_fallback');
         this.#throwIfStopRequested();
         await this.#verifyProviderStopTokenBeforeDispatch();
         const submitFallback = await this.#tryChatGPTExactSubmissionFallback({
@@ -2198,16 +2244,13 @@ export class ChatGPTController {
         lastFallbackResult = submitFallback?.lastFallbackResult || lastFallbackResult;
         this.#recordSendAttemptCompleted(requestSubmitAttempted);
         if (requestSubmitAttempted) {
-          sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
-            timeoutMs: chatgptSignalTimeoutMs,
-            pollMs: 120,
-            sendBaseline: res?.sendBaseline
-          }));
+          sent = this.#recordSendConfirmation(await waitForSendConfirmation());
         }
       }
     }
 
     if (!sent && (!res?.isChatGPT || res?.fallbackEnter)) {
+      assertSendBudget('form_dispatch');
       this.#throwIfStopRequested();
       await this.#verifyProviderStopTokenBeforeDispatch();
       const dispatchGeneration = this.#providerStopGeneration(this.currentRun);
@@ -2215,7 +2258,7 @@ export class ChatGPTController {
       const dispatchToken = JSON.stringify(this.currentRun?.providerStopToken || null);
       let dispatchResult;
       try {
-        dispatchResult = await this.#eval(`(() => {
+        dispatchResult = await evaluateSendStep(`(() => {
         const agentifyStopTokenDispatchAction = true;
         const host = location.hostname || '';
         const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
@@ -2287,7 +2330,7 @@ export class ChatGPTController {
           dispatch: { generation: ${dispatchGeneration}, sequence: ${dispatchSequence}, state: 'dispatched' }
         };
         return { attempted: true, dispatchClaimed: true, dispatchState: 'dispatched' };
-        })()`);
+        })()`, 'form_dispatch');
       } catch (error) {
         await this.#reconcileProviderStopDispatch(this.currentRun);
         throw error;
@@ -2303,11 +2346,7 @@ export class ChatGPTController {
         throw this.#providerStopDispatchError('dispatch');
       }
       this.#recordSendAttemptCompleted(!!dispatchResult?.dispatchClaimed);
-      sent = this.#recordSendConfirmation(await this.#waitForSendSignal({
-        timeoutMs: res?.isChatGPT ? chatgptSignalTimeoutMs : 1400,
-        pollMs: 120,
-        sendBaseline: res?.sendBaseline
-      }));
+      sent = this.#recordSendConfirmation(await waitForSendConfirmation());
     }
 
     if (!sent && !res?.isChatGPT) {

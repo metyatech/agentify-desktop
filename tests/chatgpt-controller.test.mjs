@@ -131,8 +131,8 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, promptEvaluati
   };
 }
 
-function createController(page) {
-  return new ChatGPTController({ page, selectors });
+function createController(page, options = {}) {
+  return new ChatGPTController({ page, selectors, ...options });
 }
 
 function createPromptExpressionContext(userTurns = []) {
@@ -4904,6 +4904,36 @@ test('chatgpt-controller: send-started failure never auto-clears the composer', 
   });
   await assert.rejects(createController(page).send({ text: 'send-started', timeoutMs: 20 }), /send_not_triggered/u);
   assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: bounds a stalled send discovery evaluation before response waiting', async () => {
+  const events = [];
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (isClickSendEvaluation(js)) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('const clickFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'normal_send_not_found' };
+      if (js.includes('const submitFallbackBaselineText')) return { attempted: false, lastFallbackResult: 'active_composer_form_not_found' };
+      if (js.includes('const chatgptUserTurns')) return { isChatGPT: true, userCount: 0, lastUserId: '', lastUserTextDigest: userTurnDigestForTest(''), activePromptText: 'bounded send', activePromptTextDigest: userTurnDigestForTest('bounded send'), activePromptTextLength: 12, hasNormalSend: true, normalStopVisible: false };
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const startedAt = Date.now();
+  await assert.rejects(
+    createController(page, { sendConfirmationTimeoutMs: 20 }).send({ text: 'bounded send', timeoutMs: 5_000 }),
+    (error) => {
+      assert.equal(error.message, 'send_not_triggered');
+      assert.equal(error.data.reason, 'send_confirmation_timeout');
+      assert.equal(error.data.phase, 'sending_prompt');
+      return true;
+    }
+  );
+  assert.ok(Date.now() - startedAt < 500, 'stalled send discovery must be bounded by the send budget');
+  assert.equal(events.includes('normal-send-click'), false);
 });
 
 test('chatgpt-controller: send stop after typing clears the unsent draft before dispatch', async () => {

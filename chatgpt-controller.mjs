@@ -279,7 +279,7 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, sendConfirmationTimeoutMs = MAX_SEND_CONFIRMATION_TIMEOUT_MS }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, sendConfirmationTimeoutMs = MAX_SEND_CONFIRMATION_TIMEOUT_MS, responseClock = null, responseSleep = null }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
@@ -297,6 +297,8 @@ export class ChatGPTController {
     this.sendConfirmationTimeoutMs = Number.isFinite(Number(sendConfirmationTimeoutMs)) && Number(sendConfirmationTimeoutMs) > 0
       ? Math.min(MAX_SEND_CONFIRMATION_TIMEOUT_MS, Math.floor(Number(sendConfirmationTimeoutMs)))
       : MAX_SEND_CONFIRMATION_TIMEOUT_MS;
+    this.responseClock = typeof responseClock === 'function' ? responseClock : () => Date.now();
+    this.responseSleep = typeof responseSleep === 'function' ? responseSleep : sleep;
   }
 
   async runExclusive(fn) {
@@ -3499,21 +3501,20 @@ export class ChatGPTController {
     const chatgptAssistantSel = JSON.stringify('[data-message-author-role="assistant"], article[data-turn="assistant"]');
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
-    const start = Date.now();
+    const now = this.responseClock;
+    const wait = this.responseSleep;
+    const start = now();
     const baselineAssistantCount = Math.max(0, Number(baseline?.assistantCount) || 0);
     const baselineAssistantId = String(baseline?.lastAssistantId || '').trim();
     let last = '';
-    let lastChange = Date.now();
+    let lastChange = now();
     let stopGoneAt = null;
     let continueClicks = 0;
     let lastSnap = null;
     let lastNewChatGPTAssistant = false;
     let lastComposerIdle = false;
-    let assistantStartedAt = null;
-    let assistantStopObserved = false;
-    const identitylessAssistantGraceMs = 15_000;
 
-    while (Date.now() - start < timeoutMs) {
+    while (now() - start < timeoutMs) {
       this.#throwIfStopRequested();
       const snap = await this.#eval(`(() => {
         const host = location.hostname || '';
@@ -3613,25 +3614,27 @@ export class ChatGPTController {
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { isChatGPT, stop, sendPresent, sendEnabled, promptTextLength, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate };
+        const assistantTurn = lastNode?.closest('section, article, [data-testid*="conversation-turn" i], [data-turn-id-container]') || lastNode;
+        const assistantTerminalSignal = isChatGPT && !!assistantTurn?.querySelector('button[data-testid="copy-turn-action-button"]');
+        return { isChatGPT, stop, sendPresent, sendEnabled, promptTextLength, txt, count: nodes.length, lastAssistantId, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate, assistantTerminalSignal };
       })()`);
       lastSnap = snap;
 
       const txt = String(snap?.txt || '');
       if (txt !== last) {
         last = txt;
-        lastChange = Date.now();
+        lastChange = now();
       }
 
       // Some providers expose unrelated visible "stop/cancel" controls.
       // ChatGPT's normal stop control is authoritative even when its send control is absent.
       const generating = snap?.isChatGPT ? !!snap?.stop : !!snap?.stop && !snap?.sendEnabled;
       if (generating) stopGoneAt = null;
-      else if (stopGoneAt == null) stopGoneAt = Date.now();
+      else if (stopGoneAt == null) stopGoneAt = now();
 
       const dynamicStableMs = Math.max(stableMs, txt.length > 8000 ? 3000 : txt.length > 2000 ? 2200 : stableMs);
-      const stable = Date.now() - lastChange >= dynamicStableMs;
-      const stopGoneLongEnough = stopGoneAt != null && Date.now() - stopGoneAt >= 800;
+      const stable = now() - lastChange >= dynamicStableMs;
+      const stopGoneLongEnough = stopGoneAt != null && now() - stopGoneAt >= 800;
 
       if (!snap?.stop && snap?.hasContinue && continueClicks < 3) {
         continueClicks += 1;
@@ -3639,32 +3642,21 @@ export class ChatGPTController {
           const btn = Array.from(document.querySelectorAll('button, a')).find(b => /continue generating/i.test((b.textContent||'').trim()));
           if (btn) btn.click();
         })()`);
-        await sleep(250);
+        await wait(250);
         continue;
       }
 
       const readyByNodes = (snap?.count || 0) > 0;
-      const fallbackWaited = !snap?.isChatGPT && !!snap?.usedFallback && (Date.now() - start >= 2500);
-      const fallbackStableLongEnough = !snap?.isChatGPT && txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
+      const fallbackWaited = !snap?.isChatGPT && !!snap?.usedFallback && (now() - start >= 2500);
+      const fallbackStableLongEnough = !snap?.isChatGPT && txt.length > 0 && (now() - lastChange >= Math.max(dynamicStableMs, 5000));
       const newChatGPTAssistant =
         (snap?.count || 0) > baselineAssistantCount ||
         (baselineAssistantId && snap?.lastAssistantId && baselineAssistantId !== snap.lastAssistantId) ||
         (baselineAssistantCount === 0 && (snap?.count || 0) >= 1);
-      if (newChatGPTAssistant && assistantStartedAt == null) assistantStartedAt = Date.now();
-      if (newChatGPTAssistant && snap?.stop) assistantStopObserved = true;
       const composerIdle =
         snap?.promptTextLength === 0 &&
         (!snap?.stop || !!snap?.hasRegenerate) &&
         (!snap?.sendPresent || !!snap?.sendEnabled);
-      // A streamed ChatGPT turn without a stable DOM identity or observed stop
-      // signal is not authoritative after the short text-stability window.
-      // Give that identityless turn a bounded settling period so hydration can
-      // finish before returning a partial assistant response.
-      const assistantCompletionSignal =
-        !!snap?.lastAssistantId ||
-        assistantStopObserved ||
-        (!!snap?.sendPresent && !!snap?.sendEnabled) ||
-        (assistantStartedAt != null && Date.now() - assistantStartedAt >= identitylessAssistantGraceMs);
       lastNewChatGPTAssistant = !!newChatGPTAssistant;
       lastComposerIdle = !!composerIdle;
       const chatGPTDone =
@@ -3673,7 +3665,7 @@ export class ChatGPTController {
         (!snap?.stop || !!snap?.hasRegenerate) &&
         composerIdle &&
         (stopGoneLongEnough || !!snap?.hasRegenerate) &&
-        assistantCompletionSignal &&
+        !!snap?.assistantTerminalSignal &&
         stable &&
         txt.length > 0;
       const otherProviderDone =
@@ -3698,12 +3690,14 @@ export class ChatGPTController {
         return { text: txt, codeBlocks: extra?.codeBlocks || [], meta: { count: snap?.count || 0, hasError: !!snap?.hasError } };
       }
 
-      await sleep(pollMs);
+      await wait(pollMs);
     }
 
-    const err = new Error('timeout_waiting_for_response');
+    const responseStarted = !!lastSnap?.isChatGPT && lastNewChatGPTAssistant && last.length > 0;
+    const err = new Error(responseStarted ? 'response_completion_unconfirmed' : 'timeout_waiting_for_response');
     err.data = {
-      last,
+      lastLength: last.length,
+      lastDigest: userTurnTextDigest(last),
       lastAssistantCount: Number(lastSnap?.count) || 0,
       lastAssistantId: String(lastSnap?.lastAssistantId || ''),
       sendPresent: !!lastSnap?.sendPresent,
@@ -3711,7 +3705,9 @@ export class ChatGPTController {
       stop: !!lastSnap?.stop,
       promptTextLength: Number.isFinite(Number(lastSnap?.promptTextLength)) ? Number(lastSnap.promptTextLength) : -1,
       newChatGPTAssistant: lastNewChatGPTAssistant,
-      composerIdle: lastComposerIdle
+      composerIdle: lastComposerIdle,
+      assistantTerminalSignal: !!lastSnap?.assistantTerminalSignal,
+      completionReason: responseStarted ? 'terminal_signal_missing' : 'assistant_turn_missing'
     };
     throw err;
   }

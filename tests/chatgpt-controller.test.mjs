@@ -678,7 +678,8 @@ test('chatgpt-controller: query returns the final ChatGPT assistant message, not
           usedFallback: false,
           hasError: false,
           hasContinue: false,
-          hasRegenerate: false
+          hasRegenerate: false,
+          assistantTerminalSignal: true
         };
       }
       if (js.includes('const assistantSel')) {
@@ -740,7 +741,8 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
             usedFallback: false,
             hasError: false,
             hasContinue: false,
-            hasRegenerate: false
+            hasRegenerate: false,
+            assistantTerminalSignal: true
           };
         }
         if (js.includes('const attachCandidates')) {
@@ -877,7 +879,8 @@ function assistantSnapshot({
   count = 0,
   lastAssistantId = '',
   hasContinue = false,
-  hasRegenerate = false
+  hasRegenerate = false,
+  assistantTerminalSignal = false
 } = {}) {
   return {
     isChatGPT: true,
@@ -891,7 +894,18 @@ function assistantSnapshot({
     usedFallback: false,
     hasError: false,
     hasContinue,
-    hasRegenerate
+    hasRegenerate,
+    assistantTerminalSignal
+  };
+}
+
+function virtualResponseTiming() {
+  let currentMs = 0;
+  return {
+    responseClock: () => currentMs,
+    responseSleep: async (ms) => {
+      currentMs += Math.max(1, Number(ms) || 0);
+    }
   };
 }
 
@@ -912,7 +926,7 @@ test('chatgpt-controller: waits for a new assistant turn instead of returning th
         responsePolls += 1;
         return responsePolls < 5
           ? assistantSnapshot({ count: 1, lastAssistantId: 'old-turn', txt: 'OLD-ANSWER' })
-          : assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'NEW-ANSWER' });
+          : assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'NEW-ANSWER', assistantTerminalSignal: true });
       }
       if (isClickSendEvaluation(js)) {
         return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
@@ -960,7 +974,8 @@ test('chatgpt-controller: treats a visible normal stop button without a send but
     createController(page).query({ prompt: 'wait for the current generation', timeoutMs: 25 }),
     (error) => {
       assert.equal(error.message, 'timeout_waiting_for_response');
-      assert.equal(error.data?.last, 'OLD-ANSWER');
+      assert.equal(error.data?.lastLength, 'OLD-ANSWER'.length);
+      assert.equal(error.data?.lastDigest, userTurnDigestForTest('OLD-ANSWER'));
       return true;
     }
   );
@@ -989,7 +1004,8 @@ test('chatgpt-controller: accepts a stable new answer when a stale stop remains 
           txt: 'COMPLETED-ANSWER',
           count: 1,
           lastAssistantId: 'new-turn',
-          hasRegenerate: true
+          hasRegenerate: true,
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1020,7 +1036,7 @@ test('chatgpt-controller: waits for all attachment names in two consecutive comp
       onEvaluate: async (js) => {
         if (js.includes('const assistantBaseline')) return assistantBaseline();
         if (js.includes('const codeBlocks')) return { codeBlocks: [] };
-        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'uploaded' });
+        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'uploaded', assistantTerminalSignal: true });
         if (js.includes('const attachCandidates')) {
           if (!js.includes(`activeComposer.querySelectorAll('button, [role="button"]')`)) {
             throw new Error('composer-external attachment button selected');
@@ -1127,7 +1143,7 @@ test('chatgpt-controller: limits attachment selection to the active composer and
       onEvaluate: async (js) => {
         if (js.includes('const assistantBaseline')) return assistantBaseline();
         if (js.includes('const codeBlocks')) return { codeBlocks: [] };
-        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'menu uploaded' });
+        if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'new-turn', txt: 'menu uploaded', assistantTerminalSignal: true });
         if (js.includes('const attachCandidates')) {
           if (!js.includes(`activeComposer.querySelectorAll('button, [role="button"]')`)) {
             throw new Error('composer-external attachment button selected');
@@ -1484,7 +1500,7 @@ test('chatgpt-controller: query uses the exact DOM send button when the coordina
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
       if (js.includes('const assistantCandidates')) {
-        return assistantSnapshot({ txt: 'DOM-SUBMISSION-ANSWER', count: 1, lastAssistantId: 'new-assistant' });
+        return assistantSnapshot({ txt: 'DOM-SUBMISSION-ANSWER', count: 1, lastAssistantId: 'new-assistant', assistantTerminalSignal: true });
       }
       if (js.includes('const sendBaseline')) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
       if (js.includes('const chatgptUserTurns')) {
@@ -1719,7 +1735,8 @@ test('chatgpt-controller: completes a new response when the empty ChatGPT compos
           promptTextLength: 0,
           txt: 'AUTOPILOT-MULTILINE-7F19',
           count: 1,
-          lastAssistantId: 'autopilot-answer'
+          lastAssistantId: 'autopilot-answer',
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1749,7 +1766,8 @@ test('chatgpt-controller: completes a new response when the empty ChatGPT compos
           promptTextLength: 0,
           txt: 'ENABLED-SEND-ANSWER',
           count: 1,
-          lastAssistantId: 'enabled-send-answer'
+          lastAssistantId: 'enabled-send-answer',
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1782,7 +1800,8 @@ test('chatgpt-controller: waits for stop to disappear before completing a new as
           promptTextLength: 0,
           txt: 'STOP-THEN-IDLE-ANSWER',
           count: 1,
-          lastAssistantId: 'stop-then-idle'
+          lastAssistantId: 'stop-then-idle',
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1817,7 +1836,8 @@ test('chatgpt-controller: waits for an identityless streamed assistant turn to s
           promptTextLength: 0,
           txt: responsePolls <= 25 ? partial : complete,
           count: 1,
-          lastAssistantId: ''
+          lastAssistantId: '',
+          assistantTerminalSignal: responsePolls > 25
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1831,7 +1851,161 @@ test('chatgpt-controller: waits for an identityless streamed assistant turn to s
   const result = await createController(page).query({ prompt: 'wait for streamed response', timeoutMs: 20_000 });
 
   assert.equal(result.text, complete);
-  assert.ok(responsePolls >= 38);
+  assert.ok(responsePolls > 25);
+});
+
+test('chatgpt-controller: assistant identity and elapsed time do not complete a partial stream', async () => {
+  const events = [];
+  let responsePolls = 0;
+  const timing = virtualResponseTiming();
+  const partial = 'PARTIAL-IDENTIFIED-ANSWER';
+  const complete = `${partial}-COMPLETE`;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        responsePolls += 1;
+        const completeNow = responsePolls > 60;
+        return assistantSnapshot({
+          sendPresent: true,
+          sendEnabled: true,
+          promptTextLength: 0,
+          txt: completeNow ? complete : partial,
+          count: 1,
+          lastAssistantId: 'streaming-turn',
+          assistantTerminalSignal: completeNow
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: false, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page, timing).query({ prompt: 'wait for authoritative completion', timeoutMs: 40_000 });
+
+  assert.equal(result.text, complete);
+  assert.ok(responsePolls > 60);
+});
+
+test('chatgpt-controller: enabled send and stable partial text do not complete without a terminal signal', async () => {
+  const events = [];
+  let responsePolls = 0;
+  const timing = virtualResponseTiming();
+  const partial = 'STABLE-PARTIAL-ANSWER';
+  const complete = `${partial}-COMPLETE`;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        responsePolls += 1;
+        const completeNow = responsePolls > 14;
+        return assistantSnapshot({
+          sendPresent: true,
+          sendEnabled: true,
+          promptTextLength: 0,
+          txt: completeNow ? complete : partial,
+          count: 1,
+          lastAssistantId: 'stable-partial-turn',
+          assistantTerminalSignal: completeNow
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: false, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page, timing).query({ prompt: 'do not settle on stable text', timeoutMs: 20_000 });
+
+  assert.equal(result.text, complete);
+  assert.ok(responsePolls > 14);
+});
+
+test('chatgpt-controller: a long streaming pause does not return a partial response', async () => {
+  const events = [];
+  let responsePolls = 0;
+  const timing = virtualResponseTiming();
+  const partial = 'PAUSED-PARTIAL';
+  const complete = `${partial}-AFTER-RESUME`;
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const codeBlocks')) return { codeBlocks: [] };
+      if (js.includes('const assistantCandidates')) {
+        responsePolls += 1;
+        const resumed = responsePolls > 55;
+        return assistantSnapshot({
+          sendPresent: true,
+          sendEnabled: true,
+          promptTextLength: 0,
+          txt: resumed ? complete : partial,
+          count: 1,
+          lastAssistantId: 'paused-stream-turn',
+          assistantTerminalSignal: resumed
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: false, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  const result = await createController(page, timing).query({ prompt: 'wait through a streaming pause', timeoutMs: 40_000 });
+
+  assert.equal(result.text, complete);
+  assert.ok(responsePolls > 55);
+});
+
+test('chatgpt-controller: unconfirmed ChatGPT completion is an explicit failure without partial text', async () => {
+  const events = [];
+  const timing = virtualResponseTiming();
+  const partial = 'UNCONFIRMED-PARTIAL';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return assistantBaseline();
+      if (js.includes('const assistantCandidates')) {
+        return assistantSnapshot({
+          sendPresent: true,
+          sendEnabled: true,
+          promptTextLength: 0,
+          txt: partial,
+          count: 1,
+          lastAssistantId: 'unconfirmed-turn',
+          assistantTerminalSignal: false
+        });
+      }
+      if (isClickSendEvaluation(js)) {
+        return { ok: true, isChatGPT: true, fallbackEnter: false, host: 'chatgpt.com', rect: { x: 90, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('promptLen')) return { stopVisible: false, sendDisabled: false, promptLen: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+
+  await assert.rejects(
+    createController(page, timing).query({ prompt: 'require a terminal signal', timeoutMs: 4_000 }),
+    (error) => {
+      assert.equal(error.message, 'response_completion_unconfirmed');
+      assert.equal(error.data?.lastLength, partial.length);
+      assert.equal(error.data?.lastDigest, userTurnDigestForTest(partial));
+      assert.equal(error.data?.assistantTerminalSignal, false);
+      assert.equal('last' in (error.data || {}), false);
+      return true;
+    }
+  );
 });
 
 test('chatgpt-controller: waits while an unsent prompt remains in the ChatGPT composer', async () => {
@@ -1850,7 +2024,8 @@ test('chatgpt-controller: waits while an unsent prompt remains in the ChatGPT co
           promptTextLength: responsePolls <= 6 ? 17 : 0,
           txt: 'UNSENT-PROMPT-GUARDED',
           count: 1,
-          lastAssistantId: 'unsent-prompt-guarded'
+          lastAssistantId: 'unsent-prompt-guarded',
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1883,7 +2058,8 @@ test('chatgpt-controller: waits while a visible ChatGPT send button remains disa
           promptTextLength: 0,
           txt: 'DISABLED-SEND-GUARDED',
           count: 1,
-          lastAssistantId: 'disabled-send-guarded'
+          lastAssistantId: 'disabled-send-guarded',
+          assistantTerminalSignal: true
         });
       }
       if (isClickSendEvaluation(js)) {
@@ -1930,7 +2106,8 @@ test('chatgpt-controller: does not return a previous answer when a no-send-butto
     createController(page).query({ prompt: 'do not return old answer', timeoutMs: 50 }),
     (error) => {
       assert.equal(error.message, 'timeout_waiting_for_response');
-      assert.equal(error.data?.last, 'OLD-ANSWER');
+      assert.equal(error.data?.lastLength, 'OLD-ANSWER'.length);
+      assert.equal(error.data?.lastDigest, userTurnDigestForTest('OLD-ANSWER'));
       assert.equal(error.data?.newChatGPTAssistant, false);
       assert.equal(error.data?.composerIdle, true);
       return true;
@@ -1966,9 +2143,10 @@ test('chatgpt-controller: includes ChatGPT composer diagnostics in response time
   await assert.rejects(
     createController(page).query({ prompt: 'collect timeout diagnostics', timeoutMs: 50 }),
     (error) => {
-      assert.equal(error.message, 'timeout_waiting_for_response');
+      assert.equal(error.message, 'response_completion_unconfirmed');
       assert.deepEqual(error.data, {
-        last: 'PARTIAL-ANSWER',
+        lastLength: 'PARTIAL-ANSWER'.length,
+        lastDigest: userTurnDigestForTest('PARTIAL-ANSWER'),
         lastAssistantCount: 1,
         lastAssistantId: 'partial-answer',
         sendPresent: true,
@@ -1976,7 +2154,9 @@ test('chatgpt-controller: includes ChatGPT composer diagnostics in response time
         stop: false,
         promptTextLength: 8,
         newChatGPTAssistant: true,
-        composerIdle: false
+        composerIdle: false,
+        assistantTerminalSignal: false,
+        completionReason: 'terminal_signal_missing'
       });
       return true;
     }
@@ -1990,6 +2170,9 @@ test('chatgpt-controller: recognizes the Japanese ChatGPT send and stop aria lab
   assert.equal(source.includes('button[aria-label="生成を停止する"]'), true);
   assert.equal(source.includes('button[aria-label="生成を停止"]'), true);
   assert.equal(source.includes('button[aria-label="停止"]'), true);
+  assert.equal(source.includes('button[data-testid="copy-turn-action-button"]'), true);
+  assert.equal(source.includes('assistantTerminalSignal'), true);
+  assert.equal(source.includes('!!snap?.assistantTerminalSignal'), true);
 });
 
 async function withTempAttachments(names, fn) {
@@ -2042,7 +2225,7 @@ function createDirectUploadPage({ events, fileStateForPoll, onNormalSend = null 
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
-      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'uploaded-turn', txt: 'uploaded' });
+      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'uploaded-turn', txt: 'uploaded', assistantTerminalSignal: true });
       if (js.includes('const chatgptUploadInputs')) {
         assert.equal(js.includes("activeComposer.querySelectorAll('input#upload-files[type=\"file\"]')"), true);
         assert.equal(js.includes("document.querySelectorAll('#upload-files')"), true);
@@ -2216,7 +2399,7 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
-      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'reselected-turn', txt: 'uploaded' });
+      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'reselected-turn', txt: 'uploaded', assistantTerminalSignal: true });
       if (js.includes('const chatgptUploadInputs')) {
         assert.doesNotThrow(() => new Function(js));
         return initialState;
@@ -2983,7 +3166,7 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
       if (extra !== undefined) return extra;
       if (js.includes('const assistantBaseline')) return assistantBaseline();
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
-      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'cleanup-answer', txt: 'cleanup-answer' });
+      if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'cleanup-answer', txt: 'cleanup-answer', assistantTerminalSignal: true });
       if (js.includes('const chatgptUploadInputs')) return { isChatGPT: true, inputReady: true };
       if (js.includes('const agentifyAttachmentCleanup')) {
         cleanupScript = js;

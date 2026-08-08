@@ -2434,7 +2434,9 @@ export class ChatGPTController {
         ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard)
         : [];
       const cardDisplayNames = fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim());
-       const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+       const transportMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+       const logicalMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+       const mappingResult = transportMappingResult.mappingComplete ? transportMappingResult : logicalMappingResult;
        const selectionMatchesExpected = sameFileNames(normalizeFileNames(selectedFileNames), normalizedExpectedFileNames) || sameFileNames(normalizeFileNames(selectedFileNames), normalizeFileNames(logicalFileNames));
        const fileCount = selectedFiles.length;
        const cardCount = fileCards.length;
@@ -2999,7 +3001,9 @@ export class ChatGPTController {
         const fileCount = selectedFiles.length;
         const cardCount = fileCards.length;
         const countsMatch = fileCount === cardCount;
-        const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+        const transportMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+        const logicalMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+        const mappingResult = transportMappingResult.mappingComplete ? transportMappingResult : logicalMappingResult;
         const mappingErrors = Array.isArray(mappingResult.mappingErrors) ? [...mappingResult.mappingErrors] : [];
         if (!inputIsUnique) mappingErrors.push('upload_input_not_unique');
         if (!selectionMatchesExpected) mappingErrors.push('file_selection_mismatch');
@@ -3228,7 +3232,9 @@ export class ChatGPTController {
       const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard);
       const cardDisplayNames = names(fileCards.map((card) => card.getAttribute('aria-label') || ''));
       const mappingSelectedFileNames = selectedFileNames.map((fileName, index) => logicalFileNames[index] || fileName);
-      const mappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+      const transportMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
+      const logicalMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(mappingSelectedFileNames, cardDisplayNames);
+      const mappingResult = transportMappingResult.mappingComplete ? transportMappingResult : logicalMappingResult;
       const selectedMatches = (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(expectedFileNames, selectedFileNames) || (${hasSameChatGPTAttachmentFileNameMultiset.toString()})(logicalFileNames, selectedFileNames);
       if (expectedFileNames.length === 0) {
         if (selectedFileNames.length > 0 || inputValue !== '' || fileCards.length > 0) {

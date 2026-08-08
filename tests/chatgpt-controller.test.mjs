@@ -2136,6 +2136,7 @@ test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one
     [['file.json', 'file.json'], ['file(2).json', 'file(3).json']],
     [['file.json', 'file.json'], ['file(3).json', 'file(2).json']],
     [['file.json', 'file.json', 'file.json'], ['file(2).json', 'file(4).json', 'file(3).json']],
+    [['task-contract.json', 'task-contract(1).json'], ['task-contract(6).json', 'task-contract(1)(1).json']],
     [['file.json', 'file(1).json'], ['file(2).json', 'file(1).json']],
     [['FILE.JSON'], ['file.json']]
   ];

@@ -2247,6 +2247,7 @@ test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attac
     ['foo.txt', 'foo(1).txt'],
     ['foo.txt', 'foo(2).txt'],
     ['foo.txt', 'foo(15).txt'],
+    ['foo.txt', 'foo(20260808-105520).txt'],
     ['foo(2).txt', 'foo(2).txt'],
     ['foo(2).txt', 'foo(2)(2).txt'],
     ['archive.tar.gz', 'archive.tar(2).gz'],
@@ -2258,6 +2259,7 @@ test('chatgpt-controller: accepts only exact or ChatGPT duplicate-suffixed attac
     ['foo.txt', 'foo-2.txt'],
     ['foo.txt', 'foo(0).txt'],
     ['foo.txt', 'foo(-1).txt'],
+    ['foo.txt', 'foo(0-0).txt'],
     ['foo.txt', 'foo().txt'],
     ['foo.txt', 'bar(2).txt'],
     ['foo.txt', 'foo(2).md']
@@ -2282,6 +2284,8 @@ test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one
     [['file.json', 'file.json'], ['file.json', 'file(1).json']],
     [['file.json', 'file.json'], ['file(2).json', 'file(3).json']],
     [['file.json', 'file.json'], ['file(3).json', 'file(2).json']],
+    [['file.json'], ['file(20260808-105520).json']],
+    [['file.json', 'file(1).json'], ['file(20260808-105520).json', 'file(1)(5).json']],
     [['file.json', 'file.json', 'file.json'], ['file(2).json', 'file(4).json', 'file(3).json']],
     [['task-contract.json', 'task-contract(1).json'], ['task-contract(6).json', 'task-contract(1)(1).json']],
     [['file.json', 'file(1).json'], ['file(2).json', 'file(1).json']],
@@ -2312,6 +2316,18 @@ test('chatgpt-controller: maps attachment cards as a unique unordered one-to-one
     assert.equal(new Set(result.mapping.map((entry) => entry.cardIndex)).size, cards.length);
     assert.deepEqual(result.mapping.map((entry) => entry.displayName).sort(), cards.slice().sort());
   }
+});
+
+test('chatgpt-controller: accepts timestamped duplicate aliases without losing one-to-one mapping', () => {
+  const result = mapChatGPTAttachmentCardNames(
+    ['file.json', 'file(1).json'],
+    ['file(20260808-105520).json', 'file(1)(5).json']
+  );
+  assert.equal(result.mappingComplete, true);
+  assert.deepEqual(result.mappingErrors, []);
+  assert.equal(result.mapping.every((entry) => entry.matched && entry.matchKind === 'renamed'), true);
+  assert.equal(new Set(result.mapping.map((entry) => entry.cardIndex)).size, 2);
+  assert.deepEqual(result.mapping.map((entry) => entry.displayName).sort(), ['file(1)(5).json', 'file(20260808-105520).json']);
 });
 
 test('chatgpt-controller: seven-file attachment readiness succeeds with reordered renamed cards and bounded progress', async () => {
@@ -2436,6 +2452,68 @@ test('chatgpt-controller: live seven-file duplicate-renamed shape reaches readin
     assert.equal(events.includes('normal-send-click'), true);
     assert.equal(progress.some((patch) => patch.phase === 'uploading_files' && patch.attachmentCount === 7 && patch.readyCount === 7 && patch.pendingCount === 0 && patch.failedCount === 0 && patch.mappingComplete === true), true);
     assert.equal(new Set(mapping.mapping.map((entry) => entry.cardIndex)).size, 7);
+  });
+});
+
+test('chatgpt-controller: live seven-file timestamped aliases remain ready with staged duplicate names', async () => {
+  const selected = [
+    'task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'task-contract(1).json',
+    'worker-last-message.txt',
+    'changed-files.json',
+    'verification.json'
+  ];
+  const cards = [
+    'task-contract(20260808-105520).json',
+    'repository-state(10).json',
+    'changes(10).patch',
+    'task-contract(1)(5).json',
+    'worker-last-message(9).txt',
+    'changed-files(9).json',
+    'verification(9).json'
+  ];
+  await withTempAttachments([
+    'a/task-contract.json',
+    'repository-state.json',
+    'changes.patch',
+    'b/task-contract.json',
+    'worker-last-message.txt',
+    'changed-files.json',
+    'verification.json'
+  ], async (files) => {
+    const events = [];
+    const progress = [];
+    const mapping = mapChatGPTAttachmentCardNames(selected, cards);
+    const { page, attachmentPolls } = createDirectUploadPage({
+      events,
+      fileStateForPoll: () => attachmentCardSnapshot(mapping.mapping.map((entry) => ({
+        sourceFileName: entry.sourceFileName,
+        displayName: entry.displayName,
+        matched: entry.matched,
+        pending: false,
+        failed: false
+      })), {
+        conditionsReady: mapping.mappingComplete,
+        mappingComplete: mapping.mappingComplete,
+        mappingErrors: mapping.mappingErrors,
+        promptTextLength: 22
+      })
+    });
+    const result = await createController(page).query({
+      prompt: 'live seven-file timestamped alias shape',
+      attachments: files,
+      timeoutMs: 5_000,
+      onProgress: (patch) => progress.push(patch)
+    });
+    assert.equal(result.text, 'uploaded');
+    assert.equal(attachmentPolls(), 2);
+    assert.equal(events.includes('normal-send-click'), true);
+    assert.equal(mapping.mappingComplete, true);
+    assert.deepEqual(mapping.mappingErrors, []);
+    assert.equal(new Set(mapping.mapping.map((entry) => entry.cardIndex)).size, 7);
+    assert.equal(progress.some((patch) => patch.phase === 'uploading_files' && patch.attachmentCount === 7 && patch.readyCount === 7 && patch.pendingCount === 0 && patch.failedCount === 0 && patch.mappingComplete === true), true);
   });
 });
 
@@ -3175,16 +3253,16 @@ test('chatgpt-controller: duplicate-renamed attachment cleanup clears the owned 
       events,
       promptText: 'duplicate renamed attachment draft',
       uploadInputCount: 1,
-      selectedFileNames: ['task-contract.json', 'task-contract.json'],
-      cardDisplayNames: ['task-contract(2).json', 'task-contract(3).json'],
+      selectedFileNames: ['task-contract.json', 'task-contract(1).json'],
+      cardDisplayNames: ['task-contract(20260808-105520).json', 'task-contract(1)(5).json'],
       cardCount: 2,
       userTurnTexts: ['existing user turn']
     });
     const { page } = createAttachmentCleanupPage({
       events,
       attachmentState: attachmentCardSnapshot([
-        { sourceFileName: 'task-contract.json', displayName: 'task-contract(2).json', matched: true, pending: true, failed: false },
-        { sourceFileName: 'task-contract.json', displayName: 'task-contract(3).json', matched: true, pending: true, failed: false }
+        { sourceFileName: 'task-contract.json', displayName: 'task-contract(20260808-105520).json', matched: true, pending: true, failed: false },
+        { sourceFileName: 'task-contract(1).json', displayName: 'task-contract(1)(5).json', matched: true, pending: true, failed: false }
       ], { conditionsReady: false }),
       cleanupResult: null,
       recordSendEvaluation: false,

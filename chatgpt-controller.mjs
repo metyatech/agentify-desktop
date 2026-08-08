@@ -97,9 +97,9 @@ export function mapChatGPTAttachmentCardNames(selectedFileNames, cardDisplayName
     const dot = source.lastIndexOf('.');
     const stem = dot <= 0 ? source : source.slice(0, dot);
     const extension = dot <= 0 ? '' : source.slice(dot);
-    const match = new RegExp(`^${escapeRegExp(stem)}\\(([0-9]+)\\)${escapeRegExp(extension)}$`, 'i').exec(card);
+    const match = new RegExp(`^${escapeRegExp(stem)}\\(([0-9]+(?:-[0-9]+)*)\\)${escapeRegExp(extension)}$`, 'i').exec(card);
     if (!match) return false;
-    return (match[1].replace(/^0+/u, '') || '0') !== '0';
+    return match[1].split('-').some((segment) => (segment.replace(/^0+/u, '') || '0') !== '0');
   };
   const mapping = selected.map((sourceFileName) => ({
     sourceFileName,

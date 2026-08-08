@@ -177,6 +177,163 @@ function createPromptExpressionContext(userTurns = []) {
   return { context, focused, prompt };
 }
 
+function createChallengeExpressionContext({ bodyText, challengeText = bodyText, composerText = '', promptVisible = true, sendVisible = true, verifyButton = false, turnstile = false, arkose = false }) {
+  const prompt = {
+    tagName: 'DIV',
+    id: 'prompt-textarea',
+    innerText: composerText,
+    textContent: composerText,
+    isContentEditable: true,
+    disabled: false,
+    readOnly: false,
+    getAttribute(name) {
+      if (name === 'id') return this.id;
+      if (name === 'contenteditable') return 'true';
+      if (name === 'role') return 'textbox';
+      if (name === 'aria-label') return 'Message';
+      return null;
+    },
+    matches(selector) {
+      return selector === '[contenteditable="true"]' || selector === '[role="textbox"]' || selector.includes('[contenteditable="true"]') || selector.includes('[role="textbox"]');
+    },
+    getBoundingClientRect() {
+      return { x: 12, y: 640, width: 480, height: 42 };
+    }
+  };
+  const send = {
+    textContent: 'Send',
+    getBoundingClientRect() {
+      return { x: 500, y: 640, width: 42, height: 42 };
+    },
+    getAttribute(name) {
+      if (name === 'data-testid') return 'send-button';
+      if (name === 'aria-label') return 'Send';
+      return null;
+    },
+    matches() {
+      return false;
+    }
+  };
+  const verify = {
+    textContent: 'Verify you are human',
+    getBoundingClientRect() {
+      return { x: 100, y: 100, width: 160, height: 40 };
+    }
+  };
+  const frame = (src) => ({ getAttribute: (name) => name === 'src' ? src : null });
+  const clonedBody = {
+    innerText: challengeText,
+    textContent: challengeText,
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const body = {
+    innerText: bodyText,
+    cloneNode() {
+      return clonedBody;
+    }
+  };
+  const document = {
+    body,
+    readyState: 'complete',
+    title: 'ChatGPT',
+    querySelectorAll(selector) {
+      if (selector === '#prompt-textarea' || selector.includes('main textarea') || selector.includes('[contenteditable="true"]') || selector.includes('[role="textbox"]')) return promptVisible ? [prompt] : [];
+      if (selector === 'button[data-testid="send-button"]') return sendVisible ? [send] : [];
+      if (selector === 'button, a') return verifyButton ? [verify] : [];
+      if (selector === 'iframe') return turnstile ? [frame('https://challenges.cloudflare.com/turnstile/api.js')] : arkose ? [frame('https://client-api.arkoselabs.com/fc/api')] : [];
+      return [];
+    },
+    querySelector(selector) {
+      if (turnstile && selector.includes('turnstile')) return frame('https://challenges.cloudflare.com/turnstile/api.js');
+      if (arkose && selector.includes('arkose')) return frame('https://client-api.arkoselabs.com/fc/api');
+      return null;
+    }
+  };
+  const context = {
+    document,
+    location: { href: 'https://chatgpt.com/' },
+    window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+    TextEncoder,
+    Uint8Array,
+    crypto: crypto.webcrypto
+  };
+  context.globalThis = context;
+  return { context };
+}
+
+async function captureActualChallengeEvaluation(options) {
+  const events = [];
+  const { context } = createChallengeExpressionContext(options);
+  let expression = '';
+  const page = createPage({
+    events,
+    onBasicEvaluate: async (js) => {
+      if (!js.includes('const hasTurnstile')) return undefined;
+      expression = js;
+      return await vm.runInNewContext(js, context);
+    },
+    onEvaluate: async (js) => {
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    }
+  });
+  const result = await createController(page).detectChallenge();
+  return { events, expression, result };
+}
+
+test('chatgpt-controller: challenge detection ignores composer verify text on a normal page', async () => {
+  const captured = await captureActualChallengeEvaluation({
+    bodyText: 'ChatGPT Read all files and verify every marker',
+    challengeText: 'ChatGPT',
+    composerText: 'Read all files and verify every marker'
+  });
+
+  assert.equal(captured.result.promptVisible, true);
+  assert.equal(captured.result.blocked, false);
+  assert.equal(captured.result.indicators.looks403, false);
+  assert.equal(captured.result.indicators.hasVerifyButton, false);
+  assert.match(captured.expression, /verify you are human\|human verification\|i am human/u);
+});
+
+test('chatgpt-controller: challenge detection blocks a concrete 403 page', async () => {
+  const captured = await captureActualChallengeEvaluation({
+    bodyText: '403 Forbidden',
+    promptVisible: false,
+    sendVisible: false
+  });
+
+  assert.equal(captured.result.promptVisible, false);
+  assert.equal(captured.result.indicators.looks403, true);
+  assert.equal(captured.result.blocked, true);
+  assert.equal(captured.result.kind, 'blocked');
+});
+
+test('chatgpt-controller: challenge detection preserves concrete human verification blocking', async () => {
+  const captured = await captureActualChallengeEvaluation({
+    bodyText: 'Verify you are human',
+    promptVisible: false,
+    sendVisible: false,
+    verifyButton: true
+  });
+
+  assert.equal(captured.result.blocked, true);
+  assert.equal(captured.result.indicators.hasVerifyButton, true);
+  assert.equal(captured.result.kind, 'captcha');
+});
+
+test('chatgpt-controller: conversation words do not block a usable composer', async () => {
+  const captured = await captureActualChallengeEvaluation({
+    bodyText: 'Previous user said verify this and assistant mentioned 403 in the explanation. ChatGPT Read all files and verify every marker',
+    challengeText: 'Previous user said verify this and assistant mentioned 403 in the explanation. ChatGPT',
+    composerText: 'Read all files and verify every marker'
+  });
+
+  assert.equal(captured.result.promptVisible, true);
+  assert.equal(captured.result.indicators.looks403, false);
+  assert.equal(captured.result.blocked, false);
+});
+
 function createUserTurnFixture({ id = '', messageId = '', text = '' } = {}) {
   return {
     id,

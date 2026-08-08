@@ -1227,7 +1227,6 @@ export class ChatGPTController {
       const hasVerifyButton = Array.from(document.querySelectorAll('button, a'))
         .some(b => /verify you are human|human verification|i am human/i.test((b.textContent || '').trim()));
 
-      const looks403 = /\\b403\\b|access denied|forbidden|unusual traffic|verify/i.test(bodyText) && !/prompt/i.test(bodyText);
       const loginLike = !!document.querySelector('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]')
         || /log in|sign in|continue with/i.test(bodyText);
 
@@ -1304,6 +1303,15 @@ export class ChatGPTController {
         });
       })();
       const promptVisible = rawPromptVisible && (!loginLike || sendVisible);
+      const challengeText = (() => {
+        const clone = document.body?.cloneNode?.(true);
+        if (!clone) return bodyText;
+        for (const node of clone.querySelectorAll?.('textarea, input, [contenteditable=\"true\"], [role=\"textbox\"]') || []) {
+          node.remove?.();
+        }
+        return String(clone.innerText || clone.textContent || '').slice(0, 5000);
+      })();
+      const looks403 = !promptVisible && /\\b403\\b|access denied|forbidden|unusual traffic|verify you are human|human verification|i am human/i.test(challengeText);
 
       const blocked = hasTurnstile || hasArkose || hasVerifyButton || looks403 || (loginLike && !promptVisible);
       const kind = (hasTurnstile || hasArkose || hasVerifyButton) ? 'captcha' : (loginLike ? 'login' : (looks403 ? 'blocked' : null));

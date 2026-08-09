@@ -177,6 +177,9 @@ export function buildChromeLaunchArgs({ debugPort, userDataDir, profileName = nu
     '--no-default-browser-check',
     '--disable-default-apps',
     '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
     '--disable-sync',
     startUrl
   ];

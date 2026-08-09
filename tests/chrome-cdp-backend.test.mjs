@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ChromeCdpBrowserBackend, ChromeCdpConnection, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
+import { ChromeCdpBrowserBackend, ChromeCdpConnection, buildChromeLaunchArgs, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
 
 class MockWebSocket {
   constructor() {
@@ -70,6 +70,13 @@ class DelayedMockWebSocket {
     else this.listeners.delete(type);
   }
 }
+
+test('chrome-cdp-backend: keeps managed pages active when the browser window is backgrounded', () => {
+  const args = buildChromeLaunchArgs({ debugPort: 9222, userDataDir: 'C:\\agentify-test-profile', startUrl: 'about:blank' });
+  assert.ok(args.includes('--disable-background-timer-throttling'));
+  assert.ok(args.includes('--disable-backgrounding-occluded-windows'));
+  assert.ok(args.includes('--disable-renderer-backgrounding'));
+});
 
 test('chrome-cdp-backend: pending commands reject when websocket closes', async () => {
   const ws = new MockWebSocket();

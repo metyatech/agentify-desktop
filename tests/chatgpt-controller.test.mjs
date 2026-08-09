@@ -2452,6 +2452,10 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
         return initialState;
       }
       if (js.includes('const visibleMenuRoots')) {
+        if (requireAttachmentMenuWhenInputReady) {
+          assert.equal(js.includes('|| menuSelected'), false);
+          assert.match(js, /!true \|\| (?:false|true)/u);
+        }
         if (requireAttachmentMenuWhenInputReady && menuSelectionPolls++ === 0) {
           events.push('attachment-file-option');
           return { inputAvailable: false, selected: true };

@@ -3011,7 +3011,7 @@ export class ChatGPTController {
         const chatgptUploadInput = activeComposer?.querySelector('input#upload-files[type="file"]') || null;
         const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
         const inputAvailable = !!chatgptUploadInput && !chatgptUploadInput.disabled && !chatgptUploadInput.readOnly && pageUploadInputs.length === 1;
-        if (inputAvailable && (!${JSON.stringify(!!requireMenuSelection)} || menuSelected)) return { inputAvailable: true, selected: false };
+        if (inputAvailable && (!${JSON.stringify(!!requireMenuSelection)} || ${JSON.stringify(menuSelected)})) return { inputAvailable: true, selected: false };
 
         const labelsOf = (node) => [
           node.getAttribute('aria-label') || '',

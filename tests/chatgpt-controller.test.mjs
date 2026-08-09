@@ -2446,15 +2446,14 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
         initialAttachmentEvalCount += 1;
         if (requireAttachmentMenuWhenInputReady && initialAttachmentEvalCount === 1 && initialState.inputReady) {
           events.push('attachment-menu-open');
-          return { ...initialState, opened: true };
+          return { ...initialState, opened: true, attachRect: { x: 10, y: 10, w: 20, h: 20 } };
         }
         assert.doesNotThrow(() => new Function(js));
         return initialState;
       }
       if (js.includes('const visibleMenuRoots')) {
         if (requireAttachmentMenuWhenInputReady) {
-          assert.equal(js.includes('|| menuSelected'), false);
-          assert.match(js, /!true \|\| (?:false|true)/u);
+          assert.match(js, /if \(inputAvailable\) return/u);
         }
         if (requireAttachmentMenuWhenInputReady && menuSelectionPolls++ === 0) {
           events.push('attachment-file-option');

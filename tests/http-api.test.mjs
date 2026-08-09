@@ -1551,6 +1551,39 @@ test('http-api: query packs context paths before forwarding to controller', asyn
   assert.equal(r.data.packedContextSummary.contextCharsUsed >= 1, true);
 });
 
+test('http-api: query foregrounds a ChatGPT tab before controller execution', async (t) => {
+  const events = [];
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      events.push('query');
+      return { text: 'ok', codeBlocks: [], meta: {} };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt', vendorName: 'ChatGPT' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    onShow: async ({ tabId }) => events.push(`show:${tabId}`)
+  });
+  t.after(() => server.close());
+
+  const r = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hello' } });
+
+  assert.equal(r.res.status, 200);
+  assert.deepEqual(events, ['show:t0', 'query']);
+});
+
 test('http-api: query merges saved bundle inputs', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-bundle-'));
   const bundleText = path.join(dir, 'bundle.txt');

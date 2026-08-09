@@ -1163,9 +1163,12 @@ export function startHttpApi({
           throwIfOperationActive(op);
           assertTabNotBusy(tabId);
           op.tabId = tabId;
+          const tabMeta = getTabMeta(tabs, tabId);
+          if (normalizeVendorToken(tabMeta?.vendorId || '') === 'chatgpt') {
+            await onShow?.({ tabId });
+          }
           setActiveQuery(tabId, op);
           throwIfOperationActive(op);
-          const tabMeta = getTabMeta(tabs, tabId);
           const vendorBudget = contextBudgetForVendor(tabMeta?.vendorId || 'chatgpt');
           try {
             patchActiveQuery(tabId, { phase: 'preparing_context', blocked: false, blockedKind: null });

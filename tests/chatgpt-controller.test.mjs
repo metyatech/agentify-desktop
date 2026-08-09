@@ -94,6 +94,9 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, promptEvaluati
       const basicOverride = await onBasicEvaluate?.(js);
       if (basicOverride !== undefined) return basicOverride;
       if (js.includes('missing_prompt_textarea') && promptEvaluationOverride) return await promptEvaluationOverride(js);
+      if (js.includes('agentifyUserTurnBaseline')) {
+        return userTurnBaseline || { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') };
+      }
       const basic = basicEvaluation(js);
       if (basic !== undefined) {
         if (includeUserTurnBaseline && js.includes('missing_prompt_textarea')) {
@@ -715,7 +718,7 @@ test('chatgpt-controller: query returns the final ChatGPT assistant message, not
   assert.equal(result.text.includes('非常に高い'), false);
 });
 
-test('chatgpt-controller: waits for attachment readiness after typing and before clicking the normal send button', async () => {
+test('chatgpt-controller: waits for attachment readiness before typing and clicking the normal send button', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
   const attachment = path.join(tempDir, 'attachment.txt');
   await fs.writeFile(attachment, 'test attachment');
@@ -779,11 +782,11 @@ test('chatgpt-controller: waits for attachment readiness after typing and before
     await createController(page).query({ prompt: 'body before upload', attachments: [attachment], timeoutMs: 5_000 });
 
     const index = (event) => events.indexOf(event);
-    assert.ok(index('text:body before upload') < index('attachment-menu-open'));
     assert.ok(index('attachment-menu-open') < index('attachment-file-option'));
     assert.ok(index('attachment-file-option') < index('files-set:1'));
     assert.ok(index('files-set:1') < index('attachment-ready'));
-    assert.ok(index('attachment-ready') < index('normal-send-click'));
+    assert.ok(index('attachment-ready') < index('text:body before upload'));
+    assert.ok(index('text:body before upload') < index('normal-send-click'));
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

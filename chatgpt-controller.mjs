@@ -1669,6 +1669,27 @@ export class ChatGPTController {
     return ok;
   }
 
+  async #captureUserTurnBaseline() {
+    const result = await this.#eval(`(async () => {
+      const agentifyUserTurnBaseline = true;
+      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
+      const lastUserTurn = userTurns[userTurns.length - 1] || null;
+      const lastUserId = lastUserTurn
+        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')]
+          .map((value) => String(value || '').trim()).find(Boolean) || ''
+        : '';
+      const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
+      const lastUserText = String(lastUserTurn?.innerText || '');
+      const bytes = new TextEncoder().encode(normalizeUserTurnText(lastUserText));
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+      const lastTextDigest = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      return { count: userTurns.length, lastId: lastUserId, lastTextDigest };
+    })()`);
+    const baseline = normalizeUserTurnBaseline(result);
+    if (this.currentRun) this.currentRun.userTurnBaseline = baseline;
+    return baseline;
+  }
+
   async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120, sendBaseline = null } = {}) {
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
@@ -1844,7 +1865,7 @@ export class ChatGPTController {
   }
 
   #canCleanupUnsentDraft(run) {
-    if (!run?.promptTyped || run.sendConfirmed) return false;
+    if ((!run?.promptTyped && !run?.attachmentOwnershipEstablished) || run.sendConfirmed) return false;
     if (run.dispatchStateUnknown && !run.sendConfirmationTimedOut) return false;
     if (run.requested && run.messageDispatchStarted) return false;
     return run.sendAttemptCompleted || !run.messageDispatchStarted || run.sendConfirmationTimedOut;
@@ -3767,6 +3788,7 @@ export class ChatGPTController {
       sendAttemptCompleted: false,
       sendConfirmed: false,
       sendConfirmationTimedOut: false,
+      attachmentOwnershipEstablished: false,
       userTurnBaseline: null,
       signal
     };
@@ -3779,12 +3801,10 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       await this.#activateProviderStopToken(run, signal);
       this.#throwIfStopRequested();
-      run.promptTyped = true;
-      const typed = await this.#typePrompt(prompt);
-      run.userTurnBaseline = typed?.userTurnBaseline || null;
-      this.#throwIfStopRequested();
       if (attachments?.length) {
+        run.userTurnBaseline = await this.#captureUserTurnBaseline();
         uploadPlan = await this.#attachFiles(attachments);
+        run.attachmentOwnershipEstablished = true;
         run.expectedFileNames = uploadPlan.expectedFileNames;
         run.logicalExpectedFileNames = uploadPlan.logicalFileNames;
         await this.#waitForAttachmentsReady({
@@ -3793,6 +3813,10 @@ export class ChatGPTController {
           logicalFileNames: uploadPlan.logicalFileNames
         });
       }
+      run.promptTyped = true;
+      const typed = await this.#typePrompt(prompt);
+      run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+      this.#throwIfStopRequested();
       const baseline = await this.#captureChatGPTAssistantBaseline();
       await this.#clickSend({ timeoutMs });
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });

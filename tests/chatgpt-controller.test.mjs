@@ -763,7 +763,7 @@ test('chatgpt-controller: waits for attachment readiness before typing and click
         if (js.includes('const expectedFileNames')) {
           attachmentReadyPolls += 1;
           events.push('attachment-ready');
-          return attachmentCardSnapshot([{ fileName: 'attachment.txt', found: true, pending: false, failed: false }], { promptTextLength: 14 });
+          return attachmentCardSnapshot([{ fileName: 'attachment.txt', found: true, pending: false, failed: false }], { promptTextLength: 0 });
         }
         if (isClickSendEvaluation(js)) {
           return {

@@ -3220,7 +3220,7 @@ export class ChatGPTController {
         const missingFileNames = fileStates.filter((state) => !state.matched).map((state) => state.sourceFileName);
         const pendingFileNames = fileStates.filter((state) => state.pending).map((state) => state.sourceFileName);
         const failedFileNames = fileStates.filter((state) => state.failed).map((state) => state.sourceFileName);
-        const attachmentReady = promptText.length > 0 && mappingComplete && fileStates.every((state) => state.matched && !state.pending && !state.failed) && !busy && !!send && !disabled(send);
+        const attachmentReady = mappingComplete && fileStates.every((state) => state.matched && !state.pending && !state.failed) && !busy && !!send && !disabled(send);
         return {
           isChatGPT: true,
           conditionsReady: attachmentReady,

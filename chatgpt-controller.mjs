@@ -2641,8 +2641,7 @@ export class ChatGPTController {
         composerInputCount: chatgptUploadInputs.length,
         pageUploadInputCount: pageUploadInputs.length
       };
-      if (inputReady) return inputState;
-      if (chatgptUploadInputs.length > 0) {
+      if (chatgptUploadInputs.length > 0 && !inputReady) {
         return {
           ...inputState,
           inputPresent: true,
@@ -2656,12 +2655,12 @@ export class ChatGPTController {
         const label = labelOf(node);
         return visible(node) && !excluded(label) && /attach|upload|paperclip|add photos? & files?|添付|写真とファイルを追加|ファイル/i.test(label);
       });
-      if (!attach) return { isChatGPT, opened: false };
+      if (!attach) return inputReady ? inputState : { isChatGPT, opened: false };
       attach.click();
-      return { isChatGPT, opened: true };
+      return { ...inputState, opened: true };
     })()`);
 
-    if (opened?.isChatGPT && opened?.inputReady) {
+    if (opened?.isChatGPT && opened?.inputReady && !opened?.opened) {
       if (opened?.selectionMatchesExpected && opened?.mappingComplete) return uploadPlan;
       if (opened?.selectionMatchesExpected && Number(opened?.cardCount) > 0) {
         const err = new Error('chatgpt_file_input_state_conflict');
@@ -2708,7 +2707,7 @@ export class ChatGPTController {
     }
 
     if (opened?.isChatGPT) {
-      await this.#waitForChatGPTFileInputOrMenu();
+      await this.#waitForChatGPTFileInputOrMenu({ requireMenuSelection: !!opened?.opened });
       await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
     } else {
       await this.page.setFileInputFiles(uploadPlan.files);
@@ -2959,7 +2958,7 @@ export class ChatGPTController {
     throw err;
   }
 
-  async #waitForChatGPTFileInputOrMenu({ timeoutMs = 5_000 } = {}) {
+  async #waitForChatGPTFileInputOrMenu({ timeoutMs = 5_000, requireMenuSelection = false } = {}) {
     const start = Date.now();
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
     let last = null;
@@ -3012,7 +3011,7 @@ export class ChatGPTController {
         const chatgptUploadInput = activeComposer?.querySelector('input#upload-files[type="file"]') || null;
         const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
         const inputAvailable = !!chatgptUploadInput && !chatgptUploadInput.disabled && !chatgptUploadInput.readOnly && pageUploadInputs.length === 1;
-        if (inputAvailable) return { inputAvailable: true, selected: false };
+        if (inputAvailable && (!${JSON.stringify(!!requireMenuSelection)} || menuSelected)) return { inputAvailable: true, selected: false };
 
         const labelsOf = (node) => [
           node.getAttribute('aria-label') || '',

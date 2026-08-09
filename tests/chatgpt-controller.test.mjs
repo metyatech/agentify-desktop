@@ -2430,9 +2430,11 @@ function chatgptUploadInputState({
   };
 }
 
-function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null, clearEvaluationResult = null, onSetFileInputFiles = null }) {
+function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, fileStateForPoll = null, clearEvaluationResult = null, onSetFileInputFiles = null, requireAttachmentMenuWhenInputReady = false }) {
   let attachmentPolls = 0;
   let clearPolls = 0;
+  let initialAttachmentEvalCount = 0;
+  let menuSelectionPolls = 0;
   const page = createPage({
     events,
     onSetFileInputFiles,
@@ -2441,8 +2443,20 @@ function createUploadInputStatePage({ events, initialState, clearAfterPoll = 0, 
       if (js.includes('const codeBlocks')) return { codeBlocks: [] };
       if (js.includes('const assistantCandidates')) return assistantSnapshot({ count: 1, lastAssistantId: 'reselected-turn', txt: 'uploaded', assistantTerminalSignal: true });
       if (js.includes('const chatgptUploadInputs')) {
+        initialAttachmentEvalCount += 1;
+        if (requireAttachmentMenuWhenInputReady && initialAttachmentEvalCount === 1 && initialState.inputReady) {
+          events.push('attachment-menu-open');
+          return { ...initialState, opened: true };
+        }
         assert.doesNotThrow(() => new Function(js));
         return initialState;
+      }
+      if (js.includes('const visibleMenuRoots')) {
+        if (requireAttachmentMenuWhenInputReady && menuSelectionPolls++ === 0) {
+          events.push('attachment-file-option');
+          return { inputAvailable: false, selected: true };
+        }
+        return { inputAvailable: true, selected: false };
       }
       if (js.includes('const nativeValueSetter')) {
         assert.doesNotThrow(() => new Function(js));
@@ -2495,6 +2509,25 @@ test('chatgpt-controller: initial attachment sets the ordinary file once without
     await createController(page).query({ prompt: 'attach initially', attachments: [attachment], timeoutMs: 5_000 });
 
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), ['files-set:1', 'files-selector:#upload-files']);
+  });
+});
+
+test('chatgpt-controller: does not bypass the attachment menu when a hidden input is already ready', async () => {
+  await withTempAttachments(['menu-required.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createUploadInputStatePage({
+      events,
+      initialState: chatgptUploadInputState({ selectedFileNames: [] }),
+      requireAttachmentMenuWhenInputReady: true,
+      fileStateForPoll: () => attachmentCardSnapshot([{ fileName: 'menu-required.txt', found: true, pending: false, failed: false }])
+    });
+
+    await createController(page).query({ prompt: 'follow the attachment menu', attachments: [attachment], timeoutMs: 5_000 });
+
+    const index = (event) => events.indexOf(event);
+    assert.ok(index('attachment-menu-open') >= 0);
+    assert.ok(index('attachment-menu-open') < index('attachment-file-option'));
+    assert.ok(index('attachment-file-option') < index('files-set:1'));
   });
 });
 

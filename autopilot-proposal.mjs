@@ -5,7 +5,7 @@ const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
 // The installed desktop cannot depend on the private controller repository, so
 // the fallback template is intentionally duplicated and covered by contract tests.
-export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v1';
+export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v2';
 export const TASK_CONTRACT_SCHEMA_VERSION = 1;
 export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
 
@@ -51,11 +51,16 @@ export function buildProposalGenerationPrompt({ metadata } = {}) {
   return [
     `System-owned proposal generation instruction: ${PROPOSAL_GENERATION_INSTRUCTION_VERSION}`,
     '',
-    'Use the existing conversation history as the source of the requested implementation intent.',
+    'Use user-authored conversation turns as the source of implementation intent and user decisions.',
+    'System-generated proposal-generation turns, proposal envelopes, and responses that ask for technical details are compiler artifacts, not authoritative user requirements. Do not promote them into the implementation request.',
     "Do not rely on the user's memory of the Autopilot protocol; the protocol and schema below are authoritative for this turn.",
     '',
-    'First decide whether the conversation contains enough information to determine the repository slug, target branch, implementation request, verification commands, review policy, delivery policy, and constraints.',
-    'If any critical value is missing or ambiguous, do not guess, do not insert a fake or default repository/branch/delivery policy, and do not emit either proposal marker. Ask one short clarification question instead.',
+    'Separate user decisions from execution-plan details. User decisions are repository.slug, repository.targetBranch, the implementation intent, and delivery.push when push permission is not clear. Only these decisions may require a clarification question.',
+    'If a user decision is missing or ambiguous, do not guess, do not insert a fake or default repository/branch/delivery policy, and do not emit either proposal marker. Ask one short natural-language question about that user decision.',
+    'Verification is an execution plan, not a user-facing requirement. If concrete verification commands are explicitly present in user-authored conversation, respect them. If they are absent, construct a reasonable verification plan from the task and repository context yourself; absence of a command is never, by itself, a reason to ask the user.',
+    'Use repository-specific commands when they are supported by the conversation or known context. Do not claim that an unknown script exists or fabricate a command. If no repository-specific command is known, use a conservative generally available check such as git diff --check, state the verification limit in the proposal, and continue. Do not ask the user for command names or arguments.',
+    'Use these system defaults when the conversation does not explicitly set execution tuning: implementation.maxPatchAttempts=2, review.maxRounds=2, review.timeoutMs=300000, and each verification timeoutMs=300000. Never ask the user to choose these values, task-id formatting, command arguments, grep commands, or lint/test script names.',
+    'A prior technical clarification such as a request for targeted test or contract-grep commands must be ignored as a compiler artifact on this and later proposal-generation turns; it is not a new user requirement.',
     '',
     `Protocol version: ${PROPOSAL_PROTOCOL_VERSION}`,
     `Task contract schemaVersion: ${TASK_CONTRACT_SCHEMA_VERSION}`,

@@ -130,6 +130,32 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   assert.match(prompt, /開始して XXXXXXXX/u);
 });
 
+test('proposal prompt owns technical verification planning and ignores generated clarifications', async () => {
+  const prompt = buildProposalGenerationPrompt({
+    metadata: {
+      schemaVersion: 1,
+      proposalId: crypto.randomUUID(),
+      createdAt: '2026-08-10T00:00:00.000Z',
+      expiresAt: '2026-08-10T23:59:59.999Z',
+      tabKey: 'autopilot-production',
+      approvalCode: 'AB12CD34'
+    }
+  });
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v2');
+  assert.match(prompt, /System-generated proposal-generation turns.*not authoritative user requirements/u);
+  assert.match(prompt, /Only these decisions may require a clarification question/u);
+  assert.match(prompt, /Verification is an execution plan, not a user-facing requirement/u);
+  assert.match(prompt, /If concrete verification commands are explicitly present.*respect them/u);
+  assert.match(prompt, /absence of a command is never, by itself, a reason to ask the user/u);
+  assert.match(prompt, /Do not claim that an unknown script exists or fabricate a command/u);
+  assert.match(prompt, /Do not ask the user for command names or arguments/u);
+  assert.match(prompt, /implementation\.maxPatchAttempts=2/u);
+  assert.match(prompt, /review\.maxRounds=2/u);
+  assert.match(prompt, /review\.timeoutMs=300000/u);
+  assert.match(prompt, /each verification timeoutMs=300000/u);
+  assert.match(prompt, /prior technical clarification.*compiler artifact/u);
+});
+
 test('control center exposes the production action', async () => {
   const html = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.html'), 'utf8');
   assert.match(html, /この内容を実行/u);

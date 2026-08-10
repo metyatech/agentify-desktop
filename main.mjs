@@ -24,6 +24,7 @@ import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
 import { shouldAllowPopup } from './popup-policy.mjs';
 import { cleanupRuntimeResources, createGracefulShutdown, registerShutdownSignals } from './shutdown.mjs';
+import { createControlCenterShowGate, hasStartMinimizedArg } from './launch-mode.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -112,11 +113,12 @@ async function main() {
     return;
   }
 
-  let pendingSecondInstanceFocus = false;
+  let showControlCenter = null;
   let focusDefaultTab = null;
-  app.on('second-instance', () => {
-    if (typeof focusDefaultTab === 'function') focusDefaultTab();
-    else pendingSecondInstanceFocus = true;
+  const controlCenterShowGate = createControlCenterShowGate(() => showControlCenter());
+  app.on('second-instance', (_event, commandLine) => {
+    if (hasStartMinimizedArg(commandLine)) return;
+    void controlCenterShowGate.request().catch(() => {});
   });
 
   await app.whenReady();
@@ -150,7 +152,7 @@ async function main() {
   let quitting = false;
   const orchestrators = new Map(); // key -> { child, pid, startedAt }
   const orchestratorHistory = new Map(); // key -> { pid, startedAt, exitedAt, exitCode, signal, logPath }
-  const showControlCenter = async () => {
+  showControlCenter = async () => {
     if (controlWin && !controlWin.isDestroyed()) {
       if (controlWin.isMinimized()) controlWin.restore();
       controlWin.show();
@@ -260,8 +262,6 @@ async function main() {
       win.focus?.();
     } catch {}
   };
-  if (pendingSecondInstanceFocus) focusDefaultTab();
-
   const buildMenu = () => {
     const template = [
       {
@@ -575,6 +575,7 @@ async function main() {
   // Launch control center only after IPC handlers are registered,
   // otherwise early renderer calls can race and fail with missing handlers.
   await showControlCenter().catch(() => {});
+  await controlCenterShowGate.markReady();
 
   let port = basePort;
   const tries = port === 0 ? 1 : 20;

@@ -16,6 +16,7 @@
     "SECURITY.md",
     "TRADEMARKS.md",
     "artifact-store.mjs",
+    "autopilot-proposal.mjs",
     "browser-backend.mjs",
     "bundle-store.mjs",
     "chatgpt-controller.mjs",

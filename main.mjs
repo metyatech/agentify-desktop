@@ -25,6 +25,7 @@ import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
 import { shouldAllowPopup } from './popup-policy.mjs';
 import { cleanupRuntimeResources, createGracefulShutdown, registerShutdownSignals } from './shutdown.mjs';
 import { createControlCenterShowGate, hasStartMinimizedArg } from './launch-mode.mjs';
+import { createAutopilotProposalService } from './autopilot-proposal.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -254,6 +255,30 @@ async function main() {
   });
   await tabs.restorePersistentTabs();
 
+  const autopilotProposal = createAutopilotProposalService({
+    tabs,
+    getRuntimeState: () => server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
+    requestQuery: async (body) => {
+      if (!server?.address?.()) throw new Error('agentify_query_unavailable');
+      const port = server.address().port;
+      const response = await fetch(`http://127.0.0.1:${port}/query`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.error) {
+        const error = new Error(data?.message || data?.error || `http_${response.status}`);
+        error.data = { status: response.status, body: data };
+        throw error;
+      }
+      return data;
+    }
+  });
+
   focusDefaultTab = () => {
     try {
       const win = tabs.getWindowById(defaultTabId);
@@ -311,9 +336,12 @@ async function main() {
       stateDir,
       browserBackend: browserBackendKind,
       browser: browserState,
-      runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] }
+      runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
+      autopilot: autopilotProposal.availability()
     };
   });
+
+  ipcMain.handle('agentify:requestAutopilotProposal', async () => await autopilotProposal.request());
 
   ipcMain.handle('agentify:getSettings', async () => {
     settings = await readSettings(stateDir);

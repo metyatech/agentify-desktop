@@ -117,7 +117,8 @@ function defaultState() {
     stateDir: '',
     browserBackend: 'chrome-cdp',
     browser: null,
-    runtime: { inflightQueries: 0, activeQueries: [], lastOutcomes: [] }
+    runtime: { inflightQueries: 0, activeQueries: [], lastOutcomes: [] },
+    autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false }
   };
 }
 
@@ -144,6 +145,41 @@ function statusText(msg, tone = 'info') {
   line.classList.toggle('isWarn', tone === 'warn');
   line.classList.toggle('isError', tone === 'error');
   line.classList.toggle('isMuted', tone === 'muted');
+}
+
+let autopilotStatusKey = 'ready';
+let autopilotRequestInFlight = false;
+
+function renderAutopilotState() {
+  const button = el('btnAutopilotProposal');
+  const status = el('autopilotProposalStatus');
+  const hint = el('autopilotProposalHint');
+  const state = lastState.autopilot || {};
+  const blockedByRuntime = Number(state.inflightQueries || 0) > 0 || Number(state.activeQueries || 0) > 0;
+  let label = '準備可能';
+  let className = '';
+  let detail = 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。';
+  if (autopilotRequestInFlight) {
+    label = 'ChatGPTへ依頼中';
+    className = 'isWaiting';
+    detail = 'ChatGPTからのproposal応答を待っています。ボタンは無効です。';
+  } else if (autopilotStatusKey === 'received') {
+    label = 'proposal応答受信';
+    className = 'isReceived';
+    detail = 'ChatGPTに返答が表示されています。内容を目視確認してから、既存のapproval手順を使ってください。';
+  } else if (autopilotStatusKey === 'error' || !state.ready) {
+    label = 'エラー';
+    className = 'isError';
+    if (state.tabCount !== 1) detail = '対象のautopilot-production tabがちょうど1件必要です。';
+    else if (state.vendorId !== 'chatgpt') detail = 'autopilot-production tabはChatGPTである必要があります。';
+    else if (blockedByRuntime) detail = '別のquery実行中のため、完了するまで依頼できません。';
+    else if (autopilotStatusKey === 'error') detail = 'proposal生成に失敗しました。状態を確認して、もう一度試せます。';
+  }
+  status.textContent = label;
+  status.className = `autopilotStatus ${className}`.trim();
+  hint.textContent = detail;
+  button.disabled = autopilotRequestInFlight || !state.ready;
+  button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
 }
 
 function setActivityText(html) {
@@ -275,6 +311,7 @@ async function refresh() {
     const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings() })) || defaultSettings();
     const watchFoldersData = (await callApi('listWatchFolders', undefined, { fallback: { folders: [] } })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
+    renderAutopilotState();
 
     const vendorSelect = el('vendorSelect');
     const prev = String(vendorSelect.value || '').trim();
@@ -532,6 +569,7 @@ async function refresh() {
     setActivityText(`<span class="activityLabel">Activity:</span> ${activity} • Backend: ${browserSummary} • Tabs: ${tabs.length}${runningSummary} • ${liveSummary}${refreshedSummary}`);
 
     if (!settingsDirty) applySettings(settings);
+    renderAutopilotState();
   })().finally(() => {
     refreshInFlight = null;
   });
@@ -624,6 +662,24 @@ async function main() {
       await refresh();
     } catch (e) {
       el('createHint').textContent = `Create failed: ${e?.message || String(e)}`;
+    }
+  };
+
+  el('btnAutopilotProposal').onclick = async () => {
+    if (autopilotRequestInFlight || el('btnAutopilotProposal').disabled) return;
+    autopilotRequestInFlight = true;
+    autopilotStatusKey = 'waiting';
+    renderAutopilotState();
+    try {
+      await callApi('requestAutopilotProposal', undefined, { required: true });
+      autopilotStatusKey = 'received';
+    } catch (e) {
+      autopilotStatusKey = 'error';
+      statusText(`Autopilot proposal failed: ${e?.message || String(e)}`, 'error');
+    } finally {
+      autopilotRequestInFlight = false;
+      await refresh().catch(() => {});
+      renderAutopilotState();
     }
   };
 

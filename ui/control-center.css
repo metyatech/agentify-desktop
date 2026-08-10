@@ -129,6 +129,44 @@ body {
 
 .cardTitle { font-weight: 700; margin-bottom: 10px; }
 
+.autopilotCard {
+  border-color: rgba(59, 130, 246, 0.38);
+  background: linear-gradient(145deg, rgba(37, 99, 235, 0.13), rgba(255,255,255,0.03));
+}
+.autopilotTarget {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 12px;
+  color: #bfdbfe;
+  font-size: 13px;
+}
+.autopilotTargetLabel {
+  color: rgba(233,236,242,0.62);
+  font-size: 11px;
+}
+.autopilotActionRow { align-items: center; }
+.autopilotAction {
+  min-height: 42px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.autopilotAction[disabled] {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+.autopilotStatus {
+  min-width: 8em;
+  color: #bbf7d0;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: right;
+}
+.autopilotStatus.isWaiting { color: #bfdbfe; }
+.autopilotStatus.isError { color: #fca5a5; }
+.autopilotStatus.isReceived { color: #fde68a; }
+.autopilotHint { margin-top: 10px; }
+
 .grid {
   display: grid;
   grid-template-columns: 1fr;
@@ -376,6 +414,9 @@ input::placeholder { color: rgba(233,236,242,0.45); }
 }
 
 @media (max-width: 420px) {
+  .autopilotActionRow { align-items: stretch; flex-direction: column; }
+  .autopilotAction { width: 100%; }
+  .autopilotStatus { text-align: left; }
   .governorGrid {
     grid-template-columns: 1fr;
   }

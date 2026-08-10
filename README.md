@@ -270,6 +270,24 @@ Agentify Desktop does not bypass CAPTCHAs or use third-party solvers. If a verif
 
 If your account uses Google, Microsoft, or Apple SSO, keep auth popups enabled in the Control Center. If embedded login remains unreliable, use Chrome CDP.
 
+## Autopilot Production proposal preparation
+
+The Control Center has one production-only action, `この内容を実行`, for the
+existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
+usable ChatGPT tab exists and that Agentify has no active or in-flight query.
+The action generates the version-1 proposal envelope locally, then sends the
+versioned proposal-generation instruction through the existing authenticated
+`POST /query` path. It does not create a tab, start Codex, create a worktree,
+write a task, commit, push, or send approval. The response remains in ChatGPT
+for the user to inspect; the existing watcher still requires the later exact
+approval turn (`開始して XXXXXXXX`).
+
+The fallback prompt boundary is [`autopilot-proposal.mjs`](autopilot-proposal.mjs)
+and is kept in sync with `ai-autopilot/src/proposal-generation.mjs` by matching
+the explicit instruction and protocol versions. The installed desktop cannot
+depend on the private controller repository, so this small versioned template
+is intentionally duplicated rather than introducing a daemon or API redesign.
+
 ## Structured Conversation Turns
 
 The authenticated loopback API exposes a read-only ChatGPT conversation boundary

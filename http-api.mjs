@@ -1160,7 +1160,7 @@ export function startHttpApi({
           getController: () => tabId ? tabs.getControllerById(tabId) : null
         });
         try {
-          tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
+          tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: body.createIfMissing !== false, vendors });
           bindOperationTab(op, tabId);
           throwIfOperationActive(op);
           assertTabNotBusy(tabId);

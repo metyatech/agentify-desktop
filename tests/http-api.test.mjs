@@ -40,6 +40,40 @@ test('http-api: health is public and returns serverId', async (t) => {
   assert.equal(data.serverId, 'sid-test');
 });
 
+test('http-api: a no-create query never creates a missing keyed tab', async (t) => {
+  let ensureCalls = 0;
+  const tabs = {
+    listTabs: () => [],
+    ensureTab: async () => { ensureCalls += 1; return 'unexpected'; },
+    createTab: async () => 'unexpected',
+    closeTab: async () => true,
+    getControllerById: () => { throw new Error('must_not_resolve_controller'); }
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    vendors: [{ id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/' }],
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0 }),
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/query',
+    body: { key: 'autopilot-production', vendorId: 'chatgpt', prompt: 'proposal', createIfMissing: false }
+  });
+  assert.equal(res.status, 404);
+  assert.equal(data.error, 'tab_not_found');
+  assert.equal(ensureCalls, 0);
+});
+
 test('http-api: rejects unauthorized', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
   const server = await startHttpApi({

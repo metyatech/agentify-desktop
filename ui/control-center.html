@@ -113,6 +113,20 @@
           <div id="tabsList" class="tabs"></div>
         </section>
 
+        <section class="card autopilotCard" aria-labelledby="autopilotTitle">
+          <div id="autopilotTitle" class="cardTitle">Autopilot Production</div>
+          <div class="hint">現在のChatGPTで相談した内容から、実行内容を準備します。まだ変更は開始しません。</div>
+          <div class="autopilotTarget">
+            <span class="autopilotTargetLabel">対象</span>
+            <span class="mono">autopilot-production</span>
+          </div>
+          <div class="row autopilotActionRow">
+            <button id="btnAutopilotProposal" class="btn primary autopilotAction" type="button">この内容を実行</button>
+            <div id="autopilotProposalStatus" class="autopilotStatus" role="status" aria-live="polite">準備可能</div>
+          </div>
+          <div id="autopilotProposalHint" class="hint autopilotHint">クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。</div>
+        </section>
+
         <section class="card">
           <div class="cardTitle">Watch Folders</div>
           <div class="hint">

@@ -384,6 +384,7 @@ class ChromeCdpPageAdapter {
     this.windowId = windowId;
     this.closed = false;
     this.minimized = false;
+    this.mainFrameId = null;
   }
 
   markClosed() {
@@ -398,6 +399,10 @@ class ChromeCdpPageAdapter {
     await this.client.send('Page.enable', {}, this.sessionId);
     await this.client.send('Runtime.enable', {}, this.sessionId);
     await this.client.send('DOM.enable', {}, this.sessionId);
+    try {
+      const tree = await this.client.send('Page.getFrameTree', {}, this.sessionId);
+      this.mainFrameId = String(tree?.frameTree?.frame?.id || '').trim() || null;
+    } catch {}
     await this.client.send(
       'Page.addScriptToEvaluateOnNewDocument',
       {
@@ -736,7 +741,7 @@ export class ChromeCdpBrowserBackend {
 
   setQuitting() {}
 
-  async createSession({ url, show = false, onClosed } = {}) {
+  async createSession({ url, show = false, onClosed, onUrlChanged } = {}) {
     await this.start();
 
     let target;
@@ -763,7 +768,34 @@ export class ChromeCdpBrowserBackend {
       if (show) await page.bringToFront().catch(() => {});
       else await page.minimize().catch(() => {});
 
+      const removeListeners = [];
+      const on = typeof this.client.on === 'function' ? this.client.on.bind(this.client) : null;
+      if (on && typeof onUrlChanged === 'function') {
+        removeListeners.push(
+          on('Page.frameNavigated', ({ frame } = {}, eventSessionId) => {
+            if (eventSessionId !== sessionId || !frame || frame.parentId) return;
+            page.mainFrameId = String(frame.id || '').trim() || page.mainFrameId;
+            const nextUrl = String(frame.url || '').trim();
+            if (nextUrl) onUrlChanged(nextUrl);
+          })
+        );
+        removeListeners.push(
+          on('Page.navigatedWithinDocument', ({ frameId, url: nextUrl } = {}, eventSessionId) => {
+            if (eventSessionId !== sessionId || !page.mainFrameId || frameId !== page.mainFrameId) return;
+            const value = String(nextUrl || '').trim();
+            if (value) onUrlChanged(value);
+          })
+        );
+      }
+      const cleanupListeners = () => {
+        for (const remove of removeListeners.splice(0)) {
+          try {
+            remove?.();
+          } catch {}
+        }
+      };
       this.tabClosers.set(targetId, () => {
+        cleanupListeners();
         page.markClosed();
         onClosed?.();
       });
@@ -774,6 +806,7 @@ export class ChromeCdpBrowserBackend {
         presenter: new ChromeCdpPresenter(page),
         close: async () => {
           this.tabClosers.delete(targetId);
+          cleanupListeners();
           try {
             await page.close();
           } catch {}

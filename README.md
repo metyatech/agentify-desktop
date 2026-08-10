@@ -317,6 +317,7 @@ Agentify Desktop is local-first:
 - The local API requires a bearer token stored under `~/.agentify-desktop/`.
 - Electron browser data is stored under `~/.agentify-desktop/electron-user-data/`.
 - Chrome CDP profile data is stored under `~/.agentify-desktop/chrome-user-data/` unless you choose an existing profile.
+- Stable keyed tabs are restored after Agentify restarts from `~/.agentify-desktop/tabs.json`. The registry stores the supported vendor conversation URL without credentials, query parameters, or fragments; unkeyed tabs and the built-in `default` tab remain session-only.
 - Artifacts, bundles, logs, and state are stored under `~/.agentify-desktop/`.
 
 Anyone with access to your machine account may be able to access local session data. Treat the machine account as the security boundary.

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Persist stable keyed tabs and their current vendor conversation URLs so they are restored before the local API becomes ready after an application restart.
+
 ## 0.2.4 - 2026-05-17
 
 ### Fixed

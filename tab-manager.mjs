@@ -34,12 +34,14 @@ function tabMatchesVendor(tab, { vendorId = null, url = null } = {}) {
 }
 
 export class TabManager {
-  constructor({ browserBackend, createController, maxTabs = 12, onNeedsAttention, onChanged }) {
+  constructor({ browserBackend, createController, registry = null, maxTabs = 12, onNeedsAttention, onChanged, onPersistenceError }) {
     this.browserBackend = browserBackend;
     this.createController = createController;
     this.maxTabs = Math.max(1, Number(maxTabs) || 12);
     this.onNeedsAttention = onNeedsAttention;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
+    this.registry = registry;
+    this.onPersistenceError = typeof onPersistenceError === 'function' ? onPersistenceError : null;
 
     this.tabs = new Map(); // tabId -> { id, key, name, vendorId, vendorName, url, session, presenter, controller, createdAt, lastUsedAt }
     this.keyToId = new Map();
@@ -55,60 +57,159 @@ export class TabManager {
 
   async createTab({ key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
     return await this.mutex.run(async () => {
-      if (key && this.keyToId.has(key)) return this.keyToId.get(key);
-      if (this.tabs.size >= this.maxTabs) throw new Error('max_tabs_reached');
+      return await this.#createTabUnlocked({ key, name, url, show, protectedTab, vendorId, vendorName }, { persist: true });
+    });
+  }
 
-      const id = crypto.randomUUID();
-      let finalized = false;
-      const finalizeClose = () => {
-        if (finalized) return;
-        finalized = true;
-        this.tabs.delete(id);
-        if (key) this.keyToId.delete(key);
-        this.forcedFocusTabs.delete(id);
-        this.onChanged?.();
-      };
+  async #createTabUnlocked(
+    { key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {},
+    { persist = true } = {}
+  ) {
+    const normalizedKey = key ? String(key).trim() : null;
+    if (normalizedKey && this.keyToId.has(normalizedKey)) return this.keyToId.get(normalizedKey);
+    if (this.tabs.size >= this.maxTabs) throw new Error('max_tabs_reached');
 
-      const session = await this.browserBackend.createSession({
-        tabId: id,
-        url,
-        show,
-        protectedTab,
-        vendorId,
-        vendorName,
-        onClosed: finalizeClose
-      });
-      let controller = null;
+    let persistent = null;
+    if (this.registry && normalizedKey && normalizedKey !== 'default') {
+      persistent = this.registry.normalize([
+        {
+          key: normalizedKey,
+          name: name || normalizedKey,
+          vendorId,
+          vendorName,
+          url,
+          protectedTab: !!protectedTab
+        }
+      ])[0];
+    }
+
+    const id = crypto.randomUUID();
+    let closeNotified = false;
+    const notifyClosed = () => {
+      if (closeNotified) return;
+      closeNotified = true;
+      void this.#handleSessionClosed(id);
+    };
+    const notifyUrlChanged = (nextUrl) => {
+      void this.checkpointTabUrl(id, nextUrl).catch((error) => this.#reportPersistenceError(error));
+    };
+    const session = await this.browserBackend.createSession({
+      tabId: id,
+      url: persistent?.url || url,
+      show,
+      protectedTab,
+      vendorId,
+      vendorName,
+      onClosed: notifyClosed,
+      onUrlChanged: notifyUrlChanged
+    });
+    let controller = null;
+    try {
+      controller = await this.createController({ tabId: id, page: session.page, session });
+    } catch (error) {
       try {
-        controller = await this.createController({ tabId: id, page: session.page, session });
+        await session?.close?.();
+      } catch {}
+      throw error;
+    }
+
+    const tab = {
+      id,
+      key: normalizedKey,
+      name: persistent?.name || name || normalizedKey || `tab-${id.slice(0, 8)}`,
+      vendorId: persistent?.vendorId || vendorId || null,
+      vendorName: persistent?.vendorName || vendorName || null,
+      url: persistent?.url || String(url || ''),
+      session,
+      presenter: session.presenter,
+      controller,
+      protectedTab: persistent?.protectedTab ?? !!protectedTab,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now()
+    };
+
+    this.tabs.set(id, tab);
+    if (normalizedKey) this.keyToId.set(normalizedKey, id);
+    try {
+      if (persist && persistent) await this.#writePersistentTabs();
+    } catch (error) {
+      this.tabs.delete(id);
+      this.keyToId.delete(normalizedKey);
+      try {
+        await session?.close?.();
+      } catch {}
+      throw error;
+    }
+    this.onChanged?.();
+    return id;
+  }
+
+  async restorePersistentTabs() {
+    if (!this.registry) return [];
+    return await this.mutex.run(async () => {
+      const entries = await this.registry.read();
+      if (this.tabs.size + entries.length > this.maxTabs) throw new Error('max_tabs_reached');
+      const restored = [];
+      for (const entry of entries) {
+        if (this.keyToId.has(entry.key)) throw new Error('tab_registry_key_conflict');
+        restored.push(await this.#createTabUnlocked({ ...entry, show: false }, { persist: false }));
+      }
+      return restored;
+    });
+  }
+
+  async checkpointTabUrl(id, url = null) {
+    if (!this.registry) return false;
+    return await this.mutex.run(async () => {
+      const tab = this.tabs.get(id);
+      if (!tab || !this.#isPersistent(tab)) return false;
+      const observed = url || (await tab.session?.page?.getUrl?.());
+      const canonical = this.registry.canonicalizeUrl({ vendorId: tab.vendorId, url: observed });
+      if (canonical === tab.url) return false;
+      const previousUrl = tab.url;
+      tab.url = canonical;
+      try {
+        await this.#writePersistentTabs();
       } catch (error) {
-        try {
-          await session?.close?.();
-        } catch {}
-        finalizeClose();
+        tab.url = previousUrl;
         throw error;
       }
-
-      const tab = {
-        id,
-        key,
-        name: name || key || `tab-${id.slice(0, 8)}`,
-        vendorId: vendorId || null,
-        vendorName: vendorName || null,
-        url: String(url || ''),
-        session,
-        presenter: session.presenter,
-        controller,
-        protectedTab: !!protectedTab,
-        createdAt: Date.now(),
-        lastUsedAt: Date.now()
-      };
-
-      this.tabs.set(id, tab);
-      if (key) this.keyToId.set(key, id);
       this.onChanged?.();
-      return id;
+      return true;
     });
+  }
+
+  async checkpointPersistentTabs() {
+    if (!this.registry) return [];
+    return await this.mutex.run(async () => {
+      const previousUrls = new Map();
+      for (const tab of this.tabs.values()) {
+        if (!this.#isPersistent(tab)) continue;
+        try {
+          const observed = await tab.session?.page?.getUrl?.();
+          const canonical = this.registry.canonicalizeUrl({ vendorId: tab.vendorId, url: observed });
+          if (canonical !== tab.url) {
+            previousUrls.set(tab.id, tab.url);
+            tab.url = canonical;
+          }
+        } catch (error) {
+          this.#reportPersistenceError(error);
+        }
+      }
+      try {
+        return await this.#writePersistentTabs();
+      } catch (error) {
+        for (const [id, previousUrl] of previousUrls) {
+          const tab = this.tabs.get(id);
+          if (tab) tab.url = previousUrl;
+        }
+        throw error;
+      }
+    });
+  }
+
+  async waitForPersistence() {
+    return await this.mutex.run(async () => true);
   }
 
   async ensureTab({ key, name, url, vendorId, vendorName, show } = {}) {
@@ -165,6 +266,7 @@ export class TabManager {
     return await this.mutex.run(async () => {
       const tab = this.tabs.get(id);
       if (!tab) throw new Error('tab_not_found');
+      if (this.#isPersistent(tab)) await this.#writePersistentTabs({ excludeId: id });
       if (tab.key) this.keyToId.delete(tab.key);
       this.tabs.delete(id);
       this.forcedFocusTabs.delete(id);
@@ -174,6 +276,53 @@ export class TabManager {
       this.onChanged?.();
       return true;
     });
+  }
+
+  async #handleSessionClosed(id) {
+    return await this.mutex.run(async () => {
+      const tab = this.tabs.get(id);
+      if (!tab) return;
+      if (!this.quitting && this.#isPersistent(tab)) {
+        try {
+          await this.#writePersistentTabs({ excludeId: id });
+        } catch (error) {
+          this.#reportPersistenceError(error);
+        }
+      }
+      this.tabs.delete(id);
+      if (tab.key) this.keyToId.delete(tab.key);
+      this.forcedFocusTabs.delete(id);
+      this.onChanged?.();
+    });
+  }
+
+  #isPersistent(tab) {
+    return !!(this.registry && tab?.key && tab.key !== 'default');
+  }
+
+  #persistentEntries({ excludeId = null } = {}) {
+    return Array.from(this.tabs.values())
+      .filter((tab) => tab.id !== excludeId && this.#isPersistent(tab))
+      .map((tab) => ({
+        key: tab.key,
+        name: tab.name,
+        vendorId: tab.vendorId,
+        vendorName: tab.vendorName,
+        url: tab.url,
+        protectedTab: !!tab.protectedTab
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  async #writePersistentTabs(options = {}) {
+    if (!this.registry) return [];
+    return await this.registry.write(this.#persistentEntries(options));
+  }
+
+  #reportPersistenceError(error) {
+    try {
+      this.onPersistenceError?.(error);
+    } catch {}
   }
 
   async needsAttention(tabId, reason) {

@@ -298,6 +298,45 @@ test('chrome-cdp-backend: session close is best-effort when closeTarget fails', 
   assert.equal(closedCalls, 1);
 });
 
+test('chrome-cdp-backend: reports only top-level frame and in-page navigation URL changes', async () => {
+  const listeners = new Map();
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  backend.client = {
+    connected: true,
+    ws: {},
+    on(method, handler) {
+      const list = listeners.get(method) || [];
+      list.push(handler);
+      listeners.set(method, list);
+      return () => listeners.set(method, (listeners.get(method) || []).filter((item) => item !== handler));
+    },
+    send: async (method) => {
+      if (method === 'Target.createTarget') return { targetId: 'target-navigation' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'session-navigation' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+      return {};
+    }
+  };
+  const urls = [];
+  await backend.createSession({
+    url: 'https://chatgpt.com/',
+    onUrlChanged: (url) => urls.push(url)
+  });
+  const emit = (method, params, sessionId = 'session-navigation') => {
+    for (const handler of listeners.get(method) || []) handler(params, sessionId);
+  };
+
+  emit('Page.frameNavigated', { frame: { id: 'child', parentId: 'main-frame', url: 'https://example.com/frame' } });
+  emit('Page.frameNavigated', { frame: { id: 'main-frame', url: 'https://chatgpt.com/c/regular' } });
+  emit('Page.navigatedWithinDocument', { frameId: 'main-frame', url: 'https://chatgpt.com/c/spa' });
+  emit('Page.navigatedWithinDocument', { frameId: 'child', url: 'https://example.com/subframe' });
+  emit('Page.navigatedWithinDocument', { frameId: 'main-frame', url: 'https://chatgpt.com/c/wrong-session' }, 'other-session');
+
+  assert.deepEqual(urls, ['https://chatgpt.com/c/regular', 'https://chatgpt.com/c/spa']);
+});
+
 test('chrome-cdp-backend: start cleans up spawned chrome process when CDP connect fails', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-chrome-start-fail-'));
   let executablePath = process.execPath;

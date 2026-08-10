@@ -38,6 +38,7 @@ export function createGracefulShutdown({
   stopWatchFolders,
   disposeBrowserBackend,
   stopOrchestrators,
+  prepareTabsForShutdown,
   setTabsQuitting,
   markQuitting,
   quitApp
@@ -54,6 +55,7 @@ export function createGracefulShutdown({
       try {
         stopOrchestrators?.();
       } catch {}
+      await prepareTabsForShutdown?.();
       try {
         setTabsQuitting?.();
       } catch {}

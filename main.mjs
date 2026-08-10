@@ -17,6 +17,7 @@ import {
 import { ChatGPTController } from './chatgpt-controller.mjs';
 import { startHttpApi } from './http-api.mjs';
 import { TabManager } from './tab-manager.mjs';
+import { TabRegistry } from './tab-registry.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
@@ -212,9 +213,13 @@ async function main() {
 
   const tabs = new TabManager({
     browserBackend,
+    registry: new TabRegistry({ stateDir, vendors }),
     maxTabs: Number(process.env.AGENTIFY_DESKTOP_MAX_TABS || 12),
     onNeedsAttention,
     onChanged: emitTabsChanged,
+    onPersistenceError: (error) => {
+      console.error('tab persistence failed:', error?.message || String(error));
+    },
     createController: async ({ tabId, page }) => {
       const controller = new ChatGPTController({
         page,
@@ -245,6 +250,7 @@ async function main() {
     vendorId: defaultVendor.id,
     vendorName: defaultVendor.name
   });
+  await tabs.restorePersistentTabs();
 
   focusDefaultTab = () => {
     try {
@@ -672,6 +678,9 @@ async function main() {
           v?.child?.kill?.('SIGTERM');
         } catch {}
       }
+    },
+    prepareTabsForShutdown: async () => {
+      await tabs.checkpointPersistentTabs();
     },
     setTabsQuitting: () => tabs.setQuitting(true),
     markQuitting: () => {

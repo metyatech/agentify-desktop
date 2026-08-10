@@ -3,11 +3,34 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-async function atomicWriteFile(filePath, data, { mode } = {}) {
+export async function atomicWriteFile(filePath, data, { mode } = {}) {
   const dir = path.dirname(filePath);
   const tmp = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(8).toString('hex')}.tmp`);
-  await fs.writeFile(tmp, data, mode ? { encoding: 'utf8', mode } : { encoding: 'utf8' });
-  await fs.rename(tmp, filePath);
+  let handle = null;
+  try {
+    handle = await fs.open(tmp, 'wx', mode || 0o600);
+    await handle.writeFile(data, { encoding: 'utf8' });
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(tmp, filePath);
+    try {
+      const directoryHandle = await fs.open(dir, 'r');
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch {}
+  } catch (error) {
+    try {
+      await handle?.close?.();
+    } catch {}
+    try {
+      await fs.rm(tmp, { force: true });
+    } catch {}
+    throw error;
+  }
 }
 
 export function defaultStateDir() {

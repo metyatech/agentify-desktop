@@ -1105,7 +1105,9 @@ export function startHttpApi({
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
         const controller = tabs.getControllerById(tabId);
         await runExclusive(controller, async () => controller.navigate(to));
-        return sendJson(res, 200, { ok: true, tabId, url: await controller.getUrl() });
+        const currentUrl = await controller.getUrl();
+        await tabs.checkpointTabUrl?.(tabId, currentUrl);
+        return sendJson(res, 200, { ok: true, tabId, url: currentUrl });
       }
 
       if (url.pathname === '/ensure-ready' && req.method === 'POST') {

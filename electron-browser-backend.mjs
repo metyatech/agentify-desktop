@@ -179,7 +179,8 @@ export class ElectronBrowserBackend {
     protectedTab = false,
     vendorId = null,
     vendorName = null,
-    onClosed
+    onClosed,
+    onUrlChanged
   } = {}) {
     let forceClose = false;
     const win = new this.BrowserWindowClass({
@@ -241,6 +242,16 @@ export class ElectronBrowserBackend {
           }
         }
       };
+    });
+    const reportUrlChanged = (nextUrl) => {
+      const value = String(nextUrl || '').trim();
+      if (value) onUrlChanged?.(value);
+    };
+    win.webContents.on('did-navigate', (_event, nextUrl) => {
+      reportUrlChanged(nextUrl);
+    });
+    win.webContents.on('did-navigate-in-page', (_event, nextUrl, isMainFrame) => {
+      if (isMainFrame) reportUrlChanged(nextUrl);
     });
     const fixedTitle = `Agentify Desktop${vendorName ? ` — ${vendorName}` : ''}`;
     try {

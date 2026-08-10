@@ -34,6 +34,7 @@
     "shutdown.mjs",
     "state.mjs",
     "tab-manager.mjs",
+    "tab-registry.mjs",
     "ui/",
     "vendors.json",
     "watch-folder.mjs",

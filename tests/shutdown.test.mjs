@@ -25,6 +25,7 @@ test('shutdown: before-quit waits for async cleanup before quitting', async () =
       await cleanupGate;
     },
     stopOrchestrators: () => calls.push('stopOrchestrators'),
+    prepareTabsForShutdown: async () => calls.push('prepareTabsForShutdown'),
     setTabsQuitting: () => calls.push('setTabsQuitting'),
     markQuitting: () => calls.push('markQuitting'),
     quitApp: () => calls.push('quitApp')
@@ -47,7 +48,16 @@ test('shutdown: before-quit waits for async cleanup before quitting', async () =
 
   assert.deepEqual(
     calls,
-    ['markQuitting', 'stopOrchestrators', 'setTabsQuitting', 'closeServer', 'stopWatchFolders', 'disposeBrowserBackend', 'quitApp']
+    [
+      'markQuitting',
+      'stopOrchestrators',
+      'prepareTabsForShutdown',
+      'setTabsQuitting',
+      'closeServer',
+      'stopWatchFolders',
+      'disposeBrowserBackend',
+      'quitApp'
+    ]
   );
 });
 

@@ -14,6 +14,7 @@ class MockBrowserWindow {
       isDestroyed: () => this.destroyed,
       setUserAgent: () => {},
       insertText: async () => {},
+      getURL: () => this.currentUrl || '',
       on: (event, handler) => {
         const list = this.webContentsListeners.get(event) || [];
         list.push(handler);
@@ -203,4 +204,32 @@ test('electron-browser-backend: insertText uses native webContents.insertText wh
   await session.page.insertText('hello');
 
   assert.equal(inserted, 'hello');
+});
+
+test('electron-browser-backend: reports top-level regular and in-page navigation URL changes', async () => {
+  let createdWindow = null;
+  class OkBrowserWindow extends MockBrowserWindow {
+    constructor(...args) {
+      super(...args);
+      createdWindow = this;
+    }
+
+    async loadURL(url) {
+      this.currentUrl = url;
+      return true;
+    }
+  }
+
+  const urls = [];
+  const backend = new ElectronBrowserBackend({ BrowserWindowClass: OkBrowserWindow });
+  await backend.createSession({
+    url: 'https://chatgpt.com/',
+    onUrlChanged: (url) => urls.push(url)
+  });
+
+  createdWindow.emitWebContents('did-navigate', {}, 'https://chatgpt.com/c/regular');
+  createdWindow.emitWebContents('did-navigate-in-page', {}, 'https://chatgpt.com/c/spa', true);
+  createdWindow.emitWebContents('did-navigate-in-page', {}, 'https://example.com/subframe', false);
+
+  assert.deepEqual(urls, ['https://chatgpt.com/c/regular', 'https://chatgpt.com/c/spa']);
 });

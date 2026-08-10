@@ -24,6 +24,7 @@
     "context-packer.mjs",
     "electron-browser-backend.mjs",
     "http-api.mjs",
+    "launch-mode.mjs",
     "main.mjs",
     "mcp-lib.mjs",
     "mcp-server.mjs",

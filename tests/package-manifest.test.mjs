@@ -18,6 +18,7 @@ test('package manifest is publishable under @agentify/desktop with npx-friendly 
   assert.equal(manifest.bin?.['agentify-desktop-gui'], 'bin/agentify-desktop.mjs');
   assert.equal(manifest.bin?.['agentify-desktop-mcp'], 'bin/agentify-desktop.mjs');
   assert.ok(manifest.files.includes('bin/'));
+  assert.ok(manifest.files.includes('launch-mode.mjs'));
   assert.ok(manifest.files.includes('main.mjs'));
   assert.ok(manifest.files.includes('mcp-server.mjs'));
   assert.ok(manifest.files.includes('ui/'));
@@ -26,6 +27,27 @@ test('package manifest is publishable under @agentify/desktop with npx-friendly 
   assert.equal(manifest.build?.extraMetadata?.dependencies, null);
   assert.equal(manifest.build?.win?.signExecutable, false);
   assert.equal(manifest.build?.win?.signAndEditExecutable, undefined);
+});
+
+test('npm pack dry-run includes the documented runtime entrypoints', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const npmCommand = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'npm';
+  const npmArgs = process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npm pack --dry-run --json']
+    : ['pack', '--dry-run', '--json'];
+  const { stdout } = await execFileAsync(npmCommand, npmArgs, {
+    cwd: root,
+    maxBuffer: 1024 * 1024,
+    windowsHide: true
+  });
+  const [pack] = JSON.parse(stdout);
+  const packedPaths = new Set(pack.files.map(({ path: filePath }) => filePath));
+
+  assert.ok(packedPaths.has('main.mjs'));
+  assert.ok(packedPaths.has('launch-mode.mjs'));
+  assert.ok(packedPaths.has('bin/agentify-desktop.mjs'));
 });
 
 test('desktop bin dispatches gui and mcp modes', async () => {

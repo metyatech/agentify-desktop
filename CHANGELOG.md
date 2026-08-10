@@ -4,6 +4,7 @@
 
 ### Fixed
 - Persist stable keyed tabs and their current vendor conversation URLs so they are restored before the local API becomes ready after an application restart.
+- Keep the published CLI runtime dependencies intact while producing unsigned local Windows installers from a clean dependency install.
 
 ## 0.2.4 - 2026-05-17
 

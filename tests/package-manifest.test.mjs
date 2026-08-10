@@ -22,6 +22,9 @@ test('package manifest is publishable under @agentify/desktop with npx-friendly 
   assert.ok(manifest.files.includes('mcp-server.mjs'));
   assert.ok(manifest.files.includes('ui/'));
   assert.ok(!manifest.files.includes('tests/'));
+  assert.ok(manifest.dependencies?.electron);
+  assert.equal(manifest.build?.extraMetadata?.dependencies, null);
+  assert.equal(manifest.build?.win?.signAndEditExecutable, false);
 });
 
 test('desktop bin dispatches gui and mcp modes', async () => {

@@ -57,7 +57,7 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, onBasicEvaluate = null, promptEvaluationOverride = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, attachmentDraftState = null, onBasicEvaluate = null, promptEvaluationOverride = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   const defaultStopTokenEvaluation = (js) => {
     if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
     const generation = Number(/const (?:generation|expectedGeneration) = ([0-9]+)/u.exec(js)?.[1] || 0);
@@ -92,6 +92,7 @@ function createPage({ events, onEvaluate, onBasicEvaluate = null, promptEvaluati
       if (js.includes('agentifyStopTokenLifecycle') || js.includes('agentifyStopTokenStateRead') || js.includes('agentifyStopTokenDispatchCheck') || js.includes('agentifyStopTokenDispatchClaim') || js.includes('agentifyStopTokenDispatchStart') || js.includes('agentifyStopTokenDispatchRollback') || js.includes('agentifyStopTokenDispatchComplete') || js.includes('agentifyStopTokenDispatchRead') || js.includes('agentifyStopTokenStopCancellation')) {
         return await onStopTokenEvaluate?.(js) ?? defaultStopTokenEvaluation(js);
       }
+      if (js.includes('agentifyAttachmentDraftPreflight')) return typeof attachmentDraftState === 'function' ? await attachmentDraftState() : attachmentDraftState || { isChatGPT: true, hasAttachmentState: false };
       const basicOverride = await onBasicEvaluate?.(js);
       if (basicOverride !== undefined) return basicOverride;
       if (js.includes('missing_prompt_textarea') && promptEvaluationOverride) return await promptEvaluationOverride(js);
@@ -2419,7 +2420,6 @@ function chatgptUploadInputState({
   inputValue = ''
 } = {}) {
   const draftHasAttachmentState = selectedFileNames.length > 0 || cardDisplayNames.length > 0 || inputValue !== '';
-  const draftMatchesExpected = draftHasAttachmentState && selectionMatchesExpected && mappingComplete;
   return {
     isChatGPT: true,
     inputReady: true,
@@ -2432,8 +2432,8 @@ function chatgptUploadInputState({
     countsMatch: selectedFileNames.length === cardDisplayNames.length,
     mappingComplete,
     draftHasAttachmentState,
-    draftMatchesExpected,
-    draftConflict: draftHasAttachmentState && !draftMatchesExpected,
+    hasAttachmentState: draftHasAttachmentState,
+    draftConflict: draftHasAttachmentState,
     mappingErrors,
     inputValue,
     composerInputCount: 1,
@@ -2447,6 +2447,7 @@ function createUploadInputStatePage({ events, initialState, fileStateForPoll = n
   let menuSelectionPolls = 0;
   const page = createPage({
     events,
+    attachmentDraftState: { ...initialState, hasAttachmentState: initialState.hasAttachmentState ?? initialState.draftHasAttachmentState },
     onSetFileInputFiles,
     onEvaluate: async (js) => {
       if (js.includes('const assistantBaseline')) return assistantBaseline();
@@ -2488,7 +2489,7 @@ function createUploadInputStatePage({ events, initialState, fileStateForPoll = n
 test('chatgpt-controller: initial attachment sets the ordinary file once without clearing', async () => {
   await withTempAttachments(['repeat.txt'], async ([attachment]) => {
     const events = [];
-    const { page } = createUploadInputStatePage({
+    const { page, attachmentPolls } = createUploadInputStatePage({
       events,
       initialState: chatgptUploadInputState({ selectedFileNames: [] })
     });
@@ -2606,7 +2607,7 @@ test('chatgpt-controller: preserves a stale selected file when preflight conflic
   });
 });
 
-test('chatgpt-controller: reuses complete active composer cards without clearing or setting files', async () => {
+test('chatgpt-controller: blocks a complete active composer set instead of reusing it', async () => {
   await withTempAttachments(['repeat.txt'], async ([attachment]) => {
     const events = [];
     const { page, attachmentPolls } = createUploadInputStatePage({
@@ -2619,17 +2620,20 @@ test('chatgpt-controller: reuses complete active composer cards without clearing
       })
     });
 
-    await createController(page).query({ prompt: 'reuse active attachment', attachments: [attachment], timeoutMs: 5_000 });
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not reuse active attachment', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.reason === 'current_draft_attachment_conflict'
+    );
 
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
-    assert.equal(attachmentPolls(), 2);
+    assert.equal(attachmentPolls(), 0);
   });
 });
 
-test('chatgpt-controller: does not clean up a reused attachment set after readiness failure', async () => {
+test('chatgpt-controller: blocks a matching stale set before readiness or cleanup', async () => {
   await withTempAttachments(['repeat.txt'], async ([attachment]) => {
     const events = [];
-    const { page } = createUploadInputStatePage({
+    const { page, attachmentPolls } = createUploadInputStatePage({
       events,
       initialState: chatgptUploadInputState({
         selectedFileNames: ['repeat.txt'],
@@ -2641,11 +2645,12 @@ test('chatgpt-controller: does not clean up a reused attachment set after readin
     });
 
     await assert.rejects(
-      createController(page).query({ prompt: 'preserve reused attachment', attachments: [attachment], timeoutMs: 20 }),
-      (error) => error.message === 'attachment_upload_timeout' && error.data?.cleanup === undefined
+      createController(page).query({ prompt: 'preserve stale attachment', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight'
     );
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
     assert.equal(events.includes('cleanup-draft'), false);
+    assert.equal(attachmentPolls(), 0);
   });
 });
 
@@ -2666,7 +2671,6 @@ test('chatgpt-controller: rejects a partial active composer attachment state wit
       createController(page).query({ prompt: 'do not disturb partial cards', attachments: [first, second], timeoutMs: 5_000 }),
       (error) => {
         assert.equal(error.message, 'chatgpt_file_input_state_conflict');
-        assert.deepEqual(error.data?.expectedFileNames, ['first.txt', 'second.txt']);
         assert.deepEqual(error.data?.selectedFileNames, ['first.txt', 'second.txt']);
         assert.deepEqual(error.data?.cardDisplayNames, ['first.txt']);
         return true;
@@ -3314,10 +3318,11 @@ async function evaluateCleanupScript(js, dom) {
   });
 }
 
-function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onEvaluateExtra = null, onSetFileInputFiles = null }) {
+function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, attachmentDraftState = null, sendResult = null, recordSendEvaluation = true, cleanupDom = null, userTurnBaseline = null, onBasicEvaluate = null, onInsertText = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onEvaluateExtra = null, onSetFileInputFiles = null }) {
   let cleanupScript = '';
   const page = createPage({
     events,
+    attachmentDraftState,
     includeUserTurnBaseline: true,
     userTurnBaseline,
     onBasicEvaluate,
@@ -3353,6 +3358,99 @@ function createAttachmentCleanupPage({ events, attachmentState, cleanupResult, s
   });
   return { page, cleanupScript: () => cleanupScript };
 }
+
+test('chatgpt-controller: blocks same-basename stale evidence before a new query upload', async () => {
+  await withTempAttachments(['task-contract.json', 'verification.json', 'execution-log.json', 'execution-summary.txt'], async (attachments) => {
+    const events = [];
+    const staleState = chatgptUploadInputState({
+      selectedFileNames: ['task-contract.json', 'verification.json', 'execution-log.json', 'execution-summary.txt'],
+      cardDisplayNames: ['task-contract.json', 'verification.json', 'execution-log.json', 'execution-summary.txt'],
+      selectionMatchesExpected: true,
+      mappingComplete: true
+    });
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: staleState,
+      attachmentState: attachmentCardSnapshot([]),
+      cleanupResult: { ok: true }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not send old evidence', attachments, timeoutMs: 5_000 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.reason === 'current_draft_attachment_conflict'
+    );
+    assert.equal(events.some((event) => event.startsWith('files-set:')), false);
+    assert.equal(events.includes('text:do not send old evidence'), false);
+    assert.equal(events.includes('normal-send-click'), false);
+    assert.equal(events.includes('cleanup-draft'), false);
+  });
+});
+
+test('chatgpt-controller: blocks text-only query when a stale draft exists', async () => {
+  const events = [];
+  const staleState = chatgptUploadInputState({ selectedFileNames: ['stale.txt'], cardDisplayNames: ['stale.txt'] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentDraftState: staleState,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true }
+  });
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'text-only must not attach stale draft', attachments: [], timeoutMs: 5_000 }),
+    (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight'
+  );
+  assert.equal(events.some((event) => event.startsWith('text:')), false);
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: blocks send when a stale draft exists', async () => {
+  const events = [];
+  const staleState = chatgptUploadInputState({ selectedFileNames: ['stale.txt'], cardDisplayNames: ['stale.txt'] });
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentDraftState: staleState,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: true }
+  });
+
+  await assert.rejects(
+    createController(page).send({ text: 'send must not attach stale draft', timeoutMs: 5_000 }),
+    (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight'
+  );
+  assert.equal(events.some((event) => event.startsWith('text:')), false);
+  assert.equal(events.includes('normal-send-click'), false);
+  assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: preflight blocks the next query when failed cleanup leaves a draft', async () => {
+  await withTempAttachments(['owned.txt'], async ([attachment]) => {
+    const events = [];
+    let draftState = { isChatGPT: true, hasAttachmentState: false };
+    const staleState = chatgptUploadInputState({ selectedFileNames: ['owned.txt'], cardDisplayNames: ['owned.txt'] });
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: () => draftState,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'owned.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: { ok: false, reason: 'attachment_set_changed' },
+      onSetFileInputFiles: async () => { draftState = staleState; }
+    });
+    const controller = createController(page);
+
+    await assert.rejects(
+      controller.query({ prompt: 'first query leaves a stale draft', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data?.cleanup?.status === 'failed'
+    );
+    await assert.rejects(
+      controller.query({ prompt: 'second query must stop', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight'
+    );
+    assert.equal(events.filter((event) => event.startsWith('files-set:')).length, 1);
+    assert.equal(events.filter((event) => event.startsWith('text:')).length, 0);
+    assert.equal(events.includes('normal-send-click'), false);
+  });
+});
 
 function createDispatchRaceHarness({ events, sendResult, actionMode = 'generic', actionGate = null, claimGate = null, startGate = null, startResult = null, onActionStarted = null, onClaimStarted = null, onClaimCompleted = null, onStartStarted = null, onStartCompleted = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onRollback = null, claimStateOverride = null, actionError = null, cleanupResult = null, markDispatchingBeforeActionGate = false }) {
   let browserState = { generation: 0, sequence: 0, token: null, stopRequested: false, retiredSequence: 0, dispatch: null };
@@ -5842,7 +5940,7 @@ test('chatgpt-controller: cleanup settle timeout preserves the original error an
   });
 });
 
-test('chatgpt-controller: reuses a completed renamed ChatGPT card mapped from the active FileList', async () => {
+test('chatgpt-controller: blocks a completed renamed active draft instead of reusing it', async () => {
   await withTempAttachments(['foo.txt'], async ([attachment]) => {
     const events = [];
     const { page, attachmentPolls } = createUploadInputStatePage({
@@ -5863,15 +5961,18 @@ test('chatgpt-controller: reuses a completed renamed ChatGPT card mapped from th
       }])
     });
 
-    await createController(page).query({ prompt: 'reuse renamed attachment', attachments: [attachment], timeoutMs: 5_000 });
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not reuse renamed attachment', attachments: [attachment], timeoutMs: 5_000 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict'
+    );
 
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
     assert.equal(events.includes('native-clear'), false);
-    assert.equal(attachmentPolls(), 2);
+    assert.equal(attachmentPolls(), 0);
   });
 });
 
-test('chatgpt-controller: reuses duplicate FileList entries only when every ordered card maps', async () => {
+test('chatgpt-controller: blocks duplicate active draft entries instead of reusing them', async () => {
   await withTempAttachments(['foo.txt'], async ([attachment]) => {
     const events = [];
     const { page, attachmentPolls } = createUploadInputStatePage({
@@ -5888,10 +5989,13 @@ test('chatgpt-controller: reuses duplicate FileList entries only when every orde
       ])
     });
 
-    await createController(page).query({ prompt: 'reuse duplicate attachments', attachments: [attachment, attachment], timeoutMs: 5_000 });
+    await assert.rejects(
+      createController(page).query({ prompt: 'do not reuse duplicate attachments', attachments: [attachment, attachment], timeoutMs: 5_000 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict'
+    );
 
     assert.deepEqual(events.filter((event) => event.startsWith('files-')), []);
-    assert.equal(attachmentPolls(), 2);
+    assert.equal(attachmentPolls(), 0);
   });
 });
 
@@ -5976,7 +6080,6 @@ test('chatgpt-controller: blocks before clearing when a stale FileList is presen
         assert.equal(error.message, 'chatgpt_file_input_state_conflict');
         assert.equal(error.data?.phase, 'attachment_preflight');
         assert.equal(error.data?.reason, 'current_draft_attachment_conflict');
-        assert.deepEqual(error.data?.expectedFileNames, ['expected.txt']);
         assert.deepEqual(error.data?.selectedFileNames, ['expected.txt']);
         assert.deepEqual(error.data?.cardDisplayNames, []);
         return true;

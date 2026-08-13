@@ -2535,6 +2535,85 @@ export class ChatGPTController {
     }
   }
 
+  async #preflightChatGPTAttachmentDraft() {
+    const state = await this.#eval(`(() => {
+      const agentifyAttachmentDraftPreflight = true;
+      const host = location.hostname || '';
+      const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
+      if (!isChatGPT) return { isChatGPT: false, hasAttachmentState: false };
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const editable = (node) => {
+        if (!node || !visible(node)) return false;
+        if (node.matches('textarea, input')) return !node.disabled && !node.readOnly;
+        return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+      };
+      const promptScore = (node) => {
+        const rect = node.getBoundingClientRect();
+        const label = [node.getAttribute('aria-label') || '', node.getAttribute('placeholder') || '', node.getAttribute('name') || '', node.getAttribute('id') || '', node.getAttribute('data-testid') || ''].join(' ').toLowerCase();
+        let score = 0;
+        if (/prompt|message|ask|chat|query|input/.test(label)) score += 80;
+        if (node.matches('textarea')) score += 50;
+        if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') score += 35;
+        if (node.getAttribute('role') === 'textbox') score += 25;
+        if (rect.width >= 260 && rect.height >= 26) score += 20;
+        score += Math.min(180, Math.max(0, (rect.width * rect.height) / 2500));
+        score += Math.max(0, rect.y / 8);
+        return score;
+      };
+      const sendSel = 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"], button[aria-label="プロンプトを送信する"]';
+      const stopSel = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="生成を停止する"], button[aria-label="生成を停止"], button[aria-label="停止"]';
+      const candidates = Array.from(document.querySelectorAll(${JSON.stringify(this.selectors.promptTextarea)}))
+        .concat(Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]')))
+        .filter((node, index, nodes) => nodes.indexOf(node) === index)
+        .filter(editable);
+      const prompt = candidates.reduce((best, node) => !best || promptScore(node) > promptScore(best) ? node : best, null);
+      let activeComposer = prompt?.closest('form') || null;
+      for (let node = prompt?.parentElement || null; !activeComposer && node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+        if (node.querySelector(sendSel) || node.querySelector(stopSel)) activeComposer = node;
+      }
+      const composerInputs = activeComposer ? Array.from(activeComposer.querySelectorAll('input#upload-files[type="file"]')) : [];
+      const pageInputs = Array.from(document.querySelectorAll('input#upload-files[type="file"]'));
+      const selectedFileNames = pageInputs.flatMap((input) => Array.from(input.files || []).map((file) => String(file.name || '').trim()).filter(Boolean));
+      const inputValuePresent = pageInputs.some((input) => String(input.value || '') !== '');
+      const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
+      const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
+      const currentDraftCards = activeComposer
+        ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard)
+        : [];
+      const cardDisplayNames = currentDraftCards.map((card) => String(card.getAttribute('aria-label') || '').trim()).filter(Boolean);
+      return {
+        isChatGPT: true,
+        hasAttachmentState: selectedFileNames.length > 0 || inputValuePresent || currentDraftCards.length > 0,
+        selectedFileNames,
+        cardDisplayNames,
+        currentDraftCardCount: currentDraftCards.length,
+        composerInputCount: composerInputs.length,
+        pageInputCount: pageInputs.length,
+        inputValuePresent
+      };
+    })()`);
+    if (state?.isChatGPT && state.hasAttachmentState) {
+      const err = new Error('chatgpt_file_input_state_conflict');
+      err.data = {
+        phase: 'attachment_preflight',
+        reason: 'current_draft_attachment_conflict',
+        selectedFileNames: Array.isArray(state.selectedFileNames) ? state.selectedFileNames : [],
+        cardDisplayNames: Array.isArray(state.cardDisplayNames) ? state.cardDisplayNames : [],
+        currentDraftCardCount: Number(state.currentDraftCardCount) || 0,
+        composerInputCount: Number(state.composerInputCount) || 0,
+        pageInputCount: Number(state.pageInputCount) || 0,
+        inputValuePresent: state.inputValuePresent === true
+      };
+      throw err;
+    }
+    return state;
+  }
+
   async #attachFiles(files) {
     if (!files?.length) return;
     await this.#emitProgress({ phase: 'uploading_files' });
@@ -2649,8 +2728,8 @@ export class ChatGPTController {
          };
        });
        const mappingComplete = selectionMatchesExpected && countsMatch && !!mappingResult.mappingComplete && fileStates.every((state) => state.matched);
-      const draftHasAttachmentState = selectedFileNames.length > 0 || fileCards.length > 0 || String(uploadInput?.value || '') !== '';
-      const draftMatchesExpected = draftHasAttachmentState && selectionMatchesExpected && mappingComplete;
+      const pageInputHasAttachmentState = pageUploadInputs.some((input) => Array.from(input.files || []).length > 0 || String(input.value || '') !== '');
+      const draftHasAttachmentState = selectedFileNames.length > 0 || pageInputHasAttachmentState || fileCards.length > 0 || String(uploadInput?.value || '') !== '';
       const inputState = {
         isChatGPT: true,
         opened: false,
@@ -2666,8 +2745,7 @@ export class ChatGPTController {
         countsMatch,
         mappingComplete,
         draftHasAttachmentState,
-        draftMatchesExpected,
-        draftConflict: draftHasAttachmentState && !draftMatchesExpected,
+        draftConflict: draftHasAttachmentState,
         mappingErrors,
         fileStates,
         composerInputCount: chatgptUploadInputs.length,
@@ -2711,8 +2789,6 @@ export class ChatGPTController {
       throw err;
     }
 
-    if (opened?.isChatGPT && opened?.draftMatchesExpected) return { ...uploadPlan, ownedByRun: false };
-
     if (opened?.isChatGPT && opened?.opened && opened?.attachRect?.w > 0 && opened?.attachRect?.h > 0) {
       const rect = opened.attachRect;
       await this.#clickAt(
@@ -2723,7 +2799,7 @@ export class ChatGPTController {
 
     if (opened?.isChatGPT && opened?.inputReady && !opened?.opened) {
       await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
-      return { ...uploadPlan, ownedByRun: true };
+      return uploadPlan;
     }
 
     if (opened?.isChatGPT && opened?.inputPresent) {
@@ -2744,7 +2820,7 @@ export class ChatGPTController {
     } else {
       await this.page.setFileInputFiles(uploadPlan.files);
     }
-    return { ...uploadPlan, ownedByRun: true };
+    return uploadPlan;
     } catch (error) {
       await uploadPlan.cleanup();
       throw error;
@@ -3804,10 +3880,12 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       await this.#activateProviderStopToken(run, signal);
       this.#throwIfStopRequested();
+      await this.#preflightChatGPTAttachmentDraft();
+      this.#throwIfStopRequested();
       if (attachments?.length) {
         run.userTurnBaseline = await this.#captureUserTurnBaseline();
         uploadPlan = await this.#attachFiles(attachments);
-        run.attachmentOwnershipEstablished = uploadPlan.ownedByRun !== false;
+        run.attachmentOwnershipEstablished = true;
         run.expectedFileNames = uploadPlan.expectedFileNames;
         run.logicalExpectedFileNames = uploadPlan.logicalFileNames;
         await this.#waitForAttachmentsReady({
@@ -3896,6 +3974,8 @@ export class ChatGPTController {
         await this.ensureReady({ timeoutMs });
         this.#throwIfStopRequested();
         await this.#activateProviderStopToken(run, signal);
+        this.#throwIfStopRequested();
+        await this.#preflightChatGPTAttachmentDraft();
         this.#throwIfStopRequested();
         const typed = await this.#typePrompt(prompt);
         run.promptTyped = true;

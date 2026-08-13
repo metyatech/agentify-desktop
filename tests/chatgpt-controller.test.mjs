@@ -10,6 +10,7 @@ import {
   ChatGPTController,
   hasSameChatGPTAttachmentFileNameMultiset,
   isChatGPTAttachmentCardDisplayName,
+  isChatGPTCurrentDraftAttachmentCard,
   mapChatGPTAttachmentCardNames
 } from '../chatgpt-controller.mjs';
 
@@ -2846,6 +2847,46 @@ test('chatgpt-controller: accepts timestamped duplicate aliases without losing o
   assert.equal(result.mapping.every((entry) => entry.matched && entry.matchKind === 'renamed'), true);
   assert.equal(new Set(result.mapping.map((entry) => entry.cardIndex)).size, 2);
   assert.deepEqual(result.mapping.map((entry) => entry.displayName).sort(), ['file(1)(5).json', 'file(20260808-105520).json']);
+});
+
+test('chatgpt-controller: maps only current-draft cards when conversation history has file cards', () => {
+  const makeCard = (name, owner) => ({
+    getAttribute: (attribute) => attribute === 'aria-label' ? name : null,
+    closest: (selector) => selector.includes('conversation-turn') || selector.includes('data-message-author-role') || selector.includes('article[data-turn')
+      ? owner
+      : null
+  });
+  const historyCards = Array.from({ length: 10 }, (_, index) => makeCard(`history-${index}.json`, { kind: 'conversation-turn' }));
+  const currentCards = [makeCard('first.json', null), makeCard('second.json', null), makeCard('third.json', null), makeCard('fourth.json', null)];
+  const currentDraftCards = [...historyCards, ...currentCards].filter(isChatGPTCurrentDraftAttachmentCard);
+  const result = mapChatGPTAttachmentCardNames(
+    ['first.json', 'second.json', 'third.json', 'fourth.json'],
+    currentDraftCards.map((card) => card.getAttribute('aria-label'))
+  );
+  assert.equal(currentDraftCards.length, 4);
+  assert.equal(result.mappingComplete, true);
+  assert.deepEqual(result.mappingErrors, []);
+});
+
+test('chatgpt-controller: current-draft extra attachment remains a mapping conflict', () => {
+  const makeCard = (name) => ({
+    getAttribute: (attribute) => attribute === 'aria-label' ? name : null,
+    closest: () => null
+  });
+  const currentDraftCards = [makeCard('first.json'), makeCard('second.json'), makeCard('unexpected.json')];
+  const result = mapChatGPTAttachmentCardNames(
+    ['first.json', 'second.json'],
+    currentDraftCards.filter(isChatGPTCurrentDraftAttachmentCard).map((card) => card.getAttribute('aria-label'))
+  );
+  assert.equal(result.mappingComplete, false);
+  assert.deepEqual(result.mappingErrors, ['extra_card']);
+});
+
+test('chatgpt-controller: zero attachments map to an empty current draft without a conflict', () => {
+  const result = mapChatGPTAttachmentCardNames([], []);
+  assert.equal(result.mappingComplete, true);
+  assert.deepEqual(result.mapping, []);
+  assert.deepEqual(result.mappingErrors, []);
 });
 
 test('chatgpt-controller: seven-file attachment readiness succeeds with reordered renamed cards and bounded progress', async () => {

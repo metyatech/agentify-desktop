@@ -86,6 +86,11 @@ export function isChatGPTAttachmentCardDisplayName(fileName, displayName) {
   return result.mappingComplete && result.mapping[0]?.matched === true;
 }
 
+export function isChatGPTCurrentDraftAttachmentCard(card) {
+  if (!card || typeof card.closest !== 'function') return false;
+  return !card.closest('[data-message-author-role], article[data-turn], [data-testid*="conversation-turn" i]');
+}
+
 export function mapChatGPTAttachmentCardNames(selectedFileNames, cardDisplayNames) {
   const selected = (Array.isArray(selectedFileNames) ? selectedFileNames : []).map((value) => String(value || '').trim());
   const cards = (Array.isArray(cardDisplayNames) ? cardDisplayNames : []).map((value) => String(value || '').trim());
@@ -2615,8 +2620,9 @@ export class ChatGPTController {
         const value = [node.textContent || '', node.className || '', node.getAttribute('aria-label') || ''].join(' ');
         return failureTerms.test(value);
       });
+      const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
       const fileCards = activeComposer
-        ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard)
+        ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard)
         : [];
       const cardDisplayNames = fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim());
        const transportMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
@@ -2858,7 +2864,8 @@ export class ChatGPTController {
       const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
       const uploadInput = composerUploadInputs[0] || null;
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
-      const fileCards = activeComposer ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard) : [];
+      const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
+      const fileCards = activeComposer ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard) : [];
       const expectedFileNames = ${expectedFileNamesJson};
       const snapshot = {
         expectedFileNames,
@@ -2955,7 +2962,8 @@ export class ChatGPTController {
         const clearInput = composerUploadInputs[0] || null;
         const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
         const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
-        const fileCards = activeComposer ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard) : [];
+        const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
+        const fileCards = activeComposer ? Array.from(activeComposer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard) : [];
         const selectedFileNames = Array.from(clearInput?.files || []).map((file) => file.name);
         const inputValue = String(clearInput?.value || '');
         return {
@@ -3181,7 +3189,8 @@ export class ChatGPTController {
           return failureTerms.test(value);
         });
         const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
-        const fileCards = composer ? Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard) : [];
+        const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
+        const fileCards = composer ? Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard) : [];
         const cardDisplayNames = fileCards.map((card) => String(card.getAttribute('aria-label') || '').trim());
         const uploadInputs = composer ? Array.from(composer.querySelectorAll('input#upload-files[type="file"]')) : [];
         const pageUploadInputCount = document.querySelectorAll('#upload-files').length;
@@ -3422,7 +3431,8 @@ export class ChatGPTController {
       const selectedFileNames = names(Array.from(uploadInput?.files || []).map((file) => file.name));
       const inputValue = String(uploadInput?.value || '');
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')));
-      const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard);
+      const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
+      const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard);
       const cardDisplayNames = names(fileCards.map((card) => card.getAttribute('aria-label') || ''));
       const mappingSelectedFileNames = selectedFileNames.map((fileName, index) => logicalFileNames[index] || fileName);
       const transportMappingResult = (${mapChatGPTAttachmentCardNames.toString()})(selectedFileNames, cardDisplayNames);
@@ -3468,7 +3478,7 @@ export class ChatGPTController {
       const readSettledState = () => {
         const currentUploadInput = Array.from(composer.querySelectorAll('input#upload-files[type="file"]'))[0] || uploadInput;
         const selectedFileNames = names(Array.from(currentUploadInput?.files || []).map((file) => file.name));
-        const cardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).length;
+        const cardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard).length;
         const promptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
         const userTurnCount = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')).length;
         return {

@@ -2649,6 +2649,8 @@ export class ChatGPTController {
          };
        });
        const mappingComplete = selectionMatchesExpected && countsMatch && !!mappingResult.mappingComplete && fileStates.every((state) => state.matched);
+      const draftHasAttachmentState = selectedFileNames.length > 0 || fileCards.length > 0 || String(uploadInput?.value || '') !== '';
+      const draftMatchesExpected = draftHasAttachmentState && selectionMatchesExpected && mappingComplete;
       const inputState = {
         isChatGPT: true,
         opened: false,
@@ -2663,6 +2665,9 @@ export class ChatGPTController {
         cardCount,
         countsMatch,
         mappingComplete,
+        draftHasAttachmentState,
+        draftMatchesExpected,
+        draftConflict: draftHasAttachmentState && !draftMatchesExpected,
         mappingErrors,
         fileStates,
         composerInputCount: chatgptUploadInputs.length,
@@ -2691,6 +2696,23 @@ export class ChatGPTController {
       };
     })()`);
 
+    if (opened?.isChatGPT && opened?.draftConflict) {
+      const err = new Error('chatgpt_file_input_state_conflict');
+      err.data = {
+        phase: 'attachment_preflight',
+        reason: 'current_draft_attachment_conflict',
+        expectedFileNames: opened.expectedFileNames || expectedFileNames,
+        selectedFileNames: opened.selectedFileNames || [],
+        cardDisplayNames: opened.cardDisplayNames || [],
+        fileCount: Number(opened.fileCount) || 0,
+        cardCount: Number(opened.cardCount) || 0,
+        mappingErrors: Array.isArray(opened.mappingErrors) ? opened.mappingErrors : []
+      };
+      throw err;
+    }
+
+    if (opened?.isChatGPT && opened?.draftMatchesExpected) return { ...uploadPlan, ownedByRun: false };
+
     if (opened?.isChatGPT && opened?.opened && opened?.attachRect?.w > 0 && opened?.attachRect?.h > 0) {
       const rect = opened.attachRect;
       await this.#clickAt(
@@ -2700,37 +2722,8 @@ export class ChatGPTController {
     }
 
     if (opened?.isChatGPT && opened?.inputReady && !opened?.opened) {
-      if (opened?.selectionMatchesExpected && opened?.mappingComplete) return uploadPlan;
-      if (opened?.selectionMatchesExpected && Number(opened?.cardCount) > 0) {
-        const err = new Error('chatgpt_file_input_state_conflict');
-        err.data = {
-          expectedFileNames: opened.expectedFileNames || expectedFileNames,
-          selectedFileNames: opened.selectedFileNames || [],
-          cardDisplayNames: opened.cardDisplayNames || [],
-          fileCount: Number(opened.fileCount) || 0,
-          cardCount: Number(opened.cardCount) || 0,
-          mappingErrors: Array.isArray(opened.mappingErrors) ? opened.mappingErrors : []
-        };
-        throw err;
-      }
-      if (opened?.selectionMatchesExpected && Number(opened?.cardCount) === 0) {
-        await this.#clearChatGPTFileInput({
-          expectedFileNames: opened.expectedFileNames || expectedFileNames,
-          selectedFileNames: opened.selectedFileNames || [],
-          cardDisplayNames: opened.cardDisplayNames || [],
-          composerInputCount: opened.composerInputCount,
-          pageUploadInputCount: opened.pageUploadInputCount
-        });
-        await this.#waitForChatGPTFileInputCleared({
-          expectedFileNames: opened.expectedFileNames || expectedFileNames,
-          selectedFileNames: opened.selectedFileNames || [],
-          cardDisplayNames: opened.cardDisplayNames || [],
-          composerInputCount: opened.composerInputCount,
-          pageUploadInputCount: opened.pageUploadInputCount
-        });
-      }
       await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
-      return uploadPlan;
+      return { ...uploadPlan, ownedByRun: true };
     }
 
     if (opened?.isChatGPT && opened?.inputPresent) {
@@ -2751,7 +2744,7 @@ export class ChatGPTController {
     } else {
       await this.page.setFileInputFiles(uploadPlan.files);
     }
-    return uploadPlan;
+    return { ...uploadPlan, ownedByRun: true };
     } catch (error) {
       await uploadPlan.cleanup();
       throw error;
@@ -3814,7 +3807,7 @@ export class ChatGPTController {
       if (attachments?.length) {
         run.userTurnBaseline = await this.#captureUserTurnBaseline();
         uploadPlan = await this.#attachFiles(attachments);
-        run.attachmentOwnershipEstablished = true;
+        run.attachmentOwnershipEstablished = uploadPlan.ownedByRun !== false;
         run.expectedFileNames = uploadPlan.expectedFileNames;
         run.logicalExpectedFileNames = uploadPlan.logicalFileNames;
         await this.#waitForAttachmentsReady({
@@ -3823,20 +3816,20 @@ export class ChatGPTController {
           logicalFileNames: uploadPlan.logicalFileNames
         });
       }
-      run.promptTyped = true;
       const typed = await this.#typePrompt(prompt);
+      run.promptTyped = true;
       run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
       this.#throwIfStopRequested();
       const baseline = await this.#captureChatGPTAssistantBaseline();
       await this.#clickSend({ timeoutMs });
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
     } catch (error) {
-      if (this.#canCleanupUnsentDraft(run)) {
+      if (this.#canCleanupUnsentDraft(run) && (!attachments?.length || run.attachmentOwnershipEstablished)) {
         try {
           error.data = {
             ...(error?.data && typeof error.data === 'object' ? error.data : {}),
             cleanup: await this.#cleanupUnsentDraft({
-              prompt,
+              prompt: run.promptTyped ? prompt : '',
               expectedFileNames: run.expectedFileNames,
               logicalFileNames: run.logicalExpectedFileNames,
               userTurnBaseline: run.userTurnBaseline
@@ -3904,8 +3897,8 @@ export class ChatGPTController {
         this.#throwIfStopRequested();
         await this.#activateProviderStopToken(run, signal);
         this.#throwIfStopRequested();
-        run.promptTyped = true;
         const typed = await this.#typePrompt(prompt);
+        run.promptTyped = true;
         run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
         this.#throwIfStopRequested();
         await this.#clickSend({ timeoutMs });
@@ -3928,7 +3921,7 @@ export class ChatGPTController {
             error.data = {
               ...(error?.data && typeof error.data === 'object' ? error.data : {}),
               cleanup: await this.#cleanupUnsentDraft({
-                prompt,
+                prompt: run.promptTyped ? prompt : '',
                 expectedFileNames: run.expectedFileNames,
                 userTurnBaseline: run.userTurnBaseline
               })

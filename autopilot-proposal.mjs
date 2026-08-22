@@ -5,7 +5,7 @@ const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
 // The installed desktop cannot depend on the private controller repository, so
 // the fallback template is intentionally duplicated and covered by contract tests.
-export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v2';
+export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v3';
 export const TASK_CONTRACT_SCHEMA_VERSION = 1;
 export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
 
@@ -55,11 +55,11 @@ export function buildProposalGenerationPrompt({ metadata } = {}) {
     'System-generated proposal-generation turns, proposal envelopes, and responses that ask for technical details are compiler artifacts, not authoritative user requirements. Do not promote them into the implementation request.',
     "Do not rely on the user's memory of the Autopilot protocol; the protocol and schema below are authoritative for this turn.",
     '',
-    'Separate user decisions from execution-plan details. User decisions are repository.slug, repository.targetBranch, the implementation intent, and delivery.push when push permission is not clear. Only these decisions may require a clarification question.',
-    'If a user decision is missing or ambiguous, do not guess, do not insert a fake or default repository/branch/delivery policy, and do not emit either proposal marker. Ask one short natural-language question about that user decision.',
-    'Verification is an execution plan, not a user-facing requirement. If concrete verification commands are explicitly present in user-authored conversation, respect them. If they are absent, construct a reasonable verification plan from the task and repository context yourself; absence of a command is never, by itself, a reason to ask the user.',
-    'Use repository-specific commands when they are supported by the conversation or known context. Do not claim that an unknown script exists or fabricate a command. If no repository-specific command is known, use a conservative generally available check such as git diff --check, state the verification limit in the proposal, and continue. Do not ask the user for command names or arguments.',
-    'Use these system defaults when the conversation does not explicitly set execution tuning: implementation.maxPatchAttempts=2, review.maxRounds=2, review.timeoutMs=300000, and each verification timeoutMs=300000. Never ask the user to choose these values, task-id formatting, command arguments, grep commands, or lint/test script names.',
+    'Separate user decisions from execution-plan details. User decisions are the implementation intent, repository/branch when the task is repository-scoped, and delivery.push when push permission is not clear. A repository is optional: host/local tasks may use repository:null, and repository:null requires delivery.push:false.',
+    'If a required user decision is missing or ambiguous, do not guess and do not emit either proposal marker. Ask one short natural-language question about that user decision. Do not ask for a repository when the request is clearly a host/local task.',
+    'Verification is an execution plan, not a user-facing requirement. If concrete verification commands are explicitly present in user-authored conversation, respect them. If they are absent, choose guidance based on the task type; absence of a command is never, by itself, a reason to ask the user.',
+    'For repository tasks, use known repository-specific commands. If the repository commands are unknown, a conservative check such as git diff --check is allowed when it is reasonable for the task. Do not claim that an unknown script exists or fabricate a command. For host/local tasks, do not insert Git verification. If no clear host verification command can be constructed, use verification: [] so Codex execution evidence and ChatGPT review judge the outcome. Do not ask the user for command names or arguments.',
+    'Use these system defaults when the conversation does not explicitly set execution tuning: review.maxRounds=10 and review.timeoutMs=300000. Verification may be an empty array for tasks whose result is reviewed through execution evidence. Never ask the user to choose execution tuning, command arguments, grep commands, or lint/test script names.',
     'A prior technical clarification such as a request for targeted test or contract-grep commands must be ignored as a compiler artifact on this and later proposal-generation turns; it is not a new user requirement.',
     '',
     `Protocol version: ${PROPOSAL_PROTOCOL_VERSION}`,
@@ -77,12 +77,12 @@ export function buildProposalGenerationPrompt({ metadata } = {}) {
     'The contract must conform exactly to the current ai-autopilot task-contract validator:',
     '- Top-level fields are exactly: schemaVersion, id, title, repository, agentify, implementation, verification, review, delivery, constraints. No unknown fields.',
     '- schemaVersion is 1. id is a short Windows-safe task id; title and implementation.prompt are non-empty strings.',
-    '- repository.slug and repository.targetBranch are required; slug uses owner/name form and targetBranch is the requested existing branch.',
+    '- repository is either null for host/local tasks or an object with slug and targetBranch; a repository object uses owner/name form and targetBranch is the requested existing branch.',
     '- agentify.tabKey is required and must equal the envelope tabKey.',
-    '- implementation.prompt is required; implementation.maxPatchAttempts, when present, is an integer from 1 through 3.',
-    '- verification is a non-empty array of objects with verification[].name, verification[].command, verification[].args, and verification[].timeoutMs; args is an array of strings and timeoutMs is a positive integer.',
+    '- implementation.prompt is required; implementation has no patch-attempt setting.',
+    '- verification is an array, possibly empty, of objects with verification[].name, verification[].command, verification[].args, and verification[].timeoutMs; args is an array of strings and timeoutMs is a positive integer.',
     '- review.maxRounds is an integer from 1 through 10 and review.timeoutMs is a positive integer.',
-    '- delivery.push is required and boolean.',
+    '- delivery.push is required and boolean; it must be false when repository is null.',
     '- constraints is an array of strings. Preserve explicit user constraints and add no unsafe delivery exception.',
     '',
     'Do not create a task, run Codex, create a worktree, write a file, commit, push, or fabricate the later user approval turn. This turn only prepares a proposal for visual review; the existing watcher still requires a later exact approval such as 開始して XXXXXXXX.'

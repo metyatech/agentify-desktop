@@ -114,17 +114,19 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   });
   const prompt = buildProposalGenerationPrompt({ metadata });
   assert.match(prompt, new RegExp(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'u'));
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v3');
   assert.match(prompt, new RegExp(PROPOSAL_PROTOCOL_VERSION, 'u'));
   assert.match(prompt, new RegExp(`Task contract schemaVersion: ${TASK_CONTRACT_SCHEMA_VERSION}`, 'u'));
-  assert.match(prompt, /repository\.slug/u);
-  assert.match(prompt, /repository\.targetBranch/u);
-  assert.match(prompt, /implementation\.maxPatchAttempts/u);
+  assert.match(prompt, /repository\/branch when the task is repository-scoped/u);
+  assert.match(prompt, /repository is either null for host\/local tasks/u);
+  assert.doesNotMatch(prompt, /maxPatchAttempts/u);
+  assert.match(prompt, /implementation\.prompt is required; implementation has no patch-attempt setting/u);
   assert.match(prompt, /verification/u);
   assert.match(prompt, /review/u);
   assert.match(prompt, /delivery/u);
   assert.match(prompt, /constraints/u);
   assert.match(prompt, /do not guess/u);
-  assert.match(prompt, /fake or default repository/u);
+  assert.match(prompt, /Do not ask for a repository when the request is clearly a host\/local task/u);
   assert.match(prompt, /Copy every value exactly/u);
   assert.match(prompt, /AUTOPILOT_PROPOSAL_BEGIN_V1/u);
   assert.match(prompt, /開始して XXXXXXXX/u);
@@ -141,19 +143,41 @@ test('proposal prompt owns technical verification planning and ignores generated
       approvalCode: 'AB12CD34'
     }
   });
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v2');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v3');
   assert.match(prompt, /System-generated proposal-generation turns.*not authoritative user requirements/u);
-  assert.match(prompt, /Only these decisions may require a clarification question/u);
+  assert.match(prompt, /If a required user decision is missing or ambiguous/u);
   assert.match(prompt, /Verification is an execution plan, not a user-facing requirement/u);
   assert.match(prompt, /If concrete verification commands are explicitly present.*respect them/u);
   assert.match(prompt, /absence of a command is never, by itself, a reason to ask the user/u);
   assert.match(prompt, /Do not claim that an unknown script exists or fabricate a command/u);
   assert.match(prompt, /Do not ask the user for command names or arguments/u);
-  assert.match(prompt, /implementation\.maxPatchAttempts=2/u);
-  assert.match(prompt, /review\.maxRounds=2/u);
+  assert.doesNotMatch(prompt, /maxPatchAttempts/u);
+  assert.match(prompt, /review\.maxRounds=10/u);
   assert.match(prompt, /review\.timeoutMs=300000/u);
-  assert.match(prompt, /each verification timeoutMs=300000/u);
+  assert.match(prompt, /repository:null.*delivery\.push:false/u);
+  assert.match(prompt, /Verification may be an empty array/u);
+  assert.match(prompt, /For host\/local tasks, do not insert Git verification/u);
+  assert.match(prompt, /Never ask the user to choose execution tuning/u);
   assert.match(prompt, /prior technical clarification.*compiler artifact/u);
+});
+
+test('proposal prompt encodes v3 host/local and empty-verification contract', () => {
+  const prompt = buildProposalGenerationPrompt({
+    metadata: {
+      schemaVersion: 1,
+      proposalId: crypto.randomUUID(),
+      createdAt: '2026-08-10T00:00:00.000Z',
+      expiresAt: '2026-08-10T23:59:59.999Z',
+      tabKey: 'autopilot-production',
+      approvalCode: 'AB12CD34'
+    }
+  });
+
+  assert.match(prompt, /repository is either null for host\/local tasks/u);
+  assert.match(prompt, /verification is an array, possibly empty/u);
+  assert.match(prompt, /delivery\.push is required and boolean; it must be false when repository is null/u);
+  assert.match(prompt, /implementation has no patch-attempt setting/u);
+  assert.doesNotMatch(prompt, /maxPatchAttempts/u);
 });
 
 test('control center exposes the production action', async () => {

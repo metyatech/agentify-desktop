@@ -277,14 +277,17 @@ existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
 usable ChatGPT tab exists and that Agentify has no active or in-flight query.
 The action generates the version-1 proposal envelope locally, then sends the
 versioned `ai-autopilot-proposal-generation-v3` instruction through the existing
-authenticated `POST /query` path. The instruction asks ChatGPT to clarify only
-user decisions; verification commands, timeouts, review rounds, and other
-execution-plan details are owned by Autopilot and must not be requested from the
-user. Host/local tasks may use a null repository with push disabled, and their
-verification plan may be empty. It does not create a tab, start Codex, create a
-worktree, write a task, commit, push, or send approval. The response remains in
-ChatGPT for the user to inspect; the existing watcher still requires the later
-exact approval turn (`開始して XXXXXXXX`).
+authenticated `POST /query` path. Agentify validates the response markers, JSON,
+metadata, and current v3 contract locally; malformed responses are discarded and
+retried up to three times with the same envelope metadata. The instruction asks
+ChatGPT to clarify only user decisions; verification commands, timeouts, review
+rounds, and other execution-plan details are owned by Autopilot and must not be
+requested from the user. Host/local tasks may use a null repository with push
+disabled, and their verification plan may be empty. It does not create a tab,
+start Codex, create a worktree, write a task, commit, push, or send approval. Only
+a locally validated response is treated as received and remains in ChatGPT for
+the user to inspect; the existing watcher still requires the later exact approval
+turn (`開始して XXXXXXXX`).
 
 The fallback prompt boundary is [`autopilot-proposal.mjs`](autopilot-proposal.mjs)
 and is kept in sync with `ai-autopilot/src/proposal-generation.mjs` by matching

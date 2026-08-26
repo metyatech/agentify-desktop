@@ -153,6 +153,7 @@ function statusText(msg, tone = 'info') {
 
 let autopilotStatusKey = 'ready';
 let autopilotRequestInFlight = false;
+let autopilotErrorMessage = null;
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -177,7 +178,7 @@ function renderAutopilotState() {
     if (state.tabCount !== 1) detail = '対象のautopilot-production tabがちょうど1件必要です。';
     else if (state.vendorId !== 'chatgpt') detail = 'autopilot-production tabはChatGPTである必要があります。';
     else if (blockedByRuntime) detail = '別のquery実行中のため、完了するまで依頼できません。';
-    else if (autopilotStatusKey === 'error') detail = 'proposal生成に失敗しました。状態を確認して、もう一度試せます。';
+    else if (autopilotStatusKey === 'error') detail = `proposal生成に失敗しました。${autopilotErrorMessage || '状態を確認して、もう一度試せます。'}`;
   }
   status.textContent = label;
   status.className = `autopilotStatus ${className}`.trim();
@@ -735,9 +736,11 @@ async function main() {
     renderAutopilotState();
     try {
       await callApi('requestAutopilotProposal', undefined, { required: true });
+      autopilotErrorMessage = null;
       autopilotStatusKey = 'received';
     } catch (e) {
       autopilotStatusKey = 'error';
+      autopilotErrorMessage = e?.message || String(e);
       statusText(`Autopilot proposal failed: ${e?.message || String(e)}`, 'error');
     } finally {
       autopilotRequestInFlight = false;

@@ -11,6 +11,138 @@ export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
 
 const PROPOSAL_BEGIN = 'AUTOPILOT_PROPOSAL_BEGIN_V1';
 const PROPOSAL_END = 'AUTOPILOT_PROPOSAL_END_V1';
+export const PROPOSAL_MAX_ATTEMPTS = 3;
+
+const ENVELOPE_KEYS = Object.freeze([
+  'schemaVersion',
+  'proposalId',
+  'createdAt',
+  'expiresAt',
+  'tabKey',
+  'approvalCode',
+  'contract'
+]);
+const CONTRACT_KEYS = Object.freeze([
+  'schemaVersion',
+  'id',
+  'title',
+  'repository',
+  'agentify',
+  'implementation',
+  'verification',
+  'review',
+  'delivery',
+  'constraints'
+]);
+
+function isRecord(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  return actual.length === expectedKeys.length && actual.every((key, index) => key === [...expectedKeys].sort()[index]);
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function positiveInteger(value) {
+  return Number.isInteger(value) && value > 0;
+}
+
+function proposalValidationError(reason) {
+  const error = new Error(`proposal_response_invalid:${reason}`);
+  error.code = 'proposal_response_invalid';
+  error.reason = reason;
+  return error;
+}
+
+function countOccurrences(text, needle) {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = text.indexOf(needle, offset);
+    if (index < 0) return count;
+    count += 1;
+    offset = index + needle.length;
+  }
+}
+
+function validateContract(contract, metadata) {
+  if (!isRecord(contract) || !hasExactKeys(contract, CONTRACT_KEYS)) throw proposalValidationError('contract_schema_invalid');
+  if (contract.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('contract_schema_version_invalid');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(contract.id)) throw proposalValidationError('contract_id_invalid');
+  if (!nonEmptyString(contract.title)) throw proposalValidationError('contract_title_invalid');
+
+  if (contract.repository === null) {
+    if (contract.delivery?.push !== false) throw proposalValidationError('host_task_push_must_be_false');
+  } else {
+    if (!isRecord(contract.repository) || !hasExactKeys(contract.repository, ['slug', 'targetBranch'])) {
+      throw proposalValidationError('repository_schema_invalid');
+    }
+    if (!/^[^/\\\s]+\/[^/\\\s]+$/u.test(contract.repository.slug) || !nonEmptyString(contract.repository.targetBranch)) {
+      throw proposalValidationError('repository_value_invalid');
+    }
+  }
+
+  if (!isRecord(contract.agentify) || !hasExactKeys(contract.agentify, ['tabKey']) || contract.agentify.tabKey !== metadata.tabKey) {
+    throw proposalValidationError('agentify_tab_key_invalid');
+  }
+  if (!isRecord(contract.implementation) || !hasExactKeys(contract.implementation, ['prompt']) || !nonEmptyString(contract.implementation.prompt)) {
+    throw proposalValidationError('implementation_schema_invalid');
+  }
+  if (!Array.isArray(contract.verification) || contract.verification.some((item) => (
+    !isRecord(item) ||
+    !hasExactKeys(item, ['name', 'command', 'args', 'timeoutMs']) ||
+    !nonEmptyString(item.name) ||
+    !nonEmptyString(item.command) ||
+    !Array.isArray(item.args) ||
+    item.args.some((arg) => typeof arg !== 'string') ||
+    !positiveInteger(item.timeoutMs)
+  ))) throw proposalValidationError('verification_schema_invalid');
+  if (!isRecord(contract.review) || !hasExactKeys(contract.review, ['maxRounds', 'timeoutMs']) || !Number.isInteger(contract.review.maxRounds) || contract.review.maxRounds < 1 || contract.review.maxRounds > 10 || !positiveInteger(contract.review.timeoutMs)) {
+    throw proposalValidationError('review_schema_invalid');
+  }
+  if (!isRecord(contract.delivery) || !hasExactKeys(contract.delivery, ['push']) || typeof contract.delivery.push !== 'boolean') {
+    throw proposalValidationError('delivery_schema_invalid');
+  }
+  if (!Array.isArray(contract.constraints) || contract.constraints.some((constraint) => typeof constraint !== 'string')) {
+    throw proposalValidationError('constraints_schema_invalid');
+  }
+}
+
+export function parseValidateProposalResponse(responseText, { metadata } = {}) {
+  if (!isRecord(metadata)) throw new TypeError('metadata is required');
+  if (typeof responseText !== 'string') throw proposalValidationError('response_text_missing');
+  if (countOccurrences(responseText, PROPOSAL_BEGIN) !== 1 || countOccurrences(responseText, PROPOSAL_END) !== 1) {
+    throw proposalValidationError('marker_count_invalid');
+  }
+  const beginIndex = responseText.indexOf(PROPOSAL_BEGIN);
+  const endIndex = responseText.indexOf(PROPOSAL_END);
+  if (beginIndex >= endIndex) throw proposalValidationError('marker_order_invalid');
+  const jsonText = responseText.slice(beginIndex + PROPOSAL_BEGIN.length, endIndex).trim();
+  if (!jsonText) throw proposalValidationError('proposal_json_empty');
+
+  let proposal;
+  try {
+    proposal = JSON.parse(jsonText);
+  } catch {
+    throw proposalValidationError('proposal_json_invalid');
+  }
+  if (!isRecord(proposal) || !hasExactKeys(proposal, ENVELOPE_KEYS)) throw proposalValidationError('envelope_schema_invalid');
+  for (const key of ['schemaVersion', 'proposalId', 'createdAt', 'expiresAt', 'tabKey', 'approvalCode']) {
+    if (proposal[key] !== metadata[key]) throw proposalValidationError(`metadata_mismatch_${key}`);
+  }
+  validateContract(proposal.contract, metadata);
+  return proposal;
+}
+
+function responseTextFromQuery(response) {
+  return typeof response?.result?.text === 'string' ? response.result.text : null;
+}
 
 export const AUTOPILOT_WORKFLOWS = Object.freeze([
   Object.freeze({ key: 'autopilot-production', vendorId: 'chatgpt' })
@@ -45,7 +177,7 @@ export function createProposalMetadata({
   };
 }
 
-export function buildProposalGenerationPrompt({ metadata } = {}) {
+export function buildProposalGenerationPrompt({ metadata, retryAttempt = 0 } = {}) {
   if (!metadata || typeof metadata !== 'object') throw new TypeError('metadata is required');
   const exactMetadata = JSON.stringify(metadata, null, 2);
   return [
@@ -73,6 +205,7 @@ export function buildProposalGenerationPrompt({ metadata } = {}) {
     '',
     'The JSON object must contain exactly these envelope fields plus contract: schemaVersion, proposalId, createdAt, expiresAt, tabKey, approvalCode, contract.',
     'The envelope values above must be preserved byte-for-byte as JSON string/number values. In particular, tabKey must also be copied to contract.agentify.tabKey.',
+    'Serialize the output JSON exactly as JSON.stringify would. Every string, including Windows paths, quotation marks, backslashes, and newlines, must use valid JSON escaping.',
     '',
     'The contract must conform exactly to the current ai-autopilot task-contract validator:',
     '- Top-level fields are exactly: schemaVersion, id, title, repository, agentify, implementation, verification, review, delivery, constraints. No unknown fields.',
@@ -85,7 +218,14 @@ export function buildProposalGenerationPrompt({ metadata } = {}) {
     '- delivery.push is required and boolean; it must be false when repository is null.',
     '- constraints is an array of strings. Preserve explicit user constraints and add no unsafe delivery exception.',
     '',
-    'Do not create a task, run Codex, create a worktree, write a file, commit, push, or fabricate the later user approval turn. This turn only prepares a proposal for visual review; the existing watcher still requires a later exact approval such as 開始して XXXXXXXX.'
+    'Do not create a task, run Codex, create a worktree, write a file, commit, push, or fabricate the later user approval turn. This turn only prepares a proposal for visual review; the existing watcher still requires a later exact approval such as 開始して XXXXXXXX.',
+    ...(retryAttempt > 0 ? [
+      '',
+      `System/compiler artifact correction for retry attempt ${retryAttempt}: the previous proposal output was invalid.`,
+      'Keep the same implementation intent and user decisions. Keep the same supplied envelope metadata byte-for-byte; do not regenerate proposalId, timestamps, tabKey, or approvalCode.',
+      'Return a valid JSON proposal. Apply strict JSON string escaping to every backslash, double quote, newline, and other control character; do not repair the previous text mechanically.',
+      'Do not include a code fence. Return exactly one AUTOPILOT_PROPOSAL_BEGIN_V1 and one AUTOPILOT_PROPOSAL_END_V1 marker pair.'
+    ] : [])
   ].join('\n');
 }
 
@@ -138,18 +278,34 @@ export function createAutopilotProposalService({
     const promise = (async () => {
       const { state, tab } = await assertReady();
       const metadata = createProposalMetadata({ now: now(), tabKey: workflow.key, randomUUID, randomBytes });
-      const prompt = buildProposalGenerationPrompt({ metadata });
-      const response = await requestQuery({
-        tabId: tab.id,
-        key: workflow.key,
-        vendorId: workflow.vendorId,
-        model: 'chatgpt',
-        source: 'ui',
-        createIfMissing: false,
-        prompt,
-        timeoutMs: 10 * 60 * 1000
-      });
-      return { ok: true, status: 'proposal_response_received', tabId: state.tabId, metadata, prompt, response };
+      const attempts = [];
+      for (let attempt = 1; attempt <= PROPOSAL_MAX_ATTEMPTS; attempt += 1) {
+        const prompt = buildProposalGenerationPrompt({ metadata, retryAttempt: attempt > 1 ? attempt : 0 });
+        const response = await requestQuery({
+          tabId: tab.id,
+          key: workflow.key,
+          vendorId: workflow.vendorId,
+          model: 'chatgpt',
+          source: 'ui',
+          createIfMissing: false,
+          prompt,
+          timeoutMs: 10 * 60 * 1000
+        });
+        try {
+          const proposal = parseValidateProposalResponse(responseTextFromQuery(response), { metadata });
+          return { ok: true, status: 'proposal_response_received', tabId: state.tabId, metadata, prompt, response, proposal, attempts: attempt };
+        } catch (error) {
+          attempts.push({ attempt, reason: error.reason || 'proposal_response_invalid' });
+          if (attempt === PROPOSAL_MAX_ATTEMPTS) {
+            const failure = new Error(`autopilot_proposal_generation_failed:${error.reason || 'proposal_response_invalid'}`);
+            failure.code = 'autopilot_proposal_generation_failed';
+            failure.reason = error.reason || 'proposal_response_invalid';
+            failure.data = { attempts };
+            throw failure;
+          }
+        }
+      }
+      throw new Error('autopilot_proposal_generation_failed:retry_exhausted');
     })();
     requestInFlight = promise;
     try {

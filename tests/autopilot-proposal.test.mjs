@@ -6,12 +6,47 @@ import test from 'node:test';
 
 import {
   PROPOSAL_GENERATION_INSTRUCTION_VERSION,
+  PROPOSAL_MAX_ATTEMPTS,
   PROPOSAL_PROTOCOL_VERSION,
   TASK_CONTRACT_SCHEMA_VERSION,
   buildProposalGenerationPrompt,
   createAutopilotProposalService,
-  createProposalMetadata
+  createProposalMetadata,
+  parseValidateProposalResponse
 } from '../autopilot-proposal.mjs';
+
+const PROPOSAL_BEGIN = 'AUTOPILOT_PROPOSAL_BEGIN_V1';
+const PROPOSAL_END = 'AUTOPILOT_PROPOSAL_END_V1';
+const FIXED_METADATA = Object.freeze({
+  schemaVersion: 1,
+  proposalId: '123e4567-e89b-42d3-a456-426614174000',
+  createdAt: '2026-08-10T00:00:00.000Z',
+  expiresAt: '2026-08-10T23:59:59.999Z',
+  tabKey: 'autopilot-production',
+  approvalCode: 'AB12CD34'
+});
+
+function validContract(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    id: 'proposal-validation-test',
+    title: 'Proposal validation test',
+    repository: null,
+    agentify: { tabKey: FIXED_METADATA.tabKey },
+    implementation: {
+      prompt: 'Implement the requested change. Path D:\\ghws\\RuntimeUnicodeTextSample, quoted "text", and a newline\nare intentional.'
+    },
+    verification: [],
+    review: { maxRounds: 10, timeoutMs: 300000 },
+    delivery: { push: false },
+    constraints: [],
+    ...overrides
+  };
+}
+
+function validProposalText(metadata = FIXED_METADATA, { contract = {}, envelope = {} } = {}) {
+  return `${PROPOSAL_BEGIN}\n${JSON.stringify({ ...metadata, ...envelope, contract: validContract(contract) }, null, 2)}\n${PROPOSAL_END}`;
+}
 
 function makeTabs({ rows = [{ id: 'tab-1', key: 'autopilot-production', vendorId: 'chatgpt' }], url = 'https://chatgpt.com/' } = {}) {
   const controllers = new Map(rows.map((row) => [row.id, { getUrl: async () => url }]));
@@ -31,7 +66,7 @@ function makeService(options = {}) {
   const requestQuery = options.requestQuery || (async (body) => {
     calls.push(body);
     if (release) await release;
-    return { result: { text: 'proposal response' } };
+    return { result: { text: validProposalText() } };
   });
   const service = createAutopilotProposalService({
     tabs: options.tabs || makeTabs(),
@@ -81,7 +116,7 @@ test('double click while request is pending sends one query and disables the sec
   const { service, calls } = makeService({ requestQuery: async (body) => {
     calls.push(body);
     await new Promise((r) => { resolve = r; });
-    return { result: { text: 'proposal' } };
+    return { result: { text: validProposalText() } };
   }});
   const first = service.request();
   await new Promise((r) => setImmediate(r));
@@ -98,12 +133,131 @@ test('request error clears inflight state so the button is reusable', async () =
     requestQuery: async () => {
       calls += 1;
       if (calls === 1) throw new Error('query_error');
-      return { result: { text: 'proposal' } };
-    }
+      return { result: { text: validProposalText() } };
+    },
+    now: () => new Date('2026-08-10T00:00:00.000Z'),
+    randomUUID: () => FIXED_METADATA.proposalId,
+    randomBytes: () => Buffer.from([0xab, 0x12, 0xcd, 0x34])
   });
   await assert.rejects(service.request(), /query_error/u);
   await service.request();
   assert.equal(calls, 2);
+});
+
+test('malformed Windows path is rejected and a valid retry keeps the original metadata', async () => {
+  const malformed = validProposalText().replace('\\\\', '\\');
+  const responses = [malformed, validProposalText()];
+  const calls = [];
+  const { service } = makeService({ requestQuery: async (body) => {
+    calls.push(body);
+    return { result: { text: responses.shift() } };
+  }});
+
+  const result = await service.request();
+  assert.equal(calls.length, 2);
+  assert.equal(result.attempts, 2);
+  assert.deepEqual(result.metadata, FIXED_METADATA);
+  assert.match(calls[1].prompt, /previous proposal output was invalid/u);
+  assert.match(calls[1].prompt, /same implementation intent and user decisions/u);
+  assert.match(calls[1].prompt, /byte-for-byte/u);
+  assert.match(calls[1].prompt, /backslash, double quote, newline/u);
+  assert.match(calls[1].prompt, /Do not include a code fence/u);
+});
+
+test('unescaped embedded quote is rejected and a valid retry succeeds', async () => {
+  const malformed = validProposalText().replace(String.raw`\"text\"`, '"text"');
+  const responses = [malformed, validProposalText()];
+  let calls = 0;
+  const { service } = makeService({ requestQuery: async () => ({ result: { text: responses[calls++] } }) });
+
+  const result = await service.request();
+  assert.equal(calls, 2);
+  assert.equal(result.status, 'proposal_response_received');
+});
+
+for (const [name, response] of [
+  ['marker missing', validProposalText().replace(PROPOSAL_BEGIN, 'MISSING_BEGIN')],
+  ['marker duplicate', `${validProposalText()}\n${PROPOSAL_BEGIN}`]
+]) {
+  test(`${name} is rejected without being executable`, async () => {
+    let calls = 0;
+    const { service } = makeService({ requestQuery: async () => {
+      calls += 1;
+      return { result: { text: response } };
+    }});
+    await assert.rejects(service.request(), /autopilot_proposal_generation_failed:marker_count_invalid/u);
+    assert.equal(calls, PROPOSAL_MAX_ATTEMPTS);
+  });
+}
+
+test('metadata mismatch is rejected even when JSON is valid', async () => {
+  const response = validProposalText(FIXED_METADATA, { envelope: { approvalCode: 'DEADBEEF' } });
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA }), /metadata_mismatch_approvalCode/u);
+});
+
+test('metadata mismatch causes bounded retry and never returns the old proposal', async () => {
+  const invalid = validProposalText(FIXED_METADATA, { envelope: { proposalId: '423e4567-e89b-42d3-a456-426614174000' } });
+  let calls = 0;
+  const { service } = makeService({ requestQuery: async () => {
+    calls += 1;
+    return { result: { text: invalid } };
+  }});
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:metadata_mismatch_proposalId/u);
+  assert.equal(calls, PROPOSAL_MAX_ATTEMPTS);
+});
+
+test('v3 contract boundary rejects implementation patch settings', async () => {
+  const response = validProposalText(FIXED_METADATA, {
+    contract: { implementation: { prompt: 'Implement this', maxPatchAttempts: 3 } }
+  });
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA }), /implementation_schema_invalid/u);
+});
+
+test('three invalid attempts fail without success state or fabricated approval', async () => {
+  let calls = 0;
+  const { service } = makeService({ requestQuery: async () => {
+    calls += 1;
+    return { result: { text: 'not a proposal' } };
+  }});
+  await assert.rejects(service.request(), (error) => {
+    assert.equal(error.code, 'autopilot_proposal_generation_failed');
+    assert.equal(error.reason, 'marker_count_invalid');
+    assert.equal(error.data.attempts.length, PROPOSAL_MAX_ATTEMPTS);
+    return true;
+  });
+  assert.equal(calls, PROPOSAL_MAX_ATTEMPTS);
+  assert.equal(service.isRequestInFlight(), false);
+});
+
+test('retry creates metadata exactly once and preserves it in every prompt', async () => {
+  let uuidCalls = 0;
+  let randomBytesCalls = 0;
+  const calls = [];
+  const service = createAutopilotProposalService({
+    tabs: makeTabs(),
+    requestQuery: async (body) => {
+      calls.push(body);
+      return { result: { text: calls.length < 3 ? 'invalid' : validProposalText() } };
+    },
+    now: () => new Date('2026-08-10T00:00:00.000Z'),
+    randomUUID: () => { uuidCalls += 1; return FIXED_METADATA.proposalId; },
+    randomBytes: () => { randomBytesCalls += 1; return Buffer.from([0xab, 0x12, 0xcd, 0x34]); }
+  });
+
+  const result = await service.request();
+  assert.equal(calls.length, 3);
+  assert.equal(uuidCalls, 1);
+  assert.equal(randomBytesCalls, 1);
+  const serializedMetadata = JSON.stringify(FIXED_METADATA, null, 2);
+  for (const call of calls) assert.match(call.prompt, new RegExp(serializedMetadata.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+  assert.deepEqual(result.metadata, FIXED_METADATA);
+});
+
+test('valid JSON accepts implementation prompt backslashes, quotes, and newlines', () => {
+  const proposal = parseValidateProposalResponse(validProposalText(), { metadata: FIXED_METADATA });
+  assert.match(proposal.contract.implementation.prompt, /D:\\ghws\\RuntimeUnicodeTextSample/u);
+  assert.match(proposal.contract.implementation.prompt, /quoted "text"/u);
+  assert.match(proposal.contract.implementation.prompt, /newline\nare intentional/u);
 });
 
 test('proposal prompt pins current schema, metadata, and clarification safety', async () => {
@@ -128,6 +282,8 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   assert.match(prompt, /do not guess/u);
   assert.match(prompt, /Do not ask for a repository when the request is clearly a host\/local task/u);
   assert.match(prompt, /Copy every value exactly/u);
+  assert.match(prompt, /JSON.stringify would/u);
+  assert.match(prompt, /Windows paths.*quotation marks.*backslashes.*newlines/u);
   assert.match(prompt, /AUTOPILOT_PROPOSAL_BEGIN_V1/u);
   assert.match(prompt, /開始して XXXXXXXX/u);
 });

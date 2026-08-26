@@ -286,8 +286,10 @@ requested from the user. Host/local tasks may use a null repository with push
 disabled, and their verification plan may be empty. It does not create a tab,
 start Codex, create a worktree, write a task, commit, push, or send approval. Only
 a locally validated response is treated as received and remains in ChatGPT for
-the user to inspect; the existing watcher still requires the later exact approval
-turn (`開始して XXXXXXXX`).
+the user to inspect; a non-empty marker-free response is treated as a clarification
+instead of being retried or treated as a proposal. The Control Center asks the user
+to answer ChatGPT and press `この内容を実行` again. The existing watcher still
+requires the later exact approval turn (`開始して XXXXXXXX`).
 
 The fallback prompt boundary is [`autopilot-proposal.mjs`](autopilot-proposal.mjs)
 and is kept in sync with `ai-autopilot/src/proposal-generation.mjs` by matching

@@ -165,6 +165,7 @@ body {
 .autopilotStatus.isWaiting { color: #bfdbfe; }
 .autopilotStatus.isError { color: #fca5a5; }
 .autopilotStatus.isReceived { color: #fde68a; }
+.autopilotStatus.isClarification { color: #fde68a; }
 .autopilotHint { margin-top: 10px; }
 .autopilotTaskProgress {
   margin-top: 14px;

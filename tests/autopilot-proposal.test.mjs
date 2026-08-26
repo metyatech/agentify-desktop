@@ -7,9 +7,12 @@ import test from 'node:test';
 import {
   PROPOSAL_GENERATION_INSTRUCTION_VERSION,
   PROPOSAL_MAX_ATTEMPTS,
+  PROPOSAL_MAX_BYTES,
   PROPOSAL_PROTOCOL_VERSION,
+  PROPOSAL_RESPONSE_KINDS,
   TASK_CONTRACT_SCHEMA_VERSION,
   buildProposalGenerationPrompt,
+  classifyProposalResponse,
   createAutopilotProposalService,
   createProposalMetadata,
   parseValidateProposalResponse
@@ -175,8 +178,36 @@ test('unescaped embedded quote is rejected and a valid retry succeeds', async ()
   assert.equal(result.status, 'proposal_response_received');
 });
 
+test('a non-empty marker-free response is a clarification and is not retried', async () => {
+  const calls = [];
+  const { service } = makeService({ requestQuery: async (body) => {
+    calls.push(body);
+    return { result: { text: 'Which repository branch should I use?' } };
+  }});
+
+  const result = await service.request();
+  assert.equal(calls.length, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 'clarification_response_received');
+  assert.equal(result.clarification.kind, PROPOSAL_RESPONSE_KINDS.CLARIFICATION);
+  assert.equal(result.response.result.text, 'Which repository branch should I use?');
+  assert.equal(result.proposal, undefined);
+  assert.ok(calls.every((call) => !call.prompt.includes('Return a valid JSON proposal')));
+});
+
+test('empty marker-free response is invalid and reaches the bounded retry limit', async () => {
+  let calls = 0;
+  const { service } = makeService({ requestQuery: async () => {
+    calls += 1;
+    return { result: { text: '  \r\n' } };
+  }});
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:response_empty/u);
+  assert.equal(calls, PROPOSAL_MAX_ATTEMPTS);
+});
+
 for (const [name, response] of [
-  ['marker missing', validProposalText().replace(PROPOSAL_BEGIN, 'MISSING_BEGIN')],
+  ['begin-only marker', validProposalText().replace(PROPOSAL_END, 'MISSING_END')],
+  ['end-only marker', validProposalText().replace(PROPOSAL_BEGIN, 'MISSING_BEGIN')],
   ['marker duplicate', `${validProposalText()}\n${PROPOSAL_BEGIN}`]
 ]) {
   test(`${name} is rejected without being executable`, async () => {
@@ -190,10 +221,29 @@ for (const [name, response] of [
   });
 }
 
+test('marker order is rejected without being executable', async () => {
+  const response = `${PROPOSAL_END}\n${PROPOSAL_BEGIN}\n${JSON.stringify({ ...FIXED_METADATA, contract: validContract() })}`;
+  const { service } = makeService({ requestQuery: async () => ({ result: { text: response } }) });
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:marker_order_invalid/u);
+});
+
 test('metadata mismatch is rejected even when JSON is valid', async () => {
   const response = validProposalText(FIXED_METADATA, { envelope: { approvalCode: 'DEADBEEF' } });
-  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA }), /metadata_mismatch_approvalCode/u);
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /metadata_mismatch_approvalCode/u);
 });
+
+for (const [field, value] of [
+  ['proposalId', '423e4567-e89b-42d3-a456-426614174000'],
+  ['createdAt', '2026-08-09T23:59:59.999Z'],
+  ['expiresAt', '2026-08-11T00:00:00.000Z'],
+  ['tabKey', 'autopilot-other'],
+  ['approvalCode', 'DEADBEEF']
+]) {
+  test(`metadata mismatch rejects changed ${field}`, () => {
+    const response = validProposalText(FIXED_METADATA, { envelope: { [field]: value } });
+    assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), new RegExp(`metadata_mismatch_${field}`, 'u'));
+  });
+}
 
 test('metadata mismatch causes bounded retry and never returns the old proposal', async () => {
   const invalid = validProposalText(FIXED_METADATA, { envelope: { proposalId: '423e4567-e89b-42d3-a456-426614174000' } });
@@ -210,18 +260,18 @@ test('v3 contract boundary rejects implementation patch settings', async () => {
   const response = validProposalText(FIXED_METADATA, {
     contract: { implementation: { prompt: 'Implement this', maxPatchAttempts: 3 } }
   });
-  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA }), /implementation_schema_invalid/u);
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /implementation_schema_invalid/u);
 });
 
 test('three invalid attempts fail without success state or fabricated approval', async () => {
   let calls = 0;
   const { service } = makeService({ requestQuery: async () => {
     calls += 1;
-    return { result: { text: 'not a proposal' } };
+    return { result: { text: `${PROPOSAL_BEGIN}\n{}\n${PROPOSAL_END}` } };
   }});
   await assert.rejects(service.request(), (error) => {
     assert.equal(error.code, 'autopilot_proposal_generation_failed');
-    assert.equal(error.reason, 'marker_count_invalid');
+    assert.equal(error.reason, 'envelope_schema_invalid');
     assert.equal(error.data.attempts.length, PROPOSAL_MAX_ATTEMPTS);
     return true;
   });
@@ -237,7 +287,7 @@ test('retry creates metadata exactly once and preserves it in every prompt', asy
     tabs: makeTabs(),
     requestQuery: async (body) => {
       calls.push(body);
-      return { result: { text: calls.length < 3 ? 'invalid' : validProposalText() } };
+      return { result: { text: calls.length < 3 ? `${PROPOSAL_BEGIN}\n{}\n${PROPOSAL_END}` : validProposalText() } };
     },
     now: () => new Date('2026-08-10T00:00:00.000Z'),
     randomUUID: () => { uuidCalls += 1; return FIXED_METADATA.proposalId; },
@@ -254,11 +304,59 @@ test('retry creates metadata exactly once and preserves it in every prompt', asy
 });
 
 test('valid JSON accepts implementation prompt backslashes, quotes, and newlines', () => {
-  const proposal = parseValidateProposalResponse(validProposalText(), { metadata: FIXED_METADATA });
+  const proposal = parseValidateProposalResponse(validProposalText(), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
   assert.match(proposal.contract.implementation.prompt, /D:\\ghws\\RuntimeUnicodeTextSample/u);
   assert.match(proposal.contract.implementation.prompt, /quoted "text"/u);
   assert.match(proposal.contract.implementation.prompt, /newline\nare intentional/u);
 });
+
+test('controller-compatible standalone markers accept CRLF after normalization', () => {
+  const crlf = validProposalText().replace(/\n/gu, '\r\n');
+  const classification = classifyProposalResponse(crlf, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.equal(classification.kind, PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL);
+});
+
+test('inline markers are rejected even when the surrounding JSON is valid', () => {
+  const response = validProposalText().replace(PROPOSAL_BEGIN, `prefix ${PROPOSAL_BEGIN}`);
+  const classification = classifyProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.deepEqual(classification, { kind: PROPOSAL_RESPONSE_KINDS.INVALID_ATTEMPTED_PROPOSAL, reason: 'marker_count_invalid' });
+});
+
+test('proposal responses over the controller byte limit are invalid', () => {
+  const response = `${PROPOSAL_BEGIN}\n${'x'.repeat(PROPOSAL_MAX_BYTES)}\n${PROPOSAL_END}`;
+  const classification = classifyProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.equal(classification.kind, PROPOSAL_RESPONSE_KINDS.INVALID_ATTEMPTED_PROPOSAL);
+  assert.equal(classification.reason, 'response_too_large');
+});
+
+for (const id of ['CON', 'foo..bar', 'foo.lock', 'proposal-validation-test.']) {
+  test(`controller task id rejects ${id}`, () => {
+    const response = validProposalText(FIXED_METADATA, { contract: { id } });
+    assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /contract_id_invalid/u);
+  });
+}
+
+for (const id of [`task-${'a'.repeat(60)}`, `task-${'a'.repeat(75)}`]) {
+  test(`controller task id accepts safe id of length ${id.length}`, () => {
+    const response = validProposalText(FIXED_METADATA, { contract: { id } });
+    const proposal = parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+    assert.equal(proposal.contract.id, id);
+  });
+}
+
+for (const slug of ['owner/.repo', '../repo', 'owner/repo!']) {
+  test(`unsafe repository segment ${slug} is rejected`, () => {
+    const response = validProposalText(FIXED_METADATA, { contract: { repository: { slug, targetBranch: 'main' }, delivery: { push: true } } });
+    assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /repository_value_invalid/u);
+  });
+}
+
+for (const targetBranch of ['../main', 'main..next', 'main//next', 'main@{x}', 'main/', 'main.']) {
+  test(`unsafe targetBranch ${targetBranch} is rejected`, () => {
+    const response = validProposalText(FIXED_METADATA, { contract: { repository: { slug: 'owner/repo', targetBranch }, delivery: { push: true } } });
+    assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /repository_value_invalid/u);
+  });
+}
 
 test('proposal prompt pins current schema, metadata, and clarification safety', async () => {
   const metadata = createProposalMetadata({
@@ -338,7 +436,11 @@ test('proposal prompt encodes v3 host/local and empty-verification contract', ()
 
 test('control center exposes the production action', async () => {
   const html = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.html'), 'utf8');
+  const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
   assert.match(html, /この内容を実行/u);
   assert.match(html, /autopilot-production/u);
   assert.match(html, /まだ変更は開始しません/u);
+  assert.match(js, /clarification_response_received/u);
+  assert.match(js, /確認事項あり/u);
+  assert.match(js, /ChatGPTの質問に回答してから、再度「この内容を実行」してください/u);
 });

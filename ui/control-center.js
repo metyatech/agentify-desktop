@@ -154,6 +154,7 @@ function statusText(msg, tone = 'info') {
 let autopilotStatusKey = 'ready';
 let autopilotRequestInFlight = false;
 let autopilotErrorMessage = null;
+let autopilotClarificationMessage = null;
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -168,6 +169,10 @@ function renderAutopilotState() {
     label = 'ChatGPTへ依頼中';
     className = 'isWaiting';
     detail = 'ChatGPTからのproposal応答を待っています。ボタンは無効です。';
+  } else if (autopilotStatusKey === 'clarification') {
+    label = '確認事項あり';
+    className = 'isClarification';
+    detail = autopilotClarificationMessage || 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
   } else if (autopilotStatusKey === 'received') {
     label = 'proposal応答受信';
     className = 'isReceived';
@@ -735,11 +740,19 @@ async function main() {
     autopilotStatusKey = 'waiting';
     renderAutopilotState();
     try {
-      await callApi('requestAutopilotProposal', undefined, { required: true });
+      const result = await callApi('requestAutopilotProposal', undefined, { required: true });
       autopilotErrorMessage = null;
-      autopilotStatusKey = 'received';
+      if (result?.status === 'clarification_response_received') {
+        autopilotClarificationMessage = 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
+        autopilotStatusKey = 'clarification';
+        statusText(`確認事項あり: ${autopilotClarificationMessage}`, 'warn');
+      } else {
+        autopilotClarificationMessage = null;
+        autopilotStatusKey = 'received';
+      }
     } catch (e) {
       autopilotStatusKey = 'error';
+      autopilotClarificationMessage = null;
       autopilotErrorMessage = e?.message || String(e);
       statusText(`Autopilot proposal failed: ${e?.message || String(e)}`, 'error');
     } finally {

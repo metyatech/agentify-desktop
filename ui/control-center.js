@@ -1,6 +1,7 @@
 /* global window */
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
+import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
 
 function el(id) {
   const n = document.getElementById(id);
@@ -184,6 +185,7 @@ function renderAutopilotState() {
   button.disabled = autopilotRequestInFlight || !state.ready;
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
   renderAutopilotTaskProgress(lastState.autopilotStatus);
+  autopilotStatusScheduler.schedule(lastState.autopilotStatus);
 }
 
 function renderAutopilotTaskProgress(snapshot) {
@@ -260,6 +262,9 @@ let lastRefreshAt = 0;
 let hasLiveUpdates = false;
 let tabsAreHidden = false;
 let settingsDirty = false;
+const autopilotStatusScheduler = createAutopilotStatusStaleScheduler({
+  onStale: () => renderAutopilotTaskProgress(lastState.autopilotStatus),
+});
 
 function updateSaveEnabled() {
   el('btnSaveSettings').disabled = !settingsDirty || !el('setAcknowledge').checked;
@@ -833,6 +838,7 @@ async function main() {
     setInterval(() => refresh().catch(() => {}), 3000);
   }
 
+  window.addEventListener('beforeunload', () => autopilotStatusScheduler.cancel(), { once: true });
   await refresh();
 }
 

@@ -1,5 +1,7 @@
 /* global window */
 
+import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
+
 function el(id) {
   const n = document.getElementById(id);
   if (!n) throw new Error(`missing_element:${id}`);
@@ -118,7 +120,8 @@ function defaultState() {
     browserBackend: 'chrome-cdp',
     browser: null,
     runtime: { inflightQueries: 0, activeQueries: [], lastOutcomes: [] },
-    autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false }
+    autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false },
+    autopilotStatus: null
   };
 }
 
@@ -180,6 +183,61 @@ function renderAutopilotState() {
   hint.textContent = detail;
   button.disabled = autopilotRequestInFlight || !state.ready;
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
+  renderAutopilotTaskProgress(lastState.autopilotStatus);
+}
+
+function renderAutopilotTaskProgress(snapshot) {
+  const root = el('autopilotTaskProgress');
+  root.innerHTML = '';
+  const view = autopilotStatusViewModel(snapshot);
+  const headline = document.createElement('div');
+  headline.className = `autopilotProgressHeadline status-${view.kind}`;
+  headline.textContent = view.statusLabel || view.label;
+  root.appendChild(headline);
+  if (view.kind === 'empty') {
+    const empty = document.createElement('div');
+    empty.className = 'hint';
+    empty.textContent = view.detail;
+    root.appendChild(empty);
+    return;
+  }
+  const task = document.createElement('div');
+  task.className = 'autopilotProgressTask mono';
+  task.textContent = view.taskLabel;
+  root.appendChild(task);
+  if (view.title) {
+    const title = document.createElement('div');
+    title.className = 'autopilotProgressTitle';
+    title.textContent = view.title;
+    root.appendChild(title);
+  }
+  const phase = document.createElement('div');
+  phase.className = 'autopilotProgressLine';
+  phase.textContent = `${view.phaseLabel} — ${view.roundLabel}`;
+  root.appendChild(phase);
+  const target = document.createElement('div');
+  target.className = 'autopilotProgressLine';
+  target.textContent = view.targetLabel;
+  root.appendChild(target);
+  for (const detail of [view.verdictLabel, view.verificationLabel]) {
+    if (!detail) continue;
+    const line = document.createElement('div');
+    line.className = 'autopilotProgressMeta';
+    line.textContent = detail;
+    root.appendChild(line);
+  }
+  if (view.errorCode) {
+    const error = document.createElement('div');
+    error.className = 'autopilotProgressError';
+    error.textContent = `${view.errorCode}${view.errorMessage ? ` — ${view.errorMessage}` : ''}`;
+    root.appendChild(error);
+  }
+  if (view.updatedLabel) {
+    const updated = document.createElement('div');
+    updated.className = 'autopilotProgressMeta';
+    updated.textContent = view.updatedLabel;
+    root.appendChild(updated);
+  }
 }
 
 function setActivityText(html) {

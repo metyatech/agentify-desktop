@@ -292,6 +292,15 @@ the explicit instruction and protocol versions. The installed desktop cannot
 depend on the private controller repository, so this small versioned template
 is intentionally duplicated rather than introducing a daemon or API redesign.
 
+After approval, the Autopilot Production card also shows the latest
+ai-autopilot task progress snapshot: task id, phase, round, repository target,
+latest review verdict, verification counts, and blocked/completed details. The
+snapshot is a small versioned observation contract received through the
+authenticated loopback API (`POST /autopilot/status`); Agentify does not read
+ai-autopilot's `state.json` and does not control delivery. The last snapshot is
+kept under the existing Agentify state directory, with an `updatedAt` timestamp
+and a stale marker for old running snapshots.
+
 ## Structured Conversation Turns
 
 The authenticated loopback API exposes a read-only ChatGPT conversation boundary

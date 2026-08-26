@@ -113,6 +113,52 @@ test('http-api: status returns getStatus output', async (t) => {
   assert.equal(data.url, 'https://chatgpt.com/');
 });
 
+test('http-api: authenticated autopilot status endpoint validates and stores only snapshots', async (t) => {
+  const stored = [];
+  const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true }),
+    getAutopilotStatus: async () => stored.at(-1) || null,
+    onAutopilotStatus: async ({ snapshot }) => {
+      if (snapshot?.schemaVersion !== 1 || snapshot?.taskId !== 'task-1') throw new Error('invalid_autopilot_status');
+      stored.push(snapshot);
+      return snapshot;
+    }
+  });
+  t.after(() => server.close());
+  const snapshot = {
+    schemaVersion: 1,
+    taskId: 'task-1',
+    title: 'Safe task',
+    repository: null,
+    targetBranch: null,
+    status: 'running',
+    phase: 'executing',
+    round: 1,
+    maxRounds: 10,
+    latestVerdict: null,
+    verification: { completed: 0, total: 0, failed: 0 },
+    error: null,
+    updatedAt: '2026-08-26T00:00:00.000Z'
+  };
+  const posted = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/autopilot/status', body: snapshot });
+  assert.equal(posted.res.status, 200);
+  assert.equal(posted.data.snapshot.taskId, 'task-1');
+  const read = await req({ port: server.address().port, token: 'secret', method: 'GET', pth: '/autopilot/status' });
+  assert.equal(read.res.status, 200);
+  assert.equal(read.data.snapshot.phase, 'executing');
+  const malformed = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/autopilot/status', body: { secret: 'no' } });
+  assert.equal(malformed.res.status, 400);
+  const unauthorized = await req({ port: server.address().port, method: 'POST', pth: '/autopilot/status', body: snapshot });
+  assert.equal(unauthorized.res.status, 401);
+});
+
 test('http-api: status surfaces active query runtime and stop can cancel it', async (t) => {
   let releaseQuery = null;
   let stopCalls = 0;

@@ -8,6 +8,7 @@ import { ensureArtifactsDir, listArtifacts, registerArtifact, artifactsRoot } fr
 import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store.mjs';
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
+import { validateAutopilotStatus } from './autopilot-status.mjs';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -214,6 +215,8 @@ function authOk(req, token) {
 export function mapErrorToHttp(error) {
   const msg = String(error?.message || '');
   if (msg === 'body_too_large') return { code: 413, body: { error: 'body_too_large' } };
+  if (msg === 'invalid_autopilot_status') return { code: 400, body: { error: 'invalid_autopilot_status', data: error?.data || null } };
+  if (msg === 'stale_autopilot_status') return { code: 409, body: { error: 'stale_autopilot_status', data: error?.data || null } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
   if (msg === 'invalid_vendor') return { code: 400, body: { error: 'invalid_vendor', data: error?.data || null } };
   if (msg === 'invalid_artifact_mode') return { code: 400, body: { error: 'invalid_artifact_mode', data: error?.data || null } };
@@ -614,6 +617,8 @@ export function startHttpApi({
   onOpenWatchFolder,
   onScanWatchFolder,
   getStatus,
+  getAutopilotStatus,
+  onAutopilotStatus,
   getSettings,
   onRuntimeChanged,
   prepareQueryContextFn = prepareQueryContext
@@ -1019,6 +1024,17 @@ export function startHttpApi({
           activeQuery: activeQueries.get(tabId) || null,
           runtime: runtimeSnapshot()
         });
+      }
+
+      if (url.pathname === '/autopilot/status' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, snapshot: (await getAutopilotStatus?.()) || null });
+      }
+
+      if (url.pathname === '/autopilot/status' && req.method === 'POST') {
+        if (typeof onAutopilotStatus !== 'function') return sendJson(res, 503, { error: 'autopilot_status_unavailable' });
+        const body = await parseBody(req, { maxBytes: 32 * 1024 });
+        const snapshot = await onAutopilotStatus({ snapshot: validateAutopilotStatus(body) });
+        return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
       }
 
       if (url.pathname === '/show' && req.method === 'POST') {

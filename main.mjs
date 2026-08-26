@@ -19,6 +19,7 @@ import { startHttpApi } from './http-api.mjs';
 import { TabManager } from './tab-manager.mjs';
 import { TabRegistry } from './tab-registry.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
+import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
@@ -125,6 +126,7 @@ async function main() {
   await app.whenReady();
 
   const token = await ensureToken(stateDir);
+  const autopilotStatus = await createAutopilotStatusStore({ stateDir });
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
@@ -337,7 +339,8 @@ async function main() {
       browserBackend: browserBackendKind,
       browser: browserState,
       runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
-      autopilot: autopilotProposal.availability()
+      autopilot: autopilotProposal.availability(),
+      autopilotStatus: autopilotStatus.get()
     };
   });
 
@@ -650,6 +653,12 @@ async function main() {
         onScanWatchFolder: async () => await watchFolders.scan(),
         onRuntimeChanged: async () => {
           emitTabsChanged();
+        },
+        getAutopilotStatus: async () => autopilotStatus.get(),
+        onAutopilotStatus: async ({ snapshot }) => {
+          const stored = await autopilotStatus.update(snapshot);
+          emitTabsChanged();
+          return stored;
         },
         getStatus: async ({ tabId }) => {
           const controller = tabId ? tabs.getControllerById(tabId) : tabs.getControllerById(defaultTabId);

@@ -125,6 +125,7 @@
             <div id="autopilotProposalStatus" class="autopilotStatus" role="status" aria-live="polite">準備可能</div>
           </div>
           <div id="autopilotProposalHint" class="hint autopilotHint">クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。</div>
+          <div id="autopilotTaskProgress" class="autopilotTaskProgress" aria-live="polite" aria-label="Autopilot task progress"></div>
         </section>
 
         <section class="card">
@@ -265,6 +266,6 @@
       </footer>
     </div>
 
-    <script src="./control-center.js"></script>
+    <script type="module" src="./control-center.js"></script>
   </body>
 </html>

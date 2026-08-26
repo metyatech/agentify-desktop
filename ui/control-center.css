@@ -166,6 +166,23 @@ body {
 .autopilotStatus.isError { color: #fca5a5; }
 .autopilotStatus.isReceived { color: #fde68a; }
 .autopilotHint { margin-top: 10px; }
+.autopilotTaskProgress {
+  margin-top: 14px;
+  padding: 11px;
+  border: 1px solid rgba(255,255,255,0.11);
+  border-radius: 11px;
+  background: rgba(0,0,0,0.18);
+}
+.autopilotProgressHeadline { font-size: 15px; font-weight: 750; }
+.autopilotProgressHeadline.status-running { color: #bfdbfe; }
+.autopilotProgressHeadline.status-completed { color: #bbf7d0; }
+.autopilotProgressHeadline.status-blocked { color: #fecaca; }
+.autopilotProgressHeadline.status-empty { color: rgba(233,236,242,0.78); }
+.autopilotProgressTask { margin-top: 8px; color: #e9ecf2; font-size: 13px; overflow-wrap: anywhere; }
+.autopilotProgressTitle { margin-top: 4px; color: rgba(233,236,242,0.78); font-size: 12px; overflow-wrap: anywhere; }
+.autopilotProgressLine { margin-top: 7px; color: #e9ecf2; font-size: 13px; overflow-wrap: anywhere; }
+.autopilotProgressMeta { margin-top: 6px; color: rgba(233,236,242,0.68); font-size: 12px; overflow-wrap: anywhere; }
+.autopilotProgressError { margin-top: 8px; color: #fecaca; font-size: 12px; overflow-wrap: anywhere; }
 
 .grid {
   display: grid;

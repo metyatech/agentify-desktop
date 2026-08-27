@@ -17,7 +17,20 @@ test('proposal stays in watcher confirmation until matching observed status arri
 
 test('watcher errors and stale heartbeat never become approval', () => {
   assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { status: 'error', lastError: { code: 'TURNS_FAILED' } }) }).key, 'error');
-  assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { stale: true, ageMs: 16000 }) }).key, 'stale');
+  const stale = autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { stale: true, ageMs: 16000 }) });
+  assert.equal(stale.key, 'stale');
+  assert.equal(stale.command, null);
+});
+
+test('running task progress takes priority over a stale watcher heartbeat', () => {
+  const view = autopilotProposalViewModel({
+    proposal,
+    watchStatus: watch('running', { stale: true, ageMs: 16000 }),
+    taskStatus: { status: 'running', phase: 'verifying' },
+  });
+  assert.equal(view.key, 'running');
+  assert.equal(view.command, null);
+  assert.equal(view.disableRequest, true);
 });
 
 test('approval and launch lifecycle disable duplicate proposal requests', () => {

@@ -166,7 +166,7 @@ function renderAutopilotState() {
   const hint = el('autopilotProposalHint');
   const state = lastState.autopilot || {};
   const blockedByRuntime = Number(state.inflightQueries || 0) > 0 || Number(state.activeQueries || 0) > 0;
-  const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, watchStatus: lastState.autopilotWatchStatus });
+  const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
   let label = '準備可能';
   let className = '';
   let detail = 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。';
@@ -305,7 +305,7 @@ const autopilotStatusScheduler = createAutopilotStatusStaleScheduler({
   onStale: () => renderAutopilotTaskProgress(lastState.autopilotStatus),
 });
 const autopilotWatchStatusScheduler = createAutopilotWatchStatusStaleScheduler({
-  onStale: () => renderAutopilotState(),
+  onStale: () => refresh().catch(() => {}),
 });
 
 function updateSaveEnabled() {

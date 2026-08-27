@@ -532,3 +532,9 @@ test('control center exposes the production action', async () => {
   assert.match(js, /確認事項あり/u);
   assert.match(js, /ChatGPTの質問に回答してから、再度「この内容を実行」してください/u);
 });
+
+test('control center refreshes backend watcher state at the stale boundary', async () => {
+  const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
+  assert.match(js, /onStale: \(\) => refresh\(\)\.catch\(\(\) => \{\}\)/u);
+  assert.match(js, /taskStatus: lastState\.autopilotStatus/u);
+});

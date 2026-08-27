@@ -1,8 +1,10 @@
 const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running']);
 
-export function autopilotProposalViewModel({ proposal = null, watchStatus = null } = {}) {
+export function autopilotProposalViewModel({ proposal = null, watchStatus = null, taskStatus = null } = {}) {
   if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
+  const runningTask = taskStatus?.status === 'running' && watchStatus?.proposal?.state === 'running';
+  if (runningTask) return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
   if (watchStatus?.status === 'error') {
     const code = watchStatus.lastError?.code || 'WATCH_ERROR';
     return { key: 'error', label: 'watcherエラー', detail: `watcherが確認できません。${code}。しばらく待ってから再試行できます。`, disableRequest: false, command: null, errorCode: code };
@@ -31,7 +33,7 @@ export function autopilotProposalViewModel({ proposal = null, watchStatus = null
   return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
 }
 
-export function isActiveAutopilotProposal(proposal, watchStatus) {
-  const view = autopilotProposalViewModel({ proposal, watchStatus });
+export function isActiveAutopilotProposal(proposal, watchStatus, taskStatus = null) {
+  const view = autopilotProposalViewModel({ proposal, watchStatus, taskStatus });
   return view.disableRequest && view.key !== 'error';
 }

@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('agentifyDesktop', {
   closeTab: (args) => ipcRenderer.invoke('agentify:closeTab', args || {}),
   stopQuery: (args) => ipcRenderer.invoke('agentify:stopQuery', args || {}),
   requestAutopilotProposal: () => ipcRenderer.invoke('agentify:requestAutopilotProposal'),
+  clearAutopilotStatus: () => ipcRenderer.invoke('agentify:clearAutopilotStatus'),
   openStateDir: () => ipcRenderer.invoke('agentify:openStateDir'),
   openArtifactsDir: () => ipcRenderer.invoke('agentify:openArtifactsDir'),
   openWatchFolder: (args) => ipcRenderer.invoke('agentify:openWatchFolder', args || {}),

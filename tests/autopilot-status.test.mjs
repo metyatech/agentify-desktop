@@ -9,6 +9,11 @@ import {
   createAutopilotStatusStore,
   validateAutopilotStatus,
 } from '../autopilot-status.mjs';
+import {
+  AUTOPILOT_WATCH_STATUS_FILE,
+  createAutopilotWatchStatusStore,
+  validateAutopilotWatchStatus,
+} from '../autopilot-watch-status.mjs';
 
 function snapshot(overrides = {}) {
   return {
@@ -54,5 +59,38 @@ test('terminal status is not marked stale and host task metadata stays null', as
   const saved = await store.update(snapshot({ repository: null, targetBranch: null, status: 'completed', phase: 'completed', latestVerdict: 'PASS', verification: { completed: 0, total: 0, failed: 0 } }));
   assert.equal(saved.stale, false);
   assert.equal(saved.repository, null);
+  await store.clear();
+  const restarted = await createAutopilotStatusStore({ stateDir, now: () => Date.parse('2026-08-26T00:00:01.000Z') });
+  assert.equal(restarted.get(), null);
+  await fs.rm(stateDir, { recursive: true, force: true });
+});
+
+test('watch status validates bounded proposal metadata, persists heartbeat, and clears without touching task status', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-autopilot-watch-status-'));
+  const snapshot = {
+    schemaVersion: 1,
+    tabKey: 'autopilot-production',
+    status: 'healthy',
+    lastPollAt: '2026-08-27T00:00:00.000Z',
+    lastError: null,
+    proposal: {
+      proposalId: '123e4567-e89b-42d3-a456-426614174000',
+      taskId: 'task-1',
+      approvalCode: '4216E4AE',
+      state: 'observed',
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    },
+    updatedAt: '2026-08-27T00:00:00.000Z',
+  };
+  assert.throws(() => validateAutopilotWatchStatus({ ...snapshot, conversationText: 'secret' }), /invalid_autopilot_watch_status/u);
+  const first = await createAutopilotWatchStatusStore({ stateDir, now: () => Date.parse('2026-08-27T00:00:05.000Z') });
+  const stored = await first.update(snapshot);
+  assert.equal(stored.proposal.approvalCode, '4216E4AE');
+  assert.equal(stored.stale, false);
+  const second = await createAutopilotWatchStatusStore({ stateDir, now: () => Date.parse('2026-08-27T00:00:20.000Z') });
+  assert.equal(second.get().stale, true);
+  await second.clear();
+  assert.equal(second.get(), null);
+  await assert.rejects(() => fs.access(path.join(stateDir, AUTOPILOT_WATCH_STATUS_FILE)), { code: 'ENOENT' });
   await fs.rm(stateDir, { recursive: true, force: true });
 });

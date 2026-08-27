@@ -166,7 +166,23 @@ body {
 .autopilotStatus.isError { color: #fca5a5; }
 .autopilotStatus.isReceived { color: #fde68a; }
 .autopilotStatus.isClarification { color: #fde68a; }
+.autopilotStatus.isApprovalWaiting { color: #bbf7d0; }
+.autopilotStatus.isStale { color: #fde68a; }
+.autopilotStatus.isCompleted { color: #bbf7d0; }
 .autopilotHint { margin-top: 10px; }
+.autopilotApproval {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid rgba(34, 197, 94, 0.38);
+  border-radius: 10px;
+  background: rgba(20, 83, 45, 0.22);
+}
+.autopilotApprovalLabel { color: rgba(233,236,242,0.72); font-size: 12px; }
+.autopilotApprovalCommand { color: #dcfce7; font-size: 14px; overflow-wrap: anywhere; }
 .autopilotTaskProgress {
   margin-top: 14px;
   padding: 11px;
@@ -174,6 +190,8 @@ body {
   border-radius: 11px;
   background: rgba(0,0,0,0.18);
 }
+.autopilotProgressContext { color: rgba(233,236,242,0.62); font-size: 11px; letter-spacing: 0.2px; text-transform: uppercase; }
+.autopilotProgressDismiss { margin-top: 10px; font-size: 12px; }
 .autopilotProgressHeadline { font-size: 15px; font-weight: 750; }
 .autopilotProgressHeadline.status-running { color: #bfdbfe; }
 .autopilotProgressHeadline.status-completed { color: #bbf7d0; }
@@ -218,6 +236,9 @@ body {
 }
 .field.isHidden {
   display: none;
+}
+.isHidden {
+  display: none !important;
 }
 input, select {
   width: 100%;

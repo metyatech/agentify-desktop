@@ -9,6 +9,7 @@ import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
 import { validateAutopilotStatus } from './autopilot-status.mjs';
+import { validateAutopilotWatchStatus } from './autopilot-watch-status.mjs';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -217,6 +218,9 @@ export function mapErrorToHttp(error) {
   if (msg === 'body_too_large') return { code: 413, body: { error: 'body_too_large' } };
   if (msg === 'invalid_autopilot_status') return { code: 400, body: { error: 'invalid_autopilot_status', data: error?.data || null } };
   if (msg === 'stale_autopilot_status') return { code: 409, body: { error: 'stale_autopilot_status', data: error?.data || null } };
+  if (msg === 'invalid_autopilot_watch_status') return { code: 400, body: { error: 'invalid_autopilot_watch_status', data: error?.data || null } };
+  if (msg === 'stale_autopilot_watch_status') return { code: 409, body: { error: 'stale_autopilot_watch_status', data: error?.data || null } };
+  if (msg === 'autopilot_status_not_terminal') return { code: 409, body: { error: 'autopilot_status_not_terminal' } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
   if (msg === 'invalid_vendor') return { code: 400, body: { error: 'invalid_vendor', data: error?.data || null } };
   if (msg === 'invalid_artifact_mode') return { code: 400, body: { error: 'invalid_artifact_mode', data: error?.data || null } };
@@ -620,6 +624,9 @@ export function startHttpApi({
   getStatus,
   getAutopilotStatus,
   onAutopilotStatus,
+  getAutopilotWatchStatus,
+  onAutopilotWatchStatus,
+  onAutopilotStatusClear,
   getSettings,
   onRuntimeChanged,
   prepareQueryContextFn = prepareQueryContext
@@ -1035,6 +1042,27 @@ export function startHttpApi({
         if (typeof onAutopilotStatus !== 'function') return sendJson(res, 503, { error: 'autopilot_status_unavailable' });
         const body = await parseBody(req, { maxBytes: 32 * 1024 });
         const snapshot = await onAutopilotStatus({ snapshot: validateAutopilotStatus(body) });
+        return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
+      }
+
+      if (url.pathname === '/autopilot/status' && req.method === 'DELETE') {
+        if (typeof onAutopilotStatusClear !== 'function') return sendJson(res, 503, { error: 'autopilot_status_unavailable' });
+        const snapshot = await getAutopilotStatus?.();
+        if (snapshot && !['completed', 'blocked'].includes(snapshot.status)) {
+          return sendJson(res, 409, { error: 'autopilot_status_not_terminal' });
+        }
+        await onAutopilotStatusClear();
+        return sendJson(res, 200, { ok: true, snapshot: null });
+      }
+
+      if (url.pathname === '/autopilot/watch-status' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, snapshot: (await getAutopilotWatchStatus?.()) || null });
+      }
+
+      if (url.pathname === '/autopilot/watch-status' && req.method === 'POST') {
+        if (typeof onAutopilotWatchStatus !== 'function') return sendJson(res, 503, { error: 'autopilot_watch_status_unavailable' });
+        const body = await parseBody(req, { maxBytes: 16 * 1024 });
+        const snapshot = await onAutopilotWatchStatus({ snapshot: validateAutopilotWatchStatus(body) });
         return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
       }
 

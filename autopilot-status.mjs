@@ -100,6 +100,15 @@ export async function createAutopilotStatusStore({
       current = next;
       return view();
     },
+    async clear() {
+      try {
+        await fs.unlink(autopilotStatusPath(stateDir));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      current = null;
+      return null;
+    },
   };
 }
 

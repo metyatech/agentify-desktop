@@ -24,6 +24,8 @@ export function autopilotStatusViewModel(snapshot, now = Date.now()) {
   return {
     kind: snapshot.status,
     stale,
+    contextLabel: snapshot.status === 'running' ? '現在の実行' : '前回のAutopilot実行',
+    canDismiss: snapshot.status === 'completed' || snapshot.status === 'blocked',
     statusLabel,
     taskLabel: snapshot.taskId,
     title: snapshot.title,
@@ -37,4 +39,3 @@ export function autopilotStatusViewModel(snapshot, now = Date.now()) {
     updatedLabel: snapshot.updatedAt ? `Updated ${new Date(snapshot.updatedAt).toLocaleString()}` : null,
   };
 }
-

@@ -310,6 +310,19 @@ ai-autopilot's `state.json` and does not control delivery. The last snapshot is
 kept under the existing Agentify state directory, with an `updatedAt` timestamp
 and a stale marker for old running snapshots.
 
+The card also receives the watcher's separate bounded heartbeat mirror through
+authenticated `POST /autopilot/watch-status` and reads it with `GET`. It shows
+watcher confirmation, the matching exact approval command, approval detection,
+launch preparation, controller start, and watcher errors. The mirror contains
+only tab/proposal identifiers, approval code, lifecycle state, timestamps, and a
+bounded error code/message; it never contains conversation text, contracts,
+tokens, URLs, paths, or Codex output. The approval command is copyable but is
+never sent by Agentify. Completed or blocked task snapshots are labeled as the
+previous Autopilot execution and can be hidden with `表示を消す`; this removes
+only the Agentify display snapshot and never deletes task state, worktrees,
+branches, evidence, or the watcher ledger. The API rejects clearing a running
+snapshot.
+
 ## Structured Conversation Turns
 
 The authenticated loopback API exposes a read-only ChatGPT conversation boundary

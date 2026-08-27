@@ -18,6 +18,7 @@
     "artifact-store.mjs",
     "autopilot-proposal.mjs",
     "autopilot-status.mjs",
+    "autopilot-watch-status.mjs",
     "browser-backend.mjs",
     "bundle-store.mjs",
     "chatgpt-controller.mjs",

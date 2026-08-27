@@ -161,6 +161,55 @@ test('http-api: authenticated autopilot status endpoint validates and stores onl
   assert.equal(unauthorized.res.status, 401);
 });
 
+test('http-api: watcher status is authenticated, bounded, and terminal status clear is guarded', async (t) => {
+  let watchSnapshot = null;
+  let taskSnapshot = { status: 'running' };
+  let clearCalls = 0;
+  const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true }),
+    getAutopilotStatus: async () => taskSnapshot,
+    onAutopilotStatusClear: async () => { clearCalls += 1; taskSnapshot = null; },
+    getAutopilotWatchStatus: async () => watchSnapshot,
+    onAutopilotWatchStatus: async ({ snapshot }) => { watchSnapshot = snapshot; return snapshot; },
+  });
+  t.after(() => server.close());
+  const snapshot = {
+    schemaVersion: 1,
+    tabKey: 'autopilot-production',
+    status: 'healthy',
+    lastPollAt: '2026-08-27T00:00:00.000Z',
+    lastError: null,
+    proposal: {
+      proposalId: '123e4567-e89b-42d3-a456-426614174000',
+      taskId: 'task-1',
+      approvalCode: '4216E4AE',
+      state: 'observed',
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    },
+    updatedAt: '2026-08-27T00:00:00.000Z',
+  };
+  const posted = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/autopilot/watch-status', body: snapshot });
+  assert.equal(posted.res.status, 200);
+  const read = await req({ port: server.address().port, token: 'secret', method: 'GET', pth: '/autopilot/watch-status' });
+  assert.equal(read.res.status, 200);
+  assert.equal(read.data.snapshot.proposal.state, 'observed');
+  const malformed = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/autopilot/watch-status', body: { ...snapshot, implementation: { prompt: 'must not enter mirror' } } });
+  assert.equal(malformed.res.status, 400);
+  const runningClear = await req({ port: server.address().port, token: 'secret', method: 'DELETE', pth: '/autopilot/status' });
+  assert.equal(runningClear.res.status, 409);
+  taskSnapshot = { status: 'blocked' };
+  const terminalClear = await req({ port: server.address().port, token: 'secret', method: 'DELETE', pth: '/autopilot/status' });
+  assert.equal(terminalClear.res.status, 200);
+  assert.equal(clearCalls, 1);
+});
+
 test('http-api: status surfaces active query runtime and stop can cancel it', async (t) => {
   let releaseQuery = null;
   let stopCalls = 0;

@@ -2,6 +2,8 @@
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
+import { autopilotProposalViewModel } from './autopilot-proposal-view.mjs';
+import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
 
 function el(id) {
   const n = document.getElementById(id);
@@ -122,7 +124,8 @@ function defaultState() {
     browser: null,
     runtime: { inflightQueries: 0, activeQueries: [], lastOutcomes: [] },
     autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false },
-    autopilotStatus: null
+    autopilotStatus: null,
+    autopilotWatchStatus: null
   };
 }
 
@@ -155,6 +158,7 @@ let autopilotStatusKey = 'ready';
 let autopilotRequestInFlight = false;
 let autopilotErrorMessage = null;
 let autopilotClarificationMessage = null;
+let autopilotProposal = null;
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -162,6 +166,7 @@ function renderAutopilotState() {
   const hint = el('autopilotProposalHint');
   const state = lastState.autopilot || {};
   const blockedByRuntime = Number(state.inflightQueries || 0) > 0 || Number(state.activeQueries || 0) > 0;
+  const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, watchStatus: lastState.autopilotWatchStatus });
   let label = '準備可能';
   let className = '';
   let detail = 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。';
@@ -173,10 +178,10 @@ function renderAutopilotState() {
     label = '確認事項あり';
     className = 'isClarification';
     detail = autopilotClarificationMessage || 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
-  } else if (autopilotStatusKey === 'received') {
-    label = 'proposal応答受信';
-    className = 'isReceived';
-    detail = 'ChatGPTに返答が表示されています。内容を目視確認してから、既存のapproval手順を使ってください。';
+  } else if (autopilotProposal) {
+    label = proposalView.label;
+    className = proposalView.key === 'error' ? 'isError' : proposalView.key === 'approval-waiting' ? 'isApprovalWaiting' : proposalView.key === 'stale' ? 'isStale' : proposalView.key === 'approved' || proposalView.key === 'launching' ? 'isWaiting' : proposalView.key === 'completed' ? 'isCompleted' : '';
+    detail = proposalView.detail;
   } else if (autopilotStatusKey === 'error' || !state.ready) {
     label = 'エラー';
     className = 'isError';
@@ -188,16 +193,25 @@ function renderAutopilotState() {
   status.textContent = label;
   status.className = `autopilotStatus ${className}`.trim();
   hint.textContent = detail;
-  button.disabled = autopilotRequestInFlight || !state.ready;
+  button.disabled = autopilotRequestInFlight || !state.ready || proposalView.disableRequest;
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
+  const approval = el('autopilotApproval');
+  const approvalCommand = el('autopilotApprovalCommand');
+  approval.classList.toggle('isHidden', !proposalView.command);
+  approvalCommand.textContent = proposalView.command || '';
   renderAutopilotTaskProgress(lastState.autopilotStatus);
   autopilotStatusScheduler.schedule(lastState.autopilotStatus);
+  autopilotWatchStatusScheduler.schedule(lastState.autopilotWatchStatus);
 }
 
 function renderAutopilotTaskProgress(snapshot) {
   const root = el('autopilotTaskProgress');
   root.innerHTML = '';
   const view = autopilotStatusViewModel(snapshot);
+  const context = document.createElement('div');
+  context.className = 'autopilotProgressContext';
+  context.textContent = view.contextLabel || 'Autopilot task progress';
+  root.appendChild(context);
   const headline = document.createElement('div');
   headline.className = `autopilotProgressHeadline status-${view.kind}`;
   headline.textContent = view.statusLabel || view.label;
@@ -208,6 +222,25 @@ function renderAutopilotTaskProgress(snapshot) {
     empty.textContent = view.detail;
     root.appendChild(empty);
     return;
+  }
+  if (view.canDismiss) {
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'btn autopilotProgressDismiss';
+    dismiss.textContent = '表示を消す';
+    dismiss.setAttribute('aria-label', '前回のAutopilot実行表示を消す');
+    dismiss.onclick = async () => {
+      dismiss.disabled = true;
+      try {
+        await callApi('clearAutopilotStatus', undefined, { required: true });
+        statusText('前回のAutopilot実行表示を消しました。', 'muted');
+        await refresh();
+      } catch (e) {
+        dismiss.disabled = false;
+        statusText(`表示を消せませんでした: ${e?.message || String(e)}`, 'error');
+      }
+    };
+    root.appendChild(dismiss);
   }
   const task = document.createElement('div');
   task.className = 'autopilotProgressTask mono';
@@ -270,6 +303,9 @@ let tabsAreHidden = false;
 let settingsDirty = false;
 const autopilotStatusScheduler = createAutopilotStatusStaleScheduler({
   onStale: () => renderAutopilotTaskProgress(lastState.autopilotStatus),
+});
+const autopilotWatchStatusScheduler = createAutopilotWatchStatusStaleScheduler({
+  onStale: () => renderAutopilotState(),
 });
 
 function updateSaveEnabled() {
@@ -380,6 +416,11 @@ async function refresh() {
     const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings() })) || defaultSettings();
     const watchFoldersData = (await callApi('listWatchFolders', undefined, { fallback: { folders: [] } })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
+    const watchedProposal = lastState.autopilotWatchStatus?.proposal;
+    if (!autopilotProposal && watchedProposal && ['observed', 'approved', 'launch-prepared', 'launch-started', 'running'].includes(watchedProposal.state)) {
+      autopilotProposal = { proposalId: watchedProposal.proposalId, taskId: watchedProposal.taskId, approvalCode: watchedProposal.approvalCode };
+      autopilotStatusKey = 'generated';
+    }
     renderAutopilotState();
 
     const vendorSelect = el('vendorSelect');
@@ -743,14 +784,21 @@ async function main() {
       const result = await callApi('requestAutopilotProposal', undefined, { required: true });
       autopilotErrorMessage = null;
       if (result?.status === 'clarification_response_received') {
+        autopilotProposal = null;
         autopilotClarificationMessage = 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
         autopilotStatusKey = 'clarification';
         statusText(`確認事項あり: ${autopilotClarificationMessage}`, 'warn');
       } else {
         autopilotClarificationMessage = null;
-        autopilotStatusKey = 'received';
+        autopilotProposal = result?.proposal ? {
+          proposalId: result.proposal.proposalId,
+          taskId: result.proposal.contract?.id || '',
+          approvalCode: result.proposal.approvalCode
+        } : null;
+        autopilotStatusKey = autopilotProposal ? 'generated' : 'received';
       }
     } catch (e) {
+      autopilotProposal = null;
       autopilotStatusKey = 'error';
       autopilotClarificationMessage = null;
       autopilotErrorMessage = e?.message || String(e);
@@ -759,6 +807,17 @@ async function main() {
       autopilotRequestInFlight = false;
       await refresh().catch(() => {});
       renderAutopilotState();
+    }
+  };
+
+  el('btnCopyAutopilotApproval').onclick = async () => {
+    const command = el('autopilotApprovalCommand').textContent;
+    if (!command) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      statusText('承認文をクリップボードへコピーしました。ChatGPTへは送信していません。', 'muted');
+    } catch (e) {
+      statusText(`承認文をコピーできませんでした: ${e?.message || String(e)}`, 'error');
     }
   };
 
@@ -854,7 +913,10 @@ async function main() {
     setInterval(() => refresh().catch(() => {}), 3000);
   }
 
-  window.addEventListener('beforeunload', () => autopilotStatusScheduler.cancel(), { once: true });
+  window.addEventListener('beforeunload', () => {
+    autopilotStatusScheduler.cancel();
+    autopilotWatchStatusScheduler.cancel();
+  }, { once: true });
   await refresh();
 }
 

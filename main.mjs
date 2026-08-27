@@ -20,6 +20,7 @@ import { TabManager } from './tab-manager.mjs';
 import { TabRegistry } from './tab-registry.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
+import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
@@ -127,6 +128,7 @@ async function main() {
 
   const token = await ensureToken(stateDir);
   const autopilotStatus = await createAutopilotStatusStore({ stateDir });
+  const autopilotWatchStatus = await createAutopilotWatchStatusStore({ stateDir });
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
@@ -340,11 +342,19 @@ async function main() {
       browser: browserState,
       runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
       autopilot: autopilotProposal.availability(),
-      autopilotStatus: autopilotStatus.get()
+      autopilotStatus: autopilotStatus.get(),
+      autopilotWatchStatus: autopilotWatchStatus.get()
     };
   });
 
   ipcMain.handle('agentify:requestAutopilotProposal', async () => await autopilotProposal.request());
+  ipcMain.handle('agentify:clearAutopilotStatus', async () => {
+    const snapshot = autopilotStatus.get();
+    if (snapshot && !['completed', 'blocked'].includes(snapshot.status)) throw new Error('autopilot_status_not_terminal');
+    await autopilotStatus.clear();
+    emitTabsChanged();
+    return { ok: true, snapshot: null };
+  });
 
   ipcMain.handle('agentify:getSettings', async () => {
     settings = await readSettings(stateDir);
@@ -659,6 +669,18 @@ async function main() {
           const stored = await autopilotStatus.update(snapshot);
           emitTabsChanged();
           return stored;
+        },
+        getAutopilotWatchStatus: async () => autopilotWatchStatus.get(),
+        onAutopilotWatchStatus: async ({ snapshot }) => {
+          const stored = await autopilotWatchStatus.update(snapshot);
+          emitTabsChanged();
+          return stored;
+        },
+        onAutopilotStatusClear: async () => {
+          const snapshot = autopilotStatus.get();
+          if (snapshot && !['completed', 'blocked'].includes(snapshot.status)) throw new Error('autopilot_status_not_terminal');
+          await autopilotStatus.clear();
+          emitTabsChanged();
         },
         getStatus: async ({ tabId }) => {
           const controller = tabId ? tabs.getControllerById(tabId) : tabs.getControllerById(defaultTabId);

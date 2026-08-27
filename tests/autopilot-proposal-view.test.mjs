@@ -22,15 +22,52 @@ test('watcher errors and stale heartbeat never become approval', () => {
   assert.equal(stale.command, null);
 });
 
-test('running task progress takes priority over a stale watcher heartbeat', () => {
+test('matching running task overrides a stale launch-started watcher heartbeat', () => {
   const view = autopilotProposalViewModel({
     proposal,
-    watchStatus: watch('running', { stale: true, ageMs: 16000 }),
-    taskStatus: { status: 'running', phase: 'verifying' },
+    watchStatus: watch('launch-started', { stale: true, ageMs: 16000 }),
+    taskStatus: { taskId: 'task-1', status: 'running', phase: 'verifying' },
   });
   assert.equal(view.key, 'running');
   assert.equal(view.command, null);
   assert.equal(view.disableRequest, true);
+});
+
+test('matching running task overrides stale and error watcher mirrors', () => {
+  for (const watchStatus of [
+    watch('running', { stale: true, ageMs: 16000 }),
+    watch('observed', { status: 'error', lastError: { code: 'WATCH_POST_FAILED' } }),
+  ]) {
+    const view = autopilotProposalViewModel({
+      proposal,
+      watchStatus,
+      taskStatus: { taskId: 'task-1', status: 'running', phase: 'reviewing' },
+    });
+    assert.deepEqual({ key: view.key, label: view.label, command: view.command, disableRequest: view.disableRequest }, {
+      key: 'running', label: '実行中', command: null, disableRequest: true,
+    });
+  }
+});
+
+test('unrelated or terminal task status does not override watcher state', () => {
+  for (const taskStatus of [
+    { taskId: 'old-task', status: 'running' },
+    { taskId: 'task-1', status: 'completed' },
+  ]) {
+    const view = autopilotProposalViewModel({
+      proposal,
+      watchStatus: watch('observed', { stale: true, ageMs: 16000 }),
+      taskStatus,
+    });
+    assert.equal(view.key, 'stale');
+    assert.equal(view.command, null);
+  }
+});
+
+test('normal observed proposal still waits for approval without a matching running task', () => {
+  const view = autopilotProposalViewModel({ proposal, watchStatus: watch('observed') });
+  assert.equal(view.key, 'approval-waiting');
+  assert.equal(view.command, '開始して 4216E4AE');
 });
 
 test('approval and launch lifecycle disable duplicate proposal requests', () => {

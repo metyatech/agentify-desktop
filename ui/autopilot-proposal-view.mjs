@@ -3,7 +3,7 @@ const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 
 export function autopilotProposalViewModel({ proposal = null, watchStatus = null, taskStatus = null } = {}) {
   if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
-  const runningTask = taskStatus?.status === 'running' && watchStatus?.proposal?.state === 'running';
+  const runningTask = taskStatus?.status === 'running' && taskStatus?.taskId === proposal.taskId;
   if (runningTask) return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
   if (watchStatus?.status === 'error') {
     const code = watchStatus.lastError?.code || 'WATCH_ERROR';

@@ -289,7 +289,11 @@ a locally validated response is treated as received and remains in ChatGPT for
 the user to inspect; a non-empty marker-free response is treated as a clarification
 instead of being retried or treated as a proposal. The Control Center asks the user
 to answer ChatGPT and press `この内容を実行` again. The existing watcher still
-requires the later exact approval turn (`開始して XXXXXXXX`).
+requires the later exact approval turn (`開始して XXXXXXXX`). Proposal responses
+must be emitted as exactly one unlabeled fenced code block containing the marker
+pair and standalone JSON; clarification responses remain natural language. The
+rendered DOM text obtained by Agentify removes the fence but preserves literal
+backslashes, quotes, and JSON newline escapes inside the code block.
 
 The fallback prompt boundary is [`autopilot-proposal.mjs`](autopilot-proposal.mjs)
 and is kept in sync with `ai-autopilot/src/proposal-generation.mjs` by matching

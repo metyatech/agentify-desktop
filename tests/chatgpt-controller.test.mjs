@@ -13,6 +13,7 @@ import {
   isChatGPTCurrentDraftAttachmentCard,
   mapChatGPTAttachmentCardNames
 } from '../chatgpt-controller.mjs';
+import { classifyProposalResponse, parseValidateProposalResponse } from '../autopilot-proposal.mjs';
 
 const selectors = {
   promptTextarea: '#prompt-textarea',
@@ -20,6 +21,42 @@ const selectors = {
   stopButton: 'button[data-testid="stop-button"]',
   assistantMessage: '[data-message-author-role="assistant"]'
 };
+
+const conversationProposalMetadata = Object.freeze({
+  schemaVersion: 1,
+  proposalId: '123e4567-e89b-42d3-a456-426614174000',
+  createdAt: '2026-08-10T00:00:00.000Z',
+  expiresAt: '2026-08-10T23:59:59.999Z',
+  tabKey: 'autopilot-production',
+  approvalCode: 'AB12CD34'
+});
+
+const conversationProposalPrompt = String.raw`Windows path: D:\ghws\RuntimeUnicodeTextSample
+Embedded quote: Commit with message "Replace Fab media with real Unreal screenshots"
+Newline instruction:
+Keep this line and the next line distinct.`;
+
+function conversationProposalText() {
+  return [
+    'AUTOPILOT_PROPOSAL_BEGIN_V1',
+    JSON.stringify({
+      ...conversationProposalMetadata,
+      contract: {
+        schemaVersion: 1,
+        id: 'conversation-transport-test',
+        title: 'Conversation transport test',
+        repository: null,
+        agentify: { tabKey: conversationProposalMetadata.tabKey },
+        implementation: { prompt: conversationProposalPrompt },
+        verification: [],
+        review: { maxRounds: 10, timeoutMs: 300000 },
+        delivery: { push: false },
+        constraints: []
+      }
+    }, null, 2),
+    'AUTOPILOT_PROPOSAL_END_V1'
+  ].join('\n');
+}
 
 function normalizeUserTurnTextForTest(value) {
   return String(value || '').replace(/\u0000/g, '').replace(/\s+/g, ' ').trim();
@@ -354,6 +391,56 @@ function createUserTurnFixture({ id = '', messageId = '', text = '' } = {}) {
   };
 }
 
+function createConversationTurnFixture({ role, innerText, textContent = innerText, messageId = '' }) {
+  const createClone = () => ({
+    innerText,
+    textContent,
+    matches: () => false,
+    querySelectorAll: () => []
+  });
+  return {
+    parentElement: null,
+    cloneNode: createClone,
+    getAttribute(name) {
+      if (name === 'data-message-author-role') return role;
+      if (name === 'data-message-id') return messageId;
+      return null;
+    },
+    closest(selector) {
+      if (selector === '[data-message-id]' && messageId) return this;
+      return null;
+    }
+  };
+}
+
+function createConversationExpressionContext(nodes) {
+  const document = {
+    querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]') return nodes;
+      return [];
+    }
+  };
+  const context = { document };
+  context.globalThis = context;
+  return context;
+}
+
+async function captureActualConversationExtraction(nodes) {
+  const events = [];
+  const context = createConversationExpressionContext(nodes);
+  let expression = '';
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (!js.includes('const selectedTurns = turns.slice')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      expression = js;
+      return await vm.runInNewContext(js, context);
+    }
+  });
+  const result = await createController(page).readConversationTurns({ maxTurns: 2, maxCharsPerTurn: 100_000, maxTotalChars: 200_000 });
+  return { expression, result };
+}
+
 async function captureActualTypePromptEvaluation(userTurns) {
   const events = [];
   const progress = [];
@@ -604,6 +691,44 @@ test('chatgpt-controller: reads only structured ChatGPT turns through the mutex'
   assert.equal(result.turns[0].id, 'message-user');
   assert.match(result.turns[1].id, /^turn-[0-9a-f]{24}$/u);
   assert.deepEqual(result.turns.map((turn) => turn.role), ['user', 'assistant']);
+});
+
+test('chatgpt-controller: rendered code-block innerText preserves proposal JSON transport', async () => {
+  const source = conversationProposalText();
+  const captured = await captureActualConversationExtraction([
+    createConversationTurnFixture({ role: 'assistant', innerText: source, textContent: source, messageId: 'proposal-message' })
+  ]);
+  assert.match(captured.expression, /clone\.innerText \|\| clone\.textContent/u);
+  assert.equal(captured.result.turns[0].text, source);
+  const proposal = parseValidateProposalResponse(captured.result.turns[0].text, {
+    metadata: conversationProposalMetadata,
+    now: new Date(conversationProposalMetadata.createdAt)
+  });
+  assert.equal(proposal.contract.implementation.prompt, conversationProposalPrompt);
+  assert.match(proposal.contract.implementation.prompt, /D:\\ghws\\RuntimeUnicodeTextSample/u);
+  assert.match(proposal.contract.implementation.prompt, /Commit with message "Replace Fab media with real Unreal screenshots"/u);
+  assert.match(proposal.contract.implementation.prompt, /Newline instruction:\nKeep this line/u);
+});
+
+test('chatgpt-controller: plain Markdown fixture can lose escaping while the rendered code block avoids it', async () => {
+  const source = conversationProposalText();
+  const lossyRenderedText = source.replace(/\\\\/gu, '\\').replace(/\\"/gu, '"');
+  const plain = await captureActualConversationExtraction([
+    createConversationTurnFixture({ role: 'assistant', innerText: lossyRenderedText, textContent: source })
+  ]);
+  const codeBlock = await captureActualConversationExtraction([
+    createConversationTurnFixture({ role: 'assistant', innerText: source, textContent: source })
+  ]);
+  assert.notEqual(plain.result.turns[0].text, source);
+  assert.equal(classifyProposalResponse(plain.result.turns[0].text, {
+    metadata: conversationProposalMetadata,
+    now: new Date(conversationProposalMetadata.createdAt)
+  }).reason, 'proposal_json_invalid');
+  const classification = classifyProposalResponse(codeBlock.result.turns[0].text, {
+    metadata: conversationProposalMetadata,
+    now: new Date(conversationProposalMetadata.createdAt)
+  });
+  assert.equal(classification.kind, 'valid_proposal');
 });
 
 test('chatgpt-controller: returns the latest valid turns while preserving conversation indexes', async () => {

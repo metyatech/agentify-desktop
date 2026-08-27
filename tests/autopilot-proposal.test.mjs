@@ -51,6 +51,10 @@ function validProposalText(metadata = FIXED_METADATA, { contract = {}, envelope 
   return `${PROPOSAL_BEGIN}\n${JSON.stringify({ ...metadata, ...envelope, contract: validContract(contract) }, null, 2)}\n${PROPOSAL_END}`;
 }
 
+function fencedProposalText(metadata = FIXED_METADATA, options = {}) {
+  return `\`\`\`\n${validProposalText(metadata, options)}\n\`\`\``;
+}
+
 function makeTabs({ rows = [{ id: 'tab-1', key: 'autopilot-production', vendorId: 'chatgpt' }], url = 'https://chatgpt.com/' } = {}) {
   const controllers = new Map(rows.map((row) => [row.id, { getUrl: async () => url }]));
   return {
@@ -164,18 +168,81 @@ test('malformed Windows path is rejected and a valid retry keeps the original me
   assert.match(calls[1].prompt, /same implementation intent and user decisions/u);
   assert.match(calls[1].prompt, /byte-for-byte/u);
   assert.match(calls[1].prompt, /backslash, double quote, newline/u);
-  assert.match(calls[1].prompt, /Do not include a code fence/u);
+  assert.match(calls[1].prompt, /Previous proposal was rejected because JSON\.parse reported:/u);
+  assert.match(calls[1].prompt, /position \d+/u);
+  assert.match(calls[1].prompt, /parse line was \d+/u);
+  assert.match(calls[1].prompt, /parse column was \d+/u);
+  assert.match(calls[1].prompt, /exactly one unlabeled fenced code block/u);
+  assert.doesNotMatch(calls[1].prompt, /Do not include a code fence/u);
 });
 
 test('unescaped embedded quote is rejected and a valid retry succeeds', async () => {
   const malformed = validProposalText().replace(String.raw`\"text\"`, '"text"');
   const responses = [malformed, validProposalText()];
-  let calls = 0;
-  const { service } = makeService({ requestQuery: async () => ({ result: { text: responses[calls++] } }) });
+  const calls = [];
+  const { service } = makeService({ requestQuery: async (body) => {
+    calls.push(body);
+    return { result: { text: responses.shift() } };
+  }});
 
   const result = await service.request();
-  assert.equal(calls, 2);
+  assert.equal(calls.length, 2);
   assert.equal(result.status, 'proposal_response_received');
+  assert.match(calls[1].prompt, /JSON\.parse reported:/u);
+  assert.match(calls[1].prompt, /position \d+/u);
+});
+
+test('trailing JSON text reports its parse position and a second valid proposal succeeds', async () => {
+  const malformed = validProposalText().replace(PROPOSAL_END, `trailing output\n${PROPOSAL_END}`);
+  const calls = [];
+  const { service } = makeService({ requestQuery: async (body) => {
+    calls.push(body);
+    return { result: { text: calls.length === 1 ? malformed : validProposalText() } };
+  }});
+  const result = await service.request();
+  assert.equal(result.attempts, 2);
+  assert.match(calls[1].prompt, /Unexpected non-whitespace character after JSON.*position \d+/u);
+  assert.match(calls[1].prompt, /parse line was \d+/u);
+  assert.match(calls[1].prompt, /parse column was \d+/u);
+});
+
+test('JSON parse diagnostics are bounded and expose position, line, and column without response text', () => {
+  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+  const malformed = validProposalText().replace('Proposal validation test', `Proposal ${secret}`).replace('\\\\', '\\');
+  const classification = classifyProposalResponse(malformed, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.equal(classification.reason, 'proposal_json_invalid');
+  assert.equal(classification.diagnostic.category, 'SyntaxError');
+  assert.equal(Number.isSafeInteger(classification.diagnostic.position), true);
+  assert.equal(Number.isSafeInteger(classification.diagnostic.line), true);
+  assert.equal(Number.isSafeInteger(classification.diagnostic.column), true);
+  assert.equal(classification.diagnostic.message.length <= 240, true);
+  assert.doesNotMatch(classification.diagnostic.message, new RegExp(secret, 'u'));
+});
+
+test('retry diagnostic does not re-inject malformed proposal content or secrets', async () => {
+  const secret = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+  const malformed = validProposalText().replace('\\\\', '\\').replace('Proposal validation test', `Proposal ${secret}`);
+  const calls = [];
+  const { service } = makeService({ requestQuery: async (body) => {
+    calls.push(body);
+    return { result: { text: calls.length === 1 ? malformed : validProposalText() } };
+  }});
+  await service.request();
+  assert.doesNotMatch(calls[1].prompt, new RegExp(secret, 'u'));
+  assert.doesNotMatch(calls[1].prompt, /RuntimeUnicodeTextSample/u);
+  assert.match(calls[1].prompt, /JSON\.parse reported:/u);
+});
+
+test('a valid fenced proposal succeeds on the first attempt without retry', async () => {
+  let calls = 0;
+  const { service } = makeService({ requestQuery: async () => {
+    calls += 1;
+    return { result: { text: fencedProposalText() } };
+  }});
+  const result = await service.request();
+  assert.equal(result.ok, true);
+  assert.equal(result.attempts, 1);
+  assert.equal(calls, 1);
 });
 
 test('a non-empty marker-free response is a clarification and is not retried', async () => {
@@ -310,6 +377,11 @@ test('valid JSON accepts implementation prompt backslashes, quotes, and newlines
   assert.match(proposal.contract.implementation.prompt, /newline\nare intentional/u);
 });
 
+test('raw unlabeled fenced Markdown passed directly to the validator remains compatible with rendered text', () => {
+  const proposal = parseValidateProposalResponse(fencedProposalText(), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.equal(proposal.contract.implementation.prompt.includes('D:\\ghws\\RuntimeUnicodeTextSample'), true);
+});
+
 test('controller-compatible standalone markers accept CRLF after normalization', () => {
   const crlf = validProposalText().replace(/\n/gu, '\r\n');
   const classification = classifyProposalResponse(crlf, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
@@ -383,7 +455,23 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   assert.match(prompt, /JSON.stringify would/u);
   assert.match(prompt, /Windows paths.*quotation marks.*backslashes.*newlines/u);
   assert.match(prompt, /AUTOPILOT_PROPOSAL_BEGIN_V1/u);
+  assert.match(prompt, /exactly one unlabeled fenced code block/u);
+  assert.match(prompt, /opening line containing exactly ``` with no language label/u);
+  assert.doesNotMatch(prompt, /Do not include a code fence/u);
   assert.match(prompt, /開始して XXXXXXXX/u);
+});
+
+test('retry proposal prompt keeps the fenced transport requirement and contains no legacy fence prohibition', () => {
+  const prompt = buildProposalGenerationPrompt({
+    metadata: FIXED_METADATA,
+    retryAttempt: 2,
+    retryDiagnostic: { message: 'Unexpected non-whitespace character after JSON at position 4528', position: 4528, line: 99, column: 7 }
+  });
+  assert.match(prompt, /Previous proposal was rejected because JSON\.parse reported: Unexpected non-whitespace character after JSON at position 4528/u);
+  assert.match(prompt, /reported parse line was 99/u);
+  assert.match(prompt, /reported parse column was 7/u);
+  assert.match(prompt, /exactly one unlabeled fenced code block/u);
+  assert.doesNotMatch(prompt, /Do not include a code fence/u);
 });
 
 test('proposal prompt owns technical verification planning and ignores generated clarifications', async () => {

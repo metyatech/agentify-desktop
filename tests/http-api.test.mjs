@@ -5,6 +5,8 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
+import { ChatGPTController } from '../chatgpt-controller.mjs';
+import { ChromeCdpBrowserBackend } from '../chrome-cdp-backend.mjs';
 
 async function req({ port, token, method, pth, body, headers = {} }) {
   const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
@@ -3804,6 +3806,94 @@ test('http-api: conversation turns requires an existing ChatGPT tab and does not
   const unauthorized = await req({ port, method: 'POST', pth: '/conversation/turns', body: { key: 'review' } });
   assert.equal(unauthorized.res.status, 401);
   assert.equal(reads, 2);
+});
+
+test('http-api: conversation turns succeeds when the managed page recovers a stale CDP session', async (t) => {
+  const calls = [];
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  let attachCount = 0;
+  let runtimeEvaluateCount = 0;
+  backend.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}, sessionId) => {
+      calls.push({ method, params, sessionId });
+      if (method === 'Target.createTarget') return { targetId: 'conversation-target' };
+      if (method === 'Target.attachToTarget') {
+        attachCount += 1;
+        return { sessionId: attachCount === 1 ? 'conversation-session-old' : 'conversation-session-new' };
+      }
+      if (method === 'Browser.getWindowForTarget') return {};
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'conversation-main-frame' } } };
+      if (method === 'Runtime.evaluate') {
+        runtimeEvaluateCount += 1;
+        if (sessionId === 'conversation-session-old') {
+          const error = new Error('Session with given id not found.');
+          error.data = { code: -32001, message: error.message };
+          throw error;
+        }
+        if (String(params.expression || '').includes('location.href')) return { result: { value: 'https://chatgpt.com/c/preserved' } };
+        return {
+          result: {
+            value: {
+              turns: [{ role: 'user', text: 'existing turn', index: 0, messageId: 'message-1' }],
+              limitExceeded: false,
+              limitKind: null
+            }
+          }
+        };
+      }
+      return {};
+    }
+  };
+  const session = await backend.createSession({ url: 'https://chatgpt.com/c/preserved' });
+  const controller = new ChatGPTController({
+    page: session.page,
+    selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop', assistantMessage: '.assistant' },
+    stateDir: '/tmp/agentify-test-state'
+  });
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    ensureTab: async () => { throw new Error('must_not_create'); },
+    createTab: async () => { throw new Error('must_not_create'); },
+    closeTab: async () => true,
+    getControllerById: (id) => id === 'chat-1' ? controller : (() => { throw new Error('tab_not_found'); })()
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(async () => {
+    await server.close();
+    await session.close();
+  });
+
+  const result = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/turns',
+    body: { key: 'autopilot-production', maxTurns: 2 }
+  });
+
+  assert.equal(result.res.status, 200);
+  assert.deepEqual(result.data, {
+    ok: true,
+    tabId: 'chat-1',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/preserved',
+    turns: [{ id: 'message-1', role: 'user', text: 'existing turn', index: 0 }]
+  });
+  assert.equal(session.page.sessionId, 'conversation-session-new');
+  assert.equal(runtimeEvaluateCount, 3);
+  assert.equal(calls.filter((call) => call.method === 'Target.attachToTarget').length, 2);
+  assert.equal(calls.filter((call) => call.method === 'Target.createTarget').length, 1);
 });
 
 test('http-api: conversation turns rejects non-ChatGPT tabs and missing controllers', async (t) => {

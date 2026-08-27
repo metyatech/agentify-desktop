@@ -510,6 +510,187 @@ async function createSessionWithRuntimeResult(runtimeResult) {
   return { session, calls };
 }
 
+function staleSessionError() {
+  const error = new Error('Session with given id not found.');
+  error.data = { code: -32001, message: error.message };
+  return error;
+}
+
+async function createSessionWithRecoveryMock({ onEvaluate, userAgent = null, onUrlChanged = null } = {}) {
+  const calls = [];
+  const listeners = new Map();
+  let attachCount = 0;
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state', userAgent });
+  backend.started = true;
+  backend.client = {
+    connected: true,
+    ws: {},
+    on(method, handler) {
+      const list = listeners.get(method) || [];
+      list.push(handler);
+      listeners.set(method, list);
+      return () => listeners.set(method, (listeners.get(method) || []).filter((item) => item !== handler));
+    },
+    send: async (method, params = {}, sessionId) => {
+      calls.push({ method, params, sessionId });
+      if (method === 'Target.createTarget') return { targetId: 'recovery-target' };
+      if (method === 'Target.attachToTarget') {
+        attachCount += 1;
+        return { sessionId: attachCount === 1 ? 'session-old' : 'session-new' };
+      }
+      if (method === 'Browser.getWindowForTarget') return { windowId: 11 };
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main-frame' } } };
+      if (method === 'Runtime.evaluate') return await onEvaluate?.({ sessionId, calls });
+      return {};
+    }
+  };
+  const session = await backend.createSession({ url: 'https://chatgpt.com/', onUrlChanged });
+  return {
+    backend,
+    session,
+    calls,
+    listeners,
+    emit(method, params, eventSessionId = null) {
+      for (const handler of listeners.get(method) || []) handler(params, eventSessionId);
+    }
+  };
+}
+
+test('chrome-cdp-backend: normal session command succeeds without reattach', async () => {
+  const mock = await createSessionWithRecoveryMock({ onEvaluate: async () => ({ result: { value: 'ok' } }) });
+
+  assert.equal(await mock.session.page.evaluate('1 + 1'), 'ok');
+  assert.equal(mock.session.page.sessionId, 'session-old');
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 1);
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.sessionId), ['session-old']);
+});
+
+test('chrome-cdp-backend: stale Runtime.evaluate reattaches, reinitializes, and retries once', async () => {
+  let evaluateCalls = 0;
+  const mock = await createSessionWithRecoveryMock({
+    userAgent: 'AgentifyTest/1.0',
+    onEvaluate: async ({ sessionId }) => {
+      evaluateCalls += 1;
+      if (sessionId === 'session-old' && evaluateCalls === 1) throw staleSessionError();
+      return { result: { value: 'recovered' } };
+    }
+  });
+
+  assert.equal(await mock.session.page.evaluate('1 + 1'), 'recovered');
+  assert.equal(mock.session.page.sessionId, 'session-new');
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 2);
+  assert.deepEqual(
+    mock.calls.filter((call) => call.method === 'Target.attachToTarget').map((call) => ({ targetId: call.params.targetId, flatten: call.params.flatten })),
+    [{ targetId: 'recovery-target', flatten: true }, { targetId: 'recovery-target', flatten: true }]
+  );
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.sessionId), ['session-old', 'session-new']);
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.params.expression), ['1 + 1', '1 + 1']);
+  assert.deepEqual(
+    mock.calls.filter((call) => ['Page.enable', 'Runtime.enable', 'DOM.enable', 'Page.getFrameTree', 'Page.addScriptToEvaluateOnNewDocument', 'Network.setUserAgentOverride'].includes(call.method)).map((call) => call.sessionId),
+    ['session-old', 'session-old', 'session-old', 'session-old', 'session-old', 'session-old', 'session-new', 'session-new', 'session-new', 'session-new', 'session-new', 'session-new']
+  );
+  assert.equal(evaluateCalls, 2);
+});
+
+test('chrome-cdp-backend: concurrent stale commands share one reattach flight', async () => {
+  let staleCalls = 0;
+  let releaseStale;
+  const staleGate = new Promise((resolve) => { releaseStale = resolve; });
+  const mock = await createSessionWithRecoveryMock({
+    onEvaluate: async ({ sessionId }) => {
+      if (sessionId === 'session-old') {
+        staleCalls += 1;
+        if (staleCalls === 2) releaseStale();
+        await staleGate;
+        throw staleSessionError();
+      }
+      return { result: { value: 'ok' } };
+    }
+  });
+
+  const results = await Promise.all([mock.session.page.evaluate('1'), mock.session.page.evaluate('2')]);
+  assert.deepEqual(results, ['ok', 'ok']);
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 2);
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.sessionId), ['session-old', 'session-old', 'session-new', 'session-new']);
+});
+
+test('chrome-cdp-backend: detached event marks the current session and new-session navigation updates URL', async () => {
+  const urls = [];
+  let evaluateCalls = 0;
+  const mock = await createSessionWithRecoveryMock({
+    onUrlChanged: (url) => urls.push(url),
+    onEvaluate: async ({ sessionId }) => {
+      evaluateCalls += 1;
+      if (sessionId === 'session-old' && evaluateCalls === 1) throw staleSessionError();
+      return { result: { value: 'ok' } };
+    }
+  });
+
+  mock.emit('Target.detachedFromTarget', { targetId: 'recovery-target', sessionId: 'session-old' });
+  assert.equal(await mock.session.page.evaluate('location.href'), 'ok');
+  mock.emit('Page.frameNavigated', { frame: { id: 'main-frame', url: 'https://chatgpt.com/c/recovered' } }, 'session-new');
+  mock.emit('Page.navigatedWithinDocument', { frameId: 'main-frame', url: 'https://chatgpt.com/c/recovered-2' }, 'session-new');
+  mock.emit('Page.frameNavigated', { frame: { id: 'main-frame', url: 'https://chatgpt.com/c/ignored' } }, 'session-old');
+
+  assert.deepEqual(urls, ['https://chatgpt.com/c/recovered', 'https://chatgpt.com/c/recovered-2']);
+});
+
+test('chrome-cdp-backend: non-session CDP errors do not reattach', async () => {
+  const error = new Error('Invalid request');
+  error.data = { code: -32600, message: error.message };
+  const mock = await createSessionWithRecoveryMock({ onEvaluate: async () => { throw error; } });
+
+  await assert.rejects(mock.session.page.evaluate('1 + 1'), (actual) => actual === error);
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 1);
+});
+
+test('chrome-cdp-backend: target loss during recovery fails without creating another target', async () => {
+  let attachCount = 1;
+  const mock = await createSessionWithRecoveryMock({
+    onEvaluate: async ({ sessionId }) => {
+      if (sessionId === 'session-old') throw staleSessionError();
+      return { result: { value: 'unreachable' } };
+    }
+  });
+  const originalSend = mock.backend.client.send;
+  mock.backend.client.send = async (method, params, sessionId) => {
+    if (method === 'Target.attachToTarget') {
+      attachCount += 1;
+      if (attachCount === 2) {
+        const error = new Error('No target with given id');
+        error.data = { code: -32000 };
+        throw error;
+      }
+    }
+    return await originalSend(method, params, sessionId);
+  };
+
+  await assert.rejects(mock.session.page.evaluate('1 + 1'), (error) => {
+    assert.equal(error.message, 'chrome_cdp_session_closed');
+    assert.equal(error.data.code, -32001);
+    assert.equal(error.data.recoveryCode, -32000);
+    return true;
+  });
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.createTarget').length, 1);
+});
+
+test('chrome-cdp-backend: a second stale response after retry is not recovered again', async () => {
+  const mock = await createSessionWithRecoveryMock({ onEvaluate: async () => { throw staleSessionError(); } });
+
+  await assert.rejects(mock.session.page.evaluate('1 + 1'), (error) => error.data?.code === -32001);
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 2);
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.sessionId), ['session-old', 'session-new']);
+});
+
+test('chrome-cdp-backend: detached preflight and a stale command still perform one recovery per command', async () => {
+  const mock = await createSessionWithRecoveryMock({ onEvaluate: async () => { throw staleSessionError(); } });
+  mock.emit('Target.detachedFromTarget', { targetId: 'recovery-target', sessionId: 'session-old' });
+
+  await assert.rejects(mock.session.page.evaluate('1 + 1'), (error) => error.data?.code === -32001);
+  assert.equal(mock.calls.filter((call) => call.method === 'Target.attachToTarget').length, 2);
+  assert.deepEqual(mock.calls.filter((call) => call.method === 'Runtime.evaluate').map((call) => call.sessionId), ['session-new']);
+});
+
 test('chrome-cdp-backend: Runtime.evaluate preserves normal values and undefined', async () => {
   const valueSession = await createSessionWithRuntimeResult({ result: { type: 'string', value: 'ok' } });
   assert.equal(await valueSession.session.page.evaluate('1 + 1'), 'ok');

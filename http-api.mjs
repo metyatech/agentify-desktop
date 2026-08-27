@@ -247,6 +247,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'key_vendor_mismatch') return { code: 409, body: { error: 'key_vendor_mismatch' } };
   if (msg === 'tab_not_found') return { code: 404, body: { error: 'tab_not_found' } };
   if (msg === 'tab_closed') return { code: 409, body: { error: 'tab_closed' } };
+  if (msg === 'chrome_cdp_session_closed') return { code: 409, body: { error: 'chrome_cdp_session_closed', data: error?.data || null } };
   if (msg === 'default_tab_protected') return { code: 409, body: { error: 'default_tab_protected' } };
   if (msg === 'max_tabs_reached') return { code: 409, body: { error: 'max_tabs_reached' } };
   if (msg === 'rate_limited') return { code: 429, body: { error: 'rate_limited', ...(error?.data || {}) } };

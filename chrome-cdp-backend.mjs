@@ -194,6 +194,12 @@ export function chromeSpawnOptions() {
 
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
 
+function isStaleSessionError(error) {
+  const code = Number(error?.data?.code);
+  const message = String(error?.message || error?.data?.message || '').trim();
+  return code === -32001 || message === 'Session with given id not found.';
+}
+
 async function readJson(url) {
   const response = await fetch(url, { headers: { accept: 'application/json' } });
   if (!response.ok) {
@@ -385,6 +391,9 @@ class ChromeCdpPageAdapter {
     this.closed = false;
     this.minimized = false;
     this.mainFrameId = null;
+    this.userAgent = null;
+    this.detachedSessionId = null;
+    this.reattachPromise = null;
   }
 
   markClosed() {
@@ -396,13 +405,20 @@ class ChromeCdpPageAdapter {
   }
 
   async initialize({ userAgent } = {}) {
-    await this.client.send('Page.enable', {}, this.sessionId);
-    await this.client.send('Runtime.enable', {}, this.sessionId);
-    await this.client.send('DOM.enable', {}, this.sessionId);
+    this.userAgent = userAgent ? String(userAgent) : null;
+    await this.#initializeSession(this.sessionId);
+  }
+
+  async #initializeSession(sessionId) {
+    await this.client.send('Page.enable', {}, sessionId);
+    await this.client.send('Runtime.enable', {}, sessionId);
+    await this.client.send('DOM.enable', {}, sessionId);
     try {
-      const tree = await this.client.send('Page.getFrameTree', {}, this.sessionId);
+      const tree = await this.client.send('Page.getFrameTree', {}, sessionId);
       this.mainFrameId = String(tree?.frameTree?.frame?.id || '').trim() || null;
-    } catch {}
+    } catch (error) {
+      if (isStaleSessionError(error)) throw error;
+    }
     await this.client.send(
       'Page.addScriptToEvaluateOnNewDocument',
       {
@@ -412,26 +428,101 @@ class ChromeCdpPageAdapter {
           } catch {}
         `
       },
-      this.sessionId
+      sessionId
     );
-    if (userAgent) {
-      await this.client.send('Network.setUserAgentOverride', { userAgent }, this.sessionId).catch(() => {});
+    if (this.userAgent) {
+      try {
+        await this.client.send('Network.setUserAgentOverride', { userAgent: this.userAgent }, sessionId);
+      } catch (error) {
+        if (isStaleSessionError(error)) throw error;
+      }
+    }
+  }
+
+  markSessionDetached(sessionId) {
+    const detached = String(sessionId || '').trim();
+    if (detached && detached === this.sessionId) this.detachedSessionId = detached;
+  }
+
+  async #recoverSession(staleSessionId) {
+    if (this.reattachPromise) return await this.reattachPromise;
+    if (this.closed) throw new Error('chrome_cdp_session_closed');
+    if (this.sessionId !== staleSessionId) return;
+
+    const recovery = (async () => {
+      if (this.closed) throw new Error('chrome_cdp_session_closed');
+      if (this.sessionId !== staleSessionId) return;
+      const attach = await this.client.send('Target.attachToTarget', { targetId: this.targetId, flatten: true });
+      const nextSessionId = String(attach?.sessionId || '').trim();
+      if (!nextSessionId) throw new Error('chrome_cdp_attach_failed');
+
+      this.sessionId = nextSessionId;
+      this.detachedSessionId = null;
+      await this.#initializeSession(nextSessionId);
+    })();
+    this.reattachPromise = recovery;
+    try {
+      await recovery;
+    } finally {
+      if (this.reattachPromise === recovery) this.reattachPromise = null;
+    }
+  }
+
+  async #sendSessionCommand(method, params = {}) {
+    let staleSessionId = this.sessionId;
+    let recoveryAttempted = false;
+    if (this.detachedSessionId === staleSessionId) {
+      try {
+        await this.#recoverSession(staleSessionId);
+        recoveryAttempted = true;
+      } catch (recoveryError) {
+        const closedError = new Error('chrome_cdp_session_closed', { cause: recoveryError });
+        closedError.data = {
+          recoveryMessage: String(recoveryError?.message || 'reattach_failed'),
+          recoveryCode: recoveryError?.data?.code ?? null
+        };
+        throw closedError;
+      }
+      staleSessionId = this.sessionId;
+    }
+    try {
+      return await this.client.send(method, params, staleSessionId);
+    } catch (error) {
+      if (!isStaleSessionError(error) || recoveryAttempted) throw error;
+      recoveryAttempted = true;
+      try {
+        await this.#recoverSession(staleSessionId);
+      } catch (recoveryError) {
+        const closedError = new Error('chrome_cdp_session_closed', { cause: error });
+        closedError.data = {
+          code: error?.data?.code ?? null,
+          originalMessage: String(error?.message || 'cdp_error'),
+          recoveryMessage: String(recoveryError?.message || 'reattach_failed'),
+          recoveryCode: recoveryError?.data?.code ?? null
+        };
+        throw closedError;
+      }
+      if (this.closed) {
+        const closedError = new Error('chrome_cdp_session_closed', { cause: error });
+        closedError.data = { code: error?.data?.code ?? null, originalMessage: String(error?.message || 'cdp_error') };
+        throw closedError;
+      }
+      return await this.client.send(method, params, this.sessionId);
     }
   }
 
   async navigate(url) {
-    await this.client.send('Page.navigate', { url }, this.sessionId);
+    await this.#sendSessionCommand('Page.navigate', { url });
   }
 
   async evaluate(js) {
-    const result = await this.client.send(
+    const result = await this.#sendSessionCommand(
       'Runtime.evaluate',
       {
         expression: String(js || ''),
         awaitPromise: true,
         returnByValue: true
-      },
-      this.sessionId
+      }
     );
     if (result?.exceptionDetails) throw browserEvaluationError(result.exceptionDetails);
     return result?.result?.value;
@@ -445,7 +536,7 @@ class ChromeCdpPageAdapter {
   async sendKey(key, { modifiers = [] } = {}) {
     const desc = keyDescriptor(key);
     const mask = modifierMask(modifiers);
-    await this.client.send(
+    await this.#sendSessionCommand(
       'Input.dispatchKeyEvent',
       {
         type: 'keyDown',
@@ -454,10 +545,9 @@ class ChromeCdpPageAdapter {
         code: desc.code,
         windowsVirtualKeyCode: desc.windowsVirtualKeyCode,
         nativeVirtualKeyCode: desc.nativeVirtualKeyCode
-      },
-      this.sessionId
+      }
     );
-    await this.client.send(
+    await this.#sendSessionCommand(
       'Input.dispatchKeyEvent',
       {
         type: 'keyUp',
@@ -466,25 +556,24 @@ class ChromeCdpPageAdapter {
         code: desc.code,
         windowsVirtualKeyCode: desc.windowsVirtualKeyCode,
         nativeVirtualKeyCode: desc.nativeVirtualKeyCode
-      },
-      this.sessionId
+      }
     );
   }
 
   async insertText(text) {
-    await this.client.send('Input.insertText', { text: String(text || '') }, this.sessionId);
+    await this.#sendSessionCommand('Input.insertText', { text: String(text || '') });
   }
 
   async moveMouse(x, y) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }, this.sessionId);
+    await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   }
 
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount }, this.sessionId);
+    await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount });
   }
 
   async mouseUp(x, y, { button = 'left', clickCount = 1 } = {}) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount }, this.sessionId);
+    await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount });
   }
 
   async setFileInputFiles(files, { selector = null } = {}) {
@@ -492,13 +581,13 @@ class ChromeCdpPageAdapter {
     if (targetSelector) {
       let found = 0;
       for (let attempt = 0; attempt < 10; attempt++) {
-        const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
-        const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: targetSelector }, this.sessionId);
+        const { root } = await this.#sendSessionCommand('DOM.getDocument', { depth: 12, pierce: true });
+        const q = await this.#sendSessionCommand('DOM.querySelectorAll', { nodeId: root.nodeId, selector: targetSelector });
         const nodeIds = Array.isArray(q?.nodeIds) ? q.nodeIds : [];
         found = nodeIds.length;
         if (found === 1) {
           const nodeId = nodeIds[0];
-          await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
+          await this.#sendSessionCommand('DOM.setFileInputFiles', { nodeId, files });
           return { selector: targetSelector, found, nodeId };
         }
         if (found > 1) {
@@ -516,8 +605,8 @@ class ChromeCdpPageAdapter {
 
     let lastNodeIds = [];
     for (let attempt = 0; attempt < 10; attempt++) {
-      const { root } = await this.client.send('DOM.getDocument', { depth: 12, pierce: true }, this.sessionId);
-      const q = await this.client.send('DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type="file"]' }, this.sessionId);
+      const { root } = await this.#sendSessionCommand('DOM.getDocument', { depth: 12, pierce: true });
+      const q = await this.#sendSessionCommand('DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type="file"]' });
       const nodeIds = Array.isArray(q?.nodeIds) ? q.nodeIds : [];
       lastNodeIds = nodeIds;
       if (!nodeIds.length) {
@@ -528,7 +617,7 @@ class ChromeCdpPageAdapter {
       let lastErr = null;
       for (const nodeId of [...nodeIds].reverse()) {
         try {
-          await this.client.send('DOM.setFileInputFiles', { nodeId, files }, this.sessionId);
+          await this.#sendSessionCommand('DOM.setFileInputFiles', { nodeId, files });
           lastErr = null;
           break;
         } catch (error) {
@@ -545,7 +634,7 @@ class ChromeCdpPageAdapter {
   }
 
   async bringToFront() {
-    await this.client.send('Page.bringToFront', {}, this.sessionId).catch(() => {});
+    await this.#sendSessionCommand('Page.bringToFront', {}).catch(() => {});
     if (this.windowId != null) {
       await this.client.send('Browser.setWindowBounds', { windowId: this.windowId, bounds: { windowState: 'normal' } }).catch(() => {});
       this.minimized = false;
@@ -770,10 +859,19 @@ export class ChromeCdpBrowserBackend {
 
       const removeListeners = [];
       const on = typeof this.client.on === 'function' ? this.client.on.bind(this.client) : null;
+      if (on) {
+        removeListeners.push(
+          on('Target.detachedFromTarget', ({ targetId: detachedTargetId, sessionId: detachedSessionId } = {}, eventSessionId) => {
+            const eventTargetId = String(detachedTargetId || '').trim();
+            const eventSession = String(detachedSessionId || eventSessionId || '').trim();
+            if (eventTargetId === targetId && eventSession === page.sessionId) page.markSessionDetached(eventSession);
+          })
+        );
+      }
       if (on && typeof onUrlChanged === 'function') {
         removeListeners.push(
           on('Page.frameNavigated', ({ frame } = {}, eventSessionId) => {
-            if (eventSessionId !== sessionId || !frame || frame.parentId) return;
+            if (eventSessionId !== page.sessionId || !frame || frame.parentId) return;
             page.mainFrameId = String(frame.id || '').trim() || page.mainFrameId;
             const nextUrl = String(frame.url || '').trim();
             if (nextUrl) onUrlChanged(nextUrl);
@@ -781,7 +879,7 @@ export class ChromeCdpBrowserBackend {
         );
         removeListeners.push(
           on('Page.navigatedWithinDocument', ({ frameId, url: nextUrl } = {}, eventSessionId) => {
-            if (eventSessionId !== sessionId || !page.mainFrameId || frameId !== page.mainFrameId) return;
+            if (eventSessionId !== page.sessionId || !page.mainFrameId || frameId !== page.mainFrameId) return;
             const value = String(nextUrl || '').trim();
             if (value) onUrlChanged(value);
           })

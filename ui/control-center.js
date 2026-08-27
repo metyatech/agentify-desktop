@@ -4,6 +4,7 @@ import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
 import { autopilotProposalViewModel } from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
+import { callControlCenterApi, safeControlCenterErrorCode } from './control-center-startup.mjs';
 
 function el(id) {
   const n = document.getElementById(id);
@@ -99,18 +100,7 @@ function hasApi(name) {
 }
 
 async function callApi(name, args, { fallback = null, required = false } = {}) {
-  const b = getBridge();
-  if (typeof b?.[name] !== 'function') {
-    if (required) throw new Error(`${name} is unavailable in this window. Restart Agentify Desktop after updating.`);
-    return fallback;
-  }
-  try {
-    if (typeof args === 'undefined') return await b[name]();
-    return await b[name](args);
-  } catch (e) {
-    if (required) throw e;
-    return fallback;
-  }
+  return callControlCenterApi(getBridge(), name, args, { fallback, required });
 }
 
 function defaultState() {
@@ -308,6 +298,20 @@ const autopilotWatchStatusScheduler = createAutopilotWatchStatusStaleScheduler({
   onStale: () => refresh().catch(() => {}),
 });
 
+function showStartupFailure(error) {
+  const code = safeControlCenterErrorCode(error);
+  const status = document.getElementById('statusLine');
+  if (status) {
+    status.textContent = `Control Center failed to initialize: ${code}`;
+    status.classList.add('isError');
+  }
+  const message = document.getElementById('messageLine');
+  if (message) {
+    message.textContent = '起動に失敗しました。Refreshで再試行してください。';
+    message.classList.add('isError');
+  }
+}
+
 function updateSaveEnabled() {
   el('btnSaveSettings').disabled = !settingsDirty || !el('setAcknowledge').checked;
 }
@@ -409,12 +413,13 @@ async function setAllTabsVisible(visible) {
   statusText(`${visible ? 'Showed' : 'Hid'} ${changed} managed tab${changed === 1 ? '' : 's'}.`);
 }
 
-async function refresh() {
+async function refresh({ initial = false } = {}) {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const state = (await callApi('getState', undefined, { fallback: lastState })) || lastState;
-    const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings() })) || defaultSettings();
-    const watchFoldersData = (await callApi('listWatchFolders', undefined, { fallback: { folders: [] } })) || { folders: [] };
+    const state = (await callApi('getState', undefined, { fallback: lastState, required: initial })) || lastState;
+    const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings(), required: initial })) || defaultSettings();
+    const watchFoldersData =
+      (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
     const watchedProposal = lastState.autopilotWatchStatus?.proposal;
     if (!autopilotProposal && watchedProposal && ['observed', 'approved', 'launch-prepared', 'launch-started', 'running'].includes(watchedProposal.state)) {
@@ -680,6 +685,7 @@ async function refresh() {
 
     if (!settingsDirty) applySettings(settings);
     renderAutopilotState();
+    if (initial) statusText('Control Center ready.');
   })().finally(() => {
     refreshInFlight = null;
   });
@@ -691,7 +697,7 @@ async function main() {
     statusText('Control Center starting (waiting for desktop bridge)…');
   }
 
-  el('btnRefresh').onclick = () => refresh().catch((e) => statusText(`Refresh failed: ${e?.message || String(e)}`));
+  el('btnRefresh').onclick = () => refresh({ initial: true }).catch(showStartupFailure);
   el('btnToggleTabs').onclick = () => setAllTabsVisible(tabsAreHidden).catch((e) => statusText(`${tabsAreHidden ? 'Show' : 'Hide'} all failed: ${e?.message || String(e)}`));
   el('btnOpenState').onclick = async () => {
     try {
@@ -917,10 +923,9 @@ async function main() {
     autopilotStatusScheduler.cancel();
     autopilotWatchStatusScheduler.cancel();
   }, { once: true });
-  await refresh();
+  await refresh({ initial: true });
 }
 
 main().catch((e) => {
-  const st = el('statusLine');
-  st.textContent = `Control Center error: ${e?.message || String(e)}`;
+  showStartupFailure(e);
 });

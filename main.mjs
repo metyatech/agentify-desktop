@@ -42,6 +42,38 @@ function argValue(name) {
   return process.argv[idx + 1] || null;
 }
 
+const CONTROL_CENTER_DIAGNOSTIC_LIMIT = 64 * 1024;
+
+function createControlCenterDiagnosticLogger(stateDir) {
+  const logFile = path.join(stateDir, 'control-center-diagnostics.log');
+  let writeInFlight = Promise.resolve();
+  return (code, details = {}) => {
+    const safeCode = String(code || 'CONTROL_CENTER_DIAGNOSTIC')
+      .toUpperCase()
+      .replace(/[^A-Z0-9_]/g, '_')
+      .slice(0, 64);
+    const safeDetails = {};
+    for (const key of ['errorCode', 'reason', 'level', 'isMainFrame']) {
+      if (typeof details[key] === 'boolean' || typeof details[key] === 'number') safeDetails[key] = details[key];
+      else if (typeof details[key] === 'string') safeDetails[key] = details[key].replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64);
+    }
+    const line = `${JSON.stringify({ at: new Date().toISOString(), code: safeCode, ...safeDetails })}\n`;
+    writeInFlight = writeInFlight
+      .then(async () => {
+        let previous = '';
+        try {
+          previous = await fs.readFile(logFile, 'utf8');
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+        await fs.mkdir(stateDir, { recursive: true });
+        await fs.writeFile(logFile, `${previous}${line}`.slice(-CONTROL_CENTER_DIAGNOSTIC_LIMIT), 'utf8');
+      })
+      .catch(() => {});
+    console.warn(`[control-center:${safeCode}]`);
+  };
+}
+
 function buildChromeUserAgent() {
   const platform =
     process.platform === 'darwin'
@@ -157,6 +189,7 @@ async function main() {
   let quitting = false;
   const orchestrators = new Map(); // key -> { child, pid, startedAt }
   const orchestratorHistory = new Map(); // key -> { pid, startedAt, exitedAt, exitCode, signal, logPath }
+  const logControlCenterDiagnostic = createControlCenterDiagnosticLogger(stateDir);
   showControlCenter = async () => {
     if (controlWin && !controlWin.isDestroyed()) {
       if (controlWin.isMinimized()) controlWin.restore();
@@ -177,6 +210,21 @@ async function main() {
       }
     });
     controlWin.setMenuBarVisibility(false);
+    controlWin.webContents.on('did-fail-load', (_event, errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+      if (isMainFrame) logControlCenterDiagnostic('DID_FAIL_LOAD', { errorCode, isMainFrame });
+    });
+    controlWin.webContents.on('render-process-gone', (_event, details) => {
+      logControlCenterDiagnostic('RENDER_PROCESS_GONE', { reason: details?.reason });
+    });
+    controlWin.webContents.on('console-message', (_event, level) => {
+      if (Number(level) >= 2) logControlCenterDiagnostic('RENDERER_CONSOLE_ERROR', { level });
+    });
+    controlWin.webContents.on('preload-error', (_event, _preloadPath, error) => {
+      logControlCenterDiagnostic('PRELOAD_ERROR', { errorCode: error?.code });
+    });
+    controlWin.webContents.on('dom-ready', () => {
+      logControlCenterDiagnostic('DOM_READY');
+    });
     controlWin.on('close', (e) => {
       if (quitting) return;
       try {
@@ -184,7 +232,12 @@ async function main() {
         controlWin.hide();
       } catch {}
     });
-    await controlWin.loadFile(path.join(__dirname, 'ui', 'control-center.html'));
+    try {
+      await controlWin.loadFile(path.join(__dirname, 'ui', 'control-center.html'));
+    } catch (error) {
+      logControlCenterDiagnostic('CONTROL_CENTER_LOAD_FAILED', { errorCode: error?.code });
+      throw error;
+    }
   };
 
   const emitTabsChanged = () => {
@@ -615,7 +668,9 @@ async function main() {
 
   // Launch control center only after IPC handlers are registered,
   // otherwise early renderer calls can race and fail with missing handlers.
-  await showControlCenter().catch(() => {});
+  await showControlCenter().catch((error) => {
+    logControlCenterDiagnostic('CONTROL_CENTER_SHOW_FAILED', { errorCode: error?.code });
+  });
   await controlCenterShowGate.markReady();
 
   let port = basePort;

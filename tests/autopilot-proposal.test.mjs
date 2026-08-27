@@ -538,3 +538,13 @@ test('control center refreshes backend watcher state at the stale boundary', asy
   assert.match(js, /onStale: \(\) => refresh\(\)\.catch\(\(\) => \{\}\)/u);
   assert.match(js, /taskStatus: lastState\.autopilotStatus/u);
 });
+
+test('control center startup keeps renderer imports Node-free and fails visibly', async () => {
+  const scheduler = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'autopilot-watch-status-scheduler.mjs'), 'utf8');
+  const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
+  assert.doesNotMatch(scheduler, /from ['"]\.\.\/autopilot-watch-status\.mjs['"]/u);
+  assert.match(js, /callControlCenterApi/u);
+  assert.match(js, /required: initial/u);
+  assert.match(js, /Control Center failed to initialize: \$\{code\}/u);
+  assert.match(js, /statusText\('Control Center ready\.'\)/u);
+});

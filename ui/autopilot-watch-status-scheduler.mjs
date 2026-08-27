@@ -1,4 +1,6 @@
-import { AUTOPILOT_WATCH_STATUS_STALE_AFTER_MS } from '../autopilot-watch-status.mjs';
+// Keep this renderer module free of Node-only imports. The authoritative store
+// owns the same protocol threshold; this UI scheduler only needs its value.
+const AUTOPILOT_WATCH_STATUS_STALE_AFTER_MS = 15_000;
 
 export function createAutopilotWatchStatusStaleScheduler({
   now = () => Date.now(),

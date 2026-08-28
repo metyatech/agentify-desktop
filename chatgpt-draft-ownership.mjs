@@ -70,13 +70,14 @@ function isCardAlias(sourceName, cardName) {
 }
 
 export function hasOnlyOwnedAttachmentCards(expectedAttachments, cardDisplayNames) {
-  const expectedNames = (Array.isArray(expectedAttachments) ? expectedAttachments : [])
-    .flatMap((item) => [item?.transportName, item?.logicalName])
-    .map((name) => path.basename(String(name || '')).trim())
-    .filter(Boolean);
+  const expected = (Array.isArray(expectedAttachments) ? expectedAttachments : []).map((item) => ({
+    aliases: [item?.transportName, item?.logicalName]
+      .map((name) => path.basename(String(name || '')).trim())
+      .filter(Boolean)
+  }));
   const used = new Set();
   for (const cardName of Array.isArray(cardDisplayNames) ? cardDisplayNames : []) {
-    const index = expectedNames.findIndex((name, candidateIndex) => !used.has(candidateIndex) && isCardAlias(name, cardName));
+    const index = expected.findIndex((item, candidateIndex) => !used.has(candidateIndex) && item.aliases.some((name) => isCardAlias(name, cardName)));
     if (index < 0) return false;
     used.add(index);
   }
@@ -92,7 +93,13 @@ export function canRecoverDraftLease({ lease, current, tabId, conversationDigest
   const updatedAt = Date.parse(lease.updatedAt || '');
   if (!Number.isFinite(updatedAt) || now - updatedAt > DRAFT_OWNERSHIP_TTL_MS) return false;
   if (!current || current.composerInputCount !== 1 || current.pageInputCount !== 1) return false;
-  if (current.promptDigest !== lease.promptDigest || current.promptLength !== lease.promptLength) return false;
+  if (lease.ownedPrompt === true) {
+    if (current.promptDigest !== lease.promptDigest || current.promptLength !== lease.promptLength) return false;
+  } else if (lease.ownedPrompt === false) {
+    if (current.promptLength !== 0) return false;
+  } else {
+    return false;
+  }
   if (!sameBaseline(lease.userTurnBaseline, current.userTurnBaseline)) return false;
   const expected = Array.isArray(lease.expectedAttachments) ? lease.expectedAttachments : [];
   const selected = Array.isArray(current.selectedFiles) ? current.selectedFiles : [];
@@ -177,6 +184,7 @@ export function createDraftLease({ operationId, tabId, conversationDigest, userT
     conversationDigest: String(conversationDigest || ''),
     userTurnBaseline: normalizedBaseline(userTurnBaseline),
     expectedAttachments: (Array.isArray(expectedAttachments) ? expectedAttachments : []).map(normalizedAttachment),
+    ownedPrompt: promptIsOwned,
     promptDigest: promptIsOwned ? String(ownedPromptDigest || '') : '',
     promptLength: promptIsOwned ? Math.max(0, Number(ownedPromptLength) || 0) : 0,
     phase: OWNERSHIP_PHASES.has(phase) ? phase : 'prepared',

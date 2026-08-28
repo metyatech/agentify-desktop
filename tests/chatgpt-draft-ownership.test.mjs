@@ -76,9 +76,20 @@ test('draft ownership: prepared lease never claims ownership of a matching-looki
 
 test('draft ownership: attachment-owned lease accepts empty prompt and normal file input value', () => {
   const attachmentLease = lease({ phase: 'attachments-owned', promptDigest: '', promptLength: 0, ownedPrompt: false });
-  const emptyPrompt = current({ promptDigest: '', promptLength: 0, inputValuePresent: true });
+  const emptyPrompt = current({ promptDigest: textDigest(''), promptLength: 0, inputValuePresent: true });
   assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: emptyPrompt, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), true);
-  assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: { ...emptyPrompt, promptDigest: textDigest('user typed') }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
+  assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: { ...emptyPrompt, promptDigest: textDigest('user typed'), promptLength: 10 }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
+});
+
+test('draft ownership: leases persist ownedPrompt and enforce prompt rules by ownership', () => {
+  const attachmentLease = createDraftLease({ ...lease({ phase: 'attachments-owned', ownedPrompt: false }), phase: 'attachments-owned', ownedPrompt: false });
+  const promptLease = createDraftLease({ ...lease({ phase: 'prompt-owned', ownedPrompt: true }), phase: 'prompt-owned', ownedPrompt: true });
+  assert.equal(attachmentLease.ownedPrompt, false);
+  assert.equal(promptLease.ownedPrompt, true);
+  assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: current({ promptDigest: textDigest(''), promptLength: 0 }), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), true);
+  assert.equal(canRecoverDraftLease({ lease: promptLease, current: current(), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), true);
+  assert.equal(canRecoverDraftLease({ lease: promptLease, current: current({ promptDigest: textDigest('changed') }), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
+  assert.equal(canRecoverDraftLease({ lease: promptLease, current: current({ promptLength: 12 }), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
 });
 
 test('draft ownership: same tab and conversation recover an owned partial card set', () => {
@@ -103,6 +114,35 @@ test('draft ownership: restart can reload the bounded lease', async () => {
     assert.equal(canRecoverDraftLease({ lease: loaded, current: current(), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), true);
     await afterRestart.clear();
     assert.equal(await afterRestart.read(), null);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('draft ownership: restart preserves attachment-only prompt ownership for actual empty preflight digest', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ownership-empty-prompt-'));
+  try {
+    const beforeRestart = new DraftOwnershipStore({ stateDir, tabId: 'tab-1' });
+    await beforeRestart.write(createDraftLease({
+      operationId: 'operation-empty-prompt',
+      tabId: 'tab-1',
+      conversationDigest: textDigest('conversation-1'),
+      userTurnBaseline: baseline,
+      expectedAttachments,
+      ownedPrompt: false,
+      phase: 'cleanup-required'
+    }));
+    const afterRestart = new DraftOwnershipStore({ stateDir, tabId: 'tab-1' });
+    const loaded = await afterRestart.read();
+    assert.equal(loaded.ownedPrompt, false);
+    assert.equal(loaded.promptDigest, '');
+    assert.equal(loaded.promptLength, 0);
+    assert.equal(canRecoverDraftLease({
+      lease: loaded,
+      current: current({ promptDigest: textDigest(''), promptLength: 0, inputValuePresent: true }),
+      tabId: 'tab-1',
+      conversationDigest: textDigest('conversation-1')
+    }), true);
   } finally {
     await fs.rm(stateDir, { recursive: true, force: true });
   }
@@ -151,4 +191,19 @@ test('draft ownership: production-like nine-file evidence is one exact owned set
   assert.equal(sameAttachmentIdentitySet(attachments, attachments.map((item) => ({ ...item }))), true);
   assert.equal(hasOnlyOwnedAttachmentCards(attachments, ['task-contract(20260828-053945).json', 'repository-state(20260828-053946).json']), true);
   assert.equal(hasOnlyOwnedAttachmentCards(attachments, ['task-contract.json', 'unrelated.json']), false);
+});
+
+test('draft ownership: card aliases are one-to-one per expected attachment', () => {
+  const one = [{ transportName: 'task-contract.json', logicalName: 'task-contract.json', size: 4, sha256: textDigest('one') }];
+  assert.equal(hasOnlyOwnedAttachmentCards(one, ['task-contract.json']), true);
+  assert.equal(hasOnlyOwnedAttachmentCards(one, ['task-contract(2).json']), true);
+  assert.equal(hasOnlyOwnedAttachmentCards(one, ['task-contract.json', 'task-contract(2).json']), false);
+  assert.equal(hasOnlyOwnedAttachmentCards(one, ['task-contract(2).json', 'task-contract(3).json']), false);
+
+  const staged = [
+    { transportName: 'task-contract.json', logicalName: 'task-contract.json', size: 4, sha256: textDigest('one') },
+    { transportName: 'task-contract(1).json', logicalName: 'task-contract.json', size: 5, sha256: textDigest('two') }
+  ];
+  assert.equal(hasOnlyOwnedAttachmentCards(staged, ['task-contract(2).json', 'task-contract(1).json']), true);
+  assert.equal(hasOnlyOwnedAttachmentCards(staged, ['task-contract(2).json', 'task-contract(3).json', 'task-contract(4).json']), false);
 });

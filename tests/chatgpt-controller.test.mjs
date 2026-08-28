@@ -13,7 +13,7 @@ import {
   isChatGPTCurrentDraftAttachmentCard,
   mapChatGPTAttachmentCardNames
 } from '../chatgpt-controller.mjs';
-import { describeAttachmentFiles, DraftOwnershipStore } from '../chatgpt-draft-ownership.mjs';
+import { createDraftLease, describeAttachmentFiles, DraftOwnershipStore, textDigest } from '../chatgpt-draft-ownership.mjs';
 import { classifyProposalResponse, parseValidateProposalResponse } from '../autopilot-proposal.mjs';
 
 const selectors = {
@@ -4194,7 +4194,7 @@ test('chatgpt-controller: production-like cleanup failure survives restart and r
     const staleState = {
       ...chatgptUploadInputState({ selectedFileNames: evidenceNames, cardDisplayNames: ['task-contract(2).json', 'repository-state(2).json', 'changed-files(2).json', 'binary-files(1).json', 'verification(2).json', 'execution-log(2).json', 'execution-summary(2).txt'], inputValue: 'C:\\fakepath\\task-contract.json' }),
       selectedFiles: expected,
-      promptDigest: '',
+      promptDigest: textDigest(''),
       promptLength: 0,
       inputValuePresent: true,
       pageInputCount: 1
@@ -4211,6 +4211,7 @@ test('chatgpt-controller: production-like cleanup failure survives restart and r
     );
     const stored = await new DraftOwnershipStore({ stateDir, tabId: 'restart-production-tab' }).read();
     assert.equal(stored.phase, 'cleanup-required');
+    assert.equal(stored.ownedPrompt, false);
     const events = [];
     let preflightCount = 0;
     const secondPage = createAttachmentCleanupPage({
@@ -4225,6 +4226,54 @@ test('chatgpt-controller: production-like cleanup failure survives restart and r
     assert.equal(preflightCount, 2);
     assert.equal(events.filter((event) => event === 'files-set:9').length, 1);
     assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'restart-production-tab' }).read(), null);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('chatgpt-controller: restart recovery blocks a duplicate owned-looking card without cleanup', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-duplicate-card-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-duplicate-files-'));
+  const files = ['task-contract.json', 'repository-state.json', 'repository-diff.txt', 'changed-files.json', 'binary-files.json', 'commits.txt', 'verification.json', 'execution-log.json', 'execution-summary.txt'].map((name) => path.join(root, name));
+  try {
+    await Promise.all(files.map((filePath, index) => fs.writeFile(filePath, index === 2 || index === 5 ? '' : path.basename(filePath), 'utf8')));
+    const expected = await describeAttachmentFiles(files);
+    const tabId = 'restart-duplicate-card-tab';
+    const ownership = new DraftOwnershipStore({ stateDir, tabId });
+    await ownership.write(createDraftLease({
+      operationId: 'old-duplicate-card-operation',
+      tabId,
+      conversationDigest: textDigest('https://chatgpt.com/'),
+      userTurnBaseline: { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') },
+      expectedAttachments: expected,
+      ownedPrompt: false,
+      phase: 'cleanup-required'
+    }));
+    const cardDisplayNames = ['task-contract(20260828-053945).json', 'task-contract(2).json', 'repository-state(20260828-053946).json', 'changed-files(20260828-053946).json', 'binary-files(1).json', 'verification(20260828-053946).json', 'execution-log(7).json', 'execution-summary(7).txt'];
+    const staleState = {
+      ...chatgptUploadInputState({ selectedFileNames: files.map((filePath) => path.basename(filePath)), cardDisplayNames, inputValue: 'C:\\fakepath\\task-contract.json' }),
+      selectedFiles: expected,
+      promptDigest: textDigest(''),
+      promptLength: 0,
+      inputValuePresent: true,
+      pageInputCount: 1
+    };
+    const events = [];
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: staleState,
+      attachmentState: attachmentCardSnapshot([]),
+      cleanupResult: { ok: true },
+      recordSendEvaluation: false
+    });
+    await assert.rejects(
+      createController(page, { stateDir, tabId }).query({ prompt: 'must block duplicate card', attachments: files, timeoutMs: 20 }),
+      (error) => error.message === 'chatgpt_file_input_state_conflict'
+    );
+    assert.equal(events.includes('cleanup-draft'), false);
+    assert.equal(events.some((event) => event.startsWith('files-set:')), false);
+    assert.deepEqual((await ownership.read()).phase, 'cleanup-required');
   } finally {
     await fs.rm(stateDir, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });

@@ -3682,10 +3682,22 @@ export class ChatGPTController {
           const sequence = lowerCard.slice(prefix.length, lowerCard.length - lowerExtension.length - 1);
           return /^[0-9]+(?:-[0-9]+)*$/u.test(sequence) && sequence.split('-').some((part) => (part.replace(/^0+/u, '') || '0') !== '0');
         };
-        const expectedCardNames = [...new Set([...expectedFileNames, ...logicalFileNames].map(safeName).filter(Boolean))];
-        const cardsAreOwned = fileCards.every((card) => expectedCardNames.some((expectedName) => cardAliasMatches(expectedName, card.getAttribute('aria-label') || '')));
         const identityEvidenceAvailable = expectedAttachmentIdentities.length > 0;
         const selectedIdentityMatches = identityEvidenceAvailable && sameIdentitySet(expectedAttachmentIdentities, selectedIdentities);
+        const cardsAreOwned = identityEvidenceAvailable
+          ? (() => {
+              const used = new Set();
+              for (const card of fileCards) {
+                const index = expectedAttachmentIdentities.findIndex((expected, expectedIndex) => {
+                  if (used.has(expectedIndex)) return false;
+                  return [expected.transportName, expected.logicalName].some((expectedName) => cardAliasMatches(expectedName, card.getAttribute('aria-label') || ''));
+                });
+                if (index < 0) return false;
+                used.add(index);
+              }
+              return true;
+            })()
+          : false;
         if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || pageUploadInputs[0] !== uploadInputs[0] || (!identityEvidenceAvailable && (!selectedMatches || !mappingResult.mappingComplete)) || (identityEvidenceAvailable && (!selectedIdentityMatches || !cardsAreOwned))) {
           return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
         }
@@ -4048,6 +4060,7 @@ export class ChatGPTController {
       expectedAttachmentIdentities: [],
       ownershipPhase: 'prepared',
       ownershipPersisted: false,
+      preflightConflict: false,
       signal
     };
     this.currentRun = run;
@@ -4062,6 +4075,7 @@ export class ChatGPTController {
       try {
         await this.#preflightChatGPTAttachmentDraft();
       } catch (error) {
+        run.preflightConflict = error?.message === 'chatgpt_file_input_state_conflict';
         if (error?.message !== 'chatgpt_file_input_state_conflict' || !(await this.#recoverOwnedDraftIfSafe(error))) throw error;
         await this.#preflightChatGPTAttachmentDraft();
       }
@@ -4138,7 +4152,7 @@ export class ChatGPTController {
       throw error;
     } finally {
       await uploadPlan?.cleanup?.().catch(() => {});
-      if (run.sendConfirmed || run.ownershipPhase === 'cleared' || (!run.attachmentOwnershipEstablished && !run.promptTyped)) await this.#clearDraftLease(run);
+      if (run.sendConfirmed || run.ownershipPhase === 'cleared' || (!run.attachmentOwnershipEstablished && !run.promptTyped && !run.preflightConflict)) await this.#clearDraftLease(run);
       this.#releaseProviderStopToken(run);
       detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;
@@ -4183,6 +4197,7 @@ export class ChatGPTController {
         expectedAttachmentIdentities: [],
         ownershipPhase: 'prepared',
         ownershipPersisted: false,
+        preflightConflict: false,
         signal
       };
       this.currentRun = run;
@@ -4196,6 +4211,7 @@ export class ChatGPTController {
         try {
           await this.#preflightChatGPTAttachmentDraft();
         } catch (error) {
+          run.preflightConflict = error?.message === 'chatgpt_file_input_state_conflict';
           if (error?.message !== 'chatgpt_file_input_state_conflict' || !(await this.#recoverOwnedDraftIfSafe(error))) throw error;
           await this.#preflightChatGPTAttachmentDraft();
         }

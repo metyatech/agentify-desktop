@@ -13,6 +13,7 @@ import {
   isChatGPTCurrentDraftAttachmentCard,
   mapChatGPTAttachmentCardNames
 } from '../chatgpt-controller.mjs';
+import { describeAttachmentFiles, DraftOwnershipStore } from '../chatgpt-draft-ownership.mjs';
 import { classifyProposalResponse, parseValidateProposalResponse } from '../autopilot-proposal.mjs';
 
 const selectors = {
@@ -3369,16 +3370,17 @@ function createCleanupDom({ events, promptText, uploadInputCount = 0, uploadInpu
   prompt.innerText = prompt._value;
   prompt.textContent = prompt._value;
   const uploadInputs = [];
+  const makeFile = (name) => ({ name, size: name.length, arrayBuffer: async () => new TextEncoder().encode(name).buffer });
   for (let index = 0; index < uploadInputCount; index += 1) {
     const input = composer.append(new FakeInputElement({ id: 'upload-files', type: 'file' }));
-    input.files = index === 0 ? selectedFileNames.map((name) => ({ name })) : [];
+    input.files = index === 0 ? selectedFileNames.map(makeFile) : [];
     if (index === 0) input._value = String(uploadInputValue || '');
     uploadInputs.push(input);
   }
   const pageUploadInputs = [];
   for (let index = 0; index < pageUploadInputCount; index += 1) {
     const input = body.append(new FakeInputElement({ id: 'upload-files', type: 'file' }));
-    input.files = index === 0 ? pageSelectedFileNames.map((name) => ({ name })) : [];
+    input.files = index === 0 ? pageSelectedFileNames.map(makeFile) : [];
     if (index === 0) input._value = String(pageUploadInputValue || '');
     pageUploadInputs.push(input);
   }
@@ -3760,7 +3762,10 @@ test('chatgpt-controller: attachment readiness failure cleanup enables the next 
     const dom = createCleanupDom({ events, promptText: '', uploadInputCount: 1 });
     let queryNumber = 0;
     const attachFilesToDom = (files) => {
-      dom.uploadInputs[0].files = files.map((file) => ({ name: path.basename(file) }));
+      dom.uploadInputs[0].files = files.map((file) => {
+        const name = path.basename(file);
+        return { name, size: name.length, arrayBuffer: async () => new TextEncoder().encode(name).buffer };
+      });
       for (const file of files) {
         dom.appendFileCard(path.basename(file));
       }
@@ -4131,6 +4136,99 @@ test('chatgpt-controller: attachment cleanup still removes owned input and cards
     assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
     assert.equal(events.includes('card-remove'), true);
   });
+});
+
+test('chatgpt-controller: production-like nine-file and seven-card residual cleanup is safe', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-like-'));
+  const evidenceNames = ['task-contract.json', 'repository-state.json', 'repository-diff.txt', 'changed-files.json', 'binary-files.json', 'commits.txt', 'verification.json', 'execution-log.json', 'execution-summary.txt'];
+  const cardNames = ['task-contract(20260828-053945).json', 'repository-state(20260828-053946).json', 'changed-files(20260828-053946).json', 'binary-files(1).json', 'verification(20260828-053946).json', 'execution-log(7).json', 'execution-summary(7).txt'];
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-evidence-'));
+  const files = evidenceNames.map((name) => path.join(root, name));
+  try {
+    await Promise.all(files.map((filePath, index) => fs.writeFile(filePath, index === 2 || index === 5 ? '' : path.basename(filePath), 'utf8')));
+    const expected = await describeAttachmentFiles(files);
+    const events = [];
+    const dom = createCleanupDom({ events, promptText: '', uploadInputCount: 1, userTurnTexts: [] });
+    const attachFilesToDom = async (pathsToAttach) => {
+      dom.uploadInputs[0].files = await Promise.all(pathsToAttach.map(async (filePath) => {
+        const bytes = await fs.readFile(filePath);
+        return { name: path.basename(filePath), size: bytes.length, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+      }));
+      for (const cardName of cardNames) dom.appendFileCard(cardName);
+    };
+    const fileStates = evidenceNames.map((name, index) => ({
+      fileName: name,
+      found: index < cardNames.length,
+      displayName: cardNames[index],
+      pending: index >= cardNames.length,
+      failed: false
+    }));
+    const { page } = createAttachmentCleanupPage({
+      events,
+      cleanupDom: dom,
+      attachmentState: () => attachmentCardSnapshot(fileStates, { conditionsReady: false, mappingComplete: false }),
+      onSetFileInputFiles: async (pathsToAttach) => { await attachFilesToDom(pathsToAttach); }
+    });
+    await assert.rejects(
+      createController(page, { stateDir, tabId: 'production-like-tab' }).query({ prompt: 'production-like residual', attachments: files, timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data?.cleanup?.status === 'cleared'
+    );
+    assert.deepEqual(dom.uploadInputs[0].files, []);
+    assert.equal(dom.composer.querySelectorAll('[role="group"][aria-label]').length, 0);
+    assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'production-like-tab' }).read(), null);
+    assert.equal(events.filter((event) => event === 'card-remove').length, 7);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('chatgpt-controller: production-like cleanup failure survives restart and recovers before the next query', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-restart-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-restart-files-'));
+  const evidenceNames = ['task-contract.json', 'repository-state.json', 'repository-diff.txt', 'changed-files.json', 'binary-files.json', 'commits.txt', 'verification.json', 'execution-log.json', 'execution-summary.txt'];
+  const files = evidenceNames.map((name) => path.join(root, name));
+  try {
+    await Promise.all(files.map((filePath, index) => fs.writeFile(filePath, index === 2 || index === 5 ? '' : path.basename(filePath), 'utf8')));
+    const expected = await describeAttachmentFiles(files);
+    const staleState = {
+      ...chatgptUploadInputState({ selectedFileNames: evidenceNames, cardDisplayNames: ['task-contract(2).json', 'repository-state(2).json', 'changed-files(2).json', 'binary-files(1).json', 'verification(2).json', 'execution-log(2).json', 'execution-summary(2).txt'], inputValue: 'C:\\fakepath\\task-contract.json' }),
+      selectedFiles: expected,
+      promptDigest: '',
+      promptLength: 0,
+      inputValuePresent: true,
+      pageInputCount: 1
+    };
+    const firstPage = createAttachmentCleanupPage({
+      events: [],
+      attachmentState: () => attachmentCardSnapshot(evidenceNames.map((fileName, index) => ({ fileName, found: index < 7, displayName: staleState.cardDisplayNames[index], pending: index >= 7, failed: false })), { conditionsReady: false, mappingComplete: false }),
+      cleanupResult: { ok: false, reason: 'cleanup_settle_timeout' },
+      onSetFileInputFiles: async () => {}
+    }).page;
+    await assert.rejects(
+      createController(firstPage, { stateDir, tabId: 'restart-production-tab' }).query({ prompt: 'first production attempt', attachments: files, timeoutMs: 20 }),
+      (error) => error.message === 'attachment_upload_timeout' && error.data?.cleanup?.status === 'failed'
+    );
+    const stored = await new DraftOwnershipStore({ stateDir, tabId: 'restart-production-tab' }).read();
+    assert.equal(stored.phase, 'cleanup-required');
+    const events = [];
+    let preflightCount = 0;
+    const secondPage = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: () => preflightCount++ === 0 ? staleState : { isChatGPT: true, hasAttachmentState: false },
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+      attachmentState: () => attachmentCardSnapshot(evidenceNames.map((fileName) => ({ fileName, found: true, pending: false, failed: false }))),
+      onBasicEvaluate: async (js) => js.includes('const node = nodes[0] || null') ? '' : undefined,
+      onSetFileInputFiles: async () => {}
+    }).page;
+    await createController(secondPage, { stateDir, tabId: 'restart-production-tab' }).query({ prompt: 'second production attempt', attachments: files, timeoutMs: 5_000 });
+    assert.equal(preflightCount, 2);
+    assert.equal(events.filter((event) => event === 'files-set:9').length, 1);
+    assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'restart-production-tab' }).read(), null);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('chatgpt-controller: duplicate-renamed attachment cleanup clears the owned unsent draft', async () => {

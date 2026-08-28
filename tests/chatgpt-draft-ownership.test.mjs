@@ -28,6 +28,9 @@ function lease(overrides = {}) {
     expectedAttachments,
     promptDigest: textDigest('review prompt'),
     promptLength: 13,
+    ownedPrompt: true,
+    ownedPromptDigest: textDigest('review prompt'),
+    ownedPromptLength: 13,
     phase: 'cleanup-required',
     updatedAt: new Date().toISOString(),
     ...overrides
@@ -61,6 +64,21 @@ test('draft ownership: exact bytes and metadata are required', () => {
   assert.equal(sameAttachmentIdentitySet(expectedAttachments, current().selectedFiles), true);
   assert.equal(sameAttachmentIdentitySet(expectedAttachments, [{ ...expectedAttachments[0], sha256: textDigest('different') }, expectedAttachments[1]]), false);
   assert.equal(canRecoverDraftLease({ lease: lease(), current: current({ selectedFiles: [{ ...expectedAttachments[0], size: 999 }, expectedAttachments[1]] }), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
+});
+
+test('draft ownership: browser preflight name shape normalizes to transport identity', () => {
+  assert.equal(sameAttachmentIdentitySet(expectedAttachments, expectedAttachments.map(({ transportName, size, sha256 }) => ({ name: transportName, size, sha256 }))), true);
+});
+
+test('draft ownership: prepared lease never claims ownership of a matching-looking draft', () => {
+  assert.equal(canRecoverDraftLease({ lease: lease({ phase: 'prepared', ownedPrompt: false }), current: current(), tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
+});
+
+test('draft ownership: attachment-owned lease accepts empty prompt and normal file input value', () => {
+  const attachmentLease = lease({ phase: 'attachments-owned', promptDigest: '', promptLength: 0, ownedPrompt: false });
+  const emptyPrompt = current({ promptDigest: '', promptLength: 0, inputValuePresent: true });
+  assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: emptyPrompt, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), true);
+  assert.equal(canRecoverDraftLease({ lease: attachmentLease, current: { ...emptyPrompt, promptDigest: textDigest('user typed') }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }), false);
 });
 
 test('draft ownership: same tab and conversation recover an owned partial card set', () => {

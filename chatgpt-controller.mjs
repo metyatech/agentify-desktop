@@ -354,6 +354,9 @@ export class ChatGPTController {
       expectedAttachments: run.expectedAttachmentIdentities,
       promptDigest: run.promptDigest,
       promptLength: run.promptLength,
+      ownedPrompt: run.promptTyped === true,
+      ownedPromptDigest: run.promptDigest,
+      ownedPromptLength: run.promptLength,
       phase,
       sendConfirmed: run.sendConfirmed,
       updatedAt: new Date().toISOString()
@@ -1708,9 +1711,9 @@ export class ChatGPTController {
       if (!node) return { ok: false, reason: 'prompt_not_found', promptTextLength: 0 };
       const text = node.matches('textarea, input') ? String(node.value || '') : String(node.innerText || node.textContent || '');
       const normalized = text.replace(/\\s+/g, ' ').trim();
-      return { ok: normalized === ${JSON.stringify(expectedPromptText)}, promptTextLength: normalized.length };
+      return { ok: normalized === ${JSON.stringify(expectedPromptText)}, promptTextLength: text.length, promptLength: text.length, promptText: text };
     })()`);
-    const typedPrompt = await readTypedPrompt();
+    let typedPrompt = await readTypedPrompt();
     if (!typedPrompt?.ok) {
       const cleared = await this.#eval(`(() => {
         const agentifyPromptTypeClear = true;
@@ -1758,9 +1761,11 @@ export class ChatGPTController {
         error.data = { phase: 'typing_prompt', reason: 'prompt_verification_mismatch', expectedPromptTextLength: expectedPromptText.length, actualPromptTextLength: Number(retried?.promptTextLength) || 0 };
         throw error;
       }
+      typedPrompt = retried;
     }
     this.#throwIfStopRequested();
-    return ok;
+    const verifiedPromptText = typeof typedPrompt?.promptText === 'string' ? typedPrompt.promptText : prompt;
+    return { ...ok, promptDigest: textDigest(verifiedPromptText), promptLength: Number(typedPrompt?.promptLength) || verifiedPromptText.length };
   }
 
   async #captureUserTurnBaseline() {
@@ -2682,12 +2687,16 @@ export class ChatGPTController {
           return '';
         }
       };
-      const selectedFiles = (await Promise.all(pageInputs.flatMap((input) => Array.from(input.files || []).map(async (file) => ({
-        name: String(file.name || '').trim(),
-        size: Number(file.size) || 0,
-        sha256: await digestFile(file)
-      }))))).filter((file) => file.name);
-      const selectedFileNames = selectedFiles.map((file) => file.name);
+      const selectedFiles = (await Promise.all(pageInputs.flatMap((input) => Array.from(input.files || []).map(async (file) => {
+        const name = String(file.name || '').trim();
+        return {
+          transportName: name,
+          logicalName: name,
+          size: Number(file.size) || 0,
+          sha256: await digestFile(file)
+        };
+      })))).filter((file) => file.transportName);
+      const selectedFileNames = selectedFiles.map((file) => file.transportName);
       const inputValuePresent = pageInputs.some((input) => String(input.value || '') !== '');
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
       const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
@@ -3657,7 +3666,27 @@ export class ChatGPTController {
           return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, inputCount: pageUploadInputs.length, inputValuePresent: inputValue !== '' };
         }
       } else {
-        if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || pageUploadInputs[0] !== uploadInputs[0] || !selectedMatches || !mappingResult.mappingComplete) {
+        const cardAliasMatches = (sourceName, cardName) => {
+          const source = safeName(sourceName);
+          const card = safeName(cardName);
+          if (!source || !card) return false;
+          if (normalize(source) === normalize(card)) return true;
+          const dot = source.lastIndexOf('.');
+          const stem = dot <= 0 ? source : source.slice(0, dot);
+          const extension = dot <= 0 ? '' : source.slice(dot);
+          const lowerCard = normalize(card);
+          const lowerStem = normalize(stem);
+          const lowerExtension = normalize(extension);
+          const prefix = lowerStem + '(';
+          if (!lowerCard.startsWith(prefix) || !lowerCard.endsWith(lowerExtension) || !lowerCard.slice(0, lowerCard.length - lowerExtension.length).endsWith(')')) return false;
+          const sequence = lowerCard.slice(prefix.length, lowerCard.length - lowerExtension.length - 1);
+          return /^[0-9]+(?:-[0-9]+)*$/u.test(sequence) && sequence.split('-').some((part) => (part.replace(/^0+/u, '') || '0') !== '0');
+        };
+        const expectedCardNames = [...new Set([...expectedFileNames, ...logicalFileNames].map(safeName).filter(Boolean))];
+        const cardsAreOwned = fileCards.every((card) => expectedCardNames.some((expectedName) => cardAliasMatches(expectedName, card.getAttribute('aria-label') || '')));
+        const identityEvidenceAvailable = expectedAttachmentIdentities.length > 0;
+        const selectedIdentityMatches = identityEvidenceAvailable && sameIdentitySet(expectedAttachmentIdentities, selectedIdentities);
+        if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || pageUploadInputs[0] !== uploadInputs[0] || (!identityEvidenceAvailable && (!selectedMatches || !mappingResult.mappingComplete)) || (identityEvidenceAvailable && (!selectedIdentityMatches || !cardsAreOwned))) {
           return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
         }
         for (const card of fileCards) {
@@ -4014,8 +4043,8 @@ export class ChatGPTController {
       attachmentOwnershipEstablished: false,
       userTurnBaseline: null,
       conversationDigest: null,
-      promptDigest: textDigest(prompt),
-      promptLength: prompt.length,
+      promptDigest: '',
+      promptLength: 0,
       expectedAttachmentIdentities: [],
       ownershipPhase: 'prepared',
       ownershipPersisted: false,
@@ -4065,6 +4094,8 @@ export class ChatGPTController {
       const typed = await this.#typePrompt(prompt);
       run.promptTyped = true;
       run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+      run.promptDigest = typed?.promptDigest || textDigest(prompt);
+      run.promptLength = Number(typed?.promptLength) || prompt.length;
       await this.#persistDraftLease(run, 'prompt-owned');
       this.#throwIfStopRequested();
       const baseline = await this.#captureChatGPTAssistantBaseline();
@@ -4147,8 +4178,8 @@ export class ChatGPTController {
         sendConfirmationTimedOut: false,
         userTurnBaseline: null,
         conversationDigest: null,
-        promptDigest: textDigest(prompt),
-        promptLength: prompt.length,
+        promptDigest: '',
+        promptLength: 0,
         expectedAttachmentIdentities: [],
         ownershipPhase: 'prepared',
         ownershipPersisted: false,
@@ -4175,6 +4206,8 @@ export class ChatGPTController {
         const typed = await this.#typePrompt(prompt);
         run.promptTyped = true;
         run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+        run.promptDigest = typed?.promptDigest || textDigest(prompt);
+        run.promptLength = Number(typed?.promptLength) || prompt.length;
         await this.#persistDraftLease(run, 'prompt-owned');
         this.#throwIfStopRequested();
         await this.#persistDraftLease(run, 'dispatch-started');

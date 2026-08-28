@@ -34,10 +34,11 @@ function normalizedBaseline(value) {
 
 function normalizedAttachment(value) {
   const attachment = value && typeof value === 'object' ? value : {};
+  const transportName = attachment.transportName || attachment.name;
   const sha256 = String(attachment.sha256 || '').toLowerCase();
   return {
-    transportName: path.basename(String(attachment.transportName || '')).slice(0, 256),
-    logicalName: path.basename(String(attachment.logicalName || attachment.transportName || '')).slice(0, 256),
+    transportName: path.basename(String(transportName || '')).slice(0, 256),
+    logicalName: path.basename(String(attachment.logicalName || transportName || '')).slice(0, 256),
     size: Number.isSafeInteger(Number(attachment.size)) && Number(attachment.size) >= 0 ? Number(attachment.size) : -1,
     sha256: /^[0-9a-f]{64}$/u.test(sha256) ? sha256 : ''
   };
@@ -87,10 +88,10 @@ export function canRecoverDraftLease({ lease, current, tabId, conversationDigest
   if (!tabId || lease.tabId !== tabId || !conversationDigest || lease.conversationDigest !== conversationDigest) return false;
   if (!lease.operationId || lease.operationId === activeOperationId) return false;
   if (lease.sendConfirmed === true || ['dispatch-started', 'send-confirmed', 'cleared'].includes(lease.phase)) return false;
-  if (!OWNERSHIP_PHASES.has(lease.phase) || !['prepared', 'attachments-owned', 'prompt-owned', 'cleanup-required'].includes(lease.phase)) return false;
+  if (!OWNERSHIP_PHASES.has(lease.phase) || !['attachments-owned', 'prompt-owned', 'cleanup-required'].includes(lease.phase)) return false;
   const updatedAt = Date.parse(lease.updatedAt || '');
   if (!Number.isFinite(updatedAt) || now - updatedAt > DRAFT_OWNERSHIP_TTL_MS) return false;
-  if (!current || current.inputValuePresent === true || current.composerInputCount !== 1 || current.pageInputCount !== 1) return false;
+  if (!current || current.composerInputCount !== 1 || current.pageInputCount !== 1) return false;
   if (current.promptDigest !== lease.promptDigest || current.promptLength !== lease.promptLength) return false;
   if (!sameBaseline(lease.userTurnBaseline, current.userTurnBaseline)) return false;
   const expected = Array.isArray(lease.expectedAttachments) ? lease.expectedAttachments : [];
@@ -98,7 +99,7 @@ export function canRecoverDraftLease({ lease, current, tabId, conversationDigest
   if (expected.length > 0) {
     if (!sameAttachmentIdentitySet(expected, selected)) return false;
     if (!hasOnlyOwnedAttachmentCards(expected, current.cardDisplayNames)) return false;
-  } else if (selected.length > 0 || (current.cardDisplayNames || []).length > 0) {
+  } else if (selected.length > 0 || (current.cardDisplayNames || []).length > 0 || current.inputValuePresent === true) {
     return false;
   }
   return true;
@@ -167,7 +168,8 @@ export class DraftOwnershipStore {
   }
 }
 
-export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest, promptLength, phase = 'prepared', sendConfirmed = false, updatedAt = new Date().toISOString() }) {
+export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest = '', promptLength = 0, ownedPrompt = false, ownedPromptDigest = promptDigest, ownedPromptLength = promptLength, phase = 'prepared', sendConfirmed = false, updatedAt = new Date().toISOString() }) {
+  const promptIsOwned = ownedPrompt === true && phase !== 'prepared' && phase !== 'attachments-owned';
   return {
     schemaVersion: DRAFT_OWNERSHIP_SCHEMA_VERSION,
     operationId: String(operationId || ''),
@@ -175,8 +177,8 @@ export function createDraftLease({ operationId, tabId, conversationDigest, userT
     conversationDigest: String(conversationDigest || ''),
     userTurnBaseline: normalizedBaseline(userTurnBaseline),
     expectedAttachments: (Array.isArray(expectedAttachments) ? expectedAttachments : []).map(normalizedAttachment),
-    promptDigest: String(promptDigest || ''),
-    promptLength: Math.max(0, Number(promptLength) || 0),
+    promptDigest: promptIsOwned ? String(ownedPromptDigest || '') : '',
+    promptLength: promptIsOwned ? Math.max(0, Number(ownedPromptLength) || 0) : 0,
     phase: OWNERSHIP_PHASES.has(phase) ? phase : 'prepared',
     sendConfirmed: sendConfirmed === true,
     updatedAt: new Date(updatedAt).toISOString()

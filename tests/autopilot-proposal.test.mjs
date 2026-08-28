@@ -531,6 +531,8 @@ test('control center exposes the production action', async () => {
   assert.match(js, /clarification_response_received/u);
   assert.match(js, /確認事項あり/u);
   assert.match(js, /ChatGPTの質問に回答してから、再度「この内容を実行」してください/u);
+  assert.match(html, /<script type="module" src="\.\/control-center-bootstrap\.js"><\/script>/u);
+  assert.doesNotMatch(html, /<script type="module" src="\.\/control-center\.js"><\/script>/u);
 });
 
 test('control center refreshes backend watcher state at the stale boundary', async () => {

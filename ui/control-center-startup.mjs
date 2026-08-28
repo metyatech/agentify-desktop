@@ -1,5 +1,4 @@
 export const CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS = 15_000;
-export const CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS = 11 * 60 * 1000;
 
 export async function callControlCenterApi(
   bridge,

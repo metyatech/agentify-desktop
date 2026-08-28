@@ -548,7 +548,17 @@ test('control center startup keeps renderer imports Node-free and fails visibly'
   assert.match(js, /callControlCenterApi/u);
   assert.match(js, /required: initial/u);
   assert.match(js, /CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS/u);
-  assert.match(js, /timeoutMs: CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS/u);
+  assert.doesNotMatch(js, /CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS/u);
+  assert.match(js, /requestAutopilotProposal', undefined, \{\s*required: true,\s*\}/u);
   assert.match(js, /Control Center failed to initialize: \$\{code\}/u);
   assert.match(js, /statusText\('Control Center ready\.'\)/u);
+});
+
+test('control center keeps proposal errors visible and suppresses duplicate requests while pending', async () => {
+  const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
+  assert.match(js, /if \(autopilotRequestInFlight \|\| el\('btnAutopilotProposal'\)\.disabled\) return;/u);
+  assert.match(js, /autopilotRequestInFlight = true;/u);
+  assert.match(js, /autopilotErrorMessage = e\?\.message \|\| String\(e\);/u);
+  assert.match(js, /statusText\(`Autopilot proposal failed:/u);
+  assert.match(js, /autopilotRequestInFlight = false;/u);
 });

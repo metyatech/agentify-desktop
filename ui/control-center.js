@@ -7,7 +7,6 @@ import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-stat
 import {
   callControlCenterApi,
   safeControlCenterErrorCode,
-  CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS,
   CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS,
 } from './control-center-startup.mjs';
 
@@ -795,7 +794,6 @@ async function main() {
     try {
       const result = await callApi('requestAutopilotProposal', undefined, {
         required: true,
-        timeoutMs: CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS,
       });
       autopilotErrorMessage = null;
       if (result?.status === 'clarification_response_received') {

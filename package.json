@@ -22,6 +22,7 @@
     "browser-backend.mjs",
     "bundle-store.mjs",
     "chatgpt-controller.mjs",
+    "chatgpt-draft-ownership.mjs",
     "chrome-cdp-backend.mjs",
     "config.mjs",
     "context-packer.mjs",

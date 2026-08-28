@@ -3907,6 +3907,25 @@ test('chatgpt-controller: explicit attachment failure clears the unsent draft', 
   });
 });
 
+test('chatgpt-controller: establishes attachment ownership immediately after file input mutation', async () => {
+  await withTempAttachments(['mutation-then-failure.txt'], async ([attachment]) => {
+    const events = [];
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentState: attachmentCardSnapshot([{ fileName: 'mutation-then-failure.txt', found: true, pending: true, failed: false }], { conditionsReady: false }),
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+      onSetFileInputFiles: async () => { await fs.unlink(attachment); }
+    });
+
+    await assert.rejects(
+      createController(page).query({ prompt: 'cleanup after mutation failure', attachments: [attachment], timeoutMs: 20 }),
+      (error) => error.code === 'ENOENT' && error.data?.cleanup?.status === 'cleared'
+    );
+    assert.deepEqual(events.filter((event) => event === 'files-set:1'), ['files-set:1']);
+    assert.deepEqual(events.filter((event) => event === 'cleanup-draft'), ['cleanup-draft']);
+  });
+});
+
 test('chatgpt-controller: cleanup failure preserves the original error code and diagnostic', async () => {
   await withTempAttachments(['cleanup-failure.txt'], async ([attachment]) => {
     const { page } = createAttachmentCleanupPage({

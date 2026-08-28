@@ -285,6 +285,7 @@ async function main() {
         page,
         selectors,
         stateDir,
+        tabId,
         onBlocked: async (st) => {
           await tabs.needsAttention(tabId, st);
         },

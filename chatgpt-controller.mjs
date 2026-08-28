@@ -3,6 +3,14 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+import {
+  canRecoverDraftLease,
+  createDraftLease,
+  describeAttachmentFiles,
+  DraftOwnershipStore,
+  textDigest
+} from './chatgpt-draft-ownership.mjs';
+
 export const MAX_CONVERSATION_TURNS = 200;
 export const MAX_CONVERSATION_TURN_CHARS = 200_000;
 export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
@@ -284,12 +292,14 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, sendConfirmationTimeoutMs = MAX_SEND_CONFIRMATION_TIMEOUT_MS, responseClock = null, responseSleep = null }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, tabId = null, sendConfirmationTimeoutMs = MAX_SEND_CONFIRMATION_TIMEOUT_MS, responseClock = null, responseSleep = null }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
     this.onUnblocked = onUnblocked;
     this.stateDir = stateDir;
+    this.tabId = String(tabId || '').trim();
+    this.draftOwnership = new DraftOwnershipStore({ stateDir, tabId: this.tabId });
     this.mutex = new Mutex();
     this.blocked = false;
     this.blockedKind = null;
@@ -316,6 +326,85 @@ export class ChatGPTController {
 
   async #eval(js) {
     return await this.page.evaluate(js);
+  }
+
+  async #conversationDigest() {
+    let url = '';
+    try { url = await this.page.getUrl(); } catch {}
+    return textDigest(url || '');
+  }
+
+  async #readCurrentComposerPrompt() {
+    const result = await this.#eval(`(() => {
+      const editable = (node) => node && (node.matches('textarea, input') || node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox');
+      const nodes = Array.from(document.querySelectorAll(${JSON.stringify(this.selectors.promptTextarea)})).filter(editable);
+      const node = nodes[0] || null;
+      return node?.matches('textarea, input') ? String(node.value || '') : String(node?.innerText || node?.textContent || '');
+    })()`);
+    return typeof result === 'string' ? result : '';
+  }
+
+  async #persistDraftLease(run, phase = run?.ownershipPhase || 'prepared') {
+    if (!run || !this.draftOwnership.enabled) return;
+    const lease = createDraftLease({
+      operationId: run.operationId,
+      tabId: this.tabId,
+      conversationDigest: run.conversationDigest,
+      userTurnBaseline: run.userTurnBaseline,
+      expectedAttachments: run.expectedAttachmentIdentities,
+      promptDigest: run.promptDigest,
+      promptLength: run.promptLength,
+      phase,
+      sendConfirmed: run.sendConfirmed,
+      updatedAt: new Date().toISOString()
+    });
+    run.ownershipPhase = lease.phase;
+    try {
+      await this.draftOwnership.write(lease);
+      run.ownershipPersisted = true;
+    } catch (error) {
+      run.ownershipPersistenceError = String(error?.message || error).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH);
+    }
+  }
+
+  async #clearDraftLease(run) {
+    if (!run || !this.draftOwnership.enabled) return;
+    try { await this.draftOwnership.clear(); } catch (error) {
+      run.ownershipClearError = String(error?.message || error).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH);
+    }
+  }
+
+  async #recoverOwnedDraftIfSafe(conflictError) {
+    if (!this.draftOwnership.enabled) return false;
+    const lease = await this.draftOwnership.read();
+    if (!lease) return false;
+    const state = conflictError?.data || {};
+    const current = {
+      ...state,
+      userTurnBaseline: await this.#captureUserTurnBaseline(),
+      promptDigest: String(state.promptDigest || ''),
+      promptLength: Number(state.promptLength) || 0,
+      selectedFiles: Array.isArray(state.selectedFiles) ? state.selectedFiles : [],
+      cardDisplayNames: Array.isArray(state.cardDisplayNames) ? state.cardDisplayNames : []
+    };
+    const safe = canRecoverDraftLease({
+      lease,
+      current,
+      tabId: this.tabId,
+      conversationDigest: await this.#conversationDigest(),
+      activeOperationId: this.currentRun?.operationId || null
+    });
+    if (!safe) return false;
+    const cleanup = await this.cleanupUnsentDraft({
+      prompt: await this.#readCurrentComposerPrompt(),
+      expectedFileNames: lease.expectedAttachments.map((item) => item.transportName),
+      logicalFileNames: lease.expectedAttachments.map((item) => item.logicalName),
+      expectedAttachmentIdentities: lease.expectedAttachments,
+      userTurnBaseline: current.userTurnBaseline
+    });
+    if (cleanup.status !== 'cleared') return false;
+    await this.draftOwnership.clear();
+    return true;
   }
 
   #newProviderStopToken() {
@@ -2536,7 +2625,7 @@ export class ChatGPTController {
   }
 
   async #preflightChatGPTAttachmentDraft() {
-    const state = await this.#eval(`(() => {
+    const state = await this.#eval(`(async () => {
       const agentifyAttachmentDraftPreflight = true;
       const host = location.hostname || '';
       const isChatGPT = host === 'chatgpt.com' || host.endsWith('.chatgpt.com');
@@ -2578,7 +2667,27 @@ export class ChatGPTController {
       }
       const composerInputs = activeComposer ? Array.from(activeComposer.querySelectorAll('input#upload-files[type="file"]')) : [];
       const pageInputs = Array.from(document.querySelectorAll('input#upload-files[type="file"]'));
-      const selectedFileNames = pageInputs.flatMap((input) => Array.from(input.files || []).map((file) => String(file.name || '').trim()).filter(Boolean));
+      const promptText = prompt?.matches('textarea, input') ? String(prompt.value || '') : String(prompt?.innerText || prompt?.textContent || '');
+      const digestText = async (value) => {
+        const bytes = new TextEncoder().encode(String(value || ''));
+        const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      };
+      const digestFile = async (file) => {
+        try {
+          const bytes = await file.arrayBuffer();
+          const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+          return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+        } catch {
+          return '';
+        }
+      };
+      const selectedFiles = (await Promise.all(pageInputs.flatMap((input) => Array.from(input.files || []).map(async (file) => ({
+        name: String(file.name || '').trim(),
+        size: Number(file.size) || 0,
+        sha256: await digestFile(file)
+      }))))).filter((file) => file.name);
+      const selectedFileNames = selectedFiles.map((file) => file.name);
       const inputValuePresent = pageInputs.some((input) => String(input.value || '') !== '');
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove/i.test(String(button.getAttribute('aria-label') || '')));
       const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
@@ -2589,7 +2698,11 @@ export class ChatGPTController {
       return {
         isChatGPT: true,
         hasAttachmentState: selectedFileNames.length > 0 || inputValuePresent || currentDraftCards.length > 0,
+        promptText,
+        promptLength: promptText.length,
+        promptDigest: await digestText(promptText),
         selectedFileNames,
+        selectedFiles,
         cardDisplayNames,
         currentDraftCardCount: currentDraftCards.length,
         composerInputCount: composerInputs.length,
@@ -2607,14 +2720,17 @@ export class ChatGPTController {
         currentDraftCardCount: Number(state.currentDraftCardCount) || 0,
         composerInputCount: Number(state.composerInputCount) || 0,
         pageInputCount: Number(state.pageInputCount) || 0,
-        inputValuePresent: state.inputValuePresent === true
+        inputValuePresent: state.inputValuePresent === true,
+        promptLength: Number(state.promptLength) || 0,
+        promptDigest: /^[0-9a-f]{64}$/u.test(String(state.promptDigest || '')) ? state.promptDigest : '',
+        selectedFiles: Array.isArray(state.selectedFiles) ? state.selectedFiles : []
       };
       throw err;
     }
     return state;
   }
 
-  async #attachFiles(files) {
+  async #attachFiles(files, { onMutation } = {}) {
     if (!files?.length) return;
     await this.#emitProgress({ phase: 'uploading_files' });
     const absFiles = files.map((p) => path.resolve(p));
@@ -2799,6 +2915,7 @@ export class ChatGPTController {
 
     if (opened?.isChatGPT && opened?.inputReady && !opened?.opened) {
       await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
+      await onMutation?.(uploadPlan);
       return uploadPlan;
     }
 
@@ -2817,8 +2934,10 @@ export class ChatGPTController {
     if (opened?.isChatGPT) {
       await this.#waitForChatGPTFileInputOrMenu();
       await this.page.setFileInputFiles(uploadPlan.files, { selector: '#upload-files' });
+      await onMutation?.(uploadPlan);
     } else {
       await this.page.setFileInputFiles(uploadPlan.files);
+      await onMutation?.(uploadPlan);
     }
     return uploadPlan;
     } catch (error) {
@@ -3400,7 +3519,7 @@ export class ChatGPTController {
     };
   }
 
-  async #cleanupUnsentDraft({ prompt, expectedFileNames = [], logicalFileNames = expectedFileNames, userTurnBaseline = null } = {}) {
+  async cleanupUnsentDraft({ prompt, expectedFileNames = [], logicalFileNames = expectedFileNames, expectedAttachmentIdentities = [], userTurnBaseline = null } = {}) {
     if (!userTurnBaseline || !Number.isFinite(Number(userTurnBaseline.count))) {
       return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
     }
@@ -3411,6 +3530,7 @@ export class ChatGPTController {
     const promptJson = JSON.stringify(String(prompt || '').slice(0, 200_000));
     const expectedFileNamesJson = JSON.stringify(boundedAttachmentNameList(expectedFileNames));
     const logicalFileNamesJson = JSON.stringify(boundedAttachmentNameList(logicalFileNames));
+    const expectedAttachmentIdentitiesJson = JSON.stringify(expectedAttachmentIdentities);
     const baselineJson = JSON.stringify({
       count: normalizedUserTurnBaseline.count,
       lastId: normalizedUserTurnBaseline.lastId,
@@ -3421,6 +3541,7 @@ export class ChatGPTController {
       const expectedPrompt = ${promptJson};
       const expectedFileNames = ${expectedFileNamesJson};
       const logicalFileNames = ${logicalFileNamesJson};
+      const expectedAttachmentIdentities = ${expectedAttachmentIdentitiesJson};
       const baseline = ${baselineJson};
       const safeName = (value) => String(value || '').trim().replace(/^.*[\\\\/]/u, '').slice(0, 256);
       const names = (values) => (Array.isArray(values) ? values : []).map(safeName).filter(Boolean).slice(0, 50);
@@ -3497,7 +3618,30 @@ export class ChatGPTController {
       );
       if (!ownershipKnown) return { ok: false, reason: 'attachment_ownership_unknown', composerInputCount: uploadInputs.length, pageInputCount: pageUploadInputs.length };
       const uploadInput = resolvedInput;
-      const selectedFileNames = names(Array.from(uploadInput?.files || []).map((file) => file.name));
+      const selectedFiles = Array.from(uploadInput?.files || []);
+      const selectedFileNames = names(selectedFiles.map((file) => file.name));
+      const digestFile = async (file) => {
+        try {
+          const bytes = await file.arrayBuffer();
+          const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+          return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+        } catch { return ''; }
+      };
+      const selectedIdentities = await Promise.all(selectedFiles.map(async (file) => ({
+        transportName: safeName(file.name),
+        logicalName: safeName(file.name),
+        size: Number(file.size) || 0,
+        sha256: await digestFile(file)
+      })));
+      const identityKey = (item) => normalize(item?.transportName) + '\\u0000' + Number(item?.size) + '\\u0000' + String(item?.sha256 || '').toLowerCase();
+      const sameIdentitySet = (left, right) => {
+        const a = (Array.isArray(left) ? left : []).map(identityKey).sort();
+        const b = (Array.isArray(right) ? right : []).map(identityKey).sort();
+        return a.length > 0 && a.length === b.length && a.every((item, index) => item === b[index]);
+      };
+      if (expectedAttachmentIdentities.length > 0 && !sameIdentitySet(expectedAttachmentIdentities, selectedIdentities)) {
+        return { ok: false, reason: 'attachment_identity_mismatch', selectedFileNames, cardDisplayNames: [] };
+      }
       const inputValue = String(uploadInput?.value || '');
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')));
       const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
@@ -3845,7 +3989,7 @@ export class ChatGPTController {
     const expectedFileNames = (Array.isArray(attachments) ? attachments : []).map((file) => boundedAttachmentName(path.basename(String(file || '')))).filter(Boolean);
     const run = {
       kind: 'query',
-      operationId: operationId ? String(operationId) : null,
+      operationId: operationId ? String(operationId) : crypto.randomUUID(),
       providerStopGeneration: this.providerStopGeneration,
       providerStopSequence: 0,
       providerStopEpoch: 0,
@@ -3869,6 +4013,12 @@ export class ChatGPTController {
       sendConfirmationTimedOut: false,
       attachmentOwnershipEstablished: false,
       userTurnBaseline: null,
+      conversationDigest: null,
+      promptDigest: textDigest(prompt),
+      promptLength: prompt.length,
+      expectedAttachmentIdentities: [],
+      ownershipPhase: 'prepared',
+      ownershipPersisted: false,
       signal
     };
     this.currentRun = run;
@@ -3880,11 +4030,29 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       await this.#activateProviderStopToken(run, signal);
       this.#throwIfStopRequested();
-      await this.#preflightChatGPTAttachmentDraft();
+      try {
+        await this.#preflightChatGPTAttachmentDraft();
+      } catch (error) {
+        if (error?.message !== 'chatgpt_file_input_state_conflict' || !(await this.#recoverOwnedDraftIfSafe(error))) throw error;
+        await this.#preflightChatGPTAttachmentDraft();
+      }
       this.#throwIfStopRequested();
+      run.conversationDigest = await this.#conversationDigest();
+      run.userTurnBaseline = await this.#captureUserTurnBaseline();
+      run.expectedAttachmentIdentities = attachments?.length
+        ? await describeAttachmentFiles(attachments.map((file) => path.resolve(file)))
+        : [];
+      await this.#persistDraftLease(run, 'prepared');
       if (attachments?.length) {
-        run.userTurnBaseline = await this.#captureUserTurnBaseline();
-        uploadPlan = await this.#attachFiles(attachments);
+        uploadPlan = await this.#attachFiles(attachments, {
+          onMutation: async (plan) => {
+            run.attachmentOwnershipEstablished = true;
+            run.expectedFileNames = plan.expectedFileNames;
+            run.logicalExpectedFileNames = plan.logicalFileNames;
+            run.expectedAttachmentIdentities = await describeAttachmentFiles(plan.files, plan.logicalFileNames);
+            await this.#persistDraftLease(run, 'attachments-owned');
+          }
+        });
         run.attachmentOwnershipEstablished = true;
         run.expectedFileNames = uploadPlan.expectedFileNames;
         run.logicalExpectedFileNames = uploadPlan.logicalFileNames;
@@ -3897,22 +4065,29 @@ export class ChatGPTController {
       const typed = await this.#typePrompt(prompt);
       run.promptTyped = true;
       run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+      await this.#persistDraftLease(run, 'prompt-owned');
       this.#throwIfStopRequested();
       const baseline = await this.#captureChatGPTAssistantBaseline();
+      await this.#persistDraftLease(run, 'dispatch-started');
       await this.#clickSend({ timeoutMs });
+      if (run.sendConfirmed) await this.#persistDraftLease(run, 'send-confirmed');
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
     } catch (error) {
       if (this.#canCleanupUnsentDraft(run) && (!attachments?.length || run.attachmentOwnershipEstablished)) {
         try {
+          const cleanup = await this.cleanupUnsentDraft({
+            prompt: run.promptTyped ? prompt : '',
+            expectedFileNames: run.expectedFileNames,
+            logicalFileNames: run.logicalExpectedFileNames,
+            expectedAttachmentIdentities: this.draftOwnership.enabled ? run.expectedAttachmentIdentities : [],
+            userTurnBaseline: run.userTurnBaseline
+          });
           error.data = {
             ...(error?.data && typeof error.data === 'object' ? error.data : {}),
-            cleanup: await this.#cleanupUnsentDraft({
-              prompt: run.promptTyped ? prompt : '',
-              expectedFileNames: run.expectedFileNames,
-              logicalFileNames: run.logicalExpectedFileNames,
-              userTurnBaseline: run.userTurnBaseline
-            })
+            cleanup
           };
+          if (cleanup.status === 'cleared') await this.#clearDraftLease(run);
+          else await this.#persistDraftLease(run, 'cleanup-required');
         } catch (cleanupError) {
           error.data = {
             ...(error?.data && typeof error.data === 'object' ? error.data : {}),
@@ -3922,11 +4097,17 @@ export class ChatGPTController {
               diagnostic: cleanupError?.data && typeof cleanupError.data === 'object' ? cleanupError.data : null
             }
           };
+          await this.#persistDraftLease(run, 'cleanup-required');
         }
+      } else if (run.sendConfirmed) {
+        await this.#persistDraftLease(run, 'send-confirmed');
+      } else if (run.attachmentOwnershipEstablished || run.promptTyped) {
+        await this.#persistDraftLease(run, run.messageDispatchStarted || run.dispatchStateUnknown ? 'dispatch-started' : 'cleanup-required');
       }
       throw error;
     } finally {
       await uploadPlan?.cleanup?.().catch(() => {});
+      if (run.sendConfirmed || run.ownershipPhase === 'cleared' || (!run.attachmentOwnershipEstablished && !run.promptTyped)) await this.#clearDraftLease(run);
       this.#releaseProviderStopToken(run);
       detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;
@@ -3943,7 +4124,7 @@ export class ChatGPTController {
       throwIfSignalAborted(signal);
       const run = {
         kind: 'send',
-        operationId: operationId ? String(operationId) : null,
+        operationId: operationId ? String(operationId) : crypto.randomUUID(),
         providerStopGeneration: this.providerStopGeneration,
         providerStopSequence: 0,
         providerStopEpoch: 0,
@@ -3961,10 +4142,16 @@ export class ChatGPTController {
         dispatchStateUnknown: false,
         providerStopDispatchLease: false,
         providerStopInputStarted: false,
-      sendAttemptCompleted: false,
-      sendConfirmed: false,
-      sendConfirmationTimedOut: false,
-      userTurnBaseline: null,
+        sendAttemptCompleted: false,
+        sendConfirmed: false,
+        sendConfirmationTimedOut: false,
+        userTurnBaseline: null,
+        conversationDigest: null,
+        promptDigest: textDigest(prompt),
+        promptLength: prompt.length,
+        expectedAttachmentIdentities: [],
+        ownershipPhase: 'prepared',
+        ownershipPersisted: false,
         signal
       };
       this.currentRun = run;
@@ -3975,13 +4162,24 @@ export class ChatGPTController {
         this.#throwIfStopRequested();
         await this.#activateProviderStopToken(run, signal);
         this.#throwIfStopRequested();
-        await this.#preflightChatGPTAttachmentDraft();
+        try {
+          await this.#preflightChatGPTAttachmentDraft();
+        } catch (error) {
+          if (error?.message !== 'chatgpt_file_input_state_conflict' || !(await this.#recoverOwnedDraftIfSafe(error))) throw error;
+          await this.#preflightChatGPTAttachmentDraft();
+        }
         this.#throwIfStopRequested();
+        run.conversationDigest = await this.#conversationDigest();
+        run.userTurnBaseline = await this.#captureUserTurnBaseline();
+        await this.#persistDraftLease(run, 'prepared');
         const typed = await this.#typePrompt(prompt);
         run.promptTyped = true;
         run.userTurnBaseline = typed?.userTurnBaseline || run.userTurnBaseline || null;
+        await this.#persistDraftLease(run, 'prompt-owned');
         this.#throwIfStopRequested();
+        await this.#persistDraftLease(run, 'dispatch-started');
         await this.#clickSend({ timeoutMs });
+        if (run.sendConfirmed) await this.#persistDraftLease(run, 'send-confirmed');
 
         if (stopAfterSend) {
           const start = Date.now();
@@ -3998,14 +4196,17 @@ export class ChatGPTController {
       } catch (error) {
         if (this.#canCleanupUnsentDraft(run)) {
           try {
+            const cleanup = await this.cleanupUnsentDraft({
+              prompt: run.promptTyped ? prompt : '',
+              expectedFileNames: run.expectedFileNames,
+              userTurnBaseline: run.userTurnBaseline
+            });
             error.data = {
               ...(error?.data && typeof error.data === 'object' ? error.data : {}),
-              cleanup: await this.#cleanupUnsentDraft({
-                prompt: run.promptTyped ? prompt : '',
-                expectedFileNames: run.expectedFileNames,
-                userTurnBaseline: run.userTurnBaseline
-              })
+              cleanup
             };
+            if (cleanup.status === 'cleared') await this.#clearDraftLease(run);
+            else await this.#persistDraftLease(run, 'cleanup-required');
           } catch (cleanupError) {
             error.data = {
               ...(error?.data && typeof error.data === 'object' ? error.data : {}),
@@ -4015,10 +4216,16 @@ export class ChatGPTController {
                 diagnostic: cleanupError?.data && typeof cleanupError.data === 'object' ? cleanupError.data : null
               }
             };
+            await this.#persistDraftLease(run, 'cleanup-required');
           }
+        } else if (run.sendConfirmed) {
+          await this.#persistDraftLease(run, 'send-confirmed');
+        } else if (run.promptTyped) {
+          await this.#persistDraftLease(run, run.messageDispatchStarted || run.dispatchStateUnknown ? 'dispatch-started' : 'cleanup-required');
         }
         throw error;
       } finally {
+        if (run.sendConfirmed || run.ownershipPhase === 'cleared' || !run.promptTyped) await this.#clearDraftLease(run);
         this.#releaseProviderStopToken(run);
         detachRunSignal();
         if (this.currentRun === run) this.currentRun = null;

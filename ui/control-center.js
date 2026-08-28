@@ -4,7 +4,12 @@ import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
 import { autopilotProposalViewModel } from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
-import { callControlCenterApi, safeControlCenterErrorCode } from './control-center-startup.mjs';
+import {
+  callControlCenterApi,
+  safeControlCenterErrorCode,
+  CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS,
+  CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS,
+} from './control-center-startup.mjs';
 
 function el(id) {
   const n = document.getElementById(id);
@@ -99,8 +104,8 @@ function hasApi(name) {
   return typeof b?.[name] === 'function';
 }
 
-async function callApi(name, args, { fallback = null, required = false } = {}) {
-  return callControlCenterApi(getBridge(), name, args, { fallback, required });
+async function callApi(name, args, { fallback = null, required = false, timeoutMs = null } = {}) {
+  return callControlCenterApi(getBridge(), name, args, { fallback, required, timeoutMs });
 }
 
 function defaultState() {
@@ -416,10 +421,11 @@ async function setAllTabsVisible(visible) {
 async function refresh({ initial = false } = {}) {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const state = (await callApi('getState', undefined, { fallback: lastState, required: initial })) || lastState;
-    const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings(), required: initial })) || defaultSettings();
+    const startupTimeoutMs = initial ? CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS : null;
+    const state = (await callApi('getState', undefined, { fallback: lastState, required: initial, timeoutMs: startupTimeoutMs })) || lastState;
+    const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings(), required: initial, timeoutMs: startupTimeoutMs })) || defaultSettings();
     const watchFoldersData =
-      (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial })) || { folders: [] };
+      (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial, timeoutMs: startupTimeoutMs })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
     const watchedProposal = lastState.autopilotWatchStatus?.proposal;
     if (!autopilotProposal && watchedProposal && ['observed', 'approved', 'launch-prepared', 'launch-started', 'running'].includes(watchedProposal.state)) {
@@ -787,7 +793,10 @@ async function main() {
     autopilotStatusKey = 'waiting';
     renderAutopilotState();
     try {
-      const result = await callApi('requestAutopilotProposal', undefined, { required: true });
+      const result = await callApi('requestAutopilotProposal', undefined, {
+        required: true,
+        timeoutMs: CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS,
+      });
       autopilotErrorMessage = null;
       if (result?.status === 'clarification_response_received') {
         autopilotProposal = null;

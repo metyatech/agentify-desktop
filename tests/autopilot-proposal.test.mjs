@@ -547,6 +547,8 @@ test('control center startup keeps renderer imports Node-free and fails visibly'
   assert.doesNotMatch(scheduler, /from ['"]\.\.\/autopilot-watch-status\.mjs['"]/u);
   assert.match(js, /callControlCenterApi/u);
   assert.match(js, /required: initial/u);
+  assert.match(js, /CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS/u);
+  assert.match(js, /timeoutMs: CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS/u);
   assert.match(js, /Control Center failed to initialize: \$\{code\}/u);
   assert.match(js, /statusText\('Control Center ready\.'\)/u);
 });

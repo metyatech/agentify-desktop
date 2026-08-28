@@ -1,10 +1,17 @@
-export const CONTROL_CENTER_IPC_TIMEOUT_MS = 15_000;
+export const CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS = 15_000;
+export const CONTROL_CENTER_PROPOSAL_IPC_TIMEOUT_MS = 11 * 60 * 1000;
 
 export async function callControlCenterApi(
   bridge,
   name,
   args,
-  { fallback = null, required = false, timeoutMs = CONTROL_CENTER_IPC_TIMEOUT_MS } = {}
+  {
+    fallback = null,
+    required = false,
+    timeoutMs = null,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+  } = {}
 ) {
   if (typeof bridge?.[name] !== 'function') {
     const error = new Error('control_center_bridge_api_unavailable');
@@ -14,7 +21,7 @@ export async function callControlCenterApi(
   }
   try {
     const result = typeof args === 'undefined' ? bridge[name]() : bridge[name](args);
-    return await withControlCenterTimeout(result, name, timeoutMs);
+    return await withControlCenterTimeout(result, name, timeoutMs, setTimeoutImpl, clearTimeoutImpl);
   } catch (error) {
     if (required) throw error;
     return fallback;
@@ -27,7 +34,7 @@ export function safeControlCenterErrorCode(error, fallback = 'CONTROL_CENTER_STA
   return /^[A-Z][A-Z0-9_]{1,63}$/u.test(normalized) ? normalized : fallback;
 }
 
-async function withControlCenterTimeout(value, name, timeoutMs) {
+async function withControlCenterTimeout(value, name, timeoutMs, setTimeoutImpl, clearTimeoutImpl) {
   const timeout = Number(timeoutMs);
   if (!Number.isFinite(timeout) || timeout <= 0) return await value;
   let timerId = null;
@@ -35,7 +42,7 @@ async function withControlCenterTimeout(value, name, timeoutMs) {
     return await Promise.race([
       value,
       new Promise((_, reject) => {
-        timerId = setTimeout(() => {
+        timerId = setTimeoutImpl(() => {
           const error = new Error('control_center_ipc_timeout');
           error.code = `IPC_TIMEOUT_${String(name).toUpperCase().replace(/[^A-Z0-9]/g, '_').slice(0, 48)}`;
           reject(error);
@@ -43,6 +50,6 @@ async function withControlCenterTimeout(value, name, timeoutMs) {
       })
     ]);
   } finally {
-    if (timerId !== null) clearTimeout(timerId);
+    if (timerId !== null) clearTimeoutImpl(timerId);
   }
 }

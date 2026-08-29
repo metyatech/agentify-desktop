@@ -8,6 +8,8 @@ class MockBrowserWindow {
     this.destroyed = false;
     this.closed = false;
     this.minimized = false;
+    this.visible = false;
+    this.focused = false;
     this.listeners = new Map();
     this.webContentsListeners = new Map();
     this.webContents = {
@@ -38,6 +40,14 @@ class MockBrowserWindow {
 
   isDestroyed() {
     return this.destroyed;
+  }
+
+  isVisible() {
+    return this.visible;
+  }
+
+  isFocused() {
+    return this.focused;
   }
 
   destroy() {
@@ -113,6 +123,68 @@ test('electron-browser-backend: mouseWheel dispatches a bounded native mouseWhee
     type: 'mouseWheel', x: 320, y: 480, deltaX: 0, deltaY: -720
   });
   await assert.rejects(session.page.mouseWheel(10_001, 480, 0, -720), /mouse_wheel_input_invalid/u);
+  await backend.dispose();
+});
+
+test('electron-browser-backend: native input diagnostics expose read-only window state', async () => {
+  let createdWindow = null;
+  class OkBrowserWindow extends MockBrowserWindow {
+    constructor(...args) {
+      super(...args);
+      createdWindow = this;
+    }
+
+    async loadURL() {}
+  }
+  const backend = new ElectronBrowserBackend({ BrowserWindowClass: OkBrowserWindow });
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  const initial = await session.page.getNativeInputDiagnostics();
+  assert.deepEqual(initial, {
+    backend: 'electron',
+    windowDestroyed: false,
+    webContentsDestroyed: false,
+    windowVisible: false,
+    windowFocused: false,
+    windowMinimized: false
+  });
+  createdWindow.visible = true;
+  createdWindow.focused = true;
+  const focused = await session.page.getNativeInputDiagnostics();
+  assert.equal(focused.windowVisible, true);
+  assert.equal(focused.windowFocused, true);
+  createdWindow.destroyed = true;
+  const destroyed = await session.page.getNativeInputDiagnostics();
+  assert.equal(destroyed.windowDestroyed, true);
+  assert.equal(destroyed.webContentsDestroyed, true);
+  await backend.dispose();
+});
+
+test('electron-browser-backend: native input dispatch failures are wrapped with bounded cause data', async () => {
+  let createdWindow = null;
+  class FailingBrowserWindow extends MockBrowserWindow {
+    constructor(...args) {
+      super(...args);
+      createdWindow = this;
+    }
+
+    async loadURL() {}
+  }
+  const backend = new ElectronBrowserBackend({ BrowserWindowClass: FailingBrowserWindow });
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  createdWindow.webContents.sendInputEvent = () => {
+    throw Object.assign(new Error('C:\\Users\\secret\\token 123456789012345678901234567890'), { code: 'NATIVE_PRIVATE_CODE' });
+  };
+  await assert.rejects(
+    session.page.mouseWheel(320, 480, 0, -720),
+    (error) => {
+      assert.equal(error.code, 'native_mouse_wheel_dispatch_failed');
+      assert.equal(error.name, 'NativeInputError');
+      assert.equal(error.data.cause.errorName, 'Error');
+      assert.equal(error.data.cause.errorCode, 'NATIVE_PRIVATE_CODE');
+      assert.doesNotMatch(error.data.cause.errorMessage, /C:\\Users\\secret/u);
+      return true;
+    }
+  );
   await backend.dispose();
 });
 

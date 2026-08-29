@@ -2,6 +2,38 @@ import electron from 'electron';
 
 const { BrowserWindow } = electron;
 
+const MAX_NATIVE_INPUT_DIAGNOSTIC_TEXT = 256;
+
+function sanitizeNativeInputText(value, maxLength = MAX_NATIVE_INPUT_DIAGNOSTIC_TEXT) {
+  let text = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!text) return '';
+  text = text
+    .replace(/\bfile:\/\/[^\s'"<>]+/giu, '<redacted-file-url>')
+    .replace(/\bhttps?:\/\/[^\s'"<>]+/giu, '<redacted-url>')
+    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\\\\[^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '<redacted-token>');
+  return text.slice(0, maxLength);
+}
+
+function wrapNativeInputError(code, error) {
+  const wrapped = new Error(code);
+  wrapped.name = 'NativeInputError';
+  wrapped.code = code;
+  wrapped.data = {
+    code,
+    cause: {
+      errorName: sanitizeNativeInputText(error?.name || error?.constructor?.name || 'Error', 64),
+      errorCode: sanitizeNativeInputText(error?.code, 64) || null,
+      errorMessage: sanitizeNativeInputText(error?.message || error, MAX_NATIVE_INPUT_DIAGNOSTIC_TEXT) || 'native input dispatch failed'
+    }
+  };
+  return wrapped;
+}
+
 function trackWindow(windows, win) {
   if (!win) return;
   windows.add(win);
@@ -54,7 +86,11 @@ class ElectronPageAdapter {
   }
 
   async moveMouse(x, y) {
-    this.win.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
+    try {
+      this.win.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
+    } catch (error) {
+      throw wrapNativeInputError('native_mouse_move_dispatch_failed', error);
+    }
   }
 
   async mouseWheel(x, y, deltaX = 0, deltaY = 0) {
@@ -65,13 +101,35 @@ class ElectronPageAdapter {
     if (![pointX, pointY, horizontal, vertical].every(Number.isFinite) || pointX < 0 || pointY < 0 || pointX > 10_000 || pointY > 10_000 || Math.abs(horizontal) > 10_000 || Math.abs(vertical) > 10_000 || (horizontal === 0 && vertical === 0)) {
       throw new Error('mouse_wheel_input_invalid');
     }
-    this.win.webContents.sendInputEvent({
-      type: 'mouseWheel',
-      x: Math.round(pointX),
-      y: Math.round(pointY),
-      deltaX: horizontal,
-      deltaY: vertical
-    });
+    try {
+      this.win.webContents.sendInputEvent({
+        type: 'mouseWheel',
+        x: Math.round(pointX),
+        y: Math.round(pointY),
+        deltaX: horizontal,
+        deltaY: vertical
+      });
+    } catch (error) {
+      throw wrapNativeInputError('native_mouse_wheel_dispatch_failed', error);
+    }
+  }
+
+  async getNativeInputDiagnostics() {
+    const read = (object, method) => {
+      try {
+        return typeof object?.[method] === 'function' ? Boolean(object[method]()) : null;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      backend: 'electron',
+      windowDestroyed: read(this.win, 'isDestroyed'),
+      webContentsDestroyed: read(this.win?.webContents, 'isDestroyed'),
+      windowVisible: read(this.win, 'isVisible'),
+      windowFocused: read(this.win, 'isFocused'),
+      windowMinimized: read(this.win, 'isMinimized')
+    };
   }
 
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {

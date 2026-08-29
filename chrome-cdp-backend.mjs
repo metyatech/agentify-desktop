@@ -99,6 +99,21 @@ function browserEvaluationError(exceptionDetails) {
   return error;
 }
 
+function wrapNativeInputError(code, error) {
+  const wrapped = new Error(code);
+  wrapped.name = 'NativeInputError';
+  wrapped.code = code;
+  wrapped.data = {
+    code,
+    cause: {
+      errorName: sanitizeBrowserEvaluationClass(error?.name || error?.constructor?.name),
+      errorCode: (sanitizeBrowserEvaluationText(error?.code) || '').slice(0, 64) || null,
+      errorMessage: sanitizeBrowserEvaluationText(error?.message || error) || 'native input dispatch failed'
+    }
+  };
+  return wrapped;
+}
+
 async function pathExists(filePath) {
   try {
     await fs.access(filePath);
@@ -565,7 +580,11 @@ class ChromeCdpPageAdapter {
   }
 
   async moveMouse(x, y) {
-    await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    try {
+      await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
+    } catch (error) {
+      throw wrapNativeInputError('native_mouse_move_dispatch_failed', error);
+    }
   }
 
   async mouseWheel(x, y, deltaX = 0, deltaY = 0) {
@@ -576,14 +595,30 @@ class ChromeCdpPageAdapter {
     if (![pointX, pointY, horizontal, vertical].every(Number.isFinite) || pointX < 0 || pointY < 0 || pointX > 10_000 || pointY > 10_000 || Math.abs(horizontal) > 10_000 || Math.abs(vertical) > 10_000 || (horizontal === 0 && vertical === 0)) {
       throw new Error('mouse_wheel_input_invalid');
     }
-    await this.#sendSessionCommand('Input.dispatchMouseEvent', {
-      type: 'mouseWheel',
-      x: pointX,
-      y: pointY,
-      deltaX: horizontal,
-      deltaY: vertical,
-      button: 'none'
-    });
+    try {
+      await this.#sendSessionCommand('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x: pointX,
+        y: pointY,
+        deltaX: horizontal,
+        deltaY: vertical,
+        button: 'none'
+      });
+    } catch (error) {
+      throw wrapNativeInputError('native_mouse_wheel_dispatch_failed', error);
+    }
+  }
+
+  async getNativeInputDiagnostics() {
+    return {
+      backend: 'chrome-cdp',
+      pageClosed: this.isClosed(),
+      windowDestroyed: null,
+      webContentsDestroyed: null,
+      windowVisible: null,
+      windowFocused: null,
+      windowMinimized: null
+    };
   }
 
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {

@@ -521,6 +521,21 @@ test('chrome-cdp-backend: mouseWheel uses CDP native mouseWheel input', async ()
   await session.close();
 });
 
+test('chrome-cdp-backend: native input diagnostics expose bounded page state', async () => {
+  const { session } = await createSessionWithFileInputs({});
+  assert.deepEqual(await session.page.getNativeInputDiagnostics(), {
+    backend: 'chrome-cdp',
+    pageClosed: false,
+    windowDestroyed: null,
+    webContentsDestroyed: null,
+    windowVisible: null,
+    windowFocused: null,
+    windowMinimized: null
+  });
+  await session.close();
+  assert.equal((await session.page.getNativeInputDiagnostics()).pageClosed, true);
+});
+
 function staleSessionError() {
   const error = new Error('Session with given id not found.');
   error.data = { code: -32001, message: error.message };

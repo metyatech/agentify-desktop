@@ -34,6 +34,9 @@ const PROVIDER_STOP_RETRY_POLL_MS = 75;
 const PROVIDER_STOP_RELEASE_RETRY_MAX = 3;
 const PROVIDER_STOP_RELEASE_RETRY_POLL_MS = 50;
 const MAX_SEND_CONFIRMATION_TIMEOUT_MS = 15_000;
+const MAX_NATIVE_INPUT_ERROR_NAME_LENGTH = 64;
+const MAX_NATIVE_INPUT_ERROR_CODE_LENGTH = 64;
+const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
 
 let latestProviderStopGeneration = 0;
 
@@ -52,6 +55,30 @@ function normalizeConversationText(value) {
     .map((line) => line.replace(/[ \t]+$/u, ''))
     .join('\n')
     .trim();
+}
+
+function sanitizeNativeInputDiagnostic(value, maxLength) {
+  let text = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!text) return null;
+  text = text
+    .replace(/\bfile:\/\/[^\s'"<>]+/giu, '<redacted-file-url>')
+    .replace(/\bhttps?:\/\/[^\s'"<>]+/giu, '<redacted-url>')
+    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\\\\[^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '<redacted-token>');
+  return text.slice(0, maxLength);
+}
+
+function nativeInputErrorDetails(error) {
+  const cause = error?.data?.cause && typeof error.data.cause === 'object' ? error.data.cause : error;
+  return {
+    errorName: sanitizeNativeInputDiagnostic(cause?.errorName || cause?.name || cause?.constructor?.name || 'Error', MAX_NATIVE_INPUT_ERROR_NAME_LENGTH),
+    errorCode: sanitizeNativeInputDiagnostic(cause?.errorCode || cause?.code || error?.data?.code || error?.code, MAX_NATIVE_INPUT_ERROR_CODE_LENGTH),
+    errorMessage: sanitizeNativeInputDiagnostic(cause?.errorMessage || cause?.message || error?.message || error, MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH)
+  };
 }
 
 function normalizeUserTurnText(value) {
@@ -1858,7 +1885,23 @@ export class ChatGPTController {
       tailProven: false,
       startProven: false,
       conversationWindowChangeCount: 0,
-      physicalScrollChangeCount: 0
+      physicalScrollChangeCount: 0,
+      nativeInput: {
+        backend: null,
+        failurePhase: null,
+        errorName: null,
+        errorCode: null,
+        errorMessage: null,
+        coordinates: null,
+        deltaX: null,
+        deltaY: null,
+        windowVisible: null,
+        windowFocused: null,
+        windowMinimized: null,
+        windowDestroyed: null,
+        webContentsDestroyed: null,
+        pageClosed: null
+      }
     };
     let current = await this.#eval(buildConversationWindowReadScript(limits));
     const initialUrl = String(current?.url || '');
@@ -1883,6 +1926,22 @@ export class ChatGPTController {
     let snapshotStable = false;
     let tailSnapshot = null;
     const currentUrlIsStable = (state) => String(state?.url || '') === initialUrl;
+    const recordNativeInputRuntime = async () => {
+      if (typeof this.page?.getNativeInputDiagnostics !== 'function') return;
+      try {
+        const runtime = await this.page.getNativeInputDiagnostics();
+        if (!runtime || typeof runtime !== 'object') return;
+        if (typeof runtime.backend === 'string') diagnostics.nativeInput.backend = runtime.backend.slice(0, 32);
+        for (const field of ['windowVisible', 'windowFocused', 'windowMinimized', 'windowDestroyed', 'webContentsDestroyed', 'pageClosed']) {
+          if (runtime[field] === null || typeof runtime[field] === 'boolean') diagnostics.nativeInput[field] = runtime[field];
+        }
+      } catch {}
+    };
+    const recordNativeInputFailure = async (phase, error) => {
+      diagnostics.nativeInput.failurePhase = phase;
+      Object.assign(diagnostics.nativeInput, nativeInputErrorDetails(error));
+      await recordNativeInputRuntime();
+    };
     const recordWheelResult = (before, after, direction) => {
       const beforeSignature = conversationWindowSignature(before?.turns);
       const afterSignature = conversationWindowSignature(after?.turns);
@@ -1899,14 +1958,32 @@ export class ChatGPTController {
       if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return { ok: false, reason: 'scroll-target-invalid' };
       iterations += 1;
       if (direction > 0) diagnostics.wheelDownAttempts += 1; else diagnostics.wheelUpAttempts += 1;
+      const deltaX = 0;
+      const deltaY = direction > 0 ? 720 : -720;
+      diagnostics.nativeInput.coordinates = { x: Math.round(Number(point.x)), y: Math.round(Number(point.y)) };
+      diagnostics.nativeInput.deltaX = deltaX;
+      diagnostics.nativeInput.deltaY = deltaY;
+      await recordNativeInputRuntime();
       try {
         await this.page.moveMouse(Number(point.x), Number(point.y));
-        await this.page.mouseWheel(Number(point.x), Number(point.y), 0, direction > 0 ? 720 : -720);
-      } catch {
+      } catch (error) {
+        await recordNativeInputFailure('move-mouse', error);
         return { ok: false, reason: 'history-native-wheel-failed' };
       }
-      await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
-      const next = await this.#eval(buildConversationWindowReadScript(limits));
+      try {
+        await this.page.mouseWheel(Number(point.x), Number(point.y), deltaX, deltaY);
+      } catch (error) {
+        await recordNativeInputFailure('mouse-wheel', error);
+        return { ok: false, reason: 'history-native-wheel-failed' };
+      }
+      let next;
+      try {
+        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+        next = await this.#eval(buildConversationWindowReadScript(limits));
+      } catch (error) {
+        await recordNativeInputFailure('post-wheel-read', error);
+        return { ok: false, reason: 'history-native-wheel-failed' };
+      }
       if (!currentUrlIsStable(next)) return { ok: false, reason: 'conversation-changed', state: next };
       if (next?.limitExceeded) return { ok: false, reason: next.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large', state: next };
       const result = recordWheelResult(state, next, direction);

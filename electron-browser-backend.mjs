@@ -57,6 +57,23 @@ class ElectronPageAdapter {
     this.win.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
   }
 
+  async mouseWheel(x, y, deltaX = 0, deltaY = 0) {
+    const pointX = Number(x);
+    const pointY = Number(y);
+    const horizontal = Number(deltaX);
+    const vertical = Number(deltaY);
+    if (![pointX, pointY, horizontal, vertical].every(Number.isFinite) || pointX < 0 || pointY < 0 || pointX > 10_000 || pointY > 10_000 || Math.abs(horizontal) > 10_000 || Math.abs(vertical) > 10_000 || (horizontal === 0 && vertical === 0)) {
+      throw new Error('mouse_wheel_input_invalid');
+    }
+    this.win.webContents.sendInputEvent({
+      type: 'mouseWheel',
+      x: Math.round(pointX),
+      y: Math.round(pointY),
+      deltaX: horizontal,
+      deltaY: vertical
+    });
+  }
+
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {
     this.win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button, clickCount });
   }

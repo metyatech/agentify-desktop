@@ -510,6 +510,17 @@ async function createSessionWithRuntimeResult(runtimeResult) {
   return { session, calls };
 }
 
+test('chrome-cdp-backend: mouseWheel uses CDP native mouseWheel input', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  await session.page.mouseWheel(320, 480, 0, -720);
+  const wheel = calls.findLast((call) => call.method === 'Input.dispatchMouseEvent');
+  assert.deepEqual(wheel?.params, {
+    type: 'mouseWheel', x: 320, y: 480, deltaX: 0, deltaY: -720, button: 'none'
+  });
+  await assert.rejects(session.page.mouseWheel(10_001, 480, 0, -720), /mouse_wheel_input_invalid/u);
+  await session.close();
+});
+
 function staleSessionError() {
   const error = new Error('Session with given id not found.');
   error.data = { code: -32001, message: error.message };

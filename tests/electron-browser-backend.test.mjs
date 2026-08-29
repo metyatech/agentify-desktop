@@ -11,6 +11,7 @@ class MockBrowserWindow {
     this.listeners = new Map();
     this.webContentsListeners = new Map();
     this.webContents = {
+      inputEvents: [],
       isDestroyed: () => this.destroyed,
       setUserAgent: () => {},
       insertText: async () => {},
@@ -20,7 +21,8 @@ class MockBrowserWindow {
         list.push(handler);
         this.webContentsListeners.set(event, list);
       },
-      setWindowOpenHandler: () => {}
+      setWindowOpenHandler: () => {},
+      sendInputEvent: (event) => { this.webContents.inputEvents.push(event); }
     };
   }
 
@@ -92,6 +94,26 @@ test('electron-browser-backend: createSession destroys window if loadURL fails',
     /load_failed/
   );
   assert.equal(createdWindow?.destroyed, true);
+});
+
+test('electron-browser-backend: mouseWheel dispatches a bounded native mouseWheel event', async () => {
+  let createdWindow = null;
+  class OkBrowserWindow extends MockBrowserWindow {
+    constructor(...args) {
+      super(...args);
+      createdWindow = this;
+    }
+
+    async loadURL() {}
+  }
+  const backend = new ElectronBrowserBackend({ BrowserWindowClass: OkBrowserWindow });
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  await session.page.mouseWheel(320, 480, 0, -720);
+  assert.deepEqual(createdWindow.webContents.inputEvents.at(-1), {
+    type: 'mouseWheel', x: 320, y: 480, deltaX: 0, deltaY: -720
+  });
+  await assert.rejects(session.page.mouseWheel(10_001, 480, 0, -720), /mouse_wheel_input_invalid/u);
+  await backend.dispose();
 });
 
 test('electron-browser-backend: dispose closes tracked windows', async () => {

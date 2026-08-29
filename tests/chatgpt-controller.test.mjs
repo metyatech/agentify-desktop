@@ -8,7 +8,7 @@ import vm from 'node:vm';
 
 import {
   ChatGPTController,
-  buildCompleteConversationReadScript,
+  buildConversationWindowReadScript,
   mergeConversationSnapshots,
   hasSameChatGPTAttachmentFileNameMultiset,
   isChatGPTAttachmentCardDisplayName,
@@ -97,7 +97,7 @@ function basicEvaluation(js) {
   return undefined;
 }
 
-function createPage({ events, onEvaluate, attachmentDraftState = null, onBasicEvaluate = null, promptEvaluationOverride = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
+function createPage({ events, onEvaluate, attachmentDraftState = null, onBasicEvaluate = null, promptEvaluationOverride = null, onInsertText = null, onSetFileInputFiles = null, onStopTokenEvaluate = null, onMouseDown = null, onMouseUp = null, onSendKey = null, onMouseWheel = null, includeUserTurnBaseline = false, userTurnBaseline = null }) {
   const defaultStopTokenEvaluation = (js) => {
     if (js.includes('agentifyStopTokenStateRead')) return { ok: true, generation: 0, sequence: 0, retiredSequence: 0, dispatchState: null };
     const generation = Number(/const (?:generation|expectedGeneration) = ([0-9]+)/u.exec(js)?.[1] || 0);
@@ -165,6 +165,10 @@ function createPage({ events, onEvaluate, attachmentDraftState = null, onBasicEv
       await onInsertText?.(text);
     },
     async moveMouse() {},
+    async mouseWheel(x, y, deltaX = 0, deltaY = 0) {
+      events.push(`mouse-wheel:${x}:${y}:${deltaX}:${deltaY}`);
+      await onMouseWheel?.(x, y, deltaX, deltaY);
+    },
     async mouseDown(x) {
       events.push(x >= 80 ? 'normal-send-click' : 'prompt-click');
       await onMouseDown?.(x);
@@ -563,6 +567,73 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true } = {}) {
+  const events = [];
+  const windows = [
+    [0, 1, 2, 3, 4, 5, 6],
+    [5, 6, 7, 8, 9, 10, 11],
+    [10, 11, 12, 13, 14, 15, 16],
+    [15, 16, 17, 18, 19, 20, 21],
+    [20, 21, 22, 23, 24]
+  ];
+  let windowIndex = initialWindow;
+  const originalWindowIndex = initialWindow;
+  let url = 'https://chatgpt.com/c/native-wheel-test';
+  let wheelCount = 0;
+  const snapshot = () => {
+    const positions = windows[windowIndex];
+    return {
+      url,
+      turns: positions.map((position) => ({
+        role: position % 2 ? 'assistant' : 'user',
+        text: `turn-${position}`,
+        messageId: `message-${position}`,
+        turnId: null,
+        positionHint: positionHints ? position : null
+      })),
+      limitExceeded: false,
+      limitKind: null,
+      loading: false,
+      range: { min: positions[0], max: positions.at(-1) },
+      scroller: {
+        candidateCount: 1,
+        selectedMessageDescendantCount: positions.length,
+        selected: { tagName: 'DIV', id: 'conversation-scroll', className: 'conversation-scroll-region', role: '', overflowY: 'auto' },
+        selectedPath: 'body>main>div#conversation-scroll',
+        candidates: [],
+        scrollTop: windowIndex * 250,
+        scrollHeight: 1_400,
+        clientHeight: 400,
+        atTop: windowIndex === 0,
+        atBottom: windowIndex === windows.length - 1,
+        point: { x: 500, y: 400 }
+      }
+    };
+  };
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const targetDistance =')) {
+        const distance = Number(/const targetDistance = ([0-9]+)/u.exec(js)?.[1] || 0);
+        windowIndex = Math.max(0, Math.min(windows.length - 1, Math.round((1_000 - distance) / 250)));
+        return { ok: true, scrollTop: windowIndex * 250 };
+      }
+      if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+      return snapshot();
+    },
+    onMouseWheel: async (_x, _y, _deltaX, deltaY) => {
+      wheelCount += 1;
+      if (changeUrlOnWheel && wheelCount === 1) url = 'https://chatgpt.com/c/changed';
+      if (!windowChanges) return;
+      if (deltaY > 0) windowIndex = Math.min(windows.length - 1, windowIndex + 1);
+      if (deltaY < 0) windowIndex = Math.max(0, windowIndex - 1);
+    }
+  });
+  page.getUrl = async () => url;
+  if (!nativeWheel) page.mouseWheel = undefined;
+  return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, originalWindowIndex };
+}
+
 async function captureActualTypePromptEvaluation(userTurns) {
   const events = [];
   const progress = [];
@@ -853,125 +924,71 @@ test('chatgpt-controller: complete history refuses an ambiguous duplicate observ
   assert.equal(merged.ambiguous, true);
 });
 
-test('chatgpt-controller: complete history returns bounded completeness metadata and accumulated snapshots', async () => {
-  const page = createPage({
-    events: [],
-    onEvaluate: async (js) => {
-      assert.match(js, /const maxIterations = 10/u);
-      return {
-        snapshots: [
-          [{ role: 'user', text: 'oldest', messageId: 'm0', positionHint: 0 }, { role: 'assistant', text: 'proposal', messageId: 'm1', positionHint: 1 }],
-          [{ role: 'assistant', text: 'proposal', messageId: 'm1', positionHint: 1 }, { role: 'user', text: 'approval', messageId: 'm2', positionHint: 2 }]
-        ],
-        startReached: true,
-        startPositionProof: true,
-        tailProven: true,
-        snapshotStable: true,
-        iterations: 3,
-        reason: null,
-        scrollRestored: true
-      };
-    }
-  });
+test('chatgpt-controller: complete history orchestrates native wheel input and accumulates virtualized windows', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
+  const page = harness.page;
   const result = await createController(page).readConversationTurns({
-    maxTurns: 10,
+    maxTurns: 50,
     maxCharsPerTurn: 1000,
     maxTotalChars: 5000,
     historyMode: 'complete',
-    historyTimeoutMs: 1000,
-    historyMaxIterations: 10
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
   });
-  assert.deepEqual(result.turns.map((turn) => turn.text), ['oldest', 'proposal', 'approval']);
-  assert.deepEqual(result.history, {
-    mode: 'complete',
-    complete: true,
-    reason: null,
-    startReached: true,
-    snapshotStable: true,
-    iterations: 3,
-    observedTurnCount: 3,
-    returnedTurnCount: 3,
-    scrollRestored: true
-  });
+  assert.deepEqual(result.turns.map((turn) => turn.index), Array.from({ length: 25 }, (_, index) => index));
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.nativeWheelSupported, true);
+  assert.equal(result.history.diagnostics.nativeScrollControlProven, true);
+  assert.ok(harness.getWheelCount() > 0);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
 test('chatgpt-controller: complete history remains incomplete when the top proof is not established', async () => {
-  const page = createPage({
-    events: [],
-    onEvaluate: async () => ({
-      snapshots: [[{ role: 'user', text: 'latest', messageId: 'm1' }]],
-      startReached: false,
-      snapshotStable: false,
-      iterations: 10,
-      reason: 'timeout',
-      scrollRestored: true
-    })
-  });
-  const result = await createController(page).readConversationTurns({
-    maxTurns: 10,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyMode: 'complete',
-    historyTimeoutMs: 1000,
-    historyMaxIterations: 10
-  });
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 10, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 1, historyMaxIterations: 1 });
   assert.equal(result.history.complete, false);
-  assert.equal(result.history.reason, 'timeout');
+  assert.ok(['timeout', 'history-tail-unproven', 'history-native-scroll-failed'].includes(result.history.reason));
+});
+
+test('chatgpt-controller: complete history fails closed when native wheel is unsupported', async () => {
+  const harness = createNativeWheelHistoryPage({ nativeWheel: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-native-scroll-unproven');
+  assert.equal(harness.getWheelCount(), 0);
+});
+
+test('chatgpt-controller: complete history rejects native wheel dispatch without a conversation window transition', async () => {
+  const harness = createNativeWheelHistoryPage({ windowChanges: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-native-scroll-no-progress');
+  assert.ok(harness.getWheelCount() >= 2);
+  assert.equal(result.history.diagnostics.nativeScrollControlProven, false);
+});
+
+test('chatgpt-controller: complete history proves an already-tail start with a native up/down round trip', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
+  assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
 test('chatgpt-controller: complete history remains incomplete when the UI start position is not proven', async () => {
-  const page = createPage({
-    events: [],
-    onEvaluate: async () => ({
-      snapshots: [[{ role: 'assistant', text: 'latest', messageId: 'm1', positionHint: 6 }]],
-      startReached: true,
-      startPositionProof: false,
-      tailProven: true,
-      snapshotStable: true,
-      iterations: 10,
-      reason: null,
-      scrollRestored: true
-    })
-  });
-  const result = await createController(page).readConversationTurns({
-    maxTurns: 10,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyMode: 'complete',
-    historyTimeoutMs: 1000,
-    historyMaxIterations: 10
-  });
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, positionHints: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, false);
   assert.equal(result.history.reason, 'history-start-unproven');
 });
 
 test('chatgpt-controller: complete history never treats missing position hints as start proof', async () => {
-  const page = createPage({
-    events: [],
-    onEvaluate: async () => ({
-      snapshots: [[
-        { role: 'user', text: 'oldest visible window', messageId: 'm1', positionHint: null },
-        { role: 'assistant', text: 'latest visible window', messageId: 'm2', positionHint: null }
-      ]],
-      startReached: true,
-      startPositionProof: false,
-      tailProven: true,
-      snapshotStable: true,
-      iterations: 2,
-      reason: null,
-      scrollRestored: true
-    })
-  });
-  const result = await createController(page).readConversationTurns({
-    maxTurns: 10,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyMode: 'complete',
-    historyTimeoutMs: 1000,
-    historyMaxIterations: 10
-  });
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, positionHints: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, false);
-  assert.equal(result.history.startReached, true);
+  assert.equal(result.history.startReached, false);
   assert.equal(result.history.reason, 'history-start-unproven');
 });
 
@@ -988,69 +1005,43 @@ test('chatgpt-controller: complete history detects position gaps and conflicts',
   assert.equal(conflict.ambiguous, true);
 });
 
-test('chatgpt-controller: complete history script resolves a message ancestor and starts from the tail', () => {
-  const source = buildCompleteConversationReadScript({
+test('chatgpt-controller: complete history window script resolves a message ancestor and exposes a native wheel target', () => {
+  const source = buildConversationWindowReadScript({
     maxTurns: 10,
     maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyTimeoutMs: 1000,
-    historyMaxIterations: 10
+    maxTotalChars: 5000
   });
   assert.match(source, /resolveConversationScroller/u);
   assert.match(source, /common\.filter\(\(node\) => !isNavigationRegion\(node\) && isScrollable\(node\)\)/u);
-  assert.match(source, /Complete history always begins at the latest tail/u);
-  assert.match(source, /positionValues\.length > 0 && minimumPosition === 0/u);
-  assert.match(source, /history-scroll-no-progress/u);
+  assert.match(source, /getBoundingClientRect/u);
+  assert.doesNotMatch(source, /scrollTop\s*=\s*target/u);
 });
 
 test('chatgpt-controller: complete history backfills from the tail through virtualization and restores a middle position', async () => {
-  const dom = createCompleteHistoryDom({ initialScrollTop: 480 });
-  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
-    maxTurns: 50,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyTimeoutMs: 10_000,
-    historyMaxIterations: 20
-  }), dom.context);
-  assert.equal(result.reason, null);
-  assert.equal(result.startReached, true);
-  assert.equal(result.startPositionProof, true);
-  assert.equal(result.tailProven, true);
-  assert.equal(result.scrollRestored, true);
-  assert.equal(dom.scroller.scrollTop, 480);
-  assert.equal(result.diagnostics.scroller.candidateCount, 1);
-  assert.equal(result.diagnostics.scroller.selectedMessageDescendantCount, 7);
-  assert.deepEqual([...result.diagnostics.positions.oldestProgression], [15, 10, 5, 0]);
-  assert.equal(result.diagnostics.positions.observedMin, 0);
-  assert.equal(result.diagnostics.positions.observedMax, 24);
-  assert.equal(result.diagnostics.progress.olderWindowObserved, true);
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.diagnostics.scroller.candidateCount, 1);
+  assert.ok(result.history.diagnostics.wheelDownAttempts > 0);
+  assert.ok(result.history.diagnostics.wheelUpAttempts > 0);
+  assert.equal(result.history.diagnostics.positions.observedMin, 0);
+  assert.equal(result.history.diagnostics.positions.observedMax, 24);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
 test('chatgpt-controller: complete history fails closed when scroll progress never establishes a start', async () => {
-  const dom = createCompleteHistoryDom({ initialScrollTop: 480, positionHints: false });
-  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
-    maxTurns: 50,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyTimeoutMs: 10_000,
-    historyMaxIterations: 20
-  }), dom.context);
-  assert.equal(result.startReached, false);
-  assert.equal(result.startPositionProof, false);
-  assert.equal(result.reason, 'history-start-unproven');
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, positionHints: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-start-unproven');
 });
 
 test('chatgpt-controller: complete history fails closed when the conversation URL changes during backfill', async () => {
-  const dom = createCompleteHistoryDom({ initialScrollTop: 480, changeUrlOnScroll: true });
-  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
-    maxTurns: 50,
-    maxCharsPerTurn: 1000,
-    maxTotalChars: 5000,
-    historyTimeoutMs: 10_000,
-    historyMaxIterations: 20
-  }), dom.context);
-  assert.equal(result.reason, 'conversation-changed');
-  assert.equal(result.startReached, false);
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, changeUrlOnWheel: true });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.reason, 'conversation-changed');
+  assert.equal(result.history.startReached, false);
 });
 
 test('chatgpt-controller: rendered code-block innerText preserves proposal JSON transport', async () => {

@@ -568,6 +568,24 @@ class ChromeCdpPageAdapter {
     await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   }
 
+  async mouseWheel(x, y, deltaX = 0, deltaY = 0) {
+    const pointX = Number(x);
+    const pointY = Number(y);
+    const horizontal = Number(deltaX);
+    const vertical = Number(deltaY);
+    if (![pointX, pointY, horizontal, vertical].every(Number.isFinite) || pointX < 0 || pointY < 0 || pointX > 10_000 || pointY > 10_000 || Math.abs(horizontal) > 10_000 || Math.abs(vertical) > 10_000 || (horizontal === 0 && vertical === 0)) {
+      throw new Error('mouse_wheel_input_invalid');
+    }
+    await this.#sendSessionCommand('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: pointX,
+      y: pointY,
+      deltaX: horizontal,
+      deltaY: vertical,
+      button: 'none'
+    });
+  }
+
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {
     await this.#sendSessionCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount });
   }

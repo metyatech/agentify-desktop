@@ -311,7 +311,11 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
             }
           }
           if (reason) break;
-          if (topSettled && startPositionProof) { startReached = true; snapshotStable = true; break; }
+          if (topSettled) {
+            if (startPositionProof) { startReached = true; snapshotStable = true; break; }
+            reason = 'history-start-unproven';
+            break;
+          }
         } else {
           continue;
         }

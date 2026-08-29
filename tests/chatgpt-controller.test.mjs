@@ -8,6 +8,7 @@ import vm from 'node:vm';
 
 import {
   ChatGPTController,
+  buildCompleteConversationReadScript,
   mergeConversationSnapshots,
   hasSameChatGPTAttachmentFileNameMultiset,
   isChatGPTAttachmentCardDisplayName,
@@ -445,6 +446,123 @@ async function captureActualConversationExtraction(nodes) {
   return { expression, result };
 }
 
+function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true, changeUrlOnScroll = false } = {}) {
+  const body = {
+    tagName: 'BODY',
+    parentElement: null,
+    id: '',
+    className: '',
+    contains(node) { return node === this || node?.parentElement === this || node?.parentElement?.parentElement === this; },
+    matches: () => false,
+    getAttribute: () => null
+  };
+  const sidebar = {
+    tagName: 'NAV',
+    parentElement: body,
+    id: 'sidebar',
+    className: 'navigation-pane',
+    contains: () => false,
+    matches: (selector) => selector.includes('nav') || selector.includes('navigation'),
+    getAttribute: () => null,
+    scrollHeight: 20_000,
+    clientHeight: 400,
+    scrollTop: 0
+  };
+  const scroller = {
+    tagName: 'DIV',
+    parentElement: body,
+    id: 'conversation-scroll',
+    className: 'conversation-scroll-region',
+    scrollHeight: 1_400,
+    clientHeight: 400,
+    scrollTop: initialScrollTop,
+    contains(node) {
+      let current = node;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    matches: () => false,
+    getAttribute: () => null,
+    dispatchEvent: () => true,
+    scrollTo(options) { this.scrollTop = options.top; },
+    scrollBy(options) { this.scrollTop += options.top; }
+  };
+  let currentNodes = [];
+  let url = 'https://chatgpt.com/c/test';
+  const windowFor = (scrollTop) => {
+    if (scrollTop >= 900) return [20, 21, 22, 23, 24];
+    if (scrollTop >= 650) return [15, 16, 17, 18, 19, 20, 21];
+    if (scrollTop >= 400) return [10, 11, 12, 13, 14, 15, 16];
+    if (scrollTop >= 200) return [5, 6, 7, 8, 9, 10, 11];
+    return [0, 1, 2, 3, 4, 5, 6];
+  };
+  const setNodes = (scrollTop) => {
+    currentNodes = windowFor(scrollTop).map((position) => {
+      const role = position % 2 ? 'assistant' : 'user';
+      const node = {
+        tagName: 'ARTICLE',
+        parentElement: scroller,
+        id: positionHints ? `conversation-turn-${position}` : '',
+        className: '',
+        innerText: `turn-${position}`,
+        textContent: `turn-${position}`,
+        matches: () => false,
+        querySelectorAll: () => [],
+        cloneNode() {
+          return { innerText: this.innerText, textContent: this.textContent, matches: () => false, querySelectorAll: () => [] };
+        },
+        getAttribute(name) {
+          if (name === 'data-message-author-role') return role;
+          if (name === 'data-message-id') return `message-${position}`;
+          if (name === 'data-testid') return positionHints ? `conversation-turn-${position}` : null;
+          return null;
+        },
+        closest(selector) { return selector === '[data-message-id]' ? this : null; },
+        contains(child) { return child === this; }
+      };
+      if (!positionHints) node.getAttribute = (name) => name === 'data-message-author-role' ? role : name === 'data-message-id' ? `message-${position}` : null;
+      return node;
+    });
+    if (changeUrlOnScroll && scrollTop < initialScrollTop) url = 'https://chatgpt.com/c/changed';
+  };
+  Object.defineProperty(scroller, 'scrollTop', {
+    get() { return this._scrollTop; },
+    set(value) { this._scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, Number(value) || 0)); setNodes(this._scrollTop); }
+  });
+  scroller.scrollTop = initialScrollTop;
+  setNodes(initialScrollTop);
+  const document = {
+    scrollingElement: body,
+    body,
+    documentElement: body,
+    querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]') return currentNodes;
+      if (selector === '*') return [scroller, sidebar, body, ...currentNodes];
+      return [];
+    }
+  };
+  const context = {
+    document,
+    location: { get href() { return url; } },
+    getComputedStyle(node) {
+      if (node === scroller) return { overflowY: 'auto' };
+      if (node === sidebar) return { overflowY: 'auto' };
+      return { overflowY: 'visible' };
+    },
+    setTimeout(callback) { callback(); return 1; },
+    clearTimeout() {},
+    Event: class Event {},
+    WheelEvent: class WheelEvent {},
+    Date,
+    JSON
+  };
+  context.globalThis = context;
+  return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
+}
+
 async function captureActualTypePromptEvaluation(userTurns) {
   const events = [];
   const progress = [];
@@ -742,10 +860,12 @@ test('chatgpt-controller: complete history returns bounded completeness metadata
       assert.match(js, /const maxIterations = 10/u);
       return {
         snapshots: [
-          [{ role: 'user', text: 'oldest', messageId: 'm0' }, { role: 'assistant', text: 'proposal', messageId: 'm1' }],
-          [{ role: 'assistant', text: 'proposal', messageId: 'm1' }, { role: 'user', text: 'approval', messageId: 'm2' }]
+          [{ role: 'user', text: 'oldest', messageId: 'm0', positionHint: 0 }, { role: 'assistant', text: 'proposal', messageId: 'm1', positionHint: 1 }],
+          [{ role: 'assistant', text: 'proposal', messageId: 'm1', positionHint: 1 }, { role: 'user', text: 'approval', messageId: 'm2', positionHint: 2 }]
         ],
         startReached: true,
+        startPositionProof: true,
+        tailProven: true,
         snapshotStable: true,
         iterations: 3,
         reason: null,
@@ -806,6 +926,7 @@ test('chatgpt-controller: complete history remains incomplete when the UI start 
       snapshots: [[{ role: 'assistant', text: 'latest', messageId: 'm1', positionHint: 6 }]],
       startReached: true,
       startPositionProof: false,
+      tailProven: true,
       snapshotStable: true,
       iterations: 10,
       reason: null,
@@ -822,6 +943,114 @@ test('chatgpt-controller: complete history remains incomplete when the UI start 
   });
   assert.equal(result.history.complete, false);
   assert.equal(result.history.reason, 'history-start-unproven');
+});
+
+test('chatgpt-controller: complete history never treats missing position hints as start proof', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async () => ({
+      snapshots: [[
+        { role: 'user', text: 'oldest visible window', messageId: 'm1', positionHint: null },
+        { role: 'assistant', text: 'latest visible window', messageId: 'm2', positionHint: null }
+      ]],
+      startReached: true,
+      startPositionProof: false,
+      tailProven: true,
+      snapshotStable: true,
+      iterations: 2,
+      reason: null,
+      scrollRestored: true
+    })
+  });
+  const result = await createController(page).readConversationTurns({
+    maxTurns: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 1000,
+    historyMaxIterations: 10
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, true);
+  assert.equal(result.history.reason, 'history-start-unproven');
+});
+
+test('chatgpt-controller: complete history detects position gaps and conflicts', async () => {
+  const gap = mergeConversationSnapshots([
+    [{ role: 'user', text: 'turn-10', messageId: 'm10', positionHint: 10 }, { role: 'assistant', text: 'turn-14', messageId: 'm14', positionHint: 14 }],
+    [{ role: 'user', text: 'turn-0', messageId: 'm0', positionHint: 0 }, { role: 'assistant', text: 'turn-4', messageId: 'm4', positionHint: 4 }]
+  ]);
+  assert.equal(gap.continuous, false);
+  const conflict = mergeConversationSnapshots([[
+    { role: 'user', text: 'first', messageId: 'm1', positionHint: 3 },
+    { role: 'assistant', text: 'different', messageId: 'm2', positionHint: 3 }
+  ]]);
+  assert.equal(conflict.ambiguous, true);
+});
+
+test('chatgpt-controller: complete history script resolves a message ancestor and starts from the tail', () => {
+  const source = buildCompleteConversationReadScript({
+    maxTurns: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 1000,
+    historyMaxIterations: 10
+  });
+  assert.match(source, /resolveConversationScroller/u);
+  assert.match(source, /common\.filter\(\(node\) => !isNavigationRegion\(node\) && isScrollable\(node\)\)/u);
+  assert.match(source, /Complete history always begins at the latest tail/u);
+  assert.match(source, /positionValues\.length > 0 && minimumPosition === 0/u);
+  assert.match(source, /history-scroll-no-progress/u);
+});
+
+test('chatgpt-controller: complete history backfills from the tail through virtualization and restores a middle position', async () => {
+  const dom = createCompleteHistoryDom({ initialScrollTop: 480 });
+  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 10_000,
+    historyMaxIterations: 20
+  }), dom.context);
+  assert.equal(result.reason, null);
+  assert.equal(result.startReached, true);
+  assert.equal(result.startPositionProof, true);
+  assert.equal(result.tailProven, true);
+  assert.equal(result.scrollRestored, true);
+  assert.equal(dom.scroller.scrollTop, 480);
+  assert.equal(result.diagnostics.scroller.candidateCount, 1);
+  assert.equal(result.diagnostics.scroller.selectedMessageDescendantCount, 7);
+  assert.deepEqual([...result.diagnostics.positions.oldestProgression], [15, 10, 5, 0]);
+  assert.equal(result.diagnostics.positions.observedMin, 0);
+  assert.equal(result.diagnostics.positions.observedMax, 24);
+  assert.equal(result.diagnostics.progress.olderWindowObserved, true);
+});
+
+test('chatgpt-controller: complete history fails closed when scroll progress never establishes a start', async () => {
+  const dom = createCompleteHistoryDom({ initialScrollTop: 480, positionHints: false });
+  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 10_000,
+    historyMaxIterations: 20
+  }), dom.context);
+  assert.equal(result.startReached, false);
+  assert.equal(result.startPositionProof, false);
+  assert.equal(result.reason, 'history-start-unproven');
+});
+
+test('chatgpt-controller: complete history fails closed when the conversation URL changes during backfill', async () => {
+  const dom = createCompleteHistoryDom({ initialScrollTop: 480, changeUrlOnScroll: true });
+  const result = await vm.runInNewContext(buildCompleteConversationReadScript({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 10_000,
+    historyMaxIterations: 20
+  }), dom.context);
+  assert.equal(result.reason, 'conversation-changed');
+  assert.equal(result.startReached, false);
 });
 
 test('chatgpt-controller: rendered code-block innerText preserves proposal JSON transport', async () => {

@@ -77,8 +77,8 @@ function fallbackConversationTurnId({ role, index, text }) {
   return `turn-${digest}`;
 }
 
-function historyMetadata({ mode, complete = false, reason = null, startReached = false, snapshotStable = false, iterations = 0, observedTurnCount = 0, returnedTurnCount = 0, scrollRestored = true }) {
-  return {
+function historyMetadata({ mode, complete = false, reason = null, startReached = false, snapshotStable = false, iterations = 0, observedTurnCount = 0, returnedTurnCount = 0, scrollRestored = true, diagnostics = null }) {
+  const metadata = {
     mode,
     complete: complete === true,
     reason: reason || null,
@@ -89,10 +89,13 @@ function historyMetadata({ mode, complete = false, reason = null, startReached =
     returnedTurnCount: Number.isInteger(returnedTurnCount) && returnedTurnCount >= 0 ? returnedTurnCount : 0,
     scrollRestored: scrollRestored !== false
   };
+  if (diagnostics && typeof diagnostics === 'object') metadata.diagnostics = diagnostics;
+  return metadata;
 }
 
 export function mergeConversationSnapshots(snapshots = []) {
   const records = new Map();
+  const positions = new Map();
   const edges = new Map();
   const indegree = new Map();
   let ambiguous = false;
@@ -138,6 +141,22 @@ export function mergeConversationSnapshots(snapshots = []) {
       keys.push(key);
       const existing = records.get(key);
       const value = { ...observation, text, messageId: messageId || null, turnId: turnId || null, positionHint };
+      if (positionHint !== null) {
+        const positionKey = `position:${positionHint}`;
+        const positionRecord = positions.get(positionKey);
+        const positionConflicts = positionRecord && (
+          positionRecord.role !== value.role ||
+          positionRecord.text !== value.text ||
+          (positionRecord.messageId && value.messageId && positionRecord.messageId !== value.messageId) ||
+          (positionRecord.turnId && value.turnId && positionRecord.turnId !== value.turnId)
+        );
+        if (positionConflicts) ambiguous = true;
+        else if (!positionRecord) positions.set(positionKey, { role: value.role, text: value.text, messageId: value.messageId, turnId: value.turnId });
+        else {
+          if (!positionRecord.messageId) positionRecord.messageId = value.messageId;
+          if (!positionRecord.turnId) positionRecord.turnId = value.turnId;
+        }
+      }
       if (existing && (existing.role !== value.role || existing.text !== value.text || (existing.positionHint !== null && value.positionHint !== null && existing.positionHint !== value.positionHint))) {
         ambiguous = true;
       } else if (!existing) {
@@ -185,7 +204,7 @@ function validateConversationHistoryOptions({ historyMode, historyTimeoutMs, his
   if (!Number.isInteger(historyMaxIterations) || historyMaxIterations < 1 || historyMaxIterations > MAX_CONVERSATION_HISTORY_ITERATIONS) throw new Error("conversation_history_iterations_invalid");
 }
 
-function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
+export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
   return `(async () => {
     const maxTurns = ${maxTurns};
     const maxCharsPerTurn = ${maxCharsPerTurn};
@@ -195,6 +214,8 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     const scrollWaitMs = ${CONVERSATION_HISTORY_SCROLL_WAIT_MS};
     const topSettleWaitMs = ${CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS};
     const topStableSamples = ${CONVERSATION_HISTORY_TOP_STABLE_SAMPLES};
+    const tailStableWaitMs = ${CONVERSATION_HISTORY_SCROLL_WAIT_MS * 2};
+    const tailStableSamples = 3;
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
     const excludedSelector = [
       'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
@@ -246,20 +267,73 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
         fingerprint: [turn.role, digest(turn.text), digest(raw[index - 1]?.text), digest(raw[index + 1]?.text)].join('\\u0000')
       }));
     };
-    const getScroller = () => {
-      const candidates = [document.scrollingElement, ...Array.from(document.querySelectorAll('*'))].filter(Boolean).filter((node) => {
-        const style = getComputedStyle(node);
-        return (style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight;
-      });
-      candidates.sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight));
-      return candidates[0] || null;
+    const isScrollable = (node) => {
+      if (!node) return false;
+      const style = getComputedStyle(node);
+      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight;
     };
-    const scroller = getScroller();
+    const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
+    const describeNode = (node) => ({
+      tagName: String(node?.tagName || '').slice(0, 32),
+      id: String(node?.id || '').slice(0, 80),
+      className: String(node?.className || '').replace(/\\s+/g, ' ').trim().slice(0, 120),
+      role: String(node?.getAttribute?.('role') || '').slice(0, 40),
+      overflowY: String(getComputedStyle(node)?.overflowY || '').slice(0, 16)
+    });
+    const nodePath = (node) => {
+      const parts = [];
+      let current = node;
+      while (current && parts.length < 6) {
+        const tag = String(current.tagName || 'node').toLowerCase();
+        const id = String(current.id || '').trim();
+        const testId = String(current.getAttribute?.('data-testid') || '').trim();
+        parts.unshift(id ? tag + '#' + id.slice(0, 40) : testId ? tag + '[data-testid="' + testId.slice(0, 40) + '"]' : tag);
+        current = current.parentElement;
+      }
+      return parts.join('>').slice(0, 240);
+    };
+    const resolveConversationScroller = () => {
+      const nodes = messageNodes();
+      const chains = nodes.map((node) => {
+        const chain = [];
+        let current = node.parentElement;
+        while (current) { chain.push(current); current = current.parentElement; }
+        if (document.scrollingElement && !chain.includes(document.scrollingElement)) chain.push(document.scrollingElement);
+        return chain;
+      });
+      const common = chains.length
+        ? chains[0].filter((node) => chains.every((chain) => chain.includes(node)))
+        : [];
+      const candidates = common.filter((node) => !isNavigationRegion(node) && isScrollable(node)).map((node) => {
+        const distances = chains.map((chain) => chain.indexOf(node)).filter((distance) => distance >= 0);
+        const descendants = nodes.filter((turn) => turn === node || node.contains?.(turn)).length;
+        return { node, distance: Math.max(...distances), descendants, details: describeNode(node), path: nodePath(node) };
+      }).filter((candidate) => candidate.descendants > 0);
+      candidates.sort((left, right) => left.distance - right.distance);
+      const nearestDistance = candidates[0]?.distance;
+      const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
+      return {
+        nodes,
+        candidates,
+        selected: nearest.length === 1 ? nearest[0] : null,
+        ambiguous: nearest.length > 1,
+        diagnostic: {
+          candidateCount: candidates.length,
+          selectedMessageDescendantCount: nearest.length === 1 ? nearest[0].descendants : 0,
+          selected: nearest.length === 1 ? nearest[0].details : null,
+          selectedPath: nearest.length === 1 ? nearest[0].path : null,
+          candidates: candidates.slice(0, 8).map((candidate) => ({ ...candidate.details, messageDescendantCount: candidate.descendants, path: candidate.path }))
+        }
+      };
+    };
+    const resolvedScroller = resolveConversationScroller();
+    const scroller = resolvedScroller.selected?.node || null;
     const startedAt = Date.now();
     const initialUrl = location.href;
     const originalScrollTop = scroller?.scrollTop || 0;
     const originalDistanceFromBottom = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0;
     const initialTurns = extract();
+    const initialWindowSignature = JSON.stringify(initialTurns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
     const initialTail = initialTurns.at(-1) ? [initialTurns.at(-1).role, initialTurns.at(-1).messageId || initialTurns.at(-1).turnId || '', digest(initialTurns.at(-1).text)].join('\\u0000') : null;
     const snapshots = [];
     let reason = null;
@@ -267,7 +341,12 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     let startReached = false;
     let snapshotStable = false;
     let startPositionProof = false;
-    let topNudgeAttempted = false;
+    let tailProven = false;
+    let tailSnapshot = null;
+    let topProven = false;
+    let olderWindowObserved = false;
+    let scrollProgressObserved = false;
+    let oldestProgression = [];
     let scrollRestored = true;
     const capture = () => {
       const turns = extract();
@@ -279,18 +358,49 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
       scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
     };
     const isLoading = () => Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
-    if (!scroller) reason = 'scroll-container-not-found';
+    const range = (turns) => {
+      const values = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
+      return { min: values.length ? Math.min(...values) : null, max: values.length ? Math.max(...values) : null };
+    };
+    const windowSignature = (turns) => JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
+    const tailSignature = (turns) => JSON.stringify(turns.slice(-3).map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
+    const currentAtBottom = () => !!scroller && scroller.scrollTop >= Math.max(0, scroller.scrollHeight - scroller.clientHeight - 2);
+    if (!scroller) reason = resolvedScroller.ambiguous ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
     if (!reason) {
-      if (scroller.scrollTop <= 1) {
-        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        emitScroll(scroller.scrollTop);
-        await sleep(Math.max(scrollWaitMs, topSettleWaitMs));
+      // Complete history always begins at the latest tail. The initial position is restored below.
+      const bottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      scroller.scrollTo?.({ top: bottom, left: 0, behavior: 'auto' });
+      scroller.scrollTop = bottom;
+      emitScroll(bottom - originalScrollTop);
+      let previousTailSignature = null;
+      let stableTailCount = 0;
+      for (let sample = 0; sample < tailStableSamples && Date.now() - startedAt <= timeoutMs; sample += 1) {
+        const settledBottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        if (scroller.scrollTop !== settledBottom) {
+          const previousScrollTop = scroller.scrollTop;
+          scroller.scrollTo?.({ top: settledBottom, left: 0, behavior: 'auto' });
+          scroller.scrollTop = settledBottom;
+          emitScroll(settledBottom - previousScrollTop);
+        }
+        await sleep(tailStableWaitMs);
+        if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
+        const settled = capture();
+        const signature = JSON.stringify({ tail: tailSignature(settled), height: scroller.scrollHeight, count: settled.length });
+        if (currentAtBottom() && !isLoading() && signature === previousTailSignature) stableTailCount += 1; else stableTailCount = 1;
+        previousTailSignature = signature;
+          if (stableTailCount >= tailStableSamples) {
+            tailProven = true;
+          tailSnapshot = settled;
+          break;
+        }
       }
-      capture();
+      if (!reason && !tailProven) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : 'history-tail-unproven';
       while (iterations < maxIterations && Date.now() - startedAt <= timeoutMs) {
+        if (reason) break;
         iterations += 1;
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
         const before = scroller.scrollTop;
+        const beforeTurns = extract();
         const step = Math.max(240, Math.floor(scroller.clientHeight * 0.65));
         const target = Math.max(0, before - step);
         scroller.scrollBy?.({ top: target - before, left: 0, behavior: 'auto' });
@@ -299,6 +409,14 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
         await sleep(scrollWaitMs);
         const current = capture();
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
+        const beforeRange = range(beforeTurns);
+        const currentRange = range(current);
+        if (oldestProgression.length < 80) oldestProgression.push(currentRange.min);
+        if (currentRange.min !== null && (beforeRange.min === null || currentRange.min < beforeRange.min)) {
+          olderWindowObserved = true;
+          scrollProgressObserved = true;
+        }
+        if (windowSignature(current) !== windowSignature(beforeTurns)) scrollProgressObserved = true;
         if (scroller.scrollTop <= 1 && !isLoading()) {
           let previousTopSnapshot = null;
           let stableTopCount = 0;
@@ -318,7 +436,10 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
             previousTopSnapshot = signature;
             if (stableTopCount >= topStableSamples) {
               const positioned = settled.filter((turn) => Number.isInteger(turn.positionHint));
-              startPositionProof = positioned.length === 0 || positioned[0]?.positionHint === 0;
+              const positionValues = positioned.map((turn) => turn.positionHint);
+              const minimumPosition = positionValues.length ? Math.min(...positionValues) : null;
+              startPositionProof = positionValues.length > 0 && minimumPosition === 0;
+              topProven = true;
               topSettled = true;
               break;
             }
@@ -326,36 +447,61 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
           if (reason) break;
           if (topSettled) {
             if (startPositionProof) { startReached = true; snapshotStable = true; break; }
-            if (!topNudgeAttempted) {
-              topNudgeAttempted = true;
-              scroller.scrollTop = Math.min(4, scroller.scrollHeight - scroller.clientHeight);
-              emitScroll(4);
-              await sleep(scrollWaitMs);
-              scroller.scrollTop = 0;
-              emitScroll(-4);
-              continue;
-            }
-            reason = 'history-start-unproven';
+            reason = startPositionProof ? 'history-scroll-no-progress' : 'history-start-unproven';
             break;
           }
-        } else {
-          continue;
         }
-        if (before === scroller.scrollTop && current.length === 0) { reason = 'load-stalled'; break; }
+        if (!scrollProgressObserved && before === scroller.scrollTop && current.length === beforeTurns.length) { reason = 'history-scroll-no-progress'; break; }
       }
-    if (!startReached && !reason) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : (startPositionProof ? 'load-stalled' : 'history-start-unproven');
+      if (!startReached && !reason) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : (startPositionProof ? 'history-scroll-no-progress' : 'history-start-unproven');
     }
     const topSnapshot = snapshots.at(-1) || [];
     const topTailBeforeRestore = topSnapshot.at(-1) ? [topSnapshot.at(-1).role, topSnapshot.at(-1).messageId || topSnapshot.at(-1).turnId || '', digest(topSnapshot.at(-1).text)].join('\\u0000') : null;
+    if (scroller && tailProven) {
+      const tailCheckBottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const previousScrollTop = scroller.scrollTop;
+      scroller.scrollTo?.({ top: tailCheckBottom, left: 0, behavior: 'auto' });
+      scroller.scrollTop = tailCheckBottom;
+      emitScroll(tailCheckBottom - previousScrollTop);
+      await sleep(scrollWaitMs);
+      const tailCheck = extract();
+      if (location.href !== initialUrl || tailSignature(tailCheck) !== tailSignature(tailSnapshot)) reason = 'conversation-changed';
+    }
     scroller && (scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight - originalDistanceFromBottom));
     await sleep(Math.min(200, scrollWaitMs));
     const restoredTurns = extract();
     if (scroller) scrollRestored = Math.abs((scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) - originalDistanceFromBottom) <= 2;
     if (location.href !== initialUrl) reason = 'conversation-changed';
+    const restoredWindowSignature = JSON.stringify(restoredTurns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
+    if (!reason && initialWindowSignature !== restoredWindowSignature) reason = 'conversation-changed';
     const restoredTail = restoredTurns.at(-1) ? [restoredTurns.at(-1).role, restoredTurns.at(-1).messageId || restoredTurns.at(-1).turnId || '', digest(restoredTurns.at(-1).text)].join('\\u0000') : null;
-    if (initialTail !== restoredTail) reason = 'conversation-changed';
     const allSnapshots = snapshots.length ? snapshots : [initialTurns];
-    return { snapshots: allSnapshots, startReached, snapshotStable, startPositionProof, iterations, reason, scrollRestored, originalScrollTop, topTailBeforeRestore, initialTail, restoredTail, scrollerFound: !!scroller };
+    const allRanges = allSnapshots.map(range);
+    const observedPositions = allRanges.flatMap((item) => [item.min, item.max]).filter((value) => Number.isInteger(value));
+    const tailRange = range(tailSnapshot || []);
+    const diagnostics = {
+      scroller: {
+        ...resolvedScroller.diagnostic,
+        selectedAtTop: topProven,
+        selectedAtBottom: tailProven
+      },
+      positions: {
+        initialMin: range(initialTurns).min,
+        initialMax: range(initialTurns).max,
+        tailMin: tailRange.min,
+        tailMax: tailRange.max,
+        observedMin: observedPositions.length ? Math.min(...observedPositions) : null,
+        observedMax: observedPositions.length ? Math.max(...observedPositions) : null,
+        oldestProgression: oldestProgression.slice(0, 80)
+      },
+      progress: {
+        olderWindowObserved,
+        scrollProgressObserved,
+        tailProven,
+        startProven: startPositionProof
+      }
+    };
+    return { snapshots: allSnapshots, startReached, snapshotStable, startPositionProof, tailProven, iterations, reason, scrollRestored, originalScrollTop, topTailBeforeRestore, initialTail, restoredTail, scrollerFound: !!scroller, diagnostics };
   })()`;
 }
 
@@ -1629,20 +1775,22 @@ export class ChatGPTController {
           const merged = mergeConversationSnapshots(result.snapshots);
           turns = merged.turns;
           let reason = result.reason || null;
-          if (!reason && result.startPositionProof === false) reason = 'history-start-unproven';
+          if (!reason && result.tailProven !== true) reason = 'history-tail-unproven';
+          if (!reason && result.startPositionProof !== true) reason = 'history-start-unproven';
           if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
           if (!reason && !merged.continuous) reason = 'history-gap';
           if (!reason && turns.length > limits.maxTurns) reason = 'turn-limit';
           history = historyMetadata({
             mode,
-            complete: !reason && result.startReached === true && result.snapshotStable === true && merged.continuous && !merged.ambiguous,
+            complete: !reason && result.tailProven === true && result.startReached === true && result.startPositionProof === true && result.snapshotStable === true && merged.continuous && !merged.ambiguous,
             reason,
             startReached: result.startReached === true,
             snapshotStable: result.snapshotStable === true,
             iterations: result.iterations,
             observedTurnCount: merged.observedTurnCount,
             returnedTurnCount: Math.min(merged.turns.length, limits.maxTurns),
-            scrollRestored: result.scrollRestored
+            scrollRestored: result.scrollRestored,
+            diagnostics: result.diagnostics
           });
           turns = turns.slice(-limits.maxTurns);
         } else if (result?.history?.mode === 'complete') {

@@ -13,6 +13,7 @@ const OWNERSHIP_PHASES = new Set([
   'prompt-owned',
   'dispatch-started',
   'send-confirmed',
+  'post-send-settling',
   'cleanup-required',
   'cleared'
 ]);
@@ -84,6 +85,46 @@ export function hasOnlyOwnedAttachmentCards(expectedAttachments, cardDisplayName
   return true;
 }
 
+export function hasExactOwnedAttachmentCards(expectedAttachments, cardDisplayNames) {
+  const expected = Array.isArray(expectedAttachments) ? expectedAttachments : [];
+  const cards = Array.isArray(cardDisplayNames) ? cardDisplayNames : [];
+  if (expected.length !== cards.length) return false;
+  return hasOnlyOwnedAttachmentCards(expected, cards);
+}
+
+export function canSettlePostSendDraft({ lease, current, tabId, conversationDigest, activeOperationId = null, allowRuntimeTabRebind = false, now = Date.now() } = {}) {
+  if (!lease || lease.schemaVersion !== DRAFT_OWNERSHIP_SCHEMA_VERSION || lease.sendConfirmed !== true) return { safe: false, reason: 'post_send_lease_missing' };
+  if (!tabId || (!allowRuntimeTabRebind && lease.tabId !== tabId) || !conversationDigest || lease.conversationDigest !== conversationDigest) return { safe: false, reason: 'post_send_identity_mismatch' };
+  if (activeOperationId && lease.operationId === activeOperationId) return { safe: false, reason: 'post_send_operation_reused' };
+  if (!lease.operationId || !['send-confirmed', 'post-send-settling', 'cleanup-required'].includes(lease.phase)) return { safe: false, reason: 'post_send_phase_invalid' };
+  const updatedAt = Date.parse(lease.updatedAt || '');
+  if (!Number.isFinite(updatedAt) || now - updatedAt > DRAFT_OWNERSHIP_TTL_MS) return { safe: false, reason: 'post_send_lease_expired' };
+  if (!current) return { safe: false, reason: 'post_send_input_ownership_unknown' };
+  const baseline = normalizedBaseline(lease.userTurnBaseline);
+  const observed = normalizedBaseline(current.userTurnBaseline);
+  const sentTurnMatches = observed.count === baseline.count + 1 &&
+    observed.lastTextDigest === lease.promptDigest &&
+    (!baseline.lastId || !observed.lastId || baseline.lastId !== observed.lastId);
+  if (!sentTurnMatches) return { safe: false, reason: 'post_send_turn_proof_missing' };
+  const promptOwned = current.promptLength === 0 || (lease.ownedPrompt === true && current.promptDigest === lease.promptDigest && current.promptLength === lease.promptLength);
+  if (!promptOwned) return { safe: false, reason: 'post_send_foreign_prompt' };
+  const expected = Array.isArray(lease.expectedAttachments) ? lease.expectedAttachments : [];
+  const selected = Array.isArray(current.selectedFiles) ? current.selectedFiles : [];
+  const cards = Array.isArray(current.cardDisplayNames) ? current.cardDisplayNames : [];
+  const inputResidue = current.inputValuePresent === true;
+  const hasResidue = selected.length > 0 || cards.length > 0 || inputResidue;
+  if ((current.composerInputCount !== 1 || current.pageInputCount !== 1) && hasResidue) return { safe: false, reason: 'post_send_input_ownership_unknown' };
+  if (expected.length === 0 && (selected.length || cards.length || inputResidue)) return { safe: false, reason: 'post_send_foreign_attachment' };
+  if (expected.length > 0) {
+    const selectedOwned = selected.length === 0
+      ? !inputResidue
+      : sameAttachmentIdentitySet(expected, selected);
+    if (!selectedOwned || (cards.length > 0 && !hasExactOwnedAttachmentCards(expected, cards))) return { safe: false, reason: 'post_send_attachment_ownership_unknown' };
+  }
+  const clean = selected.length === 0 && cards.length === 0 && !inputResidue && current.promptLength === 0;
+  return { safe: true, clean, cleanupAllowed: !clean, reason: null };
+}
+
 export function canRecoverDraftLease({ lease, current, tabId, conversationDigest, activeOperationId, now = Date.now() } = {}) {
   if (!lease || lease.schemaVersion !== DRAFT_OWNERSHIP_SCHEMA_VERSION) return false;
   if (!tabId || lease.tabId !== tabId || !conversationDigest || lease.conversationDigest !== conversationDigest) return false;
@@ -146,6 +187,8 @@ export class DraftOwnershipStore {
     this.filePath = this.stateDir && this.tabId
       ? path.join(this.stateDir, `chatgpt-draft-ownership-${digest(this.tabId).slice(0, 32)}.json`)
       : null;
+    this.loadedPath = null;
+    this.wasFallbackRead = false;
   }
 
   get enabled() {
@@ -156,10 +199,26 @@ export class DraftOwnershipStore {
     if (!this.filePath) return null;
     try {
       const value = JSON.parse(await fs.readFile(this.filePath, 'utf8'));
+      this.loadedPath = this.filePath;
+      this.wasFallbackRead = false;
       return value && typeof value === 'object' ? value : null;
     } catch (error) {
-      if (error?.code === 'ENOENT') return null;
-      return null;
+      if (error?.code !== 'ENOENT') return null;
+      if (!this.stateDir) return null;
+      let names;
+      try { names = (await fs.readdir(this.stateDir)).filter((name) => /^chatgpt-draft-ownership-[0-9a-f]{32}\.json$/u.test(name)).slice(0, 32); } catch { return null; }
+      const candidates = [];
+      for (const name of names) {
+        const candidatePath = path.join(this.stateDir, name);
+        try {
+          const candidate = JSON.parse(await fs.readFile(candidatePath, 'utf8'));
+          if (candidate && typeof candidate === 'object' && candidate.sendConfirmed === true && ['send-confirmed', 'post-send-settling', 'cleanup-required'].includes(candidate.phase)) candidates.push({ candidate, candidatePath });
+        } catch {}
+      }
+      if (candidates.length !== 1) return null;
+      this.loadedPath = candidates[0].candidatePath;
+      this.wasFallbackRead = true;
+      return candidates[0].candidate;
     }
   }
 
@@ -167,15 +226,20 @@ export class DraftOwnershipStore {
     if (!this.filePath) return;
     await fs.mkdir(this.stateDir, { recursive: true });
     await atomicWriteFile(this.filePath, `${JSON.stringify(value)}\n`);
+    this.loadedPath = this.filePath;
+    this.wasFallbackRead = false;
   }
 
   async clear() {
     if (!this.filePath) return;
-    try { await fs.rm(this.filePath, { force: true }); } catch {}
+    const paths = new Set([this.filePath, this.loadedPath].filter(Boolean));
+    for (const filePath of paths) { try { await fs.rm(filePath, { force: true }); } catch {} }
+    this.loadedPath = null;
+    this.wasFallbackRead = false;
   }
 }
 
-export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest = '', promptLength = 0, ownedPrompt = false, ownedPromptDigest = promptDigest, ownedPromptLength = promptLength, phase = 'prepared', sendConfirmed = false, updatedAt = new Date().toISOString() }) {
+export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest = '', promptLength = 0, ownedPrompt = false, ownedPromptDigest = promptDigest, ownedPromptLength = promptLength, phase = 'prepared', sendConfirmed = false, postSendDiagnostic = null, updatedAt = new Date().toISOString() }) {
   const promptIsOwned = ownedPrompt === true && phase !== 'prepared' && phase !== 'attachments-owned';
   return {
     schemaVersion: DRAFT_OWNERSHIP_SCHEMA_VERSION,
@@ -189,6 +253,9 @@ export function createDraftLease({ operationId, tabId, conversationDigest, userT
     promptLength: promptIsOwned ? Math.max(0, Number(ownedPromptLength) || 0) : 0,
     phase: OWNERSHIP_PHASES.has(phase) ? phase : 'prepared',
     sendConfirmed: sendConfirmed === true,
+    postSendDiagnostic: postSendDiagnostic && typeof postSendDiagnostic === 'object'
+      ? { status: String(postSendDiagnostic.status || '').slice(0, 32), reason: String(postSendDiagnostic.reason || '').slice(0, 80) }
+      : null,
     updatedAt: new Date(updatedAt).toISOString()
   };
 }

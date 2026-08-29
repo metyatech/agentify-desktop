@@ -8,6 +8,7 @@ import {
   createDraftLease,
   describeAttachmentFiles,
   DraftOwnershipStore,
+  canSettlePostSendDraft,
   textDigest
 } from './chatgpt-draft-ownership.mjs';
 
@@ -359,6 +360,7 @@ export class ChatGPTController {
       ownedPromptLength: run.promptLength,
       phase,
       sendConfirmed: run.sendConfirmed,
+      postSendDiagnostic: run.postSendDiagnostic,
       updatedAt: new Date().toISOString()
     });
     run.ownershipPhase = lease.phase;
@@ -390,13 +392,41 @@ export class ChatGPTController {
       selectedFiles: Array.isArray(state.selectedFiles) ? state.selectedFiles : [],
       cardDisplayNames: Array.isArray(state.cardDisplayNames) ? state.cardDisplayNames : []
     };
+    const conversationDigest = await this.#conversationDigest();
     const safe = canRecoverDraftLease({
       lease,
       current,
       tabId: this.tabId,
-      conversationDigest: await this.#conversationDigest(),
+      conversationDigest,
       activeOperationId: this.currentRun?.operationId || null
     });
+    if (!safe && lease.sendConfirmed === true) {
+      const postSend = canSettlePostSendDraft({
+        lease,
+        current,
+        tabId: this.tabId,
+        conversationDigest,
+        activeOperationId: this.currentRun?.operationId || null,
+        allowRuntimeTabRebind: this.draftOwnership.wasFallbackRead
+      });
+      if (!postSend.safe) return false;
+      if (postSend.clean) {
+        await this.draftOwnership.clear();
+        return true;
+      }
+      const cleanup = await this.cleanupUnsentDraft({
+        prompt: current.promptLength > 0 ? this.currentRun?.prompt || '' : '',
+        expectedFileNames: lease.expectedAttachments.map((item) => item.transportName),
+        logicalFileNames: lease.expectedAttachments.map((item) => item.logicalName),
+        expectedAttachmentIdentities: lease.expectedAttachments,
+        userTurnBaseline: lease.userTurnBaseline,
+        sentPromptDigest: lease.promptDigest,
+        postSend: true
+      });
+      if (cleanup.status !== 'cleared') return false;
+      await this.draftOwnership.clear();
+      return true;
+    }
     if (!safe) return false;
     const cleanup = await this.cleanupUnsentDraft({
       prompt: await this.#readCurrentComposerPrompt(),
@@ -2629,7 +2659,7 @@ export class ChatGPTController {
     }
   }
 
-  async #preflightChatGPTAttachmentDraft() {
+  async #preflightChatGPTAttachmentDraft({ returnState = false } = {}) {
     const state = await this.#eval(`(async () => {
       const agentifyAttachmentDraftPreflight = true;
       const host = location.hostname || '';
@@ -2719,7 +2749,7 @@ export class ChatGPTController {
         inputValuePresent
       };
     })()`);
-    if (state?.isChatGPT && state.hasAttachmentState) {
+    if (state?.isChatGPT && state.hasAttachmentState && !returnState) {
       const err = new Error('chatgpt_file_input_state_conflict');
       err.data = {
         phase: 'attachment_preflight',
@@ -2737,6 +2767,65 @@ export class ChatGPTController {
       throw err;
     }
     return state;
+  }
+
+  async #settlePostSend(run) {
+    if (!run?.sendConfirmed) return { status: 'skipped', reason: 'send_not_confirmed' };
+    if (!this.draftOwnership.enabled) return { status: 'skipped', reason: 'ownership_disabled' };
+    await this.#persistDraftLease(run, 'post-send-settling');
+    const state = await this.#preflightChatGPTAttachmentDraft({ returnState: true });
+    const current = {
+      ...state,
+      userTurnBaseline: await this.#captureUserTurnBaseline()
+    };
+    const proof = canSettlePostSendDraft({
+      lease: createDraftLease({
+        operationId: run.operationId,
+        tabId: this.tabId,
+        conversationDigest: run.conversationDigest,
+        userTurnBaseline: run.userTurnBaseline,
+        expectedAttachments: run.expectedAttachmentIdentities,
+        ownedPrompt: run.promptTyped,
+        ownedPromptDigest: run.promptDigest,
+        ownedPromptLength: run.promptLength,
+        phase: 'post-send-settling',
+        sendConfirmed: true
+      }),
+      current,
+      tabId: this.tabId,
+      conversationDigest: run.conversationDigest,
+      activeOperationId: null,
+      allowRuntimeTabRebind: false
+    });
+    if (!proof.safe) {
+      run.postSendDiagnostic = { status: 'blocked', reason: proof.reason };
+      await this.#persistDraftLease(run, 'cleanup-required');
+      return { status: 'blocked', reason: proof.reason };
+    }
+    if (proof.clean) {
+      run.postSendSettled = true;
+      await this.#clearDraftLease(run);
+      run.ownershipPhase = 'cleared';
+      return { status: 'cleared' };
+    }
+    const cleanup = await this.cleanupUnsentDraft({
+      prompt: current.promptLength > 0 ? run.prompt : '',
+      expectedFileNames: run.expectedFileNames,
+      logicalFileNames: run.logicalExpectedFileNames,
+      expectedAttachmentIdentities: run.expectedAttachmentIdentities,
+      userTurnBaseline: run.userTurnBaseline,
+      sentPromptDigest: run.promptDigest,
+      postSend: true
+    });
+    if (cleanup.status === 'cleared') {
+      run.postSendSettled = true;
+      await this.#clearDraftLease(run);
+      run.ownershipPhase = 'cleared';
+      return cleanup;
+    }
+    run.postSendDiagnostic = { status: 'blocked', reason: cleanup.reason || 'post_send_cleanup_failed' };
+    await this.#persistDraftLease(run, 'cleanup-required');
+    return { status: 'blocked', reason: cleanup.reason || 'post_send_cleanup_failed', cleanup };
   }
 
   async #attachFiles(files, { onMutation } = {}) {
@@ -3528,7 +3617,7 @@ export class ChatGPTController {
     };
   }
 
-  async cleanupUnsentDraft({ prompt, expectedFileNames = [], logicalFileNames = expectedFileNames, expectedAttachmentIdentities = [], userTurnBaseline = null } = {}) {
+  async cleanupUnsentDraft({ prompt, expectedFileNames = [], logicalFileNames = expectedFileNames, expectedAttachmentIdentities = [], userTurnBaseline = null, sentPromptDigest = '', postSend = false } = {}) {
     if (!userTurnBaseline || !Number.isFinite(Number(userTurnBaseline.count))) {
       return { status: 'skipped', reason: 'user_turn_baseline_unavailable' };
     }
@@ -3545,6 +3634,7 @@ export class ChatGPTController {
       lastId: normalizedUserTurnBaseline.lastId,
       lastTextDigest: normalizedUserTurnBaseline.lastTextDigest
     });
+    const sentPromptDigestJson = JSON.stringify(/^[0-9a-f]{64}$/u.test(String(sentPromptDigest || '').toLowerCase()) ? String(sentPromptDigest).toLowerCase() : '');
     const result = await this.#eval(`(async () => {
       const agentifyAttachmentCleanup = true;
       const expectedPrompt = ${promptJson};
@@ -3552,6 +3642,8 @@ export class ChatGPTController {
       const logicalFileNames = ${logicalFileNamesJson};
       const expectedAttachmentIdentities = ${expectedAttachmentIdentitiesJson};
       const baseline = ${baselineJson};
+      const sentPromptDigest = ${sentPromptDigestJson};
+      const postSend = ${postSend === true ? 'true' : 'false'};
       const safeName = (value) => String(value || '').trim().replace(/^.*[\\\\/]/u, '').slice(0, 256);
       const names = (values) => (Array.isArray(values) ? values : []).map(safeName).filter(Boolean).slice(0, 50);
       const normalize = (value) => String(value || '').trim().toLocaleLowerCase();
@@ -3612,7 +3704,9 @@ export class ChatGPTController {
         return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
       })(lastUserText);
       const baselineChanged = userTurns.length !== baseline.count || (baseline.lastId ? baseline.lastId !== lastUserId : !baseline.lastTextDigest || baseline.lastTextDigest !== lastUserTextDigest);
-      if (baselineChanged) return { ok: false, reason: 'user_turn_added', userTurnCount: userTurns.length };
+      const sentTurnMatches = postSend && sentPromptDigest && userTurns.length === baseline.count + 1 &&
+        (!baseline.lastId || !lastUserId || baseline.lastId !== lastUserId) && lastUserTextDigest === sentPromptDigest;
+      if (baselineChanged && !sentTurnMatches) return { ok: false, reason: 'user_turn_added', userTurnCount: userTurns.length };
       const uploadInputs = Array.from(composer.querySelectorAll('input#upload-files[type="file"]'));
       const pageUploadInputs = Array.from(document.querySelectorAll('#upload-files'));
       const pageUploadInputsAreFiles = pageUploadInputs.every((input) => input.matches('input#upload-files[type="file"]'));
@@ -3648,10 +3742,11 @@ export class ChatGPTController {
         const b = (Array.isArray(right) ? right : []).map(identityKey).sort();
         return a.length > 0 && a.length === b.length && a.every((item, index) => item === b[index]);
       };
-      if (expectedAttachmentIdentities.length > 0 && !sameIdentitySet(expectedAttachmentIdentities, selectedIdentities)) {
+      const inputValue = String(uploadInput?.value || '');
+      const selectedIsEmpty = selectedIdentities.length === 0 && inputValue === '';
+      if (expectedAttachmentIdentities.length > 0 && !sameIdentitySet(expectedAttachmentIdentities, selectedIdentities) && !(postSend && selectedIsEmpty)) {
         return { ok: false, reason: 'attachment_identity_mismatch', selectedFileNames, cardDisplayNames: [] };
       }
-      const inputValue = String(uploadInput?.value || '');
       const isFileCard = (card) => card.classList.contains('group/file-tile') || Array.from(card.querySelectorAll('button[aria-label]')).some((button) => /削除|remove|delete/i.test(String(button.getAttribute('aria-label') || '')));
       const isCurrentDraftFileCard = (${isChatGPTCurrentDraftAttachmentCard.toString()});
       const fileCards = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard);
@@ -3695,10 +3790,10 @@ export class ChatGPTController {
                 if (index < 0) return false;
                 used.add(index);
               }
-              return true;
+              return !postSend || fileCards.length === 0 || fileCards.length === expectedAttachmentIdentities.length;
             })()
           : false;
-        if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || pageUploadInputs[0] !== uploadInputs[0] || (!identityEvidenceAvailable && (!selectedMatches || !mappingResult.mappingComplete)) || (identityEvidenceAvailable && (!selectedIdentityMatches || !cardsAreOwned))) {
+        if (uploadInputs.length !== 1 || pageUploadInputs.length !== 1 || pageUploadInputs[0] !== uploadInputs[0] || (!identityEvidenceAvailable && (!selectedMatches || !mappingResult.mappingComplete)) || (identityEvidenceAvailable && ((!selectedIdentityMatches && !(postSend && selectedIsEmpty)) || !cardsAreOwned))) {
           return { ok: false, reason: 'attachment_set_changed', selectedFileNames, cardDisplayNames, mappingErrors: mappingResult.mappingErrors || [] };
         }
         for (const card of fileCards) {
@@ -3740,7 +3835,7 @@ export class ChatGPTController {
           cardCount,
           promptTextLength: promptText.trim().length,
           userTurnCount,
-          cleared: selectedFileNames.length === 0 && cardCount === 0 && promptText.trim() === '' && userTurnCount === baseline.count
+          cleared: selectedFileNames.length === 0 && cardCount === 0 && promptText.trim() === '' && userTurnCount === (postSend ? baseline.count + 1 : baseline.count)
         };
       };
       const settleStartedAt = Date.now();
@@ -4059,6 +4154,7 @@ export class ChatGPTController {
       promptLength: 0,
       expectedAttachmentIdentities: [],
       ownershipPhase: 'prepared',
+      postSendSettled: false,
       ownershipPersisted: false,
       preflightConflict: false,
       signal
@@ -4116,7 +4212,9 @@ export class ChatGPTController {
       await this.#persistDraftLease(run, 'dispatch-started');
       await this.#clickSend({ timeoutMs });
       if (run.sendConfirmed) await this.#persistDraftLease(run, 'send-confirmed');
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
+      const response = await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000), baseline });
+      const postSendDraft = await this.#settlePostSend(run);
+      return { ...response, meta: { ...(response.meta || {}), postSendDraft } };
     } catch (error) {
       if (this.#canCleanupUnsentDraft(run) && (!attachments?.length || run.attachmentOwnershipEstablished)) {
         try {
@@ -4152,7 +4250,7 @@ export class ChatGPTController {
       throw error;
     } finally {
       await uploadPlan?.cleanup?.().catch(() => {});
-      if (run.sendConfirmed || run.ownershipPhase === 'cleared' || (!run.attachmentOwnershipEstablished && !run.promptTyped && !run.preflightConflict)) await this.#clearDraftLease(run);
+      if ((run.sendConfirmed && run.postSendSettled) || run.ownershipPhase === 'cleared' || (!run.attachmentOwnershipEstablished && !run.promptTyped && !run.preflightConflict)) await this.#clearDraftLease(run);
       this.#releaseProviderStopToken(run);
       detachRunSignal();
       if (this.currentRun === run) this.currentRun = null;
@@ -4196,6 +4294,7 @@ export class ChatGPTController {
         promptLength: 0,
         expectedAttachmentIdentities: [],
         ownershipPhase: 'prepared',
+        postSendSettled: false,
         ownershipPersisted: false,
         preflightConflict: false,
         signal
@@ -4241,6 +4340,7 @@ export class ChatGPTController {
           }
         }
 
+        const postSendDraft = await this.#settlePostSend(run);
         return { ok: true };
       } catch (error) {
         if (this.#canCleanupUnsentDraft(run)) {
@@ -4274,7 +4374,7 @@ export class ChatGPTController {
         }
         throw error;
       } finally {
-        if (run.sendConfirmed || run.ownershipPhase === 'cleared' || !run.promptTyped) await this.#clearDraftLease(run);
+        if ((run.sendConfirmed && run.postSendSettled) || run.ownershipPhase === 'cleared' || !run.promptTyped) await this.#clearDraftLease(run);
         this.#releaseProviderStopToken(run);
         detachRunSignal();
         if (this.currentRun === run) this.currentRun = null;

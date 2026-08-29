@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   canRecoverDraftLease,
+  canSettlePostSendDraft,
   createDraftLease,
   DraftOwnershipStore,
   hasOnlyOwnedAttachmentCards,
@@ -206,4 +207,67 @@ test('draft ownership: card aliases are one-to-one per expected attachment', () 
   ];
   assert.equal(hasOnlyOwnedAttachmentCards(staged, ['task-contract(2).json', 'task-contract(1).json']), true);
   assert.equal(hasOnlyOwnedAttachmentCards(staged, ['task-contract(2).json', 'task-contract(3).json', 'task-contract(4).json']), false);
+});
+
+test('post-send settling requires the newly sent turn and accepts clean or exact owned residue', () => {
+  const expected = [{ transportName: 'evidence.txt', logicalName: 'evidence.txt', size: 3, sha256: 'a'.repeat(64) }];
+  const lease = createDraftLease({
+    operationId: 'send-operation',
+    tabId: 'tab-1',
+    conversationDigest: textDigest('conversation-1'),
+    userTurnBaseline: { count: 2, lastId: 'old', lastTextDigest: textDigest('old') },
+    expectedAttachments: expected,
+    ownedPrompt: true,
+    ownedPromptDigest: textDigest('review prompt'),
+    ownedPromptLength: 13,
+    phase: 'send-confirmed',
+    sendConfirmed: true
+  });
+  const base = {
+    composerInputCount: 1,
+    pageInputCount: 1,
+    promptLength: 0,
+    promptDigest: textDigest(''),
+    inputValuePresent: false,
+    userTurnBaseline: { count: 3, lastId: 'new', lastTextDigest: textDigest('review prompt') }
+  };
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: [], cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).clean, true);
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: expected, cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).cleanupAllowed, true);
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['evidence(1).txt'] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).cleanupAllowed, true);
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: [{ ...expected[0], sha256: 'b'.repeat(64) }], cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['foreign.txt'] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease, current: { ...base, userTurnBaseline: { ...base.userTurnBaseline, lastTextDigest: textDigest('other') } }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
+});
+
+test('post-send lease survives a runtime tab-id change when the logical conversation is proven', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-post-send-restart-'));
+  try {
+    const oldStore = new DraftOwnershipStore({ stateDir, tabId: 'old-runtime-tab' });
+    const lease = createDraftLease({
+      operationId: 'sent-operation',
+      tabId: 'old-runtime-tab',
+      conversationDigest: textDigest('conversation-1'),
+      userTurnBaseline: { count: 1, lastId: 'old', lastTextDigest: textDigest('old') },
+      expectedAttachments: [],
+      ownedPrompt: true,
+      ownedPromptDigest: textDigest('sent prompt'),
+      ownedPromptLength: 11,
+      phase: 'cleanup-required',
+      sendConfirmed: true
+    });
+    await oldStore.write(lease);
+    const restarted = new DraftOwnershipStore({ stateDir, tabId: 'new-runtime-tab' });
+    const loaded = await restarted.read();
+    assert.equal(restarted.wasFallbackRead, true);
+    const proof = canSettlePostSendDraft({
+      lease: loaded,
+      current: { composerInputCount: 1, pageInputCount: 1, promptLength: 0, promptDigest: textDigest(''), selectedFiles: [], cardDisplayNames: [], inputValuePresent: false, userTurnBaseline: { count: 2, lastId: 'new', lastTextDigest: textDigest('sent prompt') } },
+      tabId: 'new-runtime-tab',
+      conversationDigest: textDigest('conversation-1'),
+      allowRuntimeTabRebind: true
+    });
+    assert.equal(proof.safe, true);
+    await restarted.clear();
+    assert.equal(await oldStore.read(), null);
+  } finally { await fs.rm(stateDir, { recursive: true, force: true }); }
 });

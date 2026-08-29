@@ -799,6 +799,31 @@ test('chatgpt-controller: complete history remains incomplete when the top proof
   assert.equal(result.history.reason, 'timeout');
 });
 
+test('chatgpt-controller: complete history remains incomplete when the UI start position is not proven', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async () => ({
+      snapshots: [[{ role: 'assistant', text: 'latest', messageId: 'm1', positionHint: 6 }]],
+      startReached: true,
+      startPositionProof: false,
+      snapshotStable: true,
+      iterations: 10,
+      reason: null,
+      scrollRestored: true
+    })
+  });
+  const result = await createController(page).readConversationTurns({
+    maxTurns: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 1000,
+    historyMaxIterations: 10
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-start-unproven');
+});
+
 test('chatgpt-controller: rendered code-block innerText preserves proposal JSON transport', async () => {
   const source = conversationProposalText();
   const captured = await captureActualConversationExtraction([

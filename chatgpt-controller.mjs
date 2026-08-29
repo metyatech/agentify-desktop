@@ -20,6 +20,8 @@ export const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
 const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 15_000;
 const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = 48;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
+const CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS = 540;
+const CONVERSATION_HISTORY_TOP_STABLE_SAMPLES = 4;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -191,6 +193,8 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     const timeoutMs = ${historyTimeoutMs};
     const maxIterations = ${historyMaxIterations};
     const scrollWaitMs = ${CONVERSATION_HISTORY_SCROLL_WAIT_MS};
+    const topSettleWaitMs = ${CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS};
+    const topStableSamples = ${CONVERSATION_HISTORY_TOP_STABLE_SAMPLES};
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
     const excludedSelector = [
       'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
@@ -262,6 +266,7 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     let iterations = 0;
     let startReached = false;
     let snapshotStable = false;
+    let startPositionProof = false;
     let scrollRestored = true;
     const capture = () => {
       const turns = extract();
@@ -272,8 +277,6 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     if (!scroller) reason = 'scroll-container-not-found';
     if (!reason) {
       capture();
-      let previousTopSnapshot = null;
-      let stableTopCount = 0;
       while (iterations < maxIterations && Date.now() - startedAt <= timeoutMs) {
         iterations += 1;
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
@@ -284,16 +287,37 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
         const current = capture();
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
         if (scroller.scrollTop <= 1 && !isLoading()) {
-          const signature = JSON.stringify({ first: current[0]?.fingerprint || null, count: current.length, height: scroller.scrollHeight });
-          if (signature === previousTopSnapshot) stableTopCount += 1; else stableTopCount = 0;
-          previousTopSnapshot = signature;
-          if (stableTopCount >= 1) { startReached = true; snapshotStable = true; break; }
+          let previousTopSnapshot = null;
+          let stableTopCount = 0;
+          let topSettled = false;
+          for (let sample = 0; sample < topStableSamples && Date.now() - startedAt <= timeoutMs; sample += 1) {
+            await sleep(topSettleWaitMs);
+            const settled = capture();
+            if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
+            if (scroller.scrollTop > 1 || isLoading()) break;
+            const signature = JSON.stringify({
+              first: settled[0]?.fingerprint || null,
+              firstPosition: settled[0]?.positionHint ?? null,
+              count: settled.length,
+              height: scroller.scrollHeight
+            });
+            if (signature === previousTopSnapshot) stableTopCount += 1; else stableTopCount = 1;
+            previousTopSnapshot = signature;
+            if (stableTopCount >= topStableSamples) {
+              const positioned = settled.filter((turn) => Number.isInteger(turn.positionHint));
+              startPositionProof = positioned.length === 0 || positioned[0]?.positionHint === 0;
+              topSettled = true;
+              break;
+            }
+          }
+          if (reason) break;
+          if (topSettled && startPositionProof) { startReached = true; snapshotStable = true; break; }
         } else {
-          stableTopCount = 0;
+          continue;
         }
         if (before === scroller.scrollTop && current.length === 0) { reason = 'load-stalled'; break; }
       }
-      if (!startReached && !reason) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : 'load-stalled';
+    if (!startReached && !reason) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : (startPositionProof ? 'load-stalled' : 'history-start-unproven');
     }
     const topSnapshot = snapshots.at(-1) || [];
     const topTailBeforeRestore = topSnapshot.at(-1) ? [topSnapshot.at(-1).role, topSnapshot.at(-1).messageId || topSnapshot.at(-1).turnId || '', digest(topSnapshot.at(-1).text)].join('\\u0000') : null;
@@ -305,7 +329,7 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     const restoredTail = restoredTurns.at(-1) ? [restoredTurns.at(-1).role, restoredTurns.at(-1).messageId || restoredTurns.at(-1).turnId || '', digest(restoredTurns.at(-1).text)].join('\\u0000') : null;
     if (initialTail !== restoredTail) reason = 'conversation-changed';
     const allSnapshots = snapshots.length ? snapshots : [initialTurns];
-    return { snapshots: allSnapshots, startReached, snapshotStable, iterations, reason, scrollRestored, originalScrollTop, topTailBeforeRestore, initialTail, restoredTail, scrollerFound: !!scroller };
+    return { snapshots: allSnapshots, startReached, snapshotStable, startPositionProof, iterations, reason, scrollRestored, originalScrollTop, topTailBeforeRestore, initialTail, restoredTail, scrollerFound: !!scroller };
   })()`;
 }
 
@@ -1579,6 +1603,7 @@ export class ChatGPTController {
           const merged = mergeConversationSnapshots(result.snapshots);
           turns = merged.turns;
           let reason = result.reason || null;
+          if (!reason && result.startPositionProof === false) reason = 'history-start-unproven';
           if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
           if (!reason && !merged.continuous) reason = 'history-gap';
           if (!reason && turns.length > limits.maxTurns) reason = 'turn-limit';

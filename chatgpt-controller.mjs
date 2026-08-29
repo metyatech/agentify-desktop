@@ -317,7 +317,8 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
             if (signature === previousTopSnapshot) stableTopCount += 1; else stableTopCount = 1;
             previousTopSnapshot = signature;
             if (stableTopCount >= topStableSamples) {
-              startPositionProof = true;
+              const positioned = settled.filter((turn) => Number.isInteger(turn.positionHint));
+              startPositionProof = positioned.length === 0 || positioned[0]?.positionHint === 0;
               topSettled = true;
               break;
             }

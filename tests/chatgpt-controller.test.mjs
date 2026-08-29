@@ -8,6 +8,7 @@ import vm from 'node:vm';
 
 import {
   ChatGPTController,
+  mergeConversationSnapshots,
   hasSameChatGPTAttachmentFileNameMultiset,
   isChatGPTAttachmentCardDisplayName,
   isChatGPTCurrentDraftAttachmentCard,
@@ -694,6 +695,108 @@ test('chatgpt-controller: reads only structured ChatGPT turns through the mutex'
   assert.equal(result.turns[0].id, 'message-user');
   assert.match(result.turns[1].id, /^turn-[0-9a-f]{24}$/u);
   assert.deepEqual(result.turns.map((turn) => turn.role), ['user', 'assistant']);
+});
+
+test('chatgpt-controller: complete history merges overlapping virtualized windows without losing turns', async () => {
+  const merged = mergeConversationSnapshots([
+    [
+      { role: 'user', text: 'turn-0', messageId: 'm0' },
+      { role: 'assistant', text: 'turn-1', messageId: 'm1' },
+      { role: 'user', text: 'turn-2', messageId: 'm2' }
+    ],
+    [
+      { role: 'user', text: 'turn-2', messageId: 'm2' },
+      { role: 'assistant', text: 'turn-3', messageId: 'm3' },
+      { role: 'user', text: 'turn-4', messageId: 'm4' }
+    ]
+  ]);
+  assert.equal(merged.ambiguous, false);
+  assert.equal(merged.continuous, true);
+  assert.deepEqual(merged.turns.map((turn) => turn.text), ['turn-0', 'turn-1', 'turn-2', 'turn-3', 'turn-4']);
+});
+
+test('chatgpt-controller: complete history does not deduplicate identical text without a stable identity', async () => {
+  const merged = mergeConversationSnapshots([[
+    { role: 'user', text: 'repeat', fingerprint: 'repeat-a' },
+    { role: 'assistant', text: 'answer-a', fingerprint: 'answer-a' },
+    { role: 'user', text: 'repeat', fingerprint: 'repeat-b' },
+    { role: 'assistant', text: 'answer-b', fingerprint: 'answer-b' }
+  ]]);
+  assert.equal(merged.ambiguous, false);
+  assert.equal(merged.turns.length, 4);
+  assert.deepEqual(merged.turns.map((turn) => turn.text), ['repeat', 'answer-a', 'repeat', 'answer-b']);
+});
+
+test('chatgpt-controller: complete history refuses an ambiguous duplicate observation', async () => {
+  const merged = mergeConversationSnapshots([[
+    { role: 'user', text: 'same', messageId: 'm1' },
+    { role: 'user', text: 'same', messageId: 'm1' }
+  ]]);
+  assert.equal(merged.ambiguous, true);
+});
+
+test('chatgpt-controller: complete history returns bounded completeness metadata and accumulated snapshots', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async (js) => {
+      assert.match(js, /const maxIterations = 10/u);
+      return {
+        snapshots: [
+          [{ role: 'user', text: 'oldest', messageId: 'm0' }, { role: 'assistant', text: 'proposal', messageId: 'm1' }],
+          [{ role: 'assistant', text: 'proposal', messageId: 'm1' }, { role: 'user', text: 'approval', messageId: 'm2' }]
+        ],
+        startReached: true,
+        snapshotStable: true,
+        iterations: 3,
+        reason: null,
+        scrollRestored: true
+      };
+    }
+  });
+  const result = await createController(page).readConversationTurns({
+    maxTurns: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 1000,
+    historyMaxIterations: 10
+  });
+  assert.deepEqual(result.turns.map((turn) => turn.text), ['oldest', 'proposal', 'approval']);
+  assert.deepEqual(result.history, {
+    mode: 'complete',
+    complete: true,
+    reason: null,
+    startReached: true,
+    snapshotStable: true,
+    iterations: 3,
+    observedTurnCount: 3,
+    returnedTurnCount: 3,
+    scrollRestored: true
+  });
+});
+
+test('chatgpt-controller: complete history remains incomplete when the top proof is not established', async () => {
+  const page = createPage({
+    events: [],
+    onEvaluate: async () => ({
+      snapshots: [[{ role: 'user', text: 'latest', messageId: 'm1' }]],
+      startReached: false,
+      snapshotStable: false,
+      iterations: 10,
+      reason: 'timeout',
+      scrollRestored: true
+    })
+  });
+  const result = await createController(page).readConversationTurns({
+    maxTurns: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 1000,
+    historyMaxIterations: 10
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'timeout');
 });
 
 test('chatgpt-controller: rendered code-block innerText preserves proposal JSON transport', async () => {

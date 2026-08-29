@@ -3857,6 +3857,47 @@ test('http-api: conversation turns requires an existing ChatGPT tab and does not
   assert.equal(reads, 2);
 });
 
+test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {
+  const calls = [];
+  const controller = {
+    readConversationTurns: async (options) => {
+      calls.push(options);
+      return {
+        url: 'https://chatgpt.com/c/complete',
+        turns: [{ id: 'm1', role: 'user', text: 'hello', index: 0 }],
+        history: { mode: 'complete', complete: true, reason: null, startReached: true, snapshotStable: true, iterations: 2, observedTurnCount: 1, returnedTurnCount: 1, scrollRestored: true }
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => controller,
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const complete = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete', historyTimeoutMs: 1000, historyMaxIterations: 5 } });
+  assert.equal(complete.res.status, 200);
+  assert.equal(complete.data.history.complete, true);
+  assert.equal(calls[0].historyMode, 'complete');
+  assert.equal(calls[0].historyTimeoutMs, 1000);
+  assert.equal(calls[0].historyMaxIterations, 5);
+
+  const invalidMode = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'all' } });
+  assert.equal(invalidMode.res.status, 400);
+  const invalidIterations = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMaxIterations: 81 } });
+  assert.equal(invalidIterations.res.status, 400);
+});
+
 test('http-api: conversation turns succeeds when the managed page recovers a stale CDP session', async (t) => {
   const calls = [];
   const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });

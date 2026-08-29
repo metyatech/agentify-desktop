@@ -15,6 +15,11 @@ import {
 export const MAX_CONVERSATION_TURNS = 200;
 export const MAX_CONVERSATION_TURN_CHARS = 200_000;
 export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
+export const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 30_000;
+export const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
+const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 15_000;
+const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = 48;
+const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -68,6 +73,237 @@ function fallbackConversationTurnId({ role, index, text }) {
     .digest('hex')
     .slice(0, 24);
   return `turn-${digest}`;
+}
+
+function historyMetadata({ mode, complete = false, reason = null, startReached = false, snapshotStable = false, iterations = 0, observedTurnCount = 0, returnedTurnCount = 0, scrollRestored = true }) {
+  return {
+    mode,
+    complete: complete === true,
+    reason: reason || null,
+    startReached: startReached === true,
+    snapshotStable: snapshotStable === true,
+    iterations: Number.isInteger(iterations) && iterations >= 0 ? iterations : 0,
+    observedTurnCount: Number.isInteger(observedTurnCount) && observedTurnCount >= 0 ? observedTurnCount : 0,
+    returnedTurnCount: Number.isInteger(returnedTurnCount) && returnedTurnCount >= 0 ? returnedTurnCount : 0,
+    scrollRestored: scrollRestored !== false
+  };
+}
+
+export function mergeConversationSnapshots(snapshots = []) {
+  const records = new Map();
+  const edges = new Map();
+  const indegree = new Map();
+  let ambiguous = false;
+  let continuous = true;
+  let previousKeys = null;
+
+  const addEdge = (from, to) => {
+    if (!edges.has(from)) edges.set(from, new Set());
+    if (!edges.get(from).has(to)) {
+      edges.get(from).add(to);
+      indegree.set(to, (indegree.get(to) || 0) + 1);
+    }
+  };
+
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    const observations = Array.isArray(snapshot) ? snapshot : snapshot?.turns;
+    if (!Array.isArray(observations) || observations.length === 0) {
+      continuous = false;
+      continue;
+    }
+    const keys = [];
+    for (const [localIndex, observation] of observations.entries()) {
+      if (observation?.role !== "user" && observation?.role !== "assistant") {
+        ambiguous = true;
+        continue;
+      }
+      const text = normalizeConversationText(observation.text);
+      if (!text) {
+        ambiguous = true;
+        continue;
+      }
+      const messageId = String(observation.messageId || "").trim();
+      const turnId = String(observation.turnId || "").trim();
+      const positionHint = Number.isInteger(observation.positionHint) ? observation.positionHint : null;
+      const key = messageId
+        ? `message:${messageId}`
+        : turnId
+          ? `turn:${turnId}`
+          : positionHint !== null
+            ? `position:${positionHint}`
+            : String(observation.fingerprint || `${observation.role}\u0000${text}\u0000${localIndex}`);
+      if (keys.includes(key)) ambiguous = true;
+      keys.push(key);
+      const existing = records.get(key);
+      const value = { ...observation, text, messageId: messageId || null, turnId: turnId || null, positionHint };
+      if (existing && (existing.role !== value.role || existing.text !== value.text || (existing.positionHint !== null && value.positionHint !== null && existing.positionHint !== value.positionHint))) {
+        ambiguous = true;
+      } else if (!existing) {
+        records.set(key, { ...value, firstSeen: records.size });
+        indegree.set(key, indegree.get(key) || 0);
+      }
+    }
+    if (previousKeys && !keys.some((key) => previousKeys.includes(key))) continuous = false;
+    for (let index = 1; index < keys.length; index += 1) addEdge(keys[index - 1], keys[index]);
+    previousKeys = keys;
+  }
+
+  const queue = [...records.keys()].filter((key) => (indegree.get(key) || 0) === 0);
+  queue.sort((left, right) => records.get(left).firstSeen - records.get(right).firstSeen);
+  const orderedKeys = [];
+  while (queue.length) {
+    const key = queue.shift();
+    orderedKeys.push(key);
+    for (const next of edges.get(key) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) queue.push(next);
+    }
+    queue.sort((left, right) => records.get(left).firstSeen - records.get(right).firstSeen);
+  }
+  if (orderedKeys.length !== records.size) ambiguous = true;
+
+  const turns = orderedKeys.map((key, index) => {
+    const record = records.get(key);
+    return {
+      role: record.role,
+      text: record.text,
+      index: Number.isInteger(record.positionHint) ? record.positionHint : index,
+      messageId: record.messageId || record.turnId || null,
+    };
+  });
+  return { turns, ambiguous, continuous, observedTurnCount: records.size };
+}
+
+function validateConversationHistoryOptions({ historyMode, historyTimeoutMs, historyMaxIterations }) {
+  if (historyMode !== "visible" && historyMode !== "complete") throw new Error("conversation_history_mode_invalid");
+  if (!Number.isInteger(historyTimeoutMs) || historyTimeoutMs < 1 || historyTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS) throw new Error("conversation_history_timeout_invalid");
+  if (!Number.isInteger(historyMaxIterations) || historyMaxIterations < 1 || historyMaxIterations > MAX_CONVERSATION_HISTORY_ITERATIONS) throw new Error("conversation_history_iterations_invalid");
+}
+
+function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
+  return `(async () => {
+    const maxTurns = ${maxTurns};
+    const maxCharsPerTurn = ${maxCharsPerTurn};
+    const maxTotalChars = ${maxTotalChars};
+    const timeoutMs = ${historyTimeoutMs};
+    const maxIterations = ${historyMaxIterations};
+    const scrollWaitMs = ${CONVERSATION_HISTORY_SCROLL_WAIT_MS};
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const excludedSelector = [
+      'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
+      '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
+      '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
+      '[aria-label*="composer" i]'
+    ].join(',');
+    const normalize = (value) => String(value || '').replace(/\\u0000/g, '').replace(/\\r\\n?/g, '\\n').split('\\n').map((line) => line.replace(/[ \\t]+$/u, '')).join('\\n').trim();
+    const digest = (value) => {
+      let hash = 2166136261;
+      for (const char of String(value || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
+      return (hash >>> 0).toString(16).padStart(8, '0');
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
+      let parent = node.parentElement;
+      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
+      return true;
+    });
+    const visibleText = (node) => {
+      const clone = node.cloneNode(true);
+      if (clone.matches?.(excludedSelector)) clone.remove(); else clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
+      return normalize(clone.innerText || clone.textContent || '');
+    };
+    const parsePosition = (node) => {
+      let current = node;
+      while (current) {
+        for (const value of [current.id, current.getAttribute?.('data-testid'), current.getAttribute?.('data-conversation-turn'), current.getAttribute?.('data-turn')]) {
+          const match = String(value || '').match(/conversation-turn-(\\d+)/i);
+          if (match) return Number(match[1]);
+        }
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const extract = () => {
+      const raw = messageNodes().map((node, domIndex) => {
+      const role = node.getAttribute('data-message-author-role');
+      if (role !== 'user' && role !== 'assistant') return null;
+      const text = visibleText(node);
+      if (!text) return null;
+      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
+      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
+      const positionHint = parsePosition(node);
+      return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint, domIndex };
+      }).filter(Boolean);
+      return raw.map((turn, index) => ({
+        ...turn,
+        fingerprint: [turn.role, digest(turn.text), digest(raw[index - 1]?.text), digest(raw[index + 1]?.text)].join('\\u0000')
+      }));
+    };
+    const getScroller = () => {
+      const candidates = [document.scrollingElement, ...Array.from(document.querySelectorAll('*'))].filter(Boolean).filter((node) => {
+        const style = getComputedStyle(node);
+        return (style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight;
+      });
+      candidates.sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight));
+      return candidates[0] || null;
+    };
+    const scroller = getScroller();
+    const startedAt = Date.now();
+    const initialUrl = location.href;
+    const originalScrollTop = scroller?.scrollTop || 0;
+    const originalDistanceFromBottom = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0;
+    const initialTurns = extract();
+    const initialTail = initialTurns.at(-1) ? [initialTurns.at(-1).role, initialTurns.at(-1).messageId || initialTurns.at(-1).turnId || '', digest(initialTurns.at(-1).text)].join('\\u0000') : null;
+    const snapshots = [];
+    let reason = null;
+    let iterations = 0;
+    let startReached = false;
+    let snapshotStable = false;
+    let scrollRestored = true;
+    const capture = () => {
+      const turns = extract();
+      snapshots.push(turns);
+      return turns;
+    };
+    const isLoading = () => Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    if (!scroller) reason = 'scroll-container-not-found';
+    if (!reason) {
+      capture();
+      let previousTopSnapshot = null;
+      let stableTopCount = 0;
+      while (iterations < maxIterations && Date.now() - startedAt <= timeoutMs) {
+        iterations += 1;
+        if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
+        const before = scroller.scrollTop;
+        const step = Math.max(240, Math.floor(scroller.clientHeight * 0.65));
+        scroller.scrollTop = Math.max(0, before - step);
+        await sleep(scrollWaitMs);
+        const current = capture();
+        if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
+        if (scroller.scrollTop <= 1 && !isLoading()) {
+          const signature = JSON.stringify({ first: current[0]?.fingerprint || null, count: current.length, height: scroller.scrollHeight });
+          if (signature === previousTopSnapshot) stableTopCount += 1; else stableTopCount = 0;
+          previousTopSnapshot = signature;
+          if (stableTopCount >= 1) { startReached = true; snapshotStable = true; break; }
+        } else {
+          stableTopCount = 0;
+        }
+        if (before === scroller.scrollTop && current.length === 0) { reason = 'load-stalled'; break; }
+      }
+      if (!startReached && !reason) reason = Date.now() - startedAt > timeoutMs ? 'timeout' : 'load-stalled';
+    }
+    const topSnapshot = snapshots.at(-1) || [];
+    const topTailBeforeRestore = topSnapshot.at(-1) ? [topSnapshot.at(-1).role, topSnapshot.at(-1).messageId || topSnapshot.at(-1).turnId || '', digest(topSnapshot.at(-1).text)].join('\\u0000') : null;
+    scroller && (scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight - originalDistanceFromBottom));
+    await sleep(Math.min(200, scrollWaitMs));
+    const restoredTurns = extract();
+    if (scroller) scrollRestored = Math.abs((scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) - originalDistanceFromBottom) <= 2;
+    if (location.href !== initialUrl) reason = 'conversation-changed';
+    const restoredTail = restoredTurns.at(-1) ? [restoredTurns.at(-1).role, restoredTurns.at(-1).messageId || restoredTurns.at(-1).turnId || '', digest(restoredTurns.at(-1).text)].join('\\u0000') : null;
+    if (initialTail !== restoredTail) reason = 'conversation-changed';
+    const allSnapshots = snapshots.length ? snapshots : [initialTurns];
+    return { snapshots: allSnapshots, startReached, snapshotStable, iterations, reason, scrollRestored, originalScrollTop, topTailBeforeRestore, initialTail, restoredTail, scrollerFound: !!scroller };
+  })()`;
 }
 
 function sleep(ms) {
@@ -1200,12 +1436,21 @@ export class ChatGPTController {
   async readConversationTurns({
     maxTurns = 100,
     maxCharsPerTurn = 100_000,
-    maxTotalChars = 1_000_000
+    maxTotalChars = 1_000_000,
+    historyMode = 'visible',
+    historyTimeoutMs = DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+    historyMaxIterations = DEFAULT_CONVERSATION_HISTORY_ITERATIONS
   } = {}) {
     const limits = {
       maxTurns: Number(maxTurns),
       maxCharsPerTurn: Number(maxCharsPerTurn),
       maxTotalChars: Number(maxTotalChars)
+    };
+    const mode = String(historyMode || '').trim().toLowerCase();
+    const historyOptions = {
+      historyMode: mode,
+      historyTimeoutMs: Number(historyTimeoutMs),
+      historyMaxIterations: Number(historyMaxIterations)
     };
     if (!Number.isInteger(limits.maxTurns) || limits.maxTurns < 1 || limits.maxTurns > MAX_CONVERSATION_TURNS) {
       throw new Error('conversation_turn_limits_invalid');
@@ -1216,9 +1461,12 @@ export class ChatGPTController {
     if (!Number.isInteger(limits.maxTotalChars) || limits.maxTotalChars < 1 || limits.maxTotalChars > MAX_CONVERSATION_TOTAL_CHARS) {
       throw new Error('conversation_turn_limits_invalid');
     }
+    validateConversationHistoryOptions(historyOptions);
 
     return await this.runExclusive(async () => {
-      const result = await this.#eval(`(() => {
+      const result = await this.#eval(mode === 'complete'
+        ? buildCompleteConversationReadScript({ ...limits, historyTimeoutMs: historyOptions.historyTimeoutMs, historyMaxIterations: historyOptions.historyMaxIterations })
+        : `(() => {
         const maxTurns = ${limits.maxTurns};
         const maxCharsPerTurn = ${limits.maxCharsPerTurn};
         const maxTotalChars = ${limits.maxTotalChars};
@@ -1302,7 +1550,7 @@ export class ChatGPTController {
         throw error;
       }
 
-      const turns = Array.isArray(result.turns)
+      let turns = Array.isArray(result.turns)
         ? result.turns.map((turn) => {
           const role = turn?.role === 'user' || turn?.role === 'assistant' ? turn.role : null;
           const text = normalizeConversationText(turn?.text);
@@ -1317,6 +1565,40 @@ export class ChatGPTController {
           };
         }).filter(Boolean).slice(-limits.maxTurns)
         : [];
+      let history = historyMetadata({
+        mode,
+        reason: mode === 'visible' ? 'visible-window' : 'history-unproven',
+        observedTurnCount: turns.length,
+        returnedTurnCount: turns.length
+      });
+      if (mode === 'complete') {
+        if (Array.isArray(result?.snapshots)) {
+          const merged = mergeConversationSnapshots(result.snapshots);
+          turns = merged.turns;
+          let reason = result.reason || null;
+          if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
+          if (!reason && !merged.continuous) reason = 'history-gap';
+          if (!reason && turns.length > limits.maxTurns) reason = 'turn-limit';
+          history = historyMetadata({
+            mode,
+            complete: !reason && result.startReached === true && result.snapshotStable === true && merged.continuous && !merged.ambiguous,
+            reason,
+            startReached: result.startReached === true,
+            snapshotStable: result.snapshotStable === true,
+            iterations: result.iterations,
+            observedTurnCount: merged.observedTurnCount,
+            returnedTurnCount: Math.min(merged.turns.length, limits.maxTurns),
+            scrollRestored: result.scrollRestored
+          });
+          turns = turns.slice(-limits.maxTurns);
+        } else if (result?.history?.mode === 'complete') {
+          history = historyMetadata({ ...result.history, mode: 'complete' });
+        } else {
+          const error = new Error('conversation_history_unproven');
+          error.data = { reason: 'missing-history-metadata' };
+          throw error;
+        }
+      }
       let totalChars = 0;
       for (const turn of turns) {
         if (turn.text.length > limits.maxCharsPerTurn) {
@@ -1331,7 +1613,7 @@ export class ChatGPTController {
           throw error;
         }
       }
-      return { url: String(await this.getUrl()), turns };
+      return { url: String(await this.getUrl()), turns, history };
     });
   }
 

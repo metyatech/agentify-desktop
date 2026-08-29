@@ -333,14 +333,20 @@ POST /conversation/turns
 Authorization: Bearer <local-token>
 Content-Type: application/json
 
-{"tabId":"existing-chatgpt-tab","maxTurns":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000}
+{"tabId":"existing-chatgpt-tab","maxTurns":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000,"historyMode":"complete"}
 ```
 
 The request accepts exactly one of `tabId` or `key` (a key-only request remains
-supported), requires the resolved tab's `vendorId: "chatgpt"`, and never creates
+supported), accepts `historyMode: "visible"` or bounded `"complete"`, requires the resolved tab's `vendorId: "chatgpt"`, and never creates
 a tab, navigates, queries, sends, or falls back to another vendor. The response
 is bounded and returns `ok`, `tabId`, `vendorId`, the conversation URL, and the
-latest valid DOM-ordered turns with `id`, `role`, `text`, and `index`.
+latest valid DOM-ordered turns with `id`, `role`, `text`, and `index`. Complete
+mode accumulates virtualized DOM windows and returns bounded completeness,
+top-reached, stability, iteration, count, reason, and scroll-restoration
+diagnostics. `history.complete: true` proves a continuous, stable sequence from
+conversation start through the latest turn observed at read start. Timeouts,
+loading stalls, gaps, ambiguity, and limits remain incomplete; the default
+`visible` mode preserves the prior current-DOM-window response shape.
 Clients should send the resolved `tabId` without duplicating `key` or
 `vendorId`; requests containing both selectors are rejected.
 Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,

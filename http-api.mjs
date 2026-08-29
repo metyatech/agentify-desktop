@@ -17,6 +17,8 @@ const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
 const PROVIDER_STOP_TIMEOUT_MS = 1_000;
 const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
+const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 30_000;
+const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
 
 async function boundedProviderStop(controller, { expectedOperationId, reason = 'user_stop' } = {}) {
   if (!controller || typeof controller.requestStop !== 'function') {
@@ -244,6 +246,9 @@ export function mapErrorToHttp(error) {
   if (msg === 'ambiguous_conversation_tab') return { code: 400, body: { error: 'ambiguous_conversation_tab' } };
   if (msg === 'chatgpt_tab_required') return { code: 409, body: { error: 'chatgpt_tab_required' } };
   if (msg === 'conversation_controller_unavailable') return { code: 409, body: { error: 'conversation_controller_unavailable' } };
+  if (msg === 'conversation_history_mode_invalid') return { code: 400, body: { error: 'conversation_history_mode_invalid' } };
+  if (msg === 'conversation_history_timeout_invalid') return { code: 400, body: { error: 'conversation_history_timeout_invalid' } };
+  if (msg === 'conversation_history_iterations_invalid') return { code: 400, body: { error: 'conversation_history_iterations_invalid' } };
   if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
   if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
@@ -283,6 +288,13 @@ function positiveIntOr(value, fallback, max = Number.POSITIVE_INFINITY) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.max(1, Math.min(max, Math.floor(n)));
+}
+
+function strictPositiveIntOr(value, fallback, max, errorCode) {
+  if (value === undefined || value === null) return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > max) throw new Error(errorCode);
+  return n;
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -1427,21 +1439,31 @@ export function startHttpApi({
         if (typeof controller?.readConversationTurns !== 'function') {
           throw new Error('conversation_controller_unavailable');
         }
+        const historyMode = body.historyMode === undefined ? 'visible' : String(body.historyMode).trim().toLowerCase();
+        if (historyMode !== 'visible' && historyMode !== 'complete') throw new Error('conversation_history_mode_invalid');
+        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, 15_000, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
+        const historyMaxIterations = strictPositiveIntOr(body.historyMaxIterations, 48, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid');
         const result = await controller.readConversationTurns({
           maxTurns: positiveIntOr(body.maxTurns, 100, 200),
           maxCharsPerTurn: positiveIntOr(body.maxCharsPerTurn, 100_000, 200_000),
-          maxTotalChars: positiveIntOr(body.maxTotalChars, 1_000_000, 2_000_000)
+          maxTotalChars: positiveIntOr(body.maxTotalChars, 1_000_000, 2_000_000),
+          historyMode,
+          historyTimeoutMs,
+          historyMaxIterations
         });
-        if (!result || typeof result.url !== 'string' || !Array.isArray(result.turns)) {
+        if (!result || typeof result.url !== 'string' || !Array.isArray(result.turns) ||
+            (historyMode === 'complete' && (!result.history || result.history.mode !== historyMode))) {
           throw new Error('conversation_controller_unavailable');
         }
-        return sendJson(res, 200, {
+        const responseBody = {
           ok: true,
           tabId: tab.id,
           vendorId: 'chatgpt',
           url: result.url,
           turns: result.turns
-        }, { maxBytes: 2_000_000 });
+        };
+        if (historyMode === 'complete') responseBody.history = result.history;
+        return sendJson(res, 200, responseBody, { maxBytes: 2_000_000 });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

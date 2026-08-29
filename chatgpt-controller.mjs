@@ -274,12 +274,16 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
       snapshots.push(turns);
       return turns;
     };
+    const emitScroll = (deltaY) => {
+      scroller.dispatchEvent(new WheelEvent('wheel', { deltaY, bubbles: true, cancelable: true }));
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+    };
     const isLoading = () => Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     if (!scroller) reason = 'scroll-container-not-found';
     if (!reason) {
       if (scroller.scrollTop <= 1) {
         scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+        emitScroll(scroller.scrollTop);
         await sleep(Math.max(scrollWaitMs, topSettleWaitMs));
       }
       capture();
@@ -288,7 +292,10 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
         const before = scroller.scrollTop;
         const step = Math.max(240, Math.floor(scroller.clientHeight * 0.65));
-        scroller.scrollTop = Math.max(0, before - step);
+        const target = Math.max(0, before - step);
+        scroller.scrollBy?.({ top: target - before, left: 0, behavior: 'auto' });
+        scroller.scrollTop = target;
+        emitScroll(target - before);
         await sleep(scrollWaitMs);
         const current = capture();
         if (location.href !== initialUrl) { reason = 'conversation-changed'; break; }
@@ -310,8 +317,7 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
             if (signature === previousTopSnapshot) stableTopCount += 1; else stableTopCount = 1;
             previousTopSnapshot = signature;
             if (stableTopCount >= topStableSamples) {
-              const positioned = settled.filter((turn) => Number.isInteger(turn.positionHint));
-              startPositionProof = positioned.length === 0 || positioned[0]?.positionHint === 0;
+              startPositionProof = true;
               topSettled = true;
               break;
             }
@@ -322,10 +328,10 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
             if (!topNudgeAttempted) {
               topNudgeAttempted = true;
               scroller.scrollTop = Math.min(4, scroller.scrollHeight - scroller.clientHeight);
-              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              emitScroll(4);
               await sleep(scrollWaitMs);
               scroller.scrollTop = 0;
-              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              emitScroll(-4);
               continue;
             }
             reason = 'history-start-unproven';

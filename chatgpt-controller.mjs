@@ -277,6 +277,11 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     const isLoading = () => Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     if (!scroller) reason = 'scroll-container-not-found';
     if (!reason) {
+      if (scroller.scrollTop <= 1) {
+        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await sleep(Math.max(scrollWaitMs, topSettleWaitMs));
+      }
       capture();
       while (iterations < maxIterations && Date.now() - startedAt <= timeoutMs) {
         iterations += 1;

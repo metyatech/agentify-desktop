@@ -46,6 +46,7 @@ function keyDescriptor(key) {
 }
 
 const MAX_BROWSER_EVALUATION_DIAGNOSTIC_CHARS = 256;
+const MAX_NATIVE_BACKEND_ERROR_CHARS = 256;
 
 function sanitizeBrowserEvaluationText(value) {
   let text = String(value ?? '')
@@ -75,6 +76,34 @@ function sanitizeBrowserEvaluationClass(value) {
   return match && /(?:Error|Exception)$/u.test(match[1]) ? match[1] : 'Error';
 }
 
+function sanitizeNativeBackendErrorMessage(value) {
+  let text = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!text) return '';
+  if (/^(?=.{1,64}$)[A-Za-z][A-Za-z0-9]*(?:[_.:-][A-Za-z0-9]+)+$/u.test(text)) return text;
+  text = text
+    .replace(/\bfile:\/\/[^\s'"<>]+/giu, '<redacted-file-url>')
+    .replace(/\bhttps?:\/\/[^\s'"<>]+/giu, '<redacted-url>')
+    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\\\\[^\s'"<>]+/gu, '<redacted-path>')
+    .replace(/\b[A-Za-z0-9_-]{24,}\b/gu, '<redacted-token>')
+    .replace(/\b[A-Fa-f0-9]{32,}\b/gu, '<redacted-token>');
+  return text.slice(0, MAX_NATIVE_BACKEND_ERROR_CHARS);
+}
+
+function sanitizeNativeBackendErrorCode(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000 ? value : null;
+  }
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^-?\d{1,10}$/u.test(text)) return Number(text);
+  if (/^(?=.{1,64}$)[A-Za-z][A-Za-z0-9]*(?:[_.:-][A-Za-z0-9]+)+$/u.test(text)) return text;
+  return null;
+}
+
 function sanitizeBrowserEvaluationNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return null;
@@ -100,15 +129,23 @@ function browserEvaluationError(exceptionDetails) {
 }
 
 function wrapNativeInputError(code, error) {
+  const backendCode = sanitizeNativeBackendErrorCode(error?.data?.code ?? error?.code);
+  const backendMessage = sanitizeNativeBackendErrorMessage(
+    error?.data?.message ?? error?.data?.originalMessage ?? error?.data?.recoveryMessage ?? error?.message
+  ) || 'native input dispatch failed';
+  const backendName = sanitizeBrowserEvaluationClass(error?.name || error?.constructor?.name);
   const wrapped = new Error(code);
   wrapped.name = 'NativeInputError';
   wrapped.code = code;
   wrapped.data = {
     code,
+    wrapperCode: code,
+    backendCode,
+    backendMessage,
     cause: {
-      errorName: sanitizeBrowserEvaluationClass(error?.name || error?.constructor?.name),
-      errorCode: (sanitizeBrowserEvaluationText(error?.code) || '').slice(0, 64) || null,
-      errorMessage: sanitizeBrowserEvaluationText(error?.message || error) || 'native input dispatch failed'
+      errorName: backendName,
+      errorCode: backendCode,
+      errorMessage: backendMessage
     }
   };
   return wrapped;

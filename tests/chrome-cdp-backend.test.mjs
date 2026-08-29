@@ -521,6 +521,82 @@ test('chrome-cdp-backend: mouseWheel uses CDP native mouseWheel input', async ()
   await session.close();
 });
 
+test('chrome-cdp-backend: native wheel diagnostics preserve numeric CDP protocol errors separately from wrapper codes', async () => {
+  const { session } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Input.dispatchMouseEvent' && params?.type === 'mouseWheel') {
+      const error = new Error('Invalid parameters');
+      error.data = { code: -32602, message: 'Invalid parameters' };
+      throw error;
+    }
+    return await originalSend(method, params, sessionId);
+  };
+  await assert.rejects(session.page.mouseWheel(320, 480, 0, -720), (error) => {
+    assert.equal(error.data.wrapperCode, 'native_mouse_wheel_dispatch_failed');
+    assert.equal(error.data.backendCode, -32602);
+    assert.equal(error.data.backendMessage, 'Invalid parameters');
+    assert.equal(error.data.cause.errorCode, -32602);
+    assert.equal(error.data.cause.errorMessage, 'Invalid parameters');
+    assert.doesNotMatch(error.data.backendMessage, /Runtime\.evaluate/u);
+    return true;
+  });
+  await session.close();
+});
+
+test('chrome-cdp-backend: native wheel diagnostics preserve -32000 and generic backend messages', async () => {
+  const { session } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Input.dispatchMouseEvent' && params?.type === 'mouseWheel') {
+      const error = new Error('Target closed');
+      error.data = { code: -32000, message: 'Target closed' };
+      throw error;
+    }
+    return await originalSend(method, params, sessionId);
+  };
+  await assert.rejects(session.page.mouseWheel(320, 480, 0, -720), (error) => {
+    assert.equal(error.data.backendCode, -32000);
+    assert.equal(error.data.backendMessage, 'Target closed');
+    return true;
+  });
+  await session.close();
+});
+
+test('chrome-cdp-backend: native wheel diagnostics preserve command timeout and stale-session distinctions', async () => {
+  const timeout = await createSessionWithFileInputs({});
+  timeout.session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Input.dispatchMouseEvent' && params?.type === 'mouseWheel') {
+      const error = new Error('chrome_cdp_command_timeout');
+      error.data = { method: 'Input.dispatchMouseEvent' };
+      throw error;
+    }
+    return {};
+  };
+  await assert.rejects(timeout.session.page.mouseWheel(320, 480, 0, -720), (error) => {
+    assert.equal(error.data.backendCode, null);
+    assert.equal(error.data.backendMessage, 'chrome_cdp_command_timeout');
+    return true;
+  });
+  await timeout.session.close();
+
+  const stale = await createSessionWithFileInputs({});
+  stale.session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Input.dispatchMouseEvent' && params?.type === 'mouseWheel') {
+      const error = new Error('Session with given id not found.');
+      error.data = { code: -32001, message: 'Session with given id not found.' };
+      throw error;
+    }
+    return {};
+  };
+  await assert.rejects(stale.session.page.mouseWheel(320, 480, 0, -720), (error) => {
+    assert.equal(error.data.backendCode, -32001);
+    assert.equal(error.data.backendMessage, 'Session with given id not found.');
+    return true;
+  });
+  await stale.session.close();
+});
+
 test('chrome-cdp-backend: native input diagnostics expose bounded page state', async () => {
   const { session } = await createSessionWithFileInputs({});
   assert.deepEqual(await session.page.getNativeInputDiagnostics(), {

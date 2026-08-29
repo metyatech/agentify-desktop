@@ -999,9 +999,15 @@ test('chatgpt-controller: native wheel diagnostics identify moveMouse failures w
 test('chatgpt-controller: native wheel diagnostics identify mouseWheel failures and retain runtime state', async () => {
   const harness = createNativeWheelHistoryPage();
   harness.page.mouseWheel = async () => {
-    const error = new Error('https://example.invalid/private/secret');
+    const error = new Error('Invalid parameters https://example.invalid/private/secret');
     error.name = 'WheelDispatchError';
-    error.code = 'WHEEL_PRIVATE_CODE';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = {
+      code: 'native_mouse_wheel_dispatch_failed',
+      wrapperCode: 'native_mouse_wheel_dispatch_failed',
+      backendCode: -32602,
+      backendMessage: 'Invalid parameters https://example.invalid/private/secret'
+    };
     throw error;
   };
   harness.page.getNativeInputDiagnostics = async () => ({
@@ -1018,8 +1024,12 @@ test('chatgpt-controller: native wheel diagnostics identify mouseWheel failures 
   assert.equal(nativeInput.failurePhase, 'mouse-wheel');
   assert.equal(nativeInput.backend, 'electron');
   assert.equal(nativeInput.errorName, 'WheelDispatchError');
-  assert.equal(nativeInput.errorCode, 'WHEEL_PRIVATE_CODE');
-  assert.doesNotMatch(nativeInput.errorMessage, /https:\/\//u);
+  assert.equal(nativeInput.errorCode, 'native_mouse_wheel_dispatch_failed');
+  assert.equal(nativeInput.wrapperErrorName, 'WheelDispatchError');
+  assert.equal(nativeInput.wrapperErrorCode, 'native_mouse_wheel_dispatch_failed');
+  assert.equal(nativeInput.backendErrorCode, -32602);
+  assert.match(nativeInput.backendErrorMessage, /Invalid parameters/u);
+  assert.doesNotMatch(nativeInput.backendErrorMessage, /https:\/\//u);
   assert.equal(nativeInput.windowVisible, false);
   assert.equal(nativeInput.windowFocused, false);
   assert.equal(nativeInput.windowMinimized, false);

@@ -72,12 +72,25 @@ function sanitizeNativeInputDiagnostic(value, maxLength) {
   return text.slice(0, maxLength);
 }
 
+function sanitizeNativeInputCode(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000_000 ? value : null;
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^-?\d{1,10}$/u.test(text)) return Number(text);
+  if (/^(?=.{1,64}$)[A-Za-z][A-Za-z0-9]*(?:[_.:-][A-Za-z0-9]+)+$/u.test(text)) return text;
+  return sanitizeNativeInputDiagnostic(text, MAX_NATIVE_INPUT_ERROR_CODE_LENGTH);
+}
+
 function nativeInputErrorDetails(error) {
   const cause = error?.data?.cause && typeof error.data.cause === 'object' ? error.data.cause : error;
   return {
     errorName: sanitizeNativeInputDiagnostic(cause?.errorName || cause?.name || cause?.constructor?.name || 'Error', MAX_NATIVE_INPUT_ERROR_NAME_LENGTH),
-    errorCode: sanitizeNativeInputDiagnostic(cause?.errorCode || cause?.code || error?.data?.code || error?.code, MAX_NATIVE_INPUT_ERROR_CODE_LENGTH),
-    errorMessage: sanitizeNativeInputDiagnostic(cause?.errorMessage || cause?.message || error?.message || error, MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH)
+    errorCode: sanitizeNativeInputCode(cause?.errorCode || cause?.code || error?.data?.code || error?.code),
+    errorMessage: sanitizeNativeInputDiagnostic(cause?.errorMessage || cause?.message || error?.message || error, MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH),
+    wrapperErrorName: sanitizeNativeInputDiagnostic(error?.name || error?.constructor?.name || 'Error', MAX_NATIVE_INPUT_ERROR_NAME_LENGTH),
+    wrapperErrorCode: sanitizeNativeInputCode(error?.data?.wrapperCode || error?.code),
+    backendErrorCode: sanitizeNativeInputCode(error?.data?.backendCode),
+    backendErrorMessage: sanitizeNativeInputDiagnostic(error?.data?.backendMessage || cause?.errorMessage || cause?.message || error?.message || error, MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH)
   };
 }
 
@@ -1892,6 +1905,10 @@ export class ChatGPTController {
         errorName: null,
         errorCode: null,
         errorMessage: null,
+        wrapperErrorName: null,
+        wrapperErrorCode: null,
+        backendErrorCode: null,
+        backendErrorMessage: null,
         coordinates: null,
         deltaX: null,
         deltaY: null,

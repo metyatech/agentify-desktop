@@ -164,11 +164,14 @@ export function mergeConversationSnapshots(snapshots = []) {
 
   const turns = orderedKeys.map((key, index) => {
     const record = records.get(key);
+    const turnIndex = Number.isInteger(record.positionHint) ? record.positionHint : index;
     return {
+      id: record.messageId || record.turnId || fallbackConversationTurnId({ role: record.role, index: turnIndex, text: record.text }),
       role: record.role,
       text: record.text,
-      index: Number.isInteger(record.positionHint) ? record.positionHint : index,
-      messageId: record.messageId || record.turnId || null,
+      index: turnIndex,
+      messageId: record.messageId || null,
+      turnId: record.turnId || null,
     };
   });
   return { turns, ambiguous, continuous, observedTurnCount: records.size };

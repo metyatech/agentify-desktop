@@ -267,6 +267,7 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
     let startReached = false;
     let snapshotStable = false;
     let startPositionProof = false;
+    let topNudgeAttempted = false;
     let scrollRestored = true;
     const capture = () => {
       const turns = extract();
@@ -313,6 +314,15 @@ function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTot
           if (reason) break;
           if (topSettled) {
             if (startPositionProof) { startReached = true; snapshotStable = true; break; }
+            if (!topNudgeAttempted) {
+              topNudgeAttempted = true;
+              scroller.scrollTop = Math.min(4, scroller.scrollHeight - scroller.clientHeight);
+              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              await sleep(scrollWaitMs);
+              scroller.scrollTop = 0;
+              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              continue;
+            }
             reason = 'history-start-unproven';
             break;
           }

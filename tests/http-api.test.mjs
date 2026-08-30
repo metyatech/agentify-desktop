@@ -185,6 +185,107 @@ test('http-api: native input diagnostics are read-only, serialized, and bounded'
   assert.equal(Object.hasOwn(data, 'targetId'), false);
 });
 
+test('http-api: scroll visibility probe is authenticated, tab-scoped, and bounded', async (t) => {
+  let exclusive = false;
+  const controller = {
+    runExclusive: async (fn) => {
+      assert.equal(exclusive, false);
+      exclusive = true;
+      try {
+        return await fn();
+      } finally {
+        exclusive = false;
+      }
+    },
+    probeScrollVisibility: async function () {
+      return await this.runExclusive(async () => {
+        assert.equal(exclusive, true);
+        return {
+        backend: 'chrome-cdp',
+        preconditionPassed: true,
+        before: {
+          browserWindowState: 'minimized',
+          adapterMinimized: true,
+          documentVisibilityState: 'hidden',
+          documentHidden: true,
+          documentHasFocus: false,
+          range: { min: 6, max: 10 },
+          scrollTop: 600,
+          clientHeight: 400,
+          scrollHeight: 1400,
+          atBottom: true,
+          windowSignature: 'a'.repeat(32),
+          secret: 'must-not-escape'
+        },
+        normalized: {
+          browserWindowState: 'normal',
+          adapterMinimized: false,
+          documentVisibilityState: 'visible',
+          documentHidden: false,
+          documentHasFocus: false,
+          range: { min: 6, max: 10 },
+          windowSignature: 'b'.repeat(32)
+        },
+        gestureAttempted: true,
+        gestureSourceType: 'touch',
+        gestureDirection: 'older/up',
+        gestureDistance: 280,
+        gestureSpeed: 1000,
+        gestureCommandSucceeded: true,
+        afterGesture: { range: { min: 5, max: 9 }, windowSignature: 'c'.repeat(32), scrollTop: 320 },
+        physicalScrollChanged: true,
+        conversationWindowChanged: true,
+        restoreAttempts: 1,
+        restoreVerified: true,
+        restored: {
+          browserWindowState: 'minimized',
+          adapterMinimized: true,
+          documentVisibilityState: 'hidden',
+          documentHidden: true,
+          documentHasFocus: false
+        },
+        urlStable: true,
+        reason: 'probe-success-window-changed',
+        windowId: 42,
+        targetId: 'secret'
+        };
+      });
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'tab-production', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    getControllerById: (id) => {
+      assert.equal(id, 'tab-production');
+      return controller;
+    }
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/native-input/scroll-visibility-probe',
+    body: { key: 'autopilot-production' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.backend, 'chrome-cdp');
+  assert.equal(data.reason, 'probe-success-window-changed');
+  assert.equal(data.gestureSourceType, 'touch');
+  assert.equal(data.afterGesture.range.min, 5);
+  assert.equal(Object.hasOwn(data, 'windowId'), false);
+  assert.equal(JSON.stringify(data).includes('must-not-escape'), false);
+});
+
 test('http-api: authenticated autopilot status endpoint validates and stores only snapshots', async (t) => {
   const stored = [];
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };

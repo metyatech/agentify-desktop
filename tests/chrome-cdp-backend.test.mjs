@@ -790,6 +790,39 @@ test('chrome-cdp-backend: native input diagnostics report an actual minimized br
   await session.close();
 });
 
+test('chrome-cdp-backend: visibility probe window primitives only change minimized state', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  let windowState = 'minimized';
+  calls.length = 0;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Browser.setWindowBounds') {
+      windowState = params?.bounds?.windowState || null;
+      calls.push({ method, params, sessionId });
+      return {};
+    }
+    if (method === 'Browser.getWindowBounds') {
+      calls.push({ method, params, sessionId });
+      return { bounds: { windowState } };
+    }
+    return await originalSend(method, params, sessionId);
+  };
+
+  await session.page.temporarilyUnminimizeForProbe();
+  assert.equal(windowState, 'normal');
+  assert.equal(session.page.minimized, false);
+  await session.page.restoreMinimizedForProbe();
+  assert.equal(windowState, 'minimized');
+  assert.equal(session.page.minimized, true);
+  assert.deepEqual(calls.filter((call) => call.method === 'Browser.setWindowBounds').map((call) => call.params), [
+    { windowId: 9, bounds: { windowState: 'normal' } },
+    { windowId: 9, bounds: { windowState: 'minimized' } }
+  ]);
+  assert.equal(calls.some((call) => call.method === 'Page.bringToFront'), false);
+  assert.equal(calls.some((call) => call.method.startsWith('Input.')), false);
+  await session.close();
+});
+
 function staleSessionError() {
   const error = new Error('Session with given id not found.');
   error.data = { code: -32001, message: error.message };

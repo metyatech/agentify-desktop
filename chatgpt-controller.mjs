@@ -36,6 +36,10 @@ const PROVIDER_STOP_RELEASE_RETRY_POLL_MS = 50;
 const MAX_SEND_CONFIRMATION_TIMEOUT_MS = 15_000;
 const MAX_NATIVE_INPUT_ERROR_NAME_LENGTH = 64;
 const MAX_NATIVE_INPUT_ERROR_CODE_LENGTH = 64;
+const SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS = 1_500;
+const SCROLL_VISIBILITY_PROBE_POLL_MS = 100;
+const SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS = 100;
+const SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS = 2;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
 
 let latestProviderStopGeneration = 0;
@@ -273,6 +277,20 @@ function conversationWindowSignature(turns = []) {
     Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
     textDigest(normalizeConversationText(turn?.text))
   ]));
+}
+
+function probeWindowSummary(state) {
+  const scroller = state?.scroller;
+  const range = conversationTurnRange(state?.turns);
+  const signature = conversationWindowSignature(state?.turns);
+  return {
+    range,
+    scrollTop: Number.isFinite(Number(scroller?.scrollTop)) ? Number(scroller.scrollTop) : null,
+    clientHeight: Number.isFinite(Number(scroller?.clientHeight)) ? Number(scroller.clientHeight) : null,
+    scrollHeight: Number.isFinite(Number(scroller?.scrollHeight)) ? Number(scroller.scrollHeight) : null,
+    atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
+    windowSignature: signature ? textDigest(signature).slice(0, 32) : null
+  };
 }
 
 function conversationTailSignature(turns = []) {
@@ -1892,6 +1910,182 @@ export class ChatGPTController {
       };
     }
     return await this.page.getNativeInputDiagnostics();
+  }
+
+  async probeScrollVisibility() {
+    return await this.runExclusive(async () => {
+      const limits = {
+        maxTurns: 50,
+        maxCharsPerTurn: 100_000,
+        maxTotalChars: 1_000_000
+      };
+      const result = {
+        backend: null,
+        preconditionPassed: false,
+        before: null,
+        normalized: null,
+        gestureAttempted: false,
+        gestureSourceType: null,
+        gestureDirection: null,
+        gestureDistance: null,
+        gestureSpeed: null,
+        gestureCommandSucceeded: false,
+        afterGesture: null,
+        physicalScrollChanged: false,
+        conversationWindowChanged: false,
+        restoreAttempts: 0,
+        restoreVerified: false,
+        restored: null,
+        urlStable: true,
+        reason: null
+      };
+      let normalizationAttempted = false;
+      let initialUrl = '';
+      let beforeWindow = null;
+
+      const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
+      const readUrl = async () => String(await this.page.getUrl()).trim();
+      const stableAgainstInitialUrl = async (stateUrl = null) => {
+        const currentUrl = stateUrl == null ? await readUrl() : String(stateUrl || '').trim();
+        if (!initialUrl || currentUrl !== initialUrl) {
+          result.urlStable = false;
+          return false;
+        }
+        return true;
+      };
+      const readNative = async () => await this.getNativeInputDiagnostics();
+
+      try {
+        initialUrl = await readUrl();
+        beforeWindow = await readWindow();
+        const beforeNative = await readNative();
+        result.backend = beforeNative?.backend === 'chrome-cdp' ? 'chrome-cdp' : null;
+        result.before = {
+          browserWindowState: beforeNative?.browserWindowState === 'minimized' ? 'minimized' : null,
+          adapterMinimized: beforeNative?.adapterMinimized === true,
+          documentVisibilityState: ['visible', 'hidden'].includes(beforeNative?.documentVisibilityState) ? beforeNative.documentVisibilityState : null,
+          documentHidden: typeof beforeNative?.documentHidden === 'boolean' ? beforeNative.documentHidden : null,
+          documentHasFocus: typeof beforeNative?.documentHasFocus === 'boolean' ? beforeNative.documentHasFocus : null,
+          ...probeWindowSummary(beforeWindow)
+        };
+        const initialStateUrl = String(beforeWindow?.url || '').trim();
+        const hasConversationUrl = await stableAgainstInitialUrl(initialStateUrl);
+        const hasTarget = typeof this.page?.temporarilyUnminimizeForProbe === 'function'
+          && typeof this.page?.restoreMinimizedForProbe === 'function';
+        result.preconditionPassed = result.backend === 'chrome-cdp'
+          && beforeNative?.pageClosed === false
+          && beforeNative?.browserWindowState === 'minimized'
+          && beforeNative?.adapterMinimized === true
+          && hasConversationUrl
+          && hasTarget
+          && !!beforeWindow?.scroller
+          && beforeWindow?.scroller?.candidateCount === 1;
+        if (!result.preconditionPassed) {
+          result.reason = 'probe-precondition-failed';
+          return result;
+        }
+
+        normalizationAttempted = true;
+        await this.page.temporarilyUnminimizeForProbe();
+        const normalizeDeadline = Date.now() + SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS;
+        let normalizedNative = null;
+        let normalizedWindow = null;
+        while (Date.now() <= normalizeDeadline) {
+          normalizedNative = await readNative();
+          normalizedWindow = await readWindow();
+          if (!(await stableAgainstInitialUrl(normalizedWindow?.url))) break;
+          result.normalized = {
+            browserWindowState: ['normal', 'minimized', 'maximized', 'fullscreen'].includes(normalizedNative?.browserWindowState)
+              ? normalizedNative.browserWindowState
+              : null,
+            adapterMinimized: normalizedNative?.adapterMinimized === true,
+            documentVisibilityState: ['visible', 'hidden'].includes(normalizedNative?.documentVisibilityState) ? normalizedNative.documentVisibilityState : null,
+            documentHidden: typeof normalizedNative?.documentHidden === 'boolean' ? normalizedNative.documentHidden : null,
+            documentHasFocus: typeof normalizedNative?.documentHasFocus === 'boolean' ? normalizedNative.documentHasFocus : null,
+            ...probeWindowSummary(normalizedWindow)
+          };
+          if (normalizedNative?.browserWindowState === 'normal' && normalizedNative?.documentVisibilityState === 'visible' && normalizedNative?.documentHidden === false) break;
+          if (Date.now() + SCROLL_VISIBILITY_PROBE_POLL_MS > normalizeDeadline) break;
+          await sleep(SCROLL_VISIBILITY_PROBE_POLL_MS);
+        }
+
+        const readyForGesture = result.urlStable
+          && normalizedNative?.browserWindowState === 'normal'
+          && normalizedNative?.documentVisibilityState === 'visible'
+          && normalizedNative?.documentHidden === false;
+        if (!readyForGesture) {
+          if (!result.urlStable) result.reason = 'probe-conversation-changed';
+          else if (normalizedNative?.browserWindowState !== 'normal') result.reason = 'probe-normalized-but-minimized';
+          else result.reason = 'probe-normalized-but-hidden';
+          return result;
+        }
+
+        const point = normalizedWindow?.scroller?.point;
+        const visibleHeight = Number(normalizedWindow?.scroller?.clientHeight);
+        const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
+        result.gestureAttempted = true;
+        result.gestureSourceType = 'touch';
+        result.gestureDirection = 'older/up';
+        result.gestureDistance = gestureDistance;
+        result.gestureSpeed = 1_000;
+        if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
+          result.reason = 'probe-gesture-failed';
+          return result;
+        }
+        await this.page.scrollGesture({
+          x: Number(point.x),
+          y: Number(point.y),
+          xDistance: 0,
+          yDistance: gestureDistance,
+          speed: result.gestureSpeed,
+          preventFling: true,
+          gestureSourceType: result.gestureSourceType
+        });
+        result.gestureCommandSucceeded = true;
+        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+        const afterWindow = await readWindow();
+        if (!(await stableAgainstInitialUrl(afterWindow?.url))) {
+          result.reason = 'probe-conversation-changed';
+        } else {
+          result.afterGesture = probeWindowSummary(afterWindow);
+          result.physicalScrollChanged = result.before?.scrollTop !== result.afterGesture.scrollTop;
+          result.conversationWindowChanged = result.before?.windowSignature !== result.afterGesture.windowSignature;
+          result.reason = result.conversationWindowChanged ? 'probe-success-window-changed' : 'probe-window-no-progress';
+        }
+      } catch (error) {
+        if (!result.reason) result.reason = result.gestureAttempted ? 'probe-gesture-failed' : 'probe-precondition-failed';
+      } finally {
+        if (normalizationAttempted) {
+          for (let attempt = 0; attempt < SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS && !result.restoreVerified; attempt += 1) {
+            result.restoreAttempts += 1;
+            try {
+              await this.page.restoreMinimizedForProbe();
+            } catch {}
+            await sleep(SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS);
+            try {
+              const restoredNative = await readNative();
+              const restoredUrl = await readUrl();
+              result.restored = {
+                browserWindowState: ['normal', 'minimized', 'maximized', 'fullscreen'].includes(restoredNative?.browserWindowState)
+                  ? restoredNative.browserWindowState
+                  : null,
+                adapterMinimized: restoredNative?.adapterMinimized === true,
+                documentVisibilityState: ['visible', 'hidden'].includes(restoredNative?.documentVisibilityState) ? restoredNative.documentVisibilityState : null,
+                documentHidden: typeof restoredNative?.documentHidden === 'boolean' ? restoredNative.documentHidden : null,
+                documentHasFocus: typeof restoredNative?.documentHasFocus === 'boolean' ? restoredNative.documentHasFocus : null
+              };
+              if (restoredUrl !== initialUrl) result.urlStable = false;
+              result.restoreVerified = result.restored.browserWindowState === 'minimized'
+                && result.restored.adapterMinimized === true
+                && result.restored.documentVisibilityState === 'hidden'
+                && result.restored.documentHidden === true;
+            } catch {}
+          }
+          if (!result.restoreVerified) result.reason = 'probe-restore-failed';
+        }
+      }
+      return result;
+    });
   }
 
   async readPageText({ maxChars = 200_000 } = {}) {

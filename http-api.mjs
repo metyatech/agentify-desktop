@@ -358,6 +358,69 @@ function sanitizeNativeInputDiagnostics(value) {
   };
 }
 
+function sanitizeScrollVisibilityProbe(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const windowStates = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
+  const visibilityStates = new Set(['visible', 'hidden']);
+  const boundedNumber = (item, { min = -1_000_000, max = 1_000_000, integer = false } = {}) => {
+    const number = Number(item);
+    if (!Number.isFinite(number) || number < min || number > max) return null;
+    return integer ? Math.trunc(number) : number;
+  };
+  const boolOrNull = (item) => typeof item === 'boolean' ? item : null;
+  const stateOrNull = (item, allowed) => {
+    const state = String(item || '').trim().toLowerCase();
+    return allowed.has(state) ? state : null;
+  };
+  const range = (item) => ({
+    min: boundedNumber(item?.min, { min: 0, max: 1_000_000, integer: true }),
+    max: boundedNumber(item?.max, { min: 0, max: 1_000_000, integer: true })
+  });
+  const window = (item) => item && typeof item === 'object'
+    ? {
+        range: range(item.range),
+        scrollTop: boundedNumber(item.scrollTop),
+        clientHeight: boundedNumber(item.clientHeight, { min: 0, max: 1_000_000 }),
+        scrollHeight: boundedNumber(item.scrollHeight, { min: 0, max: 1_000_000 }),
+        atBottom: boolOrNull(item.atBottom),
+        windowSignature: /^[a-f0-9]{1,64}$/u.test(String(item.windowSignature || '')) ? String(item.windowSignature) : null
+      }
+    : null;
+  const stage = (item, { includeWindow = true } = {}) => item && typeof item === 'object'
+    ? {
+        browserWindowState: stateOrNull(item.browserWindowState, windowStates),
+        adapterMinimized: boolOrNull(item.adapterMinimized),
+        documentVisibilityState: stateOrNull(item.documentVisibilityState, visibilityStates),
+        documentHidden: boolOrNull(item.documentHidden),
+        documentHasFocus: boolOrNull(item.documentHasFocus),
+        ...(includeWindow ? window(item) : {})
+      }
+    : null;
+  const gestureDirection = data.gestureDirection === 'older/up' ? data.gestureDirection : null;
+  const source = data.gestureSourceType === 'touch' ? data.gestureSourceType : null;
+  const reason = String(data.reason || '').trim();
+  return {
+    backend: data.backend === 'chrome-cdp' ? data.backend : null,
+    preconditionPassed: data.preconditionPassed === true,
+    before: stage(data.before),
+    normalized: stage(data.normalized),
+    gestureAttempted: data.gestureAttempted === true,
+    gestureSourceType: source,
+    gestureDirection,
+    gestureDistance: boundedNumber(data.gestureDistance, { min: 0, max: 600 }),
+    gestureSpeed: boundedNumber(data.gestureSpeed, { min: 0, max: 5_000 }),
+    gestureCommandSucceeded: data.gestureCommandSucceeded === true,
+    afterGesture: window(data.afterGesture),
+    physicalScrollChanged: data.physicalScrollChanged === true,
+    conversationWindowChanged: data.conversationWindowChanged === true,
+    restoreAttempts: boundedNumber(data.restoreAttempts, { min: 0, max: 2, integer: true }) || 0,
+    restoreVerified: data.restoreVerified === true,
+    restored: stage(data.restored, { includeWindow: false }),
+    urlStable: data.urlStable !== false,
+    reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
+  };
+}
+
 function normalizeVendorToken(value) {
   return String(value || '')
     .trim()
@@ -1139,6 +1202,26 @@ export function startHttpApi({
         }
         const diagnostics = await runExclusive(controller, async () => controller.getNativeInputDiagnostics());
         return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeNativeInputDiagnostics(diagnostics) });
+      }
+      if (url.pathname === '/native-input/scroll-visibility-probe' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.probeScrollVisibility !== 'function') {
+          throw new Error('scroll_visibility_probe_unavailable');
+        }
+        const probe = await controller.probeScrollVisibility();
+        return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeScrollVisibilityProbe(probe) });
       }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
         const bundles = await listBundles(stateDir);

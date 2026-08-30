@@ -700,6 +700,28 @@ class ChromeCdpPageAdapter {
     }
   }
 
+  async temporarilyUnminimizeForProbe() {
+    if (this.windowId == null || !Number.isSafeInteger(this.windowId)) {
+      throw new Error('chrome_window_bounds_unavailable');
+    }
+    await this.client.send('Browser.setWindowBounds', {
+      windowId: this.windowId,
+      bounds: { windowState: 'normal' }
+    });
+    this.minimized = false;
+  }
+
+  async restoreMinimizedForProbe() {
+    if (this.windowId == null || !Number.isSafeInteger(this.windowId)) {
+      throw new Error('chrome_window_bounds_unavailable');
+    }
+    await this.client.send('Browser.setWindowBounds', {
+      windowId: this.windowId,
+      bounds: { windowState: 'minimized' }
+    });
+    this.minimized = true;
+  }
+
   async getNativeInputDiagnostics() {
     let browserWindowState = null;
     let boundsKnown = false;

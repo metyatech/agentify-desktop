@@ -371,6 +371,26 @@ state and document visibility/focus values. It does not call scroll, pointer,
 keyboard, focus, bring-to-front, or window-bounds mutation APIs, and it does not
 expose CDP window, target, or session identifiers.
 
+For a bounded, read-only causal probe of a minimized Chrome CDP tab, use the
+authenticated endpoint below. It temporarily changes only the existing tab's
+window state to `normal`, performs exactly one older-direction touch scroll
+gesture when the document becomes visible, and always attempts to restore
+`minimized` before returning. It does not send messages or run complete-history
+backfill.
+
+```text
+POST /native-input/scroll-visibility-probe
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"key":"autopilot-production"}
+```
+
+The endpoint is intentionally limited to a tab selector and returns bounded
+window, visibility, gesture, URL-stability, and restoration diagnostics. It
+does not provide general window-control operations or expose window/session
+identifiers.
+
 ## Windows Notes
 
 Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.

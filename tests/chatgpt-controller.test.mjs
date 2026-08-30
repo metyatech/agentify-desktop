@@ -208,7 +208,7 @@ function createController(page, options = {}) {
   return new ChatGPTController({ page, selectors, ...options });
 }
 
-function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelSnapshots = [] } = {}) {
+function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelSnapshots = [], layoutSnapshots = [] } = {}) {
   const events = [];
   let phase = 'before';
   let wheelIndex = 0;
@@ -217,9 +217,15 @@ function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelS
   let visibilityState = 'hidden';
   let hidden = true;
   let hasFocus = false;
+  let layoutReadIndex = 0;
   const base = structuredClone(snapshot);
   const currentSnapshot = () => {
-    if (phase === 'normalized') return structuredClone(base);
+    if (phase === 'normalized') {
+      const layout = layoutSnapshots.length
+        ? layoutSnapshots[Math.min(layoutReadIndex++, layoutSnapshots.length - 1)]
+        : base;
+      return structuredClone(layout);
+    }
     if (phase === 'wheel') return structuredClone(wheelSnapshots[Math.min(wheelIndex - 1, wheelSnapshots.length - 1)] || base);
     if (phase === 'restored') return structuredClone(base);
     return structuredClone(base);
@@ -259,13 +265,13 @@ function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelS
   return { page, events, getWheelCount: () => wheelIndex };
 }
 
-function startMarkerSnapshot({ range = { min: 1, max: 3 }, atTop = true, scrollTop = 0, markerPositions = [1, 2, 3], turnZero = null, firstMessagePosition = 1, firstMessageRole = 'user', windowSignature = 'aaa11111', structuralSignature = 'bbb22222' } = {}) {
+function startMarkerSnapshot({ range = { min: 1, max: 3 }, atTop = true, scrollTop = 0, scrollHeight = 1_000, clientHeight = 400, markerPositions = [1, 2, 3], turnZero = null, firstMessagePosition = 1, firstMessageRole = 'user', windowSignature = 'aaa11111', structuralSignature = 'bbb22222' } = {}) {
   const positions = markerPositions.map((position) => ({ parsedPosition: position, insideSelectedScroller: true }));
   const zero = turnZero || { elementCount: 0, insideScrollerCount: 0, visibleElementCount: 0, containsUserMessage: false, containsAssistantMessage: false, rawMarkers: [] };
   return {
     url: 'https://chatgpt.com/c/start-marker-test', limitExceeded: false, limitKind: null, loading: false,
     range, windowSignature, structuralSignature,
-    scroller: { candidateCount: 1, selectedMessageDescendantCount: 3, scrollTop, scrollHeight: 1_000, clientHeight: 400, atTop, atBottom: false, point: { x: 500, y: 300 } },
+    scroller: { candidateCount: 1, selectedMessageDescendantCount: 3, scrollTop, scrollHeight, clientHeight, atTop, atBottom: false, point: { x: 500, y: 300 } },
     markerPositions: { minimum: Math.min(...markerPositions), maximum: Math.max(...markerPositions), uniquePositions: markerPositions, hasPosition0: markerPositions.includes(0), hasPosition1: markerPositions.includes(1) },
     turnZero: zero,
     positionOne: { elementCount: markerPositions.includes(1) ? 1 : 0, containsUserMessage: firstMessagePosition === 1, containsAssistantMessage: firstMessagePosition === 1 && firstMessageRole === 'assistant', rawMarkers: [] },
@@ -659,7 +665,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
   const windows = [
     [0, 1, 2, 3, 4, 5, 6],
@@ -733,6 +739,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
       readCount += 1;
       const state = snapshot();
+      const layoutOverride = Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
+        ? layoutSnapshots[readCount - 1]
+        : null;
+      if (layoutOverride) {
+        const { scroller: layoutScroller, ...layoutFields } = layoutOverride;
+        Object.assign(state, layoutFields);
+        if (layoutScroller && typeof layoutScroller === 'object') Object.assign(state.scroller, layoutScroller);
+      }
       if (readCount === limitExceededAtRead) return { ...state, limitExceeded: true, limitKind };
       return state;
     },
@@ -1370,6 +1384,35 @@ test('chatgpt-controller: history budget starts after the normalized baseline', 
   assert.equal(result.history.diagnostics.historyIterationLimit, 30);
 });
 
+test('chatgpt-controller: complete history uses the settled normalized baseline after a transient layout', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    layoutSnapshots: [
+      { range: { min: 6, max: 10 }, scroller: { scrollTop: 0, scrollHeight: 7_212, clientHeight: 763, atTop: true, atBottom: false } },
+      { range: { min: 6, max: 10 }, scroller: { scrollTop: 6_449, scrollHeight: 7_212, clientHeight: 763, atTop: false, atBottom: true } },
+      { range: { min: 6, max: 10 }, scroller: { scrollTop: 6_449, scrollHeight: 7_212, clientHeight: 763, atTop: false, atBottom: true } },
+      { range: { min: 6, max: 10 }, scroller: { scrollTop: 6_449, scrollHeight: 7_212, clientHeight: 763, atTop: false, atBottom: true } }
+    ]
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 10_000,
+    historyMaxIterations: 30
+  });
+  const diagnostics = result.history.diagnostics;
+  assert.equal(result.history.complete, true);
+  assert.equal(diagnostics.layoutSettle.verified, true);
+  assert.equal(diagnostics.layoutSettle.first.scrollTop, 0);
+  assert.equal(diagnostics.layoutSettle.final.scrollTop, 6_449);
+  assert.equal(diagnostics.historyStartedAfterNormalizedBaseline, true);
+  assert.equal(diagnostics.wheelUpAttempts > 0, true);
+  assert.equal(harness.getWheelCount() > 0, true);
+});
+
 test('chatgpt-controller: conversation restore converges after a transient signature mismatch', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 2,
@@ -1483,7 +1526,8 @@ test('chatgpt-controller: Chrome complete history fails closed before wheel when
 test('chatgpt-controller: complete history rejects a limit-exceeded post-wheel snapshot', async () => {
   const harness = createNativeWheelHistoryPage({
     backend: 'chrome-cdp',
-    limitExceededAtRead: 2,
+    // Three reads establish the stable normalized baseline; the next read is the post-wheel snapshot.
+    limitExceededAtRead: 4,
     limitKind: 'per-turn'
   });
   const result = await createController(harness.page).readConversationTurns({
@@ -2102,7 +2146,8 @@ test('chatgpt-controller: post-wheel snapshot failures have their own diagnostic
   harness.page.evaluate = async (js) => {
     if (js.includes('const maxTurns =')) {
       windowReads += 1;
-      if (windowReads === 2) throw Object.assign(new Error('post wheel read failed'), { code: 'POST_READ_FAILED' });
+      // Three reads establish the stable normalized baseline; the next read follows the wheel.
+      if (windowReads === 4) throw Object.assign(new Error('post wheel read failed'), { code: 'POST_READ_FAILED' });
     }
     return await originalEvaluate(js);
   };
@@ -7957,6 +8002,44 @@ test('chatgpt-controller: start-marker diagnostic reports one-origin messages wi
   assert.equal(harness.events.some((event) => event.startsWith('scroll-gesture:')), false);
   assert.equal(harness.events.some((event) => event.startsWith('key:')), false);
   assert.equal(harness.events.some((event) => event.startsWith('files-set:')), false);
+});
+
+test('chatgpt-controller: start-marker diagnostic settles a transient normalized conversation layout before wheeling', async () => {
+  const transient = startMarkerSnapshot({ atTop: true, scrollTop: 0, windowSignature: 'transient1', structuralSignature: 'transient2' });
+  const stable = startMarkerSnapshot({ atTop: false, scrollTop: 6_449, scrollHeight: 7_212, clientHeight: 763, windowSignature: 'stable111', structuralSignature: 'stable222' });
+  const top = startMarkerSnapshot({ atTop: true, scrollTop: 0, markerPositions: [1, 2], windowSignature: 'top33333', structuralSignature: 'top44444' });
+  const harness = createStartMarkerDiagnosticPage({
+    snapshot: stable,
+    layoutSnapshots: [transient, stable, stable, stable],
+    wheelSnapshots: [top]
+  });
+  const result = await createController(harness.page).diagnoseConversationStartMarkers();
+  assert.equal(result.layoutSettle.verified, true);
+  assert.equal(result.layoutSettle.sampleCount, 3);
+  assert.equal(result.normalized.scrollTop, 6_449);
+  assert.equal(result.normalized.atTop, false);
+  assert.equal(result.wheelAttempts, 1);
+  assert.equal(harness.getWheelCount(), 1);
+  assert.equal(result.physicalTopStable, true);
+  assert.equal(result.reason, null);
+});
+
+test('chatgpt-controller: start-marker diagnostic fails closed when conversation layout never settles', async () => {
+  const changingLayout = Array.from({ length: 20 }, (_, index) => startMarkerSnapshot({
+    atTop: index === 0,
+    scrollTop: index * 100,
+    windowSignature: `changing-${index}`,
+    structuralSignature: `structure-${index}`
+  }));
+  const harness = createStartMarkerDiagnosticPage({ snapshot: changingLayout[0], layoutSnapshots: changingLayout });
+  const result = await createController(harness.page).diagnoseConversationStartMarkers();
+  assert.equal(result.layoutSettle.attempted, true);
+  assert.equal(result.layoutSettle.verified, false);
+  assert.equal(result.reason, 'probe-layout-not-stable');
+  assert.equal(result.wheelAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(result.conversationRestore.verified, false);
+  assert.equal(result.windowLifecycle.restoreVerified, true);
 });
 
 test('chatgpt-controller: start-marker diagnostic distinguishes message turn zero from hidden non-message turn zero', async () => {

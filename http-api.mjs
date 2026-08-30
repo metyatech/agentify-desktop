@@ -628,6 +628,17 @@ function sanitizeConversationStartMarkerDiagnostic(value) {
     normalizationApplied: item.normalizationApplied === true, normalizedWindowState: states.has(item.normalizedWindowState) ? item.normalizedWindowState : null, normalizedAdapterMinimized: bool(item.normalizedAdapterMinimized), normalizedVisibilityState: visibilityStates.has(item.normalizedVisibilityState) ? item.normalizedVisibilityState : null, normalizedHidden: bool(item.normalizedHidden), normalizedHasFocus: bool(item.normalizedHasFocus),
     restoreAttempts: number(item.restoreAttempts, { min: 0, max: 2, integer: true }) || 0, restoreVerified: item.restoreVerified === true, restoredWindowState: states.has(item.restoredWindowState) ? item.restoredWindowState : null, restoredAdapterMinimized: bool(item.restoredAdapterMinimized), restoredVisibilityState: visibilityStates.has(item.restoredVisibilityState) ? item.restoredVisibilityState : null, restoredHidden: bool(item.restoredHidden), restoredHasFocus: bool(item.restoredHasFocus)
   } : null;
+  const layoutSettle = data.layoutSettle && typeof data.layoutSettle === 'object' ? {
+    attempted: data.layoutSettle.attempted === true,
+    timeoutMs: number(data.layoutSettle.timeoutMs, { min: 1, max: 2_000, integer: true }),
+    pollMs: number(data.layoutSettle.pollMs, { min: 1, max: 200, integer: true }),
+    requiredStableSamples: number(data.layoutSettle.requiredStableSamples, { min: 1, max: 5, integer: true }),
+    sampleCount: number(data.layoutSettle.sampleCount, { min: 0, max: 20, integer: true }) || 0,
+    stableSampleCount: number(data.layoutSettle.stableSampleCount, { min: 0, max: 5, integer: true }) || 0,
+    verified: data.layoutSettle.verified === true,
+    first: state(data.layoutSettle.first),
+    final: state(data.layoutSettle.final)
+  } : null;
   const restore = data.conversationRestore && typeof data.conversationRestore === 'object' ? {
     attempts: number(data.conversationRestore.attempts, { min: 0, max: 4, integer: true }) || 0, verified: data.conversationRestore.verified === true, initialDistanceFromBottom: number(data.conversationRestore.initialDistanceFromBottom, { min: 0 }), finalDistanceFromBottom: number(data.conversationRestore.finalDistanceFromBottom, { min: 0 }), distanceMatched: data.conversationRestore.distanceMatched === true, signatureMatched: data.conversationRestore.signatureMatched === true, lastFailureReason: text(data.conversationRestore.lastFailureReason, 64)
   } : null;
@@ -637,7 +648,7 @@ function sanitizeConversationStartMarkerDiagnostic(value) {
     backend: data.backend === 'chrome-cdp' ? data.backend : null, preconditionPassed: data.preconditionPassed === true,
     before: state(data.before), normalized: state(data.normalized), initial: state(data.initial), wheelAttemptLimit: number(data.wheelAttemptLimit, { min: 0, max: 24, integer: true }) || 0, wheelAttempts: number(data.wheelAttempts, { min: 0, max: 24, integer: true }) || 0, physicalTopReached: data.physicalTopReached === true, physicalTopStable: data.physicalTopStable === true, stableTop: state(data.stableTop),
     markerPositions: positions, turnZero: compactSummary(data.turnZero), positionOne: compactSummary(data.positionOne), firstMessagePosition: number(data.firstMessagePosition, { min: 0, max: 1_000_000, integer: true }), firstMessageRole: data.firstMessageRole === 'user' || data.firstMessageRole === 'assistant' ? data.firstMessageRole : null, positionSource: source(data.positionSource), firstMessages: messages, firstMessageAncestors: ancestors, previousSiblings: siblings, scrollerMarkerOrder: scrollerOrder, messagePositionOrder: positionOrder, turnZeroElementExists: data.turnZeroElementExists === true, turnZeroContainsConversationMessage: data.turnZeroContainsConversationMessage === true,
-    conversationRestore: restore, windowLifecycle: lifecycle(data.windowLifecycle), urlStable: data.urlStable !== false, reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
+    layoutSettle, conversationRestore: restore, windowLifecycle: lifecycle(data.windowLifecycle), urlStable: data.urlStable !== false, reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
   };
 }
 

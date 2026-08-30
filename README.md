@@ -352,8 +352,10 @@ when the page becomes visible and focused, uses the native mouse-wheel path for
 history movement, and restores the conversation scroll with bounded convergence
 before restoring the original window state. Its default history budget is the
 existing maximum of 30 seconds or 80 iterations, and bounded lifecycle/restore
-diagnostics are recorded. Other backends retain their existing native scrolling
-path.
+diagnostics are recorded. Both complete mode and the start-marker diagnostic
+wait for three consecutive stable conversation-layout samples after native
+window readiness before adopting a baseline. Other backends retain their
+existing native scrolling path.
 Clients should send the resolved `tabId` without duplicating `key` or
 `vendorId`; requests containing both selectors are rejected.
 Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,
@@ -424,7 +426,10 @@ Content-Type: application/json
 This operation serializes on the existing controller mutex, temporarily
 normalizes only a minimized Chrome/CDP window, walks upward with at most 24
 older-direction mouse-wheel inputs, and restores both the conversation scroll
-and original window state in cleanup. It reports bounded marker, ancestor,
+and original window state in cleanup. Before the normalized baseline is used,
+it waits up to two seconds for three consecutive stable conversation-layout
+samples, so transient post-normalization geometry is never treated as the
+baseline. It reports bounded marker, ancestor,
 sibling, position-order, top-stability, and restoration diagnostics. It is
 production-debug-only, does not run complete-history, does not infer or change
 start-proof semantics, and never sends messages or exposes a general-purpose

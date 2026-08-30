@@ -47,6 +47,9 @@ const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X = 0;
 const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y = -720;
 const MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS = 8;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
+const CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS = 2_000;
+const CONVERSATION_LAYOUT_SETTLE_POLL_MS = 200;
+const CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES = 3;
 const START_MARKER_PROBE_MAX_WHEELS = 24;
 const START_MARKER_PROBE_TOP_SAMPLES = 3;
 const START_MARKER_PROBE_TOP_SAMPLE_WAIT_MS = 240;
@@ -301,6 +304,51 @@ function probeWindowSummary(state) {
     atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
     windowSignature: signature ? textDigest(signature).slice(0, 32) : null
   };
+}
+
+function conversationLayoutSummary(state) {
+  const scroller = state?.scroller;
+  const sourceSignature = state?.windowSignature || state?.signature || conversationWindowSignature(state?.turns);
+  return {
+    range: {
+      min: Number.isInteger(state?.range?.min) ? state.range.min : null,
+      max: Number.isInteger(state?.range?.max) ? state.range.max : null
+    },
+    scrollTop: Number.isFinite(Number(scroller?.scrollTop)) ? Number(scroller.scrollTop) : null,
+    scrollHeight: Number.isFinite(Number(scroller?.scrollHeight)) ? Number(scroller.scrollHeight) : null,
+    clientHeight: Number.isFinite(Number(scroller?.clientHeight)) ? Number(scroller.clientHeight) : null,
+    atTop: typeof scroller?.atTop === 'boolean' ? scroller.atTop : null,
+    atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
+    windowSignature: sourceSignature == null ? null : textDigest(String(sourceSignature)).slice(0, 32),
+    loading: state?.loading === true,
+    candidateCount: Number.isInteger(scroller?.candidateCount) ? scroller.candidateCount : 0
+  };
+}
+
+function conversationLayoutSummaryEqual(left, right) {
+  if (!conversationLayoutSummaryReady(left) || !conversationLayoutSummaryReady(right)) return false;
+  const close = (a, b, tolerance = 1) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tolerance;
+  return close(left.scrollTop, right.scrollTop)
+    && close(left.scrollHeight, right.scrollHeight)
+    && close(left.clientHeight, right.clientHeight)
+    && left.atTop === right.atTop
+    && left.atBottom === right.atBottom
+    && left.range.min === right.range.min
+    && left.range.max === right.range.max
+    && left.windowSignature === right.windowSignature;
+}
+
+function conversationLayoutSummaryReady(summary) {
+  return summary
+    && summary.loading === false
+    && summary.candidateCount === 1
+    && Number.isFinite(summary.scrollTop)
+    && Number.isFinite(summary.scrollHeight)
+    && Number.isFinite(summary.clientHeight)
+    && typeof summary.atTop === 'boolean'
+    && typeof summary.atBottom === 'boolean'
+    && typeof summary.windowSignature === 'string'
+    && summary.windowSignature.length > 0;
 }
 
 function conversationTailSignature(turns = []) {
@@ -2173,6 +2221,52 @@ export class ChatGPTController {
     return await this.page.getNativeInputDiagnostics();
   }
 
+  async #waitForStableConversationLayout({ readWindow, initialUrl, timeoutMs = CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS, pollMs = CONVERSATION_LAYOUT_SETTLE_POLL_MS, requiredStableSamples = CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES }) {
+    const deadline = Date.now() + Math.min(CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS, Math.max(1, Number(timeoutMs) || CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS));
+    const interval = Math.min(CONVERSATION_LAYOUT_SETTLE_POLL_MS, Math.max(1, Number(pollMs) || CONVERSATION_LAYOUT_SETTLE_POLL_MS));
+    const required = Math.min(5, Math.max(1, Math.trunc(Number(requiredStableSamples) || CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES)));
+    let first = null;
+    let final = null;
+    let previous = null;
+    let samples = 0;
+    let stableSamples = 0;
+    while (Date.now() <= deadline) {
+      let state;
+      try {
+        state = await readWindow();
+      } catch {
+        return { ok: false, state: final, first, final, samples, stableSamples, reason: 'conversation-layout-timeout' };
+      }
+      samples += 1;
+      final = state;
+      if (!first) first = state;
+      if (initialUrl && String(state?.url || '') !== initialUrl) return { ok: false, state, first, final, samples, stableSamples, reason: 'conversation-changed' };
+      if (state?.limitExceeded) {
+        return {
+          ok: false,
+          state,
+          first,
+          final,
+          samples,
+          stableSamples,
+          reason: state.limitKind === 'per-turn' ? 'conversation-turn-too-large' : 'conversation-too-large'
+        };
+      }
+      if (state?.scroller?.candidateCount !== 1) {
+        return { ok: false, state, first, final, samples, stableSamples, reason: state?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found' };
+      }
+      const summary = conversationLayoutSummary(state);
+      if (!conversationLayoutSummaryReady(summary)) stableSamples = 0;
+      else if (conversationLayoutSummaryEqual(summary, previous)) stableSamples += 1;
+      else stableSamples = 1;
+      previous = summary;
+      if (stableSamples >= required) return { ok: true, state, first, final, samples, stableSamples, reason: 'conversation-layout-stable' };
+      if (Date.now() + interval > deadline) break;
+      await sleep(interval);
+    }
+    return { ok: false, state: final, first, final, samples, stableSamples, reason: 'conversation-layout-timeout' };
+  }
+
   async probeScrollVisibility() {
     return await this.runExclusive(async () => {
       const limits = {
@@ -2758,6 +2852,17 @@ export class ChatGPTController {
         before: null,
         normalized: null,
         initial: null,
+        layoutSettle: {
+          attempted: false,
+          timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+          pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+          requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES,
+          sampleCount: 0,
+          stableSampleCount: 0,
+          verified: false,
+          first: null,
+          final: null
+        },
         wheelAttemptLimit: START_MARKER_PROBE_MAX_WHEELS,
         wheelAttempts: 0,
         physicalTopReached: false,
@@ -2802,8 +2907,8 @@ export class ChatGPTController {
           restoredWindowState: null,
           restoredAdapterMinimized: null,
           restoredVisibilityState: null,
-          restoredHidden: null,
-          restoredHasFocus: null
+        restoredHidden: null,
+        restoredHasFocus: null
         },
         urlStable: true,
         reason: null
@@ -2969,11 +3074,43 @@ export class ChatGPTController {
           result.reason = !result.urlStable ? 'probe-conversation-changed' : normalizedStage?.native?.documentHasFocus !== true ? 'probe-normalized-but-unfocused' : 'probe-normalized-but-hidden';
           return result;
         }
-        normalizedBaseline = normalizedStage.window;
-        result.normalized = normalizedStage.summary;
-        result.initial = normalizedStage.summary;
-        const baseline = normalizedStage.window;
-        result.initial = normalizedStage.summary;
+        const settledLayout = await this.#waitForStableConversationLayout({
+          readWindow,
+          initialUrl,
+          timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+          pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+          requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES
+        });
+        result.layoutSettle = {
+          attempted: true,
+          timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+          pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+          requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES,
+          sampleCount: settledLayout.samples,
+          stableSampleCount: settledLayout.stableSamples,
+          verified: settledLayout.ok === true,
+          first: settledLayout.first ? conversationLayoutSummary(settledLayout.first) : null,
+          final: settledLayout.final ? conversationLayoutSummary(settledLayout.final) : null
+        };
+        result.normalized = stateSummary(normalizedStage.native, settledLayout.final || normalizedStage.window);
+        result.initial = result.normalized;
+        if (!settledLayout.ok) {
+          if (settledLayout.reason === 'conversation-changed') result.urlStable = false;
+          result.reason = settledLayout.reason === 'conversation-changed'
+            ? 'probe-conversation-changed'
+            : settledLayout.reason === 'conversation-turn-too-large'
+              ? 'conversation_turn_too_large'
+              : settledLayout.reason === 'conversation-too-large'
+                ? 'conversation_too_large'
+                : settledLayout.reason === 'scroll-container-ambiguous'
+                  ? 'scroll-container-ambiguous'
+                  : settledLayout.reason === 'scroll-container-not-found'
+                    ? 'scroll-container-not-found'
+                    : 'probe-layout-not-stable';
+          return result;
+        }
+        normalizedBaseline = settledLayout.state;
+        const baseline = settledLayout.state;
         copyStructure(baseline);
         if (!baseline?.scroller || baseline.scroller.candidateCount !== 1) { result.reason = baseline?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found'; return result; }
         if (baseline.limitExceeded) { result.reason = baseline.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; return result; }
@@ -3146,6 +3283,17 @@ export class ChatGPTController {
         restoredHidden: null,
         restoredHasFocus: null
       },
+      layoutSettle: {
+        attempted: false,
+        timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+        pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+        requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES,
+        sampleCount: 0,
+        stableSampleCount: 0,
+        verified: false,
+        first: null,
+        final: null
+      },
       conversationRestore: {
         attempts: 0,
         verified: false,
@@ -3179,6 +3327,7 @@ export class ChatGPTController {
     };
     const currentUrlIsStable = (state) => String(state?.url || '') === initialUrl;
     const historyElapsedMs = () => Date.now() - (historyStartedAt ?? operationStartedAt);
+    const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
     const recordNativeInputRuntime = async () => {
       if (typeof this.page?.getNativeInputDiagnostics !== 'function') return;
       try {
@@ -3240,12 +3389,38 @@ export class ChatGPTController {
         }
       }
       if (!reason) {
-        current = await this.#eval(buildConversationWindowReadScript(limits));
-        if (!current || current.limitExceeded) {
-          reason = current?.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
-        } else if (!currentUrlIsStable(current)) {
-          reason = 'conversation-changed';
+        const settledLayout = await this.#waitForStableConversationLayout({
+          readWindow,
+          initialUrl,
+          timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+          pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+          requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES
+        });
+        diagnostics.layoutSettle = {
+          attempted: true,
+          timeoutMs: CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS,
+          pollMs: CONVERSATION_LAYOUT_SETTLE_POLL_MS,
+          requiredStableSamples: CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES,
+          sampleCount: settledLayout.samples,
+          stableSampleCount: settledLayout.stableSamples,
+          verified: settledLayout.ok === true,
+          first: settledLayout.first ? conversationLayoutSummary(settledLayout.first) : null,
+          final: settledLayout.final ? conversationLayoutSummary(settledLayout.final) : null
+        };
+        if (!settledLayout.ok) {
+          reason = settledLayout.reason === 'conversation-turn-too-large'
+            ? 'conversation_turn_too_large'
+            : settledLayout.reason === 'conversation-too-large'
+              ? 'conversation_too_large'
+              : settledLayout.reason === 'conversation-changed'
+                ? 'conversation-changed'
+                : settledLayout.reason === 'scroll-container-ambiguous'
+                  ? 'scroll-container-ambiguous'
+                  : settledLayout.reason === 'scroll-container-not-found'
+                    ? 'scroll-container-not-found'
+                    : 'history-layout-not-stable';
         } else {
+          current = settledLayout.state;
           initialScrollTop = Number(current?.scroller?.scrollTop);
           initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
           originalWindowSignature = conversationWindowSignature(current?.turns);

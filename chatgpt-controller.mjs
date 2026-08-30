@@ -2519,12 +2519,21 @@ export class ChatGPTController {
   async #readCompleteConversationTurns({ limits, historyTimeoutMs, historyMaxIterations }) {
     const startedAt = Date.now();
     const snapshots = [];
+    let initialNative = null;
+    try {
+      initialNative = await this.getNativeInputDiagnostics();
+    } catch {}
+    const isChromeCdp = initialNative?.backend === 'chrome-cdp';
     const diagnostics = {
-      nativeWheelSupported: typeof this.page?.scrollGesture === 'function'
-        || (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function'),
-      scrollInputMethod: typeof this.page?.scrollGesture === 'function'
-        ? 'cdp-synthesize-scroll-gesture'
-        : (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function' ? 'native-mouse-wheel' : null),
+      nativeWheelSupported: isChromeCdp
+        ? typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function'
+        : typeof this.page?.scrollGesture === 'function'
+          || (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function'),
+      scrollInputMethod: isChromeCdp
+        ? (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function' ? 'chrome-cdp-mouse-wheel' : null)
+        : (typeof this.page?.scrollGesture === 'function'
+          ? 'cdp-synthesize-scroll-gesture'
+          : (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function' ? 'native-mouse-wheel' : null)),
       nativeScrollControlProven: false,
       wheelDownAttempts: 0,
       wheelUpAttempts: 0,
@@ -2544,7 +2553,7 @@ export class ChatGPTController {
       conversationWindowChangeCount: 0,
       physicalScrollChangeCount: 0,
       nativeInput: {
-        backend: null,
+        backend: typeof initialNative?.backend === 'string' ? initialNative.backend.slice(0, 32) : null,
         failurePhase: null,
         errorName: null,
         errorCode: null,
@@ -2562,13 +2571,38 @@ export class ChatGPTController {
         windowDestroyed: null,
         webContentsDestroyed: null,
         pageClosed: null
+      },
+      windowLifecycle: {
+        originalWindowState: ['normal', 'minimized', 'maximized', 'fullscreen'].includes(initialNative?.browserWindowState) ? initialNative.browserWindowState : null,
+        originalAdapterMinimized: typeof initialNative?.adapterMinimized === 'boolean' ? initialNative.adapterMinimized : null,
+        originalVisibilityState: ['visible', 'hidden'].includes(initialNative?.documentVisibilityState) ? initialNative.documentVisibilityState : null,
+        originalHidden: typeof initialNative?.documentHidden === 'boolean' ? initialNative.documentHidden : null,
+        originalHasFocus: typeof initialNative?.documentHasFocus === 'boolean' ? initialNative.documentHasFocus : null,
+        normalizationApplied: false,
+        normalizedWindowState: null,
+        normalizedAdapterMinimized: null,
+        normalizedVisibilityState: null,
+        normalizedHidden: null,
+        normalizedHasFocus: null,
+        restoreAttempts: 0,
+        restoreVerified: !isChromeCdp,
+        restoredWindowState: null,
+        restoredVisibilityState: null,
+        restoredHidden: null,
+        restoredHasFocus: null
       }
     };
-    let current = await this.#eval(buildConversationWindowReadScript(limits));
-    const initialUrl = String(current?.url || '');
-    const initialScrollTop = Number(current?.scroller?.scrollTop);
-    const initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
-    const originalWindowSignature = conversationWindowSignature(current?.turns);
+    let current = null;
+    let initialUrl = '';
+    let initialScrollTop = null;
+    let initialDistanceFromBottom = null;
+    let originalWindowSignature = null;
+    let reason = null;
+    let windowNormalizationApplied = false;
+    let startReached = false;
+    let snapshotStable = false;
+    let tailSnapshot = null;
+    let iterations = 0;
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
       const range = conversationTurnRange(state?.turns);
@@ -2578,14 +2612,6 @@ export class ChatGPTController {
         : diagnostics.observedRange;
       return range;
     };
-    addSnapshot(current);
-    diagnostics.initialRange = conversationTurnRange(current?.turns);
-    diagnostics.observedRange = { ...diagnostics.initialRange };
-    let reason = null;
-    let iterations = 0;
-    let startReached = false;
-    let snapshotStable = false;
-    let tailSnapshot = null;
     const currentUrlIsStable = (state) => String(state?.url || '') === initialUrl;
     const recordNativeInputRuntime = async () => {
       if (typeof this.page?.getNativeInputDiagnostics !== 'function') return;
@@ -2603,6 +2629,68 @@ export class ChatGPTController {
       Object.assign(diagnostics.nativeInput, nativeInputErrorDetails(error));
       await recordNativeInputRuntime();
     };
+    const recordWindowLifecycleState = (target, prefix, native) => {
+      if (!target || !native) return;
+      target[`${prefix}WindowState`] = ['normal', 'minimized', 'maximized', 'fullscreen'].includes(native.browserWindowState)
+        ? native.browserWindowState
+        : null;
+      target[`${prefix}AdapterMinimized`] = typeof native.adapterMinimized === 'boolean' ? native.adapterMinimized : null;
+      target[`${prefix}VisibilityState`] = ['visible', 'hidden'].includes(native.documentVisibilityState) ? native.documentVisibilityState : null;
+      target[`${prefix}Hidden`] = typeof native.documentHidden === 'boolean' ? native.documentHidden : null;
+      target[`${prefix}HasFocus`] = typeof native.documentHasFocus === 'boolean' ? native.documentHasFocus : null;
+    };
+    try {
+      initialUrl = String(await this.page.getUrl()).trim();
+      await recordNativeInputRuntime();
+      if (isChromeCdp) {
+        const ready = (native) => ['normal', 'maximized', 'fullscreen'].includes(native?.browserWindowState)
+          && native?.pageClosed === false
+          && native?.documentVisibilityState === 'visible'
+          && native?.documentHidden === false
+          && native?.documentHasFocus === true;
+        if (initialNative?.browserWindowState === 'minimized') {
+          if (typeof this.page?.temporarilyUnminimizeForProbe !== 'function') {
+            reason = 'history-native-window-not-ready';
+          } else {
+            windowNormalizationApplied = true;
+            diagnostics.windowLifecycle.normalizationApplied = true;
+            await this.page.temporarilyUnminimizeForProbe();
+            const deadline = Date.now() + SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS;
+            let normalized = null;
+            while (Date.now() <= deadline) {
+              normalized = await this.getNativeInputDiagnostics();
+              recordWindowLifecycleState(diagnostics.windowLifecycle, 'normalized', normalized);
+              if (ready(normalized)) break;
+              if (Date.now() + SCROLL_VISIBILITY_PROBE_POLL_MS > deadline) break;
+              await sleep(SCROLL_VISIBILITY_PROBE_POLL_MS);
+            }
+            if (!ready(normalized)) reason = 'history-native-window-not-ready';
+          }
+        } else if (!ready(initialNative)) {
+          reason = 'history-native-window-not-ready';
+        } else {
+          recordWindowLifecycleState(diagnostics.windowLifecycle, 'normalized', initialNative);
+          diagnostics.windowLifecycle.restoreVerified = true;
+        }
+      }
+      if (!reason) {
+        current = await this.#eval(buildConversationWindowReadScript(limits));
+        if (!current || current.limitExceeded) {
+          reason = current?.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+        } else if (!currentUrlIsStable(current)) {
+          reason = 'conversation-changed';
+        } else {
+          initialScrollTop = Number(current?.scroller?.scrollTop);
+          initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
+          originalWindowSignature = conversationWindowSignature(current?.turns);
+          addSnapshot(current);
+          diagnostics.initialRange = conversationTurnRange(current?.turns);
+          diagnostics.observedRange = { ...diagnostics.initialRange };
+        }
+      }
+    } catch (error) {
+      reason ||= isChromeCdp && windowNormalizationApplied ? 'history-native-window-not-ready' : 'history-native-scroll-unproven';
+    }
     const recordWheelResult = (before, after, direction) => {
       const beforeSignature = conversationWindowSignature(before?.turns);
       const afterSignature = conversationWindowSignature(after?.turns);
@@ -2620,6 +2708,21 @@ export class ChatGPTController {
     };
     const nativeWheel = async (direction, state) => {
       if (Date.now() - startedAt > historyTimeoutMs || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
+      if (isChromeCdp) {
+        let runtime = null;
+        try {
+          runtime = await this.getNativeInputDiagnostics();
+        } catch {
+          return { ok: false, reason: 'history-native-window-not-ready' };
+        }
+        if (runtime?.pageClosed !== false
+          || !['normal', 'maximized', 'fullscreen'].includes(runtime?.browserWindowState)
+          || runtime?.documentVisibilityState !== 'visible'
+          || runtime?.documentHidden !== false
+          || runtime?.documentHasFocus !== true) {
+          return { ok: false, reason: 'history-native-window-not-ready' };
+        }
+      }
       const point = state?.scroller?.point;
       if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return { ok: false, reason: 'scroll-target-invalid' };
       iterations += 1;
@@ -2630,7 +2733,7 @@ export class ChatGPTController {
       const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
       const gestureSpeed = 1_000;
       const gestureSourceType = 'touch';
-      const useScrollGesture = typeof this.page?.scrollGesture === 'function';
+      const useScrollGesture = !isChromeCdp && typeof this.page?.scrollGesture === 'function';
       diagnostics.nativeInput.coordinates = { x: Math.round(Number(point.x)), y: Math.round(Number(point.y)) };
       diagnostics.nativeInput.deltaX = deltaX;
       diagnostics.nativeInput.deltaY = useScrollGesture ? (direction > 0 ? -gestureDistance : gestureDistance) : deltaY;
@@ -2690,31 +2793,81 @@ export class ChatGPTController {
       const result = await this.#eval(buildRestoreConversationScrollScript(initialDistanceFromBottom)).catch(() => null);
       await sleep(Math.min(200, CONVERSATION_HISTORY_SCROLL_WAIT_MS));
       const restored = await this.#eval(buildConversationWindowReadScript(limits)).catch(() => null);
-      if (!restored || !currentUrlIsStable(restored)) return false;
+      if (!restored || restored.limitExceeded || !currentUrlIsStable(restored)) return false;
       const restoredDistance = Number(restored?.scroller?.scrollHeight) - Number(restored?.scroller?.clientHeight) - Number(restored?.scroller?.scrollTop);
       const restoredWindow = conversationWindowSignature(restored?.turns);
       return result?.ok === true && Math.abs(restoredDistance - initialDistanceFromBottom) <= 2 && restoredWindow === originalWindowSignature;
     };
+    const restoreWindow = async () => {
+      if (!windowNormalizationApplied) {
+        diagnostics.windowLifecycle.restoreVerified = true;
+        return true;
+      }
+      let verified = false;
+      for (let attempt = 0; attempt < SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS && !verified; attempt += 1) {
+        diagnostics.windowLifecycle.restoreAttempts += 1;
+        try {
+          await this.page.restoreMinimizedForProbe();
+        } catch {}
+        await sleep(SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS);
+        try {
+          const restoredNative = await this.getNativeInputDiagnostics();
+          recordWindowLifecycleState(diagnostics.windowLifecycle, 'restored', restoredNative);
+          verified = restoredNative?.browserWindowState === 'minimized'
+            && restoredNative?.adapterMinimized === true
+            && restoredNative?.documentVisibilityState === 'hidden'
+            && restoredNative?.documentHidden === true;
+        } catch {}
+      }
+      diagnostics.windowLifecycle.restoreVerified = verified;
+      return verified;
+    };
 
     try {
-      if (!initialUrl || !current?.scroller || current.scroller.candidateCount === 0) reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
+      if (reason) {
+        // Preserve a preflight failure and only run the history state machine when setup passed.
+      } else if (!initialUrl || !current?.scroller || current.scroller.candidateCount === 0) reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
       else {
-        const firstDirection = current.scroller.atBottom ? -1 : 1;
-        const first = await nativeWheel(firstDirection, current);
-        if (firstDirection < 0) diagnostics.firstNativeUp = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, beforeRange: first.beforeRange || null, range: first.range || conversationTurnRange(first.state?.turns) };
-        else diagnostics.firstNativeDown = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, beforeRange: first.beforeRange || null, range: first.range || conversationTurnRange(first.state?.turns) };
-        if (!first.ok) reason = first.reason;
-        else if (first.windowChanged) diagnostics.nativeScrollControlProven = true;
-        else {
-          const oppositeDirection = firstDirection < 0 ? 1 : -1;
-          const second = await nativeWheel(oppositeDirection, current);
-          if (oppositeDirection < 0) diagnostics.firstNativeUp = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, beforeRange: second.beforeRange || null, range: second.range || conversationTurnRange(second.state?.turns) };
-          else diagnostics.firstNativeDown = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, beforeRange: second.beforeRange || null, range: second.range || conversationTurnRange(second.state?.turns) };
-          if (!second.ok) reason = second.reason;
-          else if (second.windowChanged) diagnostics.nativeScrollControlProven = true;
-          else reason = 'history-native-scroll-no-progress';
+        let proofDirection = current.scroller.atBottom ? -1 : 1;
+        let oppositeAttempted = false;
+        let proofNoProgress = 0;
+        while (!diagnostics.nativeScrollControlProven && !reason && iterations < historyMaxIterations && Date.now() - startedAt <= historyTimeoutMs) {
+          const before = current;
+          const result = await nativeWheel(proofDirection, before);
+          const entry = {
+            changed: result.windowChanged === true,
+            physicalChanged: result.physicalChanged === true,
+            beforeRange: result.beforeRange || null,
+            range: result.range || conversationTurnRange(result.state?.turns)
+          };
+          if (proofDirection < 0 && !diagnostics.firstNativeUp) diagnostics.firstNativeUp = entry;
+          if (proofDirection > 0 && !diagnostics.firstNativeDown) diagnostics.firstNativeDown = entry;
+          if (!result.ok) { reason = result.reason; break; }
+          if (result.windowChanged) {
+            diagnostics.nativeScrollControlProven = true;
+            break;
+          }
+          const beforeMin = conversationTurnRange(before?.turns).min;
+          const afterMin = result.range?.min;
+          const beforeMax = conversationTurnRange(before?.turns).max;
+          const afterMax = result.range?.max;
+          const rangeProgress = proofDirection < 0
+            ? Number.isInteger(afterMin) && (!Number.isInteger(beforeMin) || afterMin < beforeMin)
+            : Number.isInteger(afterMax) && (!Number.isInteger(beforeMax) || afterMax > beforeMax);
+          if (result.physicalChanged || rangeProgress) {
+            proofNoProgress = 0;
+            continue;
+          }
+          proofNoProgress += 1;
+          if (!oppositeAttempted) {
+            proofDirection = -proofDirection;
+            oppositeAttempted = true;
+            continue;
+          }
+          if (proofNoProgress >= 2) reason = 'history-native-scroll-no-progress';
         }
+        if (!diagnostics.nativeScrollControlProven && !reason) reason = Date.now() - startedAt > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
       }
 
       if (!reason) {
@@ -2748,6 +2901,10 @@ export class ChatGPTController {
               await sleep(CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS);
               const settled = await this.#eval(buildConversationWindowReadScript(limits));
               if (!currentUrlIsStable(settled)) { reason = 'conversation-changed'; break; }
+              if (settled?.limitExceeded) {
+                reason = settled.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+                break;
+              }
               addSnapshot(settled);
               const signature = JSON.stringify({ first: conversationTurnRange(settled.turns).min, window: conversationWindowSignature(settled.turns), loading: settled.loading === true });
               if (!settled.loading && signature === previousTop) stableTopCount += 1; else stableTopCount = 1;
@@ -2767,7 +2924,9 @@ export class ChatGPTController {
           const before = current;
           const result = await nativeWheel(-1, current);
           if (!result.ok) { reason = result.reason; break; }
-          if (result.windowChanged || result.range.min !== conversationTurnRange(before.turns).min) noProgressCount = 0;
+          const rangeProgress = Number.isInteger(result.range?.min)
+            && (!Number.isInteger(conversationTurnRange(before.turns).min) || result.range.min < conversationTurnRange(before.turns).min);
+          if (result.windowChanged || result.physicalChanged || rangeProgress) noProgressCount = 0;
           else noProgressCount += 1;
           if (noProgressCount >= 3) { reason = 'history-native-scroll-no-progress'; break; }
         }
@@ -2793,6 +2952,8 @@ export class ChatGPTController {
       }
     } finally {
       diagnostics.scrollRestored = await restore();
+      const windowRestored = await restoreWindow();
+      if (!windowRestored && !reason) reason = 'history-window-restore-failed';
     }
     if (!diagnostics.scrollRestored && !reason) reason = 'scroll-restore-failed';
     const finalRange = conversationTurnRange(current?.turns);

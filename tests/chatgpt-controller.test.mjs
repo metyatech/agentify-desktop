@@ -585,7 +585,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total' } = {}) {
   const events = [];
   const windows = [
     [0, 1, 2, 3, 4, 5, 6],
@@ -598,6 +598,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   const originalWindowIndex = initialWindow;
   let url = 'https://chatgpt.com/c/native-wheel-test';
   let wheelCount = 0;
+  let readCount = 0;
+  let scrollTopOverride = null;
+  const initialState = initialBrowserWindowState || (backend === 'chrome-cdp' ? 'minimized' : null);
+  let browserWindowState = initialState;
+  let adapterMinimized = backend === 'chrome-cdp' ? initialState === 'minimized' : null;
+  let visibilityState = backend === 'chrome-cdp' && initialState === 'minimized' ? 'hidden' : backend === 'chrome-cdp' ? 'visible' : null;
+  let hidden = backend === 'chrome-cdp' ? visibilityState === 'hidden' : null;
+  let hasFocus = backend === 'chrome-cdp' ? initialState !== 'minimized' : null;
   const snapshot = () => {
     const positions = windows[windowIndex];
     return {
@@ -619,7 +627,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
         selected: { tagName: 'DIV', id: 'conversation-scroll', className: 'conversation-scroll-region', role: '', overflowY: 'auto' },
         selectedPath: 'body>main>div#conversation-scroll',
         candidates: [],
-        scrollTop: windowIndex * 250,
+        scrollTop: Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250,
         scrollHeight: 1_400,
         clientHeight: 400,
         atTop: windowIndex === 0,
@@ -632,17 +640,36 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
     events,
     onEvaluate: async (js) => {
       if (js.includes('const targetDistance =')) {
+        events.push('conversation-scroll-restore');
         const distance = Number(/const targetDistance = ([0-9]+)/u.exec(js)?.[1] || 0);
         windowIndex = Math.max(0, Math.min(windows.length - 1, Math.round((1_000 - distance) / 250)));
+        scrollTopOverride = null;
         return { ok: true, scrollTop: windowIndex * 250 };
       }
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
-      return snapshot();
+      readCount += 1;
+      const state = snapshot();
+      if (readCount === limitExceededAtRead) return { ...state, limitExceeded: true, limitKind };
+      return state;
     },
     onMouseWheel: async (_x, _y, _deltaX, deltaY) => {
       wheelCount += 1;
       if (changeUrlOnWheel && wheelCount === 1) url = 'https://chatgpt.com/c/changed';
       if (!windowChanges) return;
+      const planned = typeof mouseWheelPlan === 'function'
+        ? await mouseWheelPlan({ attempt: wheelCount, deltaY, range: windows[windowIndex].slice(0), scrollTop: windowIndex * 250 })
+        : Array.isArray(mouseWheelPlan) ? mouseWheelPlan[wheelCount - 1] : null;
+      if (planned && typeof planned === 'object') {
+        if (Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
+        if (planned.range) {
+          const next = planned.range;
+          const matching = windows.findIndex((window) => window[0] === next.min && window.at(-1) === next.max);
+          if (matching >= 0) windowIndex = matching;
+        }
+        scrollTopOverride = Number.isFinite(Number(planned.scrollTop)) ? Number(planned.scrollTop) : null;
+        return;
+      }
+      scrollTopOverride = null;
       if (deltaY > 0) windowIndex = Math.min(windows.length - 1, windowIndex + 1);
       if (deltaY < 0) windowIndex = Math.max(0, windowIndex - 1);
     },
@@ -656,6 +683,33 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
     }
   });
   page.getUrl = async () => url;
+  if (backend === 'chrome-cdp') {
+    page.getNativeInputDiagnostics = async () => ({
+      backend,
+      pageClosed: false,
+      browserWindowState,
+      adapterMinimized,
+      documentVisibilityState: visibilityState,
+      documentHidden: hidden,
+      documentHasFocus: hasFocus
+    });
+    page.temporarilyUnminimizeForProbe = async () => {
+      events.push('window-state:normal');
+      browserWindowState = 'normal';
+      adapterMinimized = false;
+      visibilityState = normalizeReady ? 'visible' : 'hidden';
+      hidden = !normalizeReady;
+      hasFocus = normalizeReady;
+    };
+    page.restoreMinimizedForProbe = async () => {
+      events.push('window-state:minimized');
+      browserWindowState = 'minimized';
+      adapterMinimized = true;
+      visibilityState = 'hidden';
+      hidden = true;
+      hasFocus = false;
+    };
+  }
   if (!nativeWheel) page.mouseWheel = undefined;
   if (!scrollGesture) page.scrollGesture = undefined;
   return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, originalWindowIndex };
@@ -1117,13 +1171,8 @@ test('chatgpt-controller: complete history orchestrates native wheel input and a
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
-test('chatgpt-controller: Chrome complete history uses scrollGesture and never falls back to mouseWheel', async () => {
-  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true, scrollGestureSource: 'touch' });
-  let mouseWheelCalls = 0;
-  harness.page.mouseWheel = async () => {
-    mouseWheelCalls += 1;
-    throw new Error('mouseWheel fallback must not be used');
-  };
+test('chatgpt-controller: Chrome complete history uses mouseWheel and never uses scrollGesture', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', scrollGesture: true, scrollGestureSource: 'touch' });
   const result = await createController(harness.page).readConversationTurns({
     maxTurns: 50,
     maxCharsPerTurn: 1000,
@@ -1133,20 +1182,26 @@ test('chatgpt-controller: Chrome complete history uses scrollGesture and never f
     historyMaxIterations: 30
   });
   assert.equal(result.history.complete, true);
-  assert.equal(result.history.diagnostics.scrollInputMethod, 'cdp-synthesize-scroll-gesture');
-  assert.equal(result.history.diagnostics.gestureSourceType, 'touch');
-  assert.ok(harness.events.some((event) => event.includes('"gestureSourceType":"touch"')));
-  assert.ok(result.history.diagnostics.gestureAttemptsDown > 0);
-  assert.ok(result.history.diagnostics.gestureAttemptsUp > 0);
-  assert.equal(mouseWheelCalls, 0);
+  assert.equal(result.history.diagnostics.scrollInputMethod, 'chrome-cdp-mouse-wheel');
+  assert.equal(result.history.diagnostics.gestureAttemptsDown, 0);
+  assert.equal(result.history.diagnostics.gestureAttemptsUp, 0);
+  assert.equal(result.history.diagnostics.windowLifecycle.normalizationApplied, true);
+  assert.equal(result.history.diagnostics.windowLifecycle.normalizedWindowState, 'normal');
+  assert.equal(result.history.diagnostics.windowLifecycle.normalizedVisibilityState, 'visible');
+  assert.equal(result.history.diagnostics.windowLifecycle.normalizedHasFocus, true);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreVerified, true);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoredWindowState, 'minimized');
+  assert.ok(harness.events.some((event) => event.startsWith('mouse-wheel:')));
+  assert.equal(harness.events.some((event) => event.startsWith('scroll-gesture:')), false);
+  assert.equal(harness.events[0], 'window-state:normal');
+  assert.ok(harness.events.indexOf('conversation-scroll-restore') < harness.events.lastIndexOf('window-state:minimized'));
+  assert.equal(harness.events.at(-1), 'window-state:minimized');
   assert.equal(harness.getWheelCount() > 0, true);
 });
 
-test('chatgpt-controller: Chrome complete history bypasses a mouseWheel timeout with scrollGesture', async () => {
-  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true, scrollGestureSource: 'touch' });
-  let mouseWheelCalls = 0;
+test('chatgpt-controller: Chrome complete history does not fall back to scrollGesture when mouseWheel fails', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', scrollGesture: true, scrollGestureSource: 'touch' });
   harness.page.mouseWheel = async () => {
-    mouseWheelCalls += 1;
     const error = new Error('chrome_cdp_command_timeout');
     error.data = { backendMessage: 'chrome_cdp_command_timeout' };
     throw error;
@@ -1159,9 +1214,92 @@ test('chatgpt-controller: Chrome complete history bypasses a mouseWheel timeout 
     historyTimeoutMs: 5000,
     historyMaxIterations: 30
   });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-native-wheel-failed');
+  assert.equal(result.history.diagnostics.nativeInput.failurePhase, 'mouse-wheel');
+  assert.equal(result.history.diagnostics.nativeInput.backendErrorMessage, 'chrome_cdp_command_timeout');
+  assert.equal(harness.events.some((event) => event.startsWith('scroll-gesture:')), false);
+});
+
+test('chatgpt-controller: Chrome proof keeps the same direction across physical-only progress', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    backend: 'chrome-cdp',
+    scrollGesture: true,
+    mouseWheelPlan: ({ attempt }) => attempt === 1
+      ? { scrollTop: 900 }
+      : attempt === 2
+        ? { windowIndex: 3, scrollTop: 650 }
+        : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  const wheels = harness.events.filter((event) => event.startsWith('mouse-wheel:'));
+  assert.equal(result.history.diagnostics.nativeScrollControlProven, true);
+  assert.equal(result.history.diagnostics.firstNativeUp.physicalChanged, true);
+  assert.equal(result.history.diagnostics.firstNativeUp.changed, false);
+  assert.equal(result.history.diagnostics.firstNativeUp.range.min, 20);
+  assert.equal(result.history.diagnostics.wheelUpAttempts >= 2, true);
+  assert.equal(wheels[0].endsWith(':0:-720'), true);
+  assert.equal(wheels[1].endsWith(':0:-720'), true);
+});
+
+test('chatgpt-controller: Chrome complete history preserves an already-normal window', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', initialBrowserWindowState: 'normal' });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
   assert.equal(result.history.complete, true);
-  assert.equal(result.history.reason, null);
-  assert.equal(mouseWheelCalls, 0);
+  assert.equal(result.history.diagnostics.windowLifecycle.normalizationApplied, false);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreAttempts, 0);
+  assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+});
+
+test('chatgpt-controller: Chrome complete history fails closed before wheel when normalized state is not ready', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', normalizeReady: false });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-native-window-not-ready');
+  assert.equal(harness.events.some((event) => event.startsWith('mouse-wheel:')), false);
+  assert.equal(harness.events.at(-1), 'window-state:minimized');
+});
+
+test('chatgpt-controller: complete history rejects a limit-exceeded post-wheel snapshot', async () => {
+  const harness = createNativeWheelHistoryPage({
+    backend: 'chrome-cdp',
+    limitExceededAtRead: 2,
+    limitKind: 'per-turn'
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'conversation_turn_too_large');
+  assert.equal(harness.getWheelCount(), 1);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreVerified, true);
 });
 
 test('chatgpt-controller: successful scrollGesture without a DOM transition remains incomplete', async () => {

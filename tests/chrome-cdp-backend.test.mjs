@@ -521,7 +521,7 @@ test('chrome-cdp-backend: mouseWheel uses CDP native mouseWheel input', async ()
   await session.close();
 });
 
-test('chrome-cdp-backend: scrollGesture uses synthesizeScrollGesture with desktop mouse semantics', async () => {
+test('chrome-cdp-backend: scrollGesture uses synthesizeScrollGesture with touch semantics', async () => {
   const { session, calls } = await createSessionWithFileInputs({});
   await session.page.scrollGesture({
     x: 320,
@@ -530,7 +530,7 @@ test('chrome-cdp-backend: scrollGesture uses synthesizeScrollGesture with deskto
     yDistance: 420,
     speed: 1_000,
     preventFling: true,
-    gestureSourceType: 'mouse'
+    gestureSourceType: 'touch'
   });
   const gesture = calls.findLast((call) => call.method === 'Input.synthesizeScrollGesture');
   assert.deepEqual(gesture?.params, {
@@ -542,11 +542,11 @@ test('chrome-cdp-backend: scrollGesture uses synthesizeScrollGesture with deskto
     yOverscroll: 0,
     preventFling: true,
     speed: 1_000,
-    gestureSourceType: 'mouse',
+    gestureSourceType: 'touch',
     repeatCount: 0,
     repeatDelayMs: 0
   });
-  await session.page.scrollGesture({ x: 320, y: 480, yDistance: -420 });
+  await session.page.scrollGesture({ x: 320, y: 480, yDistance: -420, gestureSourceType: 'touch' });
   const down = calls.findLast((call) => call.method === 'Input.synthesizeScrollGesture');
   assert.equal(down?.params.yDistance, -420);
   await session.close();
@@ -558,7 +558,7 @@ test('chrome-cdp-backend: scrollGesture rejects invalid coordinates, distances, 
   await assert.rejects(session.page.scrollGesture({ x: 10_001, y: 480, yDistance: 420 }), /scroll_gesture_input_invalid/u);
   await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 0 }), /scroll_gesture_input_invalid/u);
   await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420, speed: 0 }), /scroll_gesture_input_invalid/u);
-  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420, gestureSourceType: 'touch' }), /scroll_gesture_input_invalid/u);
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420, gestureSourceType: 'pen' }), /scroll_gesture_input_invalid/u);
   await session.close();
 });
 

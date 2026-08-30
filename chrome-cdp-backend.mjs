@@ -676,7 +676,7 @@ class ChromeCdpPageAdapter {
       || gestureSpeed < MIN_SCROLL_GESTURE_SPEED
       || gestureSpeed > MAX_SCROLL_GESTURE_SPEED
       || preventFling !== true
-      || gestureSourceType !== 'mouse'
+      || (gestureSourceType !== 'mouse' && gestureSourceType !== 'touch')
     ) {
       throw new Error('scroll_gesture_input_invalid');
     }
@@ -690,7 +690,7 @@ class ChromeCdpPageAdapter {
         yOverscroll: 0,
         preventFling: true,
         speed: gestureSpeed,
-        gestureSourceType: 'mouse',
+        gestureSourceType,
         repeatCount: 0,
         repeatDelayMs: 0
       });

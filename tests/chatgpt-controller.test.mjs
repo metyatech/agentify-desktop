@@ -582,7 +582,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null } = {}) {
   const events = [];
   const windows = [
     [0, 1, 2, 3, 4, 5, 6],
@@ -643,9 +643,10 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
       if (deltaY > 0) windowIndex = Math.min(windows.length - 1, windowIndex + 1);
       if (deltaY < 0) windowIndex = Math.max(0, windowIndex - 1);
     },
-    onScrollGesture: async ({ yDistance }) => {
+    onScrollGesture: async ({ yDistance, gestureSourceType }) => {
       wheelCount += 1;
       if (changeUrlOnWheel && wheelCount === 1) url = 'https://chatgpt.com/c/changed';
+      if (scrollGestureSource && gestureSourceType !== scrollGestureSource) return;
       if (!windowChanges) return;
       if (yDistance < 0) windowIndex = Math.min(windows.length - 1, windowIndex + 1);
       if (yDistance > 0) windowIndex = Math.max(0, windowIndex - 1);
@@ -968,7 +969,7 @@ test('chatgpt-controller: complete history orchestrates native wheel input and a
 });
 
 test('chatgpt-controller: Chrome complete history uses scrollGesture and never falls back to mouseWheel', async () => {
-  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true });
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true, scrollGestureSource: 'touch' });
   let mouseWheelCalls = 0;
   harness.page.mouseWheel = async () => {
     mouseWheelCalls += 1;
@@ -984,6 +985,8 @@ test('chatgpt-controller: Chrome complete history uses scrollGesture and never f
   });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.diagnostics.scrollInputMethod, 'cdp-synthesize-scroll-gesture');
+  assert.equal(result.history.diagnostics.gestureSourceType, 'touch');
+  assert.ok(harness.events.some((event) => event.includes('"gestureSourceType":"touch"')));
   assert.ok(result.history.diagnostics.gestureAttemptsDown > 0);
   assert.ok(result.history.diagnostics.gestureAttemptsUp > 0);
   assert.equal(mouseWheelCalls, 0);
@@ -991,7 +994,7 @@ test('chatgpt-controller: Chrome complete history uses scrollGesture and never f
 });
 
 test('chatgpt-controller: Chrome complete history bypasses a mouseWheel timeout with scrollGesture', async () => {
-  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true });
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, scrollGesture: true, scrollGestureSource: 'touch' });
   let mouseWheelCalls = 0;
   harness.page.mouseWheel = async () => {
     mouseWheelCalls += 1;
@@ -1013,7 +1016,7 @@ test('chatgpt-controller: Chrome complete history bypasses a mouseWheel timeout 
 });
 
 test('chatgpt-controller: successful scrollGesture without a DOM transition remains incomplete', async () => {
-  const harness = createNativeWheelHistoryPage({ scrollGesture: true, windowChanges: false });
+  const harness = createNativeWheelHistoryPage({ scrollGesture: true, scrollGestureSource: 'touch', windowChanges: false });
   const result = await createController(harness.page).readConversationTurns({
     maxTurns: 50,
     maxCharsPerTurn: 1000,

@@ -2009,6 +2009,7 @@ export class ChatGPTController {
       const visibleHeight = Number(state?.scroller?.clientHeight);
       const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
       const gestureSpeed = 1_000;
+      const gestureSourceType = 'touch';
       const useScrollGesture = typeof this.page?.scrollGesture === 'function';
       diagnostics.nativeInput.coordinates = { x: Math.round(Number(point.x)), y: Math.round(Number(point.y)) };
       diagnostics.nativeInput.deltaX = deltaX;
@@ -2017,7 +2018,7 @@ export class ChatGPTController {
         if (direction > 0) diagnostics.gestureAttemptsDown += 1; else diagnostics.gestureAttemptsUp += 1;
         diagnostics.gestureDistance = gestureDistance;
         diagnostics.gestureSpeed = gestureSpeed;
-        diagnostics.gestureSourceType = 'mouse';
+        diagnostics.gestureSourceType = gestureSourceType;
       }
       await recordNativeInputRuntime();
       if (useScrollGesture) {
@@ -2029,7 +2030,7 @@ export class ChatGPTController {
             yDistance: direction > 0 ? -gestureDistance : gestureDistance,
             speed: gestureSpeed,
             preventFling: true,
-            gestureSourceType: 'mouse'
+            gestureSourceType
           });
         } catch (error) {
           await recordNativeInputFailure('scroll-gesture', error);

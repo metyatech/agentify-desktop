@@ -43,6 +43,7 @@ const SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS = 2;
 const SCROLL_VISIBILITY_PROBE_MAX_GESTURES = 4;
 const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X = 0;
 const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y = -720;
+const MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS = 8;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
 
 let latestProviderStopGeneration = 0;
@@ -291,6 +292,7 @@ function probeWindowSummary(state) {
     scrollTop: Number.isFinite(Number(scroller?.scrollTop)) ? Number(scroller.scrollTop) : null,
     clientHeight: Number.isFinite(Number(scroller?.clientHeight)) ? Number(scroller.clientHeight) : null,
     scrollHeight: Number.isFinite(Number(scroller?.scrollHeight)) ? Number(scroller.scrollHeight) : null,
+    atTop: typeof scroller?.atTop === 'boolean' ? scroller.atTop : null,
     atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
     windowSignature: signature ? textDigest(signature).slice(0, 32) : null
   };
@@ -2182,13 +2184,25 @@ export class ChatGPTController {
         interactionPoint: null,
         moveMouseAttempted: false,
         moveMouseSucceeded: false,
+        wheelAttemptLimit: MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS,
+        wheelAttempts: 0,
+        steps: [],
         wheelAttempted: false,
         wheelDeltaX: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X,
         wheelDeltaY: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y,
         wheelCommandSucceeded: false,
         afterWheel: null,
+        anyPhysicalScrollChanged: false,
         physicalScrollChanged: false,
         conversationWindowChanged: false,
+        firstWindowChangeAttempt: null,
+        physicalTopReached: false,
+        initialNormalizedScrollTop: null,
+        finalScrollTop: null,
+        totalPhysicalDelta: null,
+        initialNormalizedRange: null,
+        finalRange: null,
+        failureAttempt: null,
         nativeInput: {
           failurePhase: null,
           errorName: null,
@@ -2235,6 +2249,17 @@ export class ChatGPTController {
       const recordFailure = (phase, error) => {
         result.nativeInput.failurePhase = phase;
         Object.assign(result.nativeInput, nativeInputErrorDetails(error));
+      };
+      const finalizeSummary = () => {
+        result.initialNormalizedScrollTop = result.normalized?.scrollTop ?? null;
+        result.initialNormalizedRange = result.normalized?.range ?? null;
+        const finalWindow = result.afterWheel || result.normalized;
+        result.finalScrollTop = finalWindow?.scrollTop ?? null;
+        result.finalRange = finalWindow?.range ?? null;
+        result.totalPhysicalDelta = Number.isFinite(Number(result.initialNormalizedScrollTop))
+          && Number.isFinite(Number(result.finalScrollTop))
+          ? Number(result.initialNormalizedScrollTop) - Number(result.finalScrollTop)
+          : null;
       };
 
       try {
@@ -2294,14 +2319,22 @@ export class ChatGPTController {
           return result;
         }
 
-        const point = normalizedWindow?.scroller?.point;
-        if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
+        const initialPoint = normalizedWindow?.scroller?.point;
+        if (!initialPoint || !Number.isFinite(Number(initialPoint.x)) || !Number.isFinite(Number(initialPoint.y))) {
           result.reason = 'probe-precondition-failed';
           return result;
         }
         result.readyForMouseWheel = true;
-        result.interactionPoint = { x: Number(point.x), y: Number(point.y) };
+        result.interactionPoint = { x: Number(initialPoint.x), y: Number(initialPoint.y) };
         result.nativeInput.coordinates = { ...result.interactionPoint };
+        const normalizedSummary = probeWindowSummary(normalizedWindow);
+        if (normalizedSummary.atTop === true
+          || (Number.isFinite(normalizedSummary.scrollTop) && normalizedSummary.scrollTop <= 1)) {
+          result.afterWheel = normalizedSummary;
+          result.physicalTopReached = true;
+          result.reason = 'probe-wheel-top-without-window-change';
+          return result;
+        }
 
         result.moveMouseAttempted = true;
         try {
@@ -2317,40 +2350,110 @@ export class ChatGPTController {
           return result;
         }
 
-        result.wheelAttempted = true;
-        try {
-          await this.page.mouseWheel(
-            result.interactionPoint.x,
-            result.interactionPoint.y,
-            result.wheelDeltaX,
-            result.wheelDeltaY
-          );
-          result.wheelCommandSucceeded = true;
-        } catch (error) {
-          recordFailure('mouse-wheel', error);
-          result.reason = 'probe-wheel-failed';
-          return result;
-        }
+        for (let attempt = 1; attempt <= MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS; attempt += 1) {
+          let stepNative;
+          let stepWindow;
+          try {
+            stepNative = await readNative();
+            stepWindow = await readWindow();
+          } catch {
+            result.reason = 'probe-wheel-failed';
+            break;
+          }
+          if (!(await stableAgainstInitialUrl(stepWindow?.url))) {
+            result.reason = 'probe-conversation-changed';
+            break;
+          }
+          if (stepNative?.pageClosed !== false
+            || stepNative?.browserWindowState !== 'normal'
+            || stepNative?.documentVisibilityState !== 'visible'
+            || stepNative?.documentHidden !== false
+            || stepNative?.documentHasFocus !== true
+            || !stepWindow?.scroller
+            || stepWindow.scroller.candidateCount !== 1) {
+            result.reason = 'probe-precondition-failed';
+            break;
+          }
 
-        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
-        let afterWheel;
-        try {
-          afterWheel = await readWindow();
-        } catch (error) {
-          recordFailure('post-wheel-read', error);
-          result.reason = 'probe-wheel-failed';
-          return result;
+          const point = stepWindow.scroller.point;
+          if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
+            result.reason = 'probe-precondition-failed';
+            break;
+          }
+          const beforeStep = probeWindowSummary(stepWindow);
+          const step = {
+            attempt,
+            beforeRange: beforeStep.range,
+            afterRange: null,
+            beforeScrollTop: beforeStep.scrollTop,
+            afterScrollTop: null,
+            beforeAtTop: beforeStep.atTop,
+            afterAtTop: null,
+            physicalScrollChanged: false,
+            conversationWindowChanged: false,
+            wheelDeltaX: result.wheelDeltaX,
+            wheelDeltaY: result.wheelDeltaY,
+            commandSucceeded: false
+          };
+          result.steps.push(step);
+          result.wheelAttempts = attempt;
+          result.wheelAttempted = true;
+          result.wheelCommandSucceeded = false;
+          result.nativeInput.coordinates = { x: Number(point.x), y: Number(point.y) };
+
+          try {
+            await this.page.mouseWheel(
+              Number(point.x),
+              Number(point.y),
+              result.wheelDeltaX,
+              result.wheelDeltaY
+            );
+            step.commandSucceeded = true;
+            result.wheelCommandSucceeded = true;
+          } catch (error) {
+            result.failureAttempt = attempt;
+            recordFailure('mouse-wheel', error);
+            result.reason = 'probe-wheel-failed';
+            break;
+          }
+
+          await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+          let afterWheel;
+          try {
+            afterWheel = await readWindow();
+          } catch (error) {
+            result.failureAttempt = attempt;
+            recordFailure('post-wheel-read', error);
+            result.reason = 'probe-wheel-failed';
+            break;
+          }
+          if (!(await stableAgainstInitialUrl(afterWheel?.url))) {
+            result.reason = 'probe-conversation-changed';
+            break;
+          }
+          const afterStep = probeWindowSummary(afterWheel);
+          step.afterRange = afterStep.range;
+          step.afterScrollTop = afterStep.scrollTop;
+          step.afterAtTop = afterStep.atTop;
+          step.physicalScrollChanged = beforeStep.scrollTop !== afterStep.scrollTop;
+          step.conversationWindowChanged = beforeStep.windowSignature !== afterStep.windowSignature;
+          result.afterWheel = afterStep;
+          result.anyPhysicalScrollChanged ||= step.physicalScrollChanged;
+          result.physicalScrollChanged = result.anyPhysicalScrollChanged;
+          result.conversationWindowChanged ||= step.conversationWindowChanged;
+          if (step.conversationWindowChanged) {
+            result.firstWindowChangeAttempt = attempt;
+            result.reason = 'probe-wheel-window-changed';
+            break;
+          }
+          if (afterStep.atTop === true || (Number.isFinite(afterStep.scrollTop) && afterStep.scrollTop <= 1)) {
+            result.physicalTopReached = true;
+            result.reason = 'probe-wheel-top-without-window-change';
+            break;
+          }
+          if (attempt === MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS) result.reason = 'probe-wheel-no-window-change';
         }
-        if (!(await stableAgainstInitialUrl(afterWheel?.url))) {
-          result.reason = 'probe-conversation-changed';
-          return result;
-        }
-        result.afterWheel = probeWindowSummary(afterWheel);
-        result.physicalScrollChanged = result.normalized?.scrollTop !== result.afterWheel.scrollTop;
-        result.conversationWindowChanged = result.normalized?.windowSignature !== result.afterWheel.windowSignature;
-        result.reason = result.conversationWindowChanged
-          ? 'probe-wheel-window-changed'
-          : result.physicalScrollChanged ? 'probe-wheel-physical-progress' : 'probe-wheel-no-progress';
+        finalizeSummary();
       } catch (error) {
         if (!result.reason) {
           if (result.wheelAttempted) {
@@ -2363,6 +2466,7 @@ export class ChatGPTController {
           }
         }
       } finally {
+        finalizeSummary();
         if (normalizationAttempted) {
           for (let attempt = 0; attempt < SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS && !result.restoreVerified; attempt += 1) {
             result.restoreAttempts += 1;
@@ -2384,6 +2488,7 @@ export class ChatGPTController {
           if (!result.restoreVerified) result.reason = 'probe-restore-failed';
         }
       }
+      finalizeSummary();
       return result;
     });
   }

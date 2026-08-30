@@ -678,7 +678,10 @@ function createScrollVisibilityProbePage({
   moveMouseError = null,
   mouseWheelError = null,
   mouseWheelEffect = null,
-  changeUrlAfterMouseWheel = false
+  changeUrlAfterMouseWheel = false,
+  changeUrlAtMouseWheel = null,
+  hideAfterMouseWheel = null,
+  loseFocusAfterMouseWheel = null
 } = {}) {
   const events = [];
   let browserWindowState = 'minimized';
@@ -710,8 +713,8 @@ function createScrollVisibilityProbePage({
       scrollTop,
       scrollHeight: 1_400,
       clientHeight: 400,
-      atTop: false,
-      atBottom: true,
+      atTop: scrollTop <= 1,
+      atBottom: scrollTop >= 1_000,
       point: { x: 500, y: 400 }
     }
   });
@@ -745,8 +748,11 @@ function createScrollVisibilityProbePage({
     },
     onMouseWheel: async (_x, _y, _deltaX, _deltaY) => {
       mouseWheelCount += 1;
-      if (mouseWheelError) throw mouseWheelError;
-      if (changeUrlAfterMouseWheel) url = 'https://chatgpt.com/c/changed';
+      const plannedError = typeof mouseWheelError === 'function'
+        ? await mouseWheelError({ attempt: mouseWheelCount })
+        : mouseWheelError;
+      if (plannedError) throw plannedError;
+      if (changeUrlAfterMouseWheel || changeUrlAtMouseWheel === mouseWheelCount) url = 'https://chatgpt.com/c/changed';
       const planned = typeof mouseWheelEffect === 'function'
         ? await mouseWheelEffect({ attempt: mouseWheelCount, range: { ...range }, scrollTop: scrollTop })
         : mouseWheelEffect;
@@ -754,6 +760,11 @@ function createScrollVisibilityProbePage({
         if (planned.range) range = { min: planned.range.min, max: planned.range.max };
         if (planned.scrollTop !== undefined) scrollTop = planned.scrollTop;
       }
+      if (hideAfterMouseWheel === mouseWheelCount) {
+        visibilityState = 'hidden';
+        hidden = true;
+      }
+      if (loseFocusAfterMouseWheel === mouseWheelCount) hasFocus = false;
     },
     nativeInputDiagnostics: () => ({})
   });
@@ -1353,7 +1364,7 @@ test('chatgpt-controller: visibility probe rejects non-minimized preconditions w
   assert.equal(harness.events.filter((event) => event.startsWith('scroll-gesture:')).length, 0);
 });
 
-test('chatgpt-controller: mouse-wheel probe uses normalized focused state and reports physical-only progress', async () => {
+test('chatgpt-controller: mouse-wheel probe uses normalized focused state and reports bounded physical-only progress', async () => {
   const harness = createScrollVisibilityProbePage({
     normalizedHasFocus: true,
     normalizedScrollTop: 6_449,
@@ -1372,10 +1383,13 @@ test('chatgpt-controller: mouse-wheel probe uses normalized focused state and re
   assert.equal(result.afterWheel.scrollTop, 5_729);
   assert.equal(result.physicalScrollChanged, true);
   assert.equal(result.conversationWindowChanged, false);
-  assert.equal(result.reason, 'probe-wheel-physical-progress');
-  assert.equal(harness.getMouseWheelCount(), 1);
+  assert.equal(result.reason, 'probe-wheel-no-window-change');
+  assert.equal(result.wheelAttemptLimit, 8);
+  assert.equal(result.wheelAttempts, 8);
+  assert.equal(result.steps.length, 8);
+  assert.equal(harness.getMouseWheelCount(), 8);
   assert.equal(harness.events.filter((event) => event.startsWith('scroll-gesture:')).length, 0);
-  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).length, 1);
+  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).length, 8);
   assert.equal(result.restoreVerified, true);
 });
 
@@ -1387,13 +1401,124 @@ test('chatgpt-controller: mouse-wheel probe reports a conversation window transi
   assert.equal(result.restoreVerified, true);
 });
 
+test('chatgpt-controller: mouse-wheel probe stops after the third wheel window transition', async () => {
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    normalizedScrollTop: 6_449,
+    mouseWheelEffect: ({ attempt }) => ({
+      scrollTop: 6_449 - attempt * 720,
+      range: attempt === 3 ? { min: 5, max: 9 } : { min: 6, max: 10 }
+    })
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttempts, 3);
+  assert.equal(result.steps.length, 3);
+  assert.equal(result.firstWindowChangeAttempt, 3);
+  assert.equal(result.conversationWindowChanged, true);
+  assert.equal(result.anyPhysicalScrollChanged, true);
+  assert.equal(result.reason, 'probe-wheel-window-changed');
+  assert.equal(harness.getMouseWheelCount(), 3);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe stops after eight physical-only wheels', async () => {
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    normalizedScrollTop: 6_449,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: 6_449 - attempt * 720 })
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttemptLimit, 8);
+  assert.equal(result.wheelAttempts, 8);
+  assert.equal(result.steps.length, 8);
+  assert.equal(result.anyPhysicalScrollChanged, true);
+  assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.physicalTopReached, false);
+  assert.equal(result.reason, 'probe-wheel-no-window-change');
+  assert.equal(result.totalPhysicalDelta, 5_760);
+  assert.equal(harness.getMouseWheelCount(), 8);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe stops at physical top before another wheel', async () => {
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    normalizedScrollTop: 1_000,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: attempt === 1 ? 280 : 0 })
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttempts, 2);
+  assert.equal(result.physicalTopReached, true);
+  assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.reason, 'probe-wheel-top-without-window-change');
+  assert.equal(harness.getMouseWheelCount(), 2);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe keeps normalization movement separate from wheel movement', async () => {
+  const harness = createScrollVisibilityProbePage({
+    initialScrollTop: 0,
+    normalizedScrollTop: 6_449,
+    normalizedHasFocus: true,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: 6_449 - attempt * 720 })
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.normalizationPhysicalScrollChanged, true);
+  assert.equal(result.steps[0].physicalScrollChanged, true);
+  assert.equal(result.physicalScrollChanged, true);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe stops when URL changes after the second wheel', async () => {
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: 6_449 - attempt * 720 }),
+    changeUrlAtMouseWheel: 2
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttempts, 2);
+  assert.equal(result.reason, 'probe-conversation-changed');
+  assert.equal(harness.getMouseWheelCount(), 2);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe stops before the next wheel when focus is lost', async () => {
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: 6_449 - attempt * 720 }),
+    loseFocusAfterMouseWheel: 1
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttempts, 1);
+  assert.equal(result.reason, 'probe-precondition-failed');
+  assert.equal(harness.getMouseWheelCount(), 1);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: mouse-wheel probe stops at the failing wheel attempt', async () => {
+  const error = new Error('chrome_cdp_command_timeout');
+  error.data = { wrapperCode: 'native_mouse_wheel_dispatch_failed', backendMessage: 'chrome_cdp_command_timeout' };
+  const harness = createScrollVisibilityProbePage({
+    normalizedHasFocus: true,
+    mouseWheelEffect: ({ attempt }) => ({ scrollTop: 6_449 - attempt * 720 }),
+    mouseWheelError: ({ attempt }) => attempt === 3 ? error : null
+  });
+  const result = await createController(harness.page).probeMouseWheelVisibility();
+  assert.equal(result.wheelAttempts, 3);
+  assert.equal(result.failureAttempt, 3);
+  assert.equal(result.nativeInput.failurePhase, 'mouse-wheel');
+  assert.equal(result.reason, 'probe-wheel-failed');
+  assert.equal(harness.getMouseWheelCount(), 3);
+  assert.equal(result.restoreVerified, true);
+});
+
 test('chatgpt-controller: mouse-wheel probe does not confuse normalization-only movement with wheel movement', async () => {
   const harness = createScrollVisibilityProbePage({ initialScrollTop: 0, normalizedScrollTop: 6_449, normalizedHasFocus: true });
   const result = await createController(harness.page).probeMouseWheelVisibility();
   assert.equal(result.normalizationPhysicalScrollChanged, true);
   assert.equal(result.physicalScrollChanged, false);
   assert.equal(result.conversationWindowChanged, false);
-  assert.equal(result.reason, 'probe-wheel-no-progress');
+  assert.equal(result.reason, 'probe-wheel-no-window-change');
   assert.equal(result.restoreVerified, true);
 });
 
@@ -1442,11 +1567,12 @@ test('chatgpt-controller: mouse-wheel probe restores after post-wheel read failu
   assert.equal(result.restoreVerified, true);
 });
 
-test('chatgpt-controller: mouse-wheel probe performs exactly one wheel and no touch fallback', async () => {
+test('chatgpt-controller: mouse-wheel probe performs at most eight wheels and no touch fallback', async () => {
   const harness = createScrollVisibilityProbePage({ normalizedHasFocus: true });
   const result = await createController(harness.page).probeMouseWheelVisibility();
   assert.equal(result.wheelAttempted, true);
-  assert.equal(harness.getMouseWheelCount(), 1);
+  assert.equal(result.wheelAttempts, 8);
+  assert.equal(harness.getMouseWheelCount(), 8);
   assert.equal(harness.getGestureCount(), 0);
   assert.equal(harness.events.filter((event) => event.startsWith('scroll-gesture:')).length, 0);
   assert.equal(result.restoreVerified, true);

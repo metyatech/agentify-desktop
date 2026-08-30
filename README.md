@@ -397,10 +397,11 @@ selector body. It requires the existing tab to be minimized, temporarily
 normalizes it without an explicit focus or foreground call, requires the
 document to be visible and focused, moves to the resolved conversation
 scroller, dispatches exactly one older-direction `mouseWheel` with `deltaY`
-`-720`, and restores the minimized state in a `finally` path. Caller input is
-limited to `key` or `tabId`; delta, direction, count, and window state are not
-configurable. This probe does not run complete-history backfill or send a
-message.
+`-720` per attempt, up to eight bounded attempts, stopping early on a
+conversation-window transition, physical top, or safety failure. It restores
+the minimized state in a `finally` path. Caller input is limited to `key` or
+`tabId`; delta, direction, count, and window state are not configurable. This
+probe does not run complete-history backfill or send a message.
 
 ## Windows Notes
 

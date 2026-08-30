@@ -502,6 +502,20 @@ function sanitizeMouseWheelVisibilityProbe(value) {
     deltaX: boundedNumber(data.nativeInput.deltaX, { min: -10_000, max: 10_000 }),
     deltaY: boundedNumber(data.nativeInput.deltaY, { min: -10_000, max: 10_000 })
   } : null;
+  const step = (item) => item && typeof item === 'object' ? {
+    attempt: boundedNumber(item.attempt, { min: 1, max: 8, integer: true }),
+    beforeRange: range(item.beforeRange),
+    afterRange: range(item.afterRange),
+    beforeScrollTop: boundedNumber(item.beforeScrollTop),
+    afterScrollTop: boundedNumber(item.afterScrollTop),
+    beforeAtTop: boolOrNull(item.beforeAtTop),
+    afterAtTop: boolOrNull(item.afterAtTop),
+    physicalScrollChanged: item.physicalScrollChanged === true,
+    conversationWindowChanged: item.conversationWindowChanged === true,
+    wheelDeltaX: boundedNumber(item.wheelDeltaX, { min: -10_000, max: 10_000 }),
+    wheelDeltaY: boundedNumber(item.wheelDeltaY, { min: -10_000, max: 10_000 }),
+    commandSucceeded: item.commandSucceeded === true
+  } : null;
   const reason = String(data.reason || '').trim();
   return {
     backend: data.backend === 'chrome-cdp' ? data.backend : null,
@@ -517,13 +531,25 @@ function sanitizeMouseWheelVisibilityProbe(value) {
     } : null,
     moveMouseAttempted: data.moveMouseAttempted === true,
     moveMouseSucceeded: data.moveMouseSucceeded === true,
+    wheelAttemptLimit: boundedNumber(data.wheelAttemptLimit, { min: 0, max: 8, integer: true }) || 0,
+    wheelAttempts: boundedNumber(data.wheelAttempts, { min: 0, max: 8, integer: true }) || 0,
+    steps: Array.isArray(data.steps) ? data.steps.slice(0, 8).map(step).filter(Boolean) : [],
     wheelAttempted: data.wheelAttempted === true,
     wheelDeltaX: boundedNumber(data.wheelDeltaX, { min: -10_000, max: 10_000 }),
     wheelDeltaY: boundedNumber(data.wheelDeltaY, { min: -10_000, max: 10_000 }),
     wheelCommandSucceeded: data.wheelCommandSucceeded === true,
     afterWheel: window(data.afterWheel),
+    anyPhysicalScrollChanged: data.anyPhysicalScrollChanged === true,
     physicalScrollChanged: data.physicalScrollChanged === true,
     conversationWindowChanged: data.conversationWindowChanged === true,
+    firstWindowChangeAttempt: boundedNumber(data.firstWindowChangeAttempt, { min: 1, max: 8, integer: true }),
+    physicalTopReached: data.physicalTopReached === true,
+    initialNormalizedScrollTop: boundedNumber(data.initialNormalizedScrollTop),
+    finalScrollTop: boundedNumber(data.finalScrollTop),
+    totalPhysicalDelta: boundedNumber(data.totalPhysicalDelta, { min: -1_000_000, max: 1_000_000 }),
+    initialNormalizedRange: range(data.initialNormalizedRange),
+    finalRange: range(data.finalRange),
+    failureAttempt: boundedNumber(data.failureAttempt, { min: 1, max: 8, integer: true }),
     nativeInput,
     restoreAttempts: boundedNumber(data.restoreAttempts, { min: 0, max: 2, integer: true }) || 0,
     restoreVerified: data.restoreVerified === true,

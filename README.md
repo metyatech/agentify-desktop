@@ -349,9 +349,11 @@ loading stalls, gaps, ambiguity, and limits remain incomplete; the default
 `visible` mode preserves the prior current-DOM-window response shape.
 For Chrome/CDP, complete mode temporarily normalizes a minimized window only
 when the page becomes visible and focused, uses the native mouse-wheel path for
-history movement, restores the conversation scroll before restoring the
-original window state, and records bounded lifecycle diagnostics. Other
-backends retain their existing native scrolling path.
+history movement, and restores the conversation scroll with bounded convergence
+before restoring the original window state. Its default history budget is the
+existing maximum of 30 seconds or 80 iterations, and bounded lifecycle/restore
+diagnostics are recorded. Other backends retain their existing native scrolling
+path.
 Clients should send the resolved `tabId` without duplicating `key` or
 `vendorId`; requests containing both selectors are rejected.
 Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,

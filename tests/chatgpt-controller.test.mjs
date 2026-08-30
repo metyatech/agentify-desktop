@@ -8,6 +8,8 @@ import vm from 'node:vm';
 
 import {
   ChatGPTController,
+  DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
+  DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
   buildConversationWindowReadScript,
   mergeConversationSnapshots,
   hasSameChatGPTAttachmentFileNameMultiset,
@@ -585,7 +587,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total' } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null } = {}) {
   const events = [];
   const windows = [
     [0, 1, 2, 3, 4, 5, 6],
@@ -599,7 +601,9 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   let url = 'https://chatgpt.com/c/native-wheel-test';
   let wheelCount = 0;
   let readCount = 0;
+  let restoreCount = 0;
   let scrollTopOverride = null;
+  let scrollHeightOverride = null;
   const initialState = initialBrowserWindowState || (backend === 'chrome-cdp' ? 'minimized' : null);
   let browserWindowState = initialState;
   let adapterMinimized = backend === 'chrome-cdp' ? initialState === 'minimized' : null;
@@ -628,7 +632,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
         selectedPath: 'body>main>div#conversation-scroll',
         candidates: [],
         scrollTop: Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250,
-        scrollHeight: 1_400,
+        scrollHeight: Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400,
         clientHeight: 400,
         atTop: windowIndex === 0,
         atBottom: windowIndex === windows.length - 1,
@@ -641,9 +645,17 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
     onEvaluate: async (js) => {
       if (js.includes('const targetDistance =')) {
         events.push('conversation-scroll-restore');
+        restoreCount += 1;
         const distance = Number(/const targetDistance = ([0-9]+)/u.exec(js)?.[1] || 0);
-        windowIndex = Math.max(0, Math.min(windows.length - 1, Math.round((1_000 - distance) / 250)));
-        scrollTopOverride = null;
+        const planned = typeof restorePlan === 'function'
+          ? await restorePlan({ attempt: restoreCount, distance })
+          : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
+        if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollHeight))) scrollHeightOverride = Number(planned.scrollHeight);
+        if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
+        else windowIndex = originalWindowIndex;
+        scrollTopOverride = planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollTop))
+          ? Number(planned.scrollTop)
+          : (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400) - 400 - distance;
         return { ok: true, scrollTop: windowIndex * 250 };
       }
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
@@ -712,7 +724,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   }
   if (!nativeWheel) page.mouseWheel = undefined;
   if (!scrollGesture) page.scrollGesture = undefined;
-  return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, originalWindowIndex };
+  return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, getRestoreCount: () => restoreCount, originalWindowIndex };
 }
 
 function createScrollVisibilityProbePage({
@@ -1264,6 +1276,120 @@ test('chatgpt-controller: Chrome complete history preserves an already-normal wi
   assert.equal(result.history.diagnostics.windowLifecycle.normalizationApplied, false);
   assert.equal(result.history.diagnostics.windowLifecycle.restoreAttempts, 0);
   assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+});
+
+test('chatgpt-controller: complete history defaults use the existing maximum budget', () => {
+  assert.equal(DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, 30_000);
+  assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 80);
+});
+
+test('chatgpt-controller: history budget starts after the normalized baseline', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp' });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.diagnostics.historyStartedAfterNormalizedBaseline, true);
+  assert.equal(result.history.diagnostics.historyBudgetMs, 5000);
+  assert.equal(result.history.diagnostics.historyIterationLimit, 30);
+});
+
+test('chatgpt-controller: conversation restore converges after a transient signature mismatch', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    restorePlan: ({ attempt }) => attempt === 1 ? { windowIndex: 3 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.scrollRestored, true);
+  assert.deepEqual(result.history.diagnostics.conversationRestore, {
+    attempts: 2,
+    verified: true,
+    initialDistanceFromBottom: 500,
+    finalDistanceFromBottom: 500,
+    distanceMatched: true,
+    signatureMatched: true,
+    lastFailureReason: null
+  });
+  assert.equal(harness.getRestoreCount(), 2);
+});
+
+test('chatgpt-controller: conversation restore recalculates against changed scroll geometry', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    restorePlan: ({ attempt }) => attempt === 1 ? { windowIndex: 3, scrollHeight: 1600 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.scrollRestored, true);
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 2);
+  assert.equal(result.history.diagnostics.conversationRestore.distanceMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.finalDistanceFromBottom, 500);
+});
+
+test('chatgpt-controller: permanent conversation restore mismatch is bounded and fails closed', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    restorePlan: () => ({ windowIndex: 3 })
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'scroll-restore-failed');
+  assert.equal(result.history.scrollRestored, false);
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 4);
+  assert.equal(result.history.diagnostics.conversationRestore.verified, false);
+  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'signature-mismatch');
+});
+
+test('chatgpt-controller: primary history timeout is not hidden by restore failure', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    initialBrowserWindowState: 'normal',
+    restorePlan: () => ({ windowIndex: 3 })
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 1,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'timeout');
+  assert.equal(result.history.scrollRestored, false);
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 4);
+  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'signature-mismatch');
 });
 
 test('chatgpt-controller: Chrome complete history fails closed before wheel when normalized state is not ready', async () => {

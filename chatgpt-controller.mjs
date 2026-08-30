@@ -17,11 +17,13 @@ export const MAX_CONVERSATION_TURN_CHARS = 200_000;
 export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
 export const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 30_000;
 export const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
-const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 15_000;
-const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = 48;
+export const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = MAX_CONVERSATION_HISTORY_TIMEOUT_MS;
+export const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = MAX_CONVERSATION_HISTORY_ITERATIONS;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
 const CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS = 540;
 const CONVERSATION_HISTORY_TOP_STABLE_SAMPLES = 4;
+const CONVERSATION_HISTORY_RESTORE_ATTEMPTS = 4;
+const CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS = 240;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -2517,7 +2519,7 @@ export class ChatGPTController {
   }
 
   async #readCompleteConversationTurns({ limits, historyTimeoutMs, historyMaxIterations }) {
-    const startedAt = Date.now();
+    const operationStartedAt = Date.now();
     const snapshots = [];
     let initialNative = null;
     try {
@@ -2590,6 +2592,15 @@ export class ChatGPTController {
         restoredVisibilityState: null,
         restoredHidden: null,
         restoredHasFocus: null
+      },
+      conversationRestore: {
+        attempts: 0,
+        verified: false,
+        initialDistanceFromBottom: null,
+        finalDistanceFromBottom: null,
+        distanceMatched: false,
+        signatureMatched: false,
+        lastFailureReason: null
       }
     };
     let current = null;
@@ -2597,6 +2608,7 @@ export class ChatGPTController {
     let initialScrollTop = null;
     let initialDistanceFromBottom = null;
     let originalWindowSignature = null;
+    let historyStartedAt = null;
     let reason = null;
     let windowNormalizationApplied = false;
     let startReached = false;
@@ -2613,6 +2625,7 @@ export class ChatGPTController {
       return range;
     };
     const currentUrlIsStable = (state) => String(state?.url || '') === initialUrl;
+    const historyElapsedMs = () => Date.now() - (historyStartedAt ?? operationStartedAt);
     const recordNativeInputRuntime = async () => {
       if (typeof this.page?.getNativeInputDiagnostics !== 'function') return;
       try {
@@ -2686,6 +2699,10 @@ export class ChatGPTController {
           addSnapshot(current);
           diagnostics.initialRange = conversationTurnRange(current?.turns);
           diagnostics.observedRange = { ...diagnostics.initialRange };
+          historyStartedAt = Date.now();
+          diagnostics.historyStartedAfterNormalizedBaseline = historyStartedAt >= operationStartedAt;
+          diagnostics.historyBudgetMs = historyTimeoutMs;
+          diagnostics.historyIterationLimit = historyMaxIterations;
         }
       }
     } catch (error) {
@@ -2707,7 +2724,7 @@ export class ChatGPTController {
       };
     };
     const nativeWheel = async (direction, state) => {
-      if (Date.now() - startedAt > historyTimeoutMs || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
+      if ((historyStartedAt !== null ? Date.now() - historyStartedAt : Date.now() - operationStartedAt) > historyTimeoutMs || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
       if (isChromeCdp) {
         let runtime = null;
         try {
@@ -2789,14 +2806,85 @@ export class ChatGPTController {
       return { ok: true, state: next, ...result };
     };
     const restore = async () => {
-      if (!Number.isFinite(initialDistanceFromBottom) || initialDistanceFromBottom < 0) return false;
-      const result = await this.#eval(buildRestoreConversationScrollScript(initialDistanceFromBottom)).catch(() => null);
-      await sleep(Math.min(200, CONVERSATION_HISTORY_SCROLL_WAIT_MS));
-      const restored = await this.#eval(buildConversationWindowReadScript(limits)).catch(() => null);
-      if (!restored || restored.limitExceeded || !currentUrlIsStable(restored)) return false;
-      const restoredDistance = Number(restored?.scroller?.scrollHeight) - Number(restored?.scroller?.clientHeight) - Number(restored?.scroller?.scrollTop);
-      const restoredWindow = conversationWindowSignature(restored?.turns);
-      return result?.ok === true && Math.abs(restoredDistance - initialDistanceFromBottom) <= 2 && restoredWindow === originalWindowSignature;
+      const restoreDiagnostics = diagnostics.conversationRestore;
+      restoreDiagnostics.initialDistanceFromBottom = Number.isFinite(initialDistanceFromBottom) && initialDistanceFromBottom >= 0
+        ? initialDistanceFromBottom
+        : null;
+      if (restoreDiagnostics.initialDistanceFromBottom === null) {
+        restoreDiagnostics.lastFailureReason = 'scroller-missing';
+        return false;
+      }
+      let lastState = null;
+      for (let attempt = 0; attempt < CONVERSATION_HISTORY_RESTORE_ATTEMPTS; attempt += 1) {
+        restoreDiagnostics.attempts += 1;
+        let currentState = null;
+        try {
+          currentState = await this.#eval(buildConversationWindowReadScript(limits));
+        } catch {
+          restoreDiagnostics.lastFailureReason = 'read-failed';
+          continue;
+        }
+        if (!currentState || currentState.limitExceeded) {
+          restoreDiagnostics.lastFailureReason = currentState?.limitExceeded ? 'limit-exceeded' : 'read-failed';
+          continue;
+        }
+        if (!currentUrlIsStable(currentState)) {
+          restoreDiagnostics.lastFailureReason = 'url-changed';
+          continue;
+        }
+        if (currentState.scroller?.candidateCount !== 1) {
+          restoreDiagnostics.lastFailureReason = currentState.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
+          continue;
+        }
+        const currentScrollHeight = Number(currentState.scroller?.scrollHeight);
+        const currentClientHeight = Number(currentState.scroller?.clientHeight);
+        if (!Number.isFinite(currentScrollHeight) || !Number.isFinite(currentClientHeight)) {
+          restoreDiagnostics.lastFailureReason = 'scroller-missing';
+          continue;
+        }
+        const result = await this.#eval(buildRestoreConversationScrollScript(restoreDiagnostics.initialDistanceFromBottom)).catch(() => null);
+        if (result?.ok !== true) {
+          restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
+          continue;
+        }
+        await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
+        let restored = null;
+        try {
+          restored = await this.#eval(buildConversationWindowReadScript(limits));
+        } catch {
+          restoreDiagnostics.lastFailureReason = 'read-failed';
+          continue;
+        }
+        lastState = restored;
+        if (!restored || restored.limitExceeded) {
+          restoreDiagnostics.lastFailureReason = restored?.limitExceeded ? 'limit-exceeded' : 'read-failed';
+          continue;
+        }
+        if (!currentUrlIsStable(restored)) {
+          restoreDiagnostics.lastFailureReason = 'url-changed';
+          continue;
+        }
+        if (restored.scroller?.candidateCount !== 1) {
+          restoreDiagnostics.lastFailureReason = restored.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
+          continue;
+        }
+        const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
+        const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - restoreDiagnostics.initialDistanceFromBottom) <= 2;
+        const signatureMatched = conversationWindowSignature(restored.turns) === originalWindowSignature;
+        restoreDiagnostics.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
+        restoreDiagnostics.distanceMatched = distanceMatched;
+        restoreDiagnostics.signatureMatched = signatureMatched;
+        if (distanceMatched && signatureMatched) {
+          restoreDiagnostics.verified = true;
+          restoreDiagnostics.lastFailureReason = null;
+          return true;
+        }
+        restoreDiagnostics.lastFailureReason = signatureMatched ? 'distance-mismatch' : 'signature-mismatch';
+      }
+      if (lastState && Number.isFinite(Number(lastState.scroller?.scrollHeight)) && Number.isFinite(Number(lastState.scroller?.clientHeight)) && Number.isFinite(Number(lastState.scroller?.scrollTop))) {
+        restoreDiagnostics.finalDistanceFromBottom = Number(lastState.scroller.scrollHeight) - Number(lastState.scroller.clientHeight) - Number(lastState.scroller.scrollTop);
+      }
+      return false;
     };
     const restoreWindow = async () => {
       if (!windowNormalizationApplied) {
@@ -2832,7 +2920,7 @@ export class ChatGPTController {
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;
-        while (!diagnostics.nativeScrollControlProven && !reason && iterations < historyMaxIterations && Date.now() - startedAt <= historyTimeoutMs) {
+        while (!diagnostics.nativeScrollControlProven && !reason && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
           const before = current;
           const result = await nativeWheel(proofDirection, before);
           const entry = {
@@ -2867,13 +2955,13 @@ export class ChatGPTController {
           }
           if (proofNoProgress >= 2) reason = 'history-native-scroll-no-progress';
         }
-        if (!diagnostics.nativeScrollControlProven && !reason) reason = Date.now() - startedAt > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
+        if (!diagnostics.nativeScrollControlProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
       }
 
       if (!reason) {
         let tailStableCount = 0;
         let previousTail = null;
-        while (!reason && iterations < historyMaxIterations && Date.now() - startedAt <= historyTimeoutMs) {
+        while (!reason && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
           const result = await nativeWheel(1, current);
           if (!result.ok) { reason = result.reason; break; }
           if (result.state.scroller.atBottom && !result.state.loading) {
@@ -2888,16 +2976,16 @@ export class ChatGPTController {
             }
           } else tailStableCount = 0;
         }
-        if (!diagnostics.tailProven && !reason) reason = Date.now() - startedAt > historyTimeoutMs ? 'timeout' : 'history-tail-unproven';
+        if (!diagnostics.tailProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-tail-unproven';
       }
 
       if (!reason && diagnostics.tailProven) {
         let noProgressCount = 0;
-        while (iterations < historyMaxIterations && Date.now() - startedAt <= historyTimeoutMs) {
+        while (iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
           if (current?.scroller?.atTop && !current.loading) {
             let stableTopCount = 0;
             let previousTop = null;
-            for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && Date.now() - startedAt <= historyTimeoutMs; sample += 1) {
+            for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && historyElapsedMs() <= historyTimeoutMs; sample += 1) {
               await sleep(CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS);
               const settled = await this.#eval(buildConversationWindowReadScript(limits));
               if (!currentUrlIsStable(settled)) { reason = 'conversation-changed'; break; }
@@ -2930,14 +3018,14 @@ export class ChatGPTController {
           else noProgressCount += 1;
           if (noProgressCount >= 3) { reason = 'history-native-scroll-no-progress'; break; }
         }
-        if (!startReached && !reason) reason = Date.now() - startedAt > historyTimeoutMs ? 'timeout' : 'history-start-unproven';
+        if (!startReached && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-start-unproven';
       }
 
       if (!reason && startReached && tailSnapshot) {
         const tailBaseline = conversationTailSignature(tailSnapshot.turns);
         let tailCheck = current;
         let tailCheckAttempts = 0;
-        while (!tailCheck?.scroller?.atBottom && iterations < historyMaxIterations && Date.now() - startedAt <= historyTimeoutMs) {
+        while (!tailCheck?.scroller?.atBottom && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
           const result = await nativeWheel(1, tailCheck);
           if (!result.ok) { reason = result.reason; break; }
           tailCheck = result.state;

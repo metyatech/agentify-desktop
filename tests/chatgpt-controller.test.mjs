@@ -1006,7 +1006,7 @@ test('chatgpt-controller: native wheel diagnostics identify mouseWheel failures 
       code: 'native_mouse_wheel_dispatch_failed',
       wrapperCode: 'native_mouse_wheel_dispatch_failed',
       backendCode: -32602,
-      backendMessage: 'Invalid parameters https://example.invalid/private/secret'
+      backendMessage: 'Invalid parameters'
     };
     throw error;
   };
@@ -1035,6 +1035,105 @@ test('chatgpt-controller: native wheel diagnostics identify mouseWheel failures 
   assert.equal(nativeInput.windowMinimized, false);
   assert.equal(nativeInput.windowDestroyed, false);
   assert.equal(nativeInput.webContentsDestroyed, true);
+});
+
+test('chatgpt-controller: trusted Chrome backend timeout diagnostic survives controller transport', async () => {
+  const harness = createNativeWheelHistoryPage();
+  harness.page.mouseWheel = async () => {
+    const error = new Error('transport wrapper message');
+    error.name = 'NativeInputError';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = {
+      wrapperCode: 'native_mouse_wheel_dispatch_failed',
+      backendCode: null,
+      backendMessage: 'chrome_cdp_command_timeout'
+    };
+    throw error;
+  };
+  const result = await createController(harness.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  const nativeInput = result.history.diagnostics.nativeInput;
+  assert.equal(result.history.reason, 'history-native-wheel-failed');
+  assert.equal(nativeInput.failurePhase, 'mouse-wheel');
+  assert.equal(nativeInput.wrapperErrorCode, 'native_mouse_wheel_dispatch_failed');
+  assert.equal(nativeInput.backendErrorCode, null);
+  assert.equal(nativeInput.backendErrorMessage, 'chrome_cdp_command_timeout');
+  assert.equal(nativeInput.errorMessage, 'chrome_cdp_command_timeout');
+});
+
+test('chatgpt-controller: trusted Chrome backend session-closed diagnostic survives controller transport', async () => {
+  const harness = createNativeWheelHistoryPage();
+  harness.page.mouseWheel = async () => {
+    const error = new Error('transport wrapper message');
+    error.name = 'NativeInputError';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = {
+      wrapperCode: 'native_mouse_wheel_dispatch_failed',
+      backendCode: 'chrome_cdp_session_closed',
+      backendMessage: 'chrome_cdp_session_closed'
+    };
+    throw error;
+  };
+  const result = await createController(harness.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  const nativeInput = result.history.diagnostics.nativeInput;
+  assert.equal(nativeInput.backendErrorCode, 'chrome_cdp_session_closed');
+  assert.equal(nativeInput.backendErrorMessage, 'chrome_cdp_session_closed');
+  assert.equal(nativeInput.errorMessage, 'chrome_cdp_session_closed');
+});
+
+test('chatgpt-controller: trusted Chrome backend numeric protocol diagnostics remain separate from wrapper diagnostics', async () => {
+  const harness = createNativeWheelHistoryPage();
+  harness.page.mouseWheel = async () => {
+    const error = new Error('wrapper message');
+    error.name = 'NativeInputError';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = {
+      wrapperCode: 'native_mouse_wheel_dispatch_failed',
+      backendCode: -32602,
+      backendMessage: 'Invalid parameters'
+    };
+    throw error;
+  };
+  const result = await createController(harness.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  const nativeInput = result.history.diagnostics.nativeInput;
+  assert.equal(nativeInput.wrapperErrorCode, 'native_mouse_wheel_dispatch_failed');
+  assert.equal(nativeInput.backendErrorCode, -32602);
+  assert.equal(nativeInput.backendErrorMessage, 'Invalid parameters');
+});
+
+test('chatgpt-controller: untrusted native fallback diagnostics remain redacted and bounded', async () => {
+  const harness = createNativeWheelHistoryPage();
+  harness.page.mouseWheel = async () => {
+    const error = new Error(`raw aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa https://example.invalid/private C:\\secret\\path`);
+    error.name = 'NativeInputError';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = { wrapperCode: 'native_mouse_wheel_dispatch_failed' };
+    throw error;
+  };
+  const result = await createController(harness.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  const nativeInput = result.history.diagnostics.nativeInput;
+  assert.ok(nativeInput.backendErrorMessage.length <= 256);
+  assert.doesNotMatch(nativeInput.backendErrorMessage, /https:\/\/example\.invalid/u);
+  assert.doesNotMatch(nativeInput.backendErrorMessage, /C:\\secret\\path/u);
+  assert.doesNotMatch(nativeInput.backendErrorMessage, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/u);
+});
+
+test('chatgpt-controller: trusted backend diagnostics only normalize controls and enforce the bound', async () => {
+  const harness = createNativeWheelHistoryPage();
+  harness.page.mouseWheel = async () => {
+    const error = new Error('wrapper message');
+    error.name = 'NativeInputError';
+    error.code = 'native_mouse_wheel_dispatch_failed';
+    error.data = {
+      wrapperCode: 'native_mouse_wheel_dispatch_failed',
+      backendMessage: `Invalid\nparameters ${'x'.repeat(300)}`
+    };
+    throw error;
+  };
+  const result = await createController(harness.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  const message = result.history.diagnostics.nativeInput.backendErrorMessage;
+  assert.ok(message.length <= 256);
+  assert.equal(message.startsWith('Invalid parameters'), true);
+  assert.doesNotMatch(message, /\n/u);
 });
 
 test('chatgpt-controller: post-wheel snapshot failures have their own diagnostic phase', async () => {

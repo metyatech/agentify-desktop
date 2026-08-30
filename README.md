@@ -391,6 +391,17 @@ window, visibility, gesture, URL-stability, and restoration diagnostics. It
 does not provide general window-control operations or expose window/session
 identifiers.
 
+For a separate one-shot desktop mouse-wheel experiment, use the authenticated
+`POST /native-input/mouse-wheel-visibility-probe` endpoint with the same tab
+selector body. It requires the existing tab to be minimized, temporarily
+normalizes it without an explicit focus or foreground call, requires the
+document to be visible and focused, moves to the resolved conversation
+scroller, dispatches exactly one older-direction `mouseWheel` with `deltaY`
+`-720`, and restores the minimized state in a `finally` path. Caller input is
+limited to `key` or `tabId`; delta, direction, count, and window state are not
+configurable. This probe does not run complete-history backfill or send a
+message.
+
 ## Windows Notes
 
 Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.

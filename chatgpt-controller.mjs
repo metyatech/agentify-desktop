@@ -41,6 +41,8 @@ const SCROLL_VISIBILITY_PROBE_POLL_MS = 100;
 const SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS = 100;
 const SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS = 2;
 const SCROLL_VISIBILITY_PROBE_MAX_GESTURES = 4;
+const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X = 0;
+const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y = -720;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
 
 let latestProviderStopGeneration = 0;
@@ -2148,6 +2150,230 @@ export class ChatGPTController {
                 documentHidden: typeof restoredNative?.documentHidden === 'boolean' ? restoredNative.documentHidden : null,
                 documentHasFocus: typeof restoredNative?.documentHasFocus === 'boolean' ? restoredNative.documentHasFocus : null
               };
+              if (restoredUrl !== initialUrl) result.urlStable = false;
+              result.restoreVerified = result.restored.browserWindowState === 'minimized'
+                && result.restored.adapterMinimized === true
+                && result.restored.documentVisibilityState === 'hidden'
+                && result.restored.documentHidden === true;
+            } catch {}
+          }
+          if (!result.restoreVerified) result.reason = 'probe-restore-failed';
+        }
+      }
+      return result;
+    });
+  }
+
+  async probeMouseWheelVisibility() {
+    return await this.runExclusive(async () => {
+      const limits = {
+        maxTurns: 50,
+        maxCharsPerTurn: 100_000,
+        maxTotalChars: 1_000_000
+      };
+      const result = {
+        backend: null,
+        preconditionPassed: false,
+        before: null,
+        normalized: null,
+        normalizationPhysicalScrollChanged: false,
+        normalizationConversationWindowChanged: false,
+        readyForMouseWheel: false,
+        interactionPoint: null,
+        moveMouseAttempted: false,
+        moveMouseSucceeded: false,
+        wheelAttempted: false,
+        wheelDeltaX: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X,
+        wheelDeltaY: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y,
+        wheelCommandSucceeded: false,
+        afterWheel: null,
+        physicalScrollChanged: false,
+        conversationWindowChanged: false,
+        nativeInput: {
+          failurePhase: null,
+          errorName: null,
+          errorCode: null,
+          errorMessage: null,
+          wrapperErrorName: null,
+          wrapperErrorCode: null,
+          backendErrorCode: null,
+          backendErrorMessage: null,
+          coordinates: null,
+          deltaX: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X,
+          deltaY: SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y
+        },
+        restoreAttempts: 0,
+        restoreVerified: false,
+        restored: null,
+        urlStable: true,
+        reason: null
+      };
+      let normalizationAttempted = false;
+      let initialUrl = '';
+
+      const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
+      const readUrl = async () => String(await this.page.getUrl()).trim();
+      const stableAgainstInitialUrl = async (stateUrl = null) => {
+        const currentUrl = stateUrl == null ? await readUrl() : String(stateUrl || '').trim();
+        if (!initialUrl || currentUrl !== initialUrl) {
+          result.urlStable = false;
+          return false;
+        }
+        return true;
+      };
+      const readNative = async () => await this.getNativeInputDiagnostics();
+      const stage = (native, window = null) => ({
+        browserWindowState: ['normal', 'minimized', 'maximized', 'fullscreen'].includes(native?.browserWindowState)
+          ? native.browserWindowState
+          : null,
+        adapterMinimized: native?.adapterMinimized === true,
+        documentVisibilityState: ['visible', 'hidden'].includes(native?.documentVisibilityState) ? native.documentVisibilityState : null,
+        documentHidden: typeof native?.documentHidden === 'boolean' ? native.documentHidden : null,
+        documentHasFocus: typeof native?.documentHasFocus === 'boolean' ? native.documentHasFocus : null,
+        ...(window ? probeWindowSummary(window) : {})
+      });
+      const recordFailure = (phase, error) => {
+        result.nativeInput.failurePhase = phase;
+        Object.assign(result.nativeInput, nativeInputErrorDetails(error));
+      };
+
+      try {
+        initialUrl = await readUrl();
+        const beforeWindow = await readWindow();
+        const beforeNative = await readNative();
+        result.backend = beforeNative?.backend === 'chrome-cdp' ? 'chrome-cdp' : null;
+        result.before = stage(beforeNative, beforeWindow);
+        const hasConversationUrl = await stableAgainstInitialUrl(beforeWindow?.url);
+        const hasTarget = typeof this.page?.temporarilyUnminimizeForProbe === 'function'
+          && typeof this.page?.restoreMinimizedForProbe === 'function';
+        result.preconditionPassed = result.backend === 'chrome-cdp'
+          && beforeNative?.pageClosed === false
+          && beforeNative?.browserWindowState === 'minimized'
+          && beforeNative?.adapterMinimized === true
+          && hasConversationUrl
+          && hasTarget
+          && !!beforeWindow?.scroller
+          && beforeWindow.scroller.candidateCount === 1
+          && typeof this.page?.moveMouse === 'function'
+          && typeof this.page?.mouseWheel === 'function';
+        if (!result.preconditionPassed) {
+          result.reason = 'probe-precondition-failed';
+          return result;
+        }
+
+        normalizationAttempted = true;
+        await this.page.temporarilyUnminimizeForProbe();
+        const normalizeDeadline = Date.now() + SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS;
+        let normalizedNative = null;
+        let normalizedWindow = null;
+        while (Date.now() <= normalizeDeadline) {
+          normalizedNative = await readNative();
+          normalizedWindow = await readWindow();
+          if (!(await stableAgainstInitialUrl(normalizedWindow?.url))) break;
+          result.normalized = stage(normalizedNative, normalizedWindow);
+          if (normalizedNative?.browserWindowState === 'normal'
+            && normalizedNative?.documentVisibilityState === 'visible'
+            && normalizedNative?.documentHidden === false
+            && normalizedNative?.documentHasFocus === true) break;
+          if (Date.now() + SCROLL_VISIBILITY_PROBE_POLL_MS > normalizeDeadline) break;
+          await sleep(SCROLL_VISIBILITY_PROBE_POLL_MS);
+        }
+
+        result.normalizationPhysicalScrollChanged = result.before?.scrollTop !== result.normalized?.scrollTop;
+        result.normalizationConversationWindowChanged = result.before?.windowSignature !== result.normalized?.windowSignature;
+        const ready = result.urlStable
+          && normalizedNative?.browserWindowState === 'normal'
+          && normalizedNative?.documentVisibilityState === 'visible'
+          && normalizedNative?.documentHidden === false
+          && normalizedNative?.documentHasFocus === true;
+        if (!ready) {
+          if (!result.urlStable) result.reason = 'probe-conversation-changed';
+          else if (normalizedNative?.browserWindowState !== 'normal') result.reason = 'probe-normalized-but-minimized';
+          else if (normalizedNative?.documentVisibilityState !== 'visible' || normalizedNative?.documentHidden !== false) result.reason = 'probe-normalized-but-hidden';
+          else result.reason = 'probe-normalized-but-unfocused';
+          return result;
+        }
+
+        const point = normalizedWindow?.scroller?.point;
+        if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
+          result.reason = 'probe-precondition-failed';
+          return result;
+        }
+        result.readyForMouseWheel = true;
+        result.interactionPoint = { x: Number(point.x), y: Number(point.y) };
+        result.nativeInput.coordinates = { ...result.interactionPoint };
+
+        result.moveMouseAttempted = true;
+        try {
+          await this.page.moveMouse(result.interactionPoint.x, result.interactionPoint.y);
+          result.moveMouseSucceeded = true;
+        } catch (error) {
+          recordFailure('move-mouse', error);
+          result.reason = 'probe-wheel-failed';
+          return result;
+        }
+        if (!(await stableAgainstInitialUrl())) {
+          result.reason = 'probe-conversation-changed';
+          return result;
+        }
+
+        result.wheelAttempted = true;
+        try {
+          await this.page.mouseWheel(
+            result.interactionPoint.x,
+            result.interactionPoint.y,
+            result.wheelDeltaX,
+            result.wheelDeltaY
+          );
+          result.wheelCommandSucceeded = true;
+        } catch (error) {
+          recordFailure('mouse-wheel', error);
+          result.reason = 'probe-wheel-failed';
+          return result;
+        }
+
+        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+        let afterWheel;
+        try {
+          afterWheel = await readWindow();
+        } catch (error) {
+          recordFailure('post-wheel-read', error);
+          result.reason = 'probe-wheel-failed';
+          return result;
+        }
+        if (!(await stableAgainstInitialUrl(afterWheel?.url))) {
+          result.reason = 'probe-conversation-changed';
+          return result;
+        }
+        result.afterWheel = probeWindowSummary(afterWheel);
+        result.physicalScrollChanged = result.normalized?.scrollTop !== result.afterWheel.scrollTop;
+        result.conversationWindowChanged = result.normalized?.windowSignature !== result.afterWheel.windowSignature;
+        result.reason = result.conversationWindowChanged
+          ? 'probe-wheel-window-changed'
+          : result.physicalScrollChanged ? 'probe-wheel-physical-progress' : 'probe-wheel-no-progress';
+      } catch (error) {
+        if (!result.reason) {
+          if (result.wheelAttempted) {
+            recordFailure('post-wheel-read', error);
+            result.reason = 'probe-wheel-failed';
+          } else if (normalizationAttempted) {
+            result.reason = 'probe-wheel-failed';
+          } else {
+            result.reason = 'probe-precondition-failed';
+          }
+        }
+      } finally {
+        if (normalizationAttempted) {
+          for (let attempt = 0; attempt < SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS && !result.restoreVerified; attempt += 1) {
+            result.restoreAttempts += 1;
+            try {
+              await this.page.restoreMinimizedForProbe();
+            } catch {}
+            await sleep(SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS);
+            try {
+              const restoredNative = await readNative();
+              const restoredUrl = await readUrl();
+              result.restored = stage(restoredNative);
               if (restoredUrl !== initialUrl) result.urlStable = false;
               result.restoreVerified = result.restored.browserWindowState === 'minimized'
                 && result.restored.adapterMinimized === true

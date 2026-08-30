@@ -441,6 +441,98 @@ function sanitizeScrollVisibilityProbe(value) {
   };
 }
 
+function sanitizeMouseWheelVisibilityProbe(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const windowStates = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
+  const visibilityStates = new Set(['visible', 'hidden']);
+  const boundedNumber = (item, { min = -1_000_000, max = 1_000_000, integer = false } = {}) => {
+    const number = Number(item);
+    if (!Number.isFinite(number) || number < min || number > max) return null;
+    return integer ? Math.trunc(number) : number;
+  };
+  const boolOrNull = (item) => typeof item === 'boolean' ? item : null;
+  const stateOrNull = (item, allowed) => {
+    const state = String(item || '').trim().toLowerCase();
+    return allowed.has(state) ? state : null;
+  };
+  const boundedText = (item, max) => {
+    if (typeof item !== 'string') return null;
+    const text = item.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const safeCode = (item) => {
+    if (typeof item === 'number') return Number.isSafeInteger(item) && Math.abs(item) <= 1_000_000_000 ? item : null;
+    const text = boundedText(item, 64);
+    return text && /^(?:-?\d{1,10}|[A-Za-z][A-Za-z0-9]*(?:[_.:-][A-Za-z0-9]+)+)$/u.test(text) ? text : null;
+  };
+  const range = (item) => ({
+    min: boundedNumber(item?.min, { min: 0, max: 1_000_000, integer: true }),
+    max: boundedNumber(item?.max, { min: 0, max: 1_000_000, integer: true })
+  });
+  const window = (item) => item && typeof item === 'object' ? {
+    range: range(item.range),
+    scrollTop: boundedNumber(item.scrollTop),
+    clientHeight: boundedNumber(item.clientHeight, { min: 0, max: 1_000_000 }),
+    scrollHeight: boundedNumber(item.scrollHeight, { min: 0, max: 1_000_000 }),
+    atTop: boolOrNull(item.atTop),
+    atBottom: boolOrNull(item.atBottom),
+    windowSignature: /^[a-f0-9]{1,64}$/u.test(String(item.windowSignature || '')) ? String(item.windowSignature) : null
+  } : null;
+  const stage = (item, includeWindow = true) => item && typeof item === 'object' ? {
+    browserWindowState: stateOrNull(item.browserWindowState, windowStates),
+    adapterMinimized: boolOrNull(item.adapterMinimized),
+    documentVisibilityState: stateOrNull(item.documentVisibilityState, visibilityStates),
+    documentHidden: boolOrNull(item.documentHidden),
+    documentHasFocus: boolOrNull(item.documentHasFocus),
+    ...(includeWindow ? window(item) : {})
+  } : null;
+  const nativeInput = data.nativeInput && typeof data.nativeInput === 'object' ? {
+    failurePhase: ['move-mouse', 'mouse-wheel', 'post-wheel-read'].includes(data.nativeInput.failurePhase) ? data.nativeInput.failurePhase : null,
+    errorName: boundedText(data.nativeInput.errorName, 64),
+    errorCode: safeCode(data.nativeInput.errorCode),
+    errorMessage: boundedText(data.nativeInput.errorMessage, 256),
+    wrapperErrorName: boundedText(data.nativeInput.wrapperErrorName, 64),
+    wrapperErrorCode: safeCode(data.nativeInput.wrapperErrorCode),
+    backendErrorCode: safeCode(data.nativeInput.backendErrorCode),
+    backendErrorMessage: boundedText(data.nativeInput.backendErrorMessage, 256),
+    coordinates: data.nativeInput.coordinates && typeof data.nativeInput.coordinates === 'object' ? {
+      x: boundedNumber(data.nativeInput.coordinates.x, { min: 0, max: 10_000 }),
+      y: boundedNumber(data.nativeInput.coordinates.y, { min: 0, max: 10_000 })
+    } : null,
+    deltaX: boundedNumber(data.nativeInput.deltaX, { min: -10_000, max: 10_000 }),
+    deltaY: boundedNumber(data.nativeInput.deltaY, { min: -10_000, max: 10_000 })
+  } : null;
+  const reason = String(data.reason || '').trim();
+  return {
+    backend: data.backend === 'chrome-cdp' ? data.backend : null,
+    preconditionPassed: data.preconditionPassed === true,
+    before: stage(data.before),
+    normalized: stage(data.normalized),
+    normalizationPhysicalScrollChanged: data.normalizationPhysicalScrollChanged === true,
+    normalizationConversationWindowChanged: data.normalizationConversationWindowChanged === true,
+    readyForMouseWheel: data.readyForMouseWheel === true,
+    interactionPoint: data.interactionPoint && typeof data.interactionPoint === 'object' ? {
+      x: boundedNumber(data.interactionPoint.x, { min: 0, max: 10_000 }),
+      y: boundedNumber(data.interactionPoint.y, { min: 0, max: 10_000 })
+    } : null,
+    moveMouseAttempted: data.moveMouseAttempted === true,
+    moveMouseSucceeded: data.moveMouseSucceeded === true,
+    wheelAttempted: data.wheelAttempted === true,
+    wheelDeltaX: boundedNumber(data.wheelDeltaX, { min: -10_000, max: 10_000 }),
+    wheelDeltaY: boundedNumber(data.wheelDeltaY, { min: -10_000, max: 10_000 }),
+    wheelCommandSucceeded: data.wheelCommandSucceeded === true,
+    afterWheel: window(data.afterWheel),
+    physicalScrollChanged: data.physicalScrollChanged === true,
+    conversationWindowChanged: data.conversationWindowChanged === true,
+    nativeInput,
+    restoreAttempts: boundedNumber(data.restoreAttempts, { min: 0, max: 2, integer: true }) || 0,
+    restoreVerified: data.restoreVerified === true,
+    restored: stage(data.restored, false),
+    urlStable: data.urlStable !== false,
+    reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
+  };
+}
+
 function normalizeVendorToken(value) {
   return String(value || '')
     .trim()
@@ -1242,6 +1334,26 @@ export function startHttpApi({
         }
         const probe = await controller.probeScrollVisibility();
         return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeScrollVisibilityProbe(probe) });
+      }
+      if (url.pathname === '/native-input/mouse-wheel-visibility-probe' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.probeMouseWheelVisibility !== 'function') {
+          throw new Error('mouse_wheel_visibility_probe_unavailable');
+        }
+        const probe = await controller.probeMouseWheelVisibility();
+        return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeMouseWheelVisibilityProbe(probe) });
       }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
         const bundles = await listBundles(stateDir);

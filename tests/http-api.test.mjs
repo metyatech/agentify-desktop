@@ -308,6 +308,68 @@ test('http-api: scroll visibility probe is authenticated, tab-scoped, and bounde
   assert.equal(JSON.stringify(data).includes('must-not-escape'), false);
 });
 
+test('http-api: mouse-wheel visibility probe is authenticated, tab-scoped, and input-limited', async (t) => {
+  let calls = 0;
+  const controller = {
+    probeMouseWheelVisibility: async (...args) => {
+      calls += 1;
+      assert.equal(args.length, 0);
+      return {
+        backend: 'chrome-cdp',
+        preconditionPassed: true,
+        readyForMouseWheel: true,
+        interactionPoint: { x: 595, y: 343 },
+        moveMouseAttempted: true,
+        moveMouseSucceeded: true,
+        wheelAttempted: true,
+        wheelDeltaX: 0,
+        wheelDeltaY: -720,
+        wheelCommandSucceeded: false,
+        nativeInput: {
+          failurePhase: 'mouse-wheel',
+          wrapperErrorCode: 'native_mouse_wheel_dispatch_failed',
+          backendErrorMessage: 'chrome_cdp_command_timeout'
+        },
+        restoreAttempts: 1,
+        restoreVerified: true,
+        urlStable: true,
+        reason: 'probe-wheel-failed'
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'tab-production', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    getControllerById: (id) => {
+      assert.equal(id, 'tab-production');
+      return controller;
+    }
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/native-input/mouse-wheel-visibility-probe',
+    body: { key: 'autopilot-production', deltaY: 999, count: 20, windowState: 'normal' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(calls, 1);
+  assert.equal(data.wheelDeltaX, 0);
+  assert.equal(data.wheelDeltaY, -720);
+  assert.equal(data.nativeInput.backendErrorMessage, 'chrome_cdp_command_timeout');
+  assert.equal(data.reason, 'probe-wheel-failed');
+});
+
 test('http-api: authenticated autopilot status endpoint validates and stores only snapshots', async (t) => {
   const stored = [];
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };

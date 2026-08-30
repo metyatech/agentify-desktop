@@ -1728,8 +1728,8 @@ export function startHttpApi({
         }
         const historyMode = body.historyMode === undefined ? 'visible' : String(body.historyMode).trim().toLowerCase();
         if (historyMode !== 'visible' && historyMode !== 'complete') throw new Error('conversation_history_mode_invalid');
-        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, 15_000, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
-        const historyMaxIterations = strictPositiveIntOr(body.historyMaxIterations, 48, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid');
+        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
+        const historyMaxIterations = strictPositiveIntOr(body.historyMaxIterations, MAX_CONVERSATION_HISTORY_ITERATIONS, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid');
         const result = await controller.readConversationTurns({
           maxTurns: positiveIntOr(body.maxTurns, 100, 200),
           maxCharsPerTurn: positiveIntOr(body.maxCharsPerTurn, 100_000, 200_000),

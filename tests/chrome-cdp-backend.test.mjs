@@ -521,6 +521,87 @@ test('chrome-cdp-backend: mouseWheel uses CDP native mouseWheel input', async ()
   await session.close();
 });
 
+test('chrome-cdp-backend: scrollGesture uses synthesizeScrollGesture with desktop mouse semantics', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  await session.page.scrollGesture({
+    x: 320,
+    y: 480,
+    xDistance: 0,
+    yDistance: 420,
+    speed: 1_000,
+    preventFling: true,
+    gestureSourceType: 'mouse'
+  });
+  const gesture = calls.findLast((call) => call.method === 'Input.synthesizeScrollGesture');
+  assert.deepEqual(gesture?.params, {
+    x: 320,
+    y: 480,
+    xDistance: 0,
+    yDistance: 420,
+    xOverscroll: 0,
+    yOverscroll: 0,
+    preventFling: true,
+    speed: 1_000,
+    gestureSourceType: 'mouse',
+    repeatCount: 0,
+    repeatDelayMs: 0
+  });
+  await session.page.scrollGesture({ x: 320, y: 480, yDistance: -420 });
+  const down = calls.findLast((call) => call.method === 'Input.synthesizeScrollGesture');
+  assert.equal(down?.params.yDistance, -420);
+  await session.close();
+});
+
+test('chrome-cdp-backend: scrollGesture rejects invalid coordinates, distances, speed, and source', async () => {
+  const { session } = await createSessionWithFileInputs({});
+  await assert.rejects(session.page.scrollGesture({ x: Number.NaN, y: 480, yDistance: 420 }), /scroll_gesture_input_invalid/u);
+  await assert.rejects(session.page.scrollGesture({ x: 10_001, y: 480, yDistance: 420 }), /scroll_gesture_input_invalid/u);
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 0 }), /scroll_gesture_input_invalid/u);
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420, speed: 0 }), /scroll_gesture_input_invalid/u);
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420, gestureSourceType: 'touch' }), /scroll_gesture_input_invalid/u);
+  await session.close();
+});
+
+test('chrome-cdp-backend: scrollGesture preserves protocol errors and does not invoke mouseWheel', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Input.synthesizeScrollGesture') {
+      const error = new Error('Method not found');
+      error.data = { code: -32601, message: 'Method not found' };
+      throw error;
+    }
+    return await originalSend(method, params, sessionId);
+  };
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420 }), (error) => {
+    assert.equal(error.data.wrapperCode, 'native_scroll_gesture_dispatch_failed');
+    assert.equal(error.data.backendCode, -32601);
+    assert.equal(error.data.backendMessage, 'Method not found');
+    return true;
+  });
+  assert.equal(calls.some((call) => call.method === 'Input.dispatchMouseEvent' && call.params?.type === 'mouseWheel'), false);
+  await session.close();
+});
+
+test('chrome-cdp-backend: scrollGesture preserves command timeout without falling back', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  session.page.client.send = async (method) => {
+    if (method === 'Input.synthesizeScrollGesture') {
+      const error = new Error('chrome_cdp_command_timeout');
+      error.data = { method: 'Input.synthesizeScrollGesture' };
+      throw error;
+    }
+    return {};
+  };
+  await assert.rejects(session.page.scrollGesture({ x: 320, y: 480, yDistance: 420 }), (error) => {
+    assert.equal(error.data.backendCode, null);
+    assert.equal(error.data.backendMessage, 'chrome_cdp_command_timeout');
+    return true;
+  });
+  assert.equal(calls.some((call) => call.method === 'Input.dispatchMouseEvent' && call.params?.type === 'mouseWheel'), false);
+  await session.close();
+});
+
 test('chrome-cdp-backend: native wheel diagnostics preserve numeric CDP protocol errors separately from wrapper codes', async () => {
   const { session } = await createSessionWithFileInputs({});
   const originalSend = session.page.client.send;

@@ -47,6 +47,10 @@ function keyDescriptor(key) {
 
 const MAX_BROWSER_EVALUATION_DIAGNOSTIC_CHARS = 256;
 const MAX_NATIVE_BACKEND_ERROR_CHARS = 256;
+const MAX_SCROLL_GESTURE_COORDINATE = 10_000;
+const MAX_SCROLL_GESTURE_DISTANCE = 10_000;
+const MIN_SCROLL_GESTURE_SPEED = 100;
+const MAX_SCROLL_GESTURE_SPEED = 5_000;
 
 function sanitizeBrowserEvaluationText(value) {
   let text = String(value ?? '')
@@ -643,6 +647,55 @@ class ChromeCdpPageAdapter {
       });
     } catch (error) {
       throw wrapNativeInputError('native_mouse_wheel_dispatch_failed', error);
+    }
+  }
+
+  async scrollGesture({
+    x,
+    y,
+    xDistance = 0,
+    yDistance,
+    speed = 1_000,
+    preventFling = true,
+    gestureSourceType = 'mouse'
+  } = {}) {
+    const pointX = Number(x);
+    const pointY = Number(y);
+    const horizontal = Number(xDistance);
+    const vertical = Number(yDistance);
+    const gestureSpeed = Number(speed);
+    if (
+      ![pointX, pointY, horizontal, vertical, gestureSpeed].every(Number.isFinite)
+      || pointX < 0
+      || pointY < 0
+      || pointX > MAX_SCROLL_GESTURE_COORDINATE
+      || pointY > MAX_SCROLL_GESTURE_COORDINATE
+      || Math.abs(horizontal) > MAX_SCROLL_GESTURE_DISTANCE
+      || Math.abs(vertical) > MAX_SCROLL_GESTURE_DISTANCE
+      || (horizontal === 0 && vertical === 0)
+      || gestureSpeed < MIN_SCROLL_GESTURE_SPEED
+      || gestureSpeed > MAX_SCROLL_GESTURE_SPEED
+      || preventFling !== true
+      || gestureSourceType !== 'mouse'
+    ) {
+      throw new Error('scroll_gesture_input_invalid');
+    }
+    try {
+      await this.#sendSessionCommand('Input.synthesizeScrollGesture', {
+        x: pointX,
+        y: pointY,
+        xDistance: horizontal,
+        yDistance: vertical,
+        xOverscroll: 0,
+        yOverscroll: 0,
+        preventFling: true,
+        speed: gestureSpeed,
+        gestureSourceType: 'mouse',
+        repeatCount: 0,
+        repeatDelayMs: 0
+      });
+    } catch (error) {
+      throw wrapNativeInputError('native_scroll_gesture_dispatch_failed', error);
     }
   }
 

@@ -1900,10 +1900,19 @@ export class ChatGPTController {
     const startedAt = Date.now();
     const snapshots = [];
     const diagnostics = {
-      nativeWheelSupported: typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function',
+      nativeWheelSupported: typeof this.page?.scrollGesture === 'function'
+        || (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function'),
+      scrollInputMethod: typeof this.page?.scrollGesture === 'function'
+        ? 'cdp-synthesize-scroll-gesture'
+        : (typeof this.page?.mouseWheel === 'function' && typeof this.page?.moveMouse === 'function' ? 'native-mouse-wheel' : null),
       nativeScrollControlProven: false,
       wheelDownAttempts: 0,
       wheelUpAttempts: 0,
+      gestureAttemptsDown: 0,
+      gestureAttemptsUp: 0,
+      gestureDistance: null,
+      gestureSpeed: null,
+      gestureSourceType: null,
       initialRange: { min: null, max: null },
       firstNativeUp: null,
       firstNativeDown: null,
@@ -1982,7 +1991,12 @@ export class ChatGPTController {
       if (windowChanged) diagnostics.conversationWindowChangeCount += 1;
       if (physicalChanged) diagnostics.physicalScrollChangeCount += 1;
       if (direction < 0 && diagnostics.oldestProgression.length < 80) diagnostics.oldestProgression.push(conversationTurnRange(after?.turns).min);
-      return { windowChanged, physicalChanged, range: conversationTurnRange(after?.turns) };
+      return {
+        windowChanged,
+        physicalChanged,
+        beforeRange: conversationTurnRange(before?.turns),
+        range: conversationTurnRange(after?.turns)
+      };
     };
     const nativeWheel = async (direction, state) => {
       if (Date.now() - startedAt > historyTimeoutMs || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
@@ -1992,21 +2006,48 @@ export class ChatGPTController {
       if (direction > 0) diagnostics.wheelDownAttempts += 1; else diagnostics.wheelUpAttempts += 1;
       const deltaX = 0;
       const deltaY = direction > 0 ? 720 : -720;
+      const visibleHeight = Number(state?.scroller?.clientHeight);
+      const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
+      const gestureSpeed = 1_000;
+      const useScrollGesture = typeof this.page?.scrollGesture === 'function';
       diagnostics.nativeInput.coordinates = { x: Math.round(Number(point.x)), y: Math.round(Number(point.y)) };
       diagnostics.nativeInput.deltaX = deltaX;
-      diagnostics.nativeInput.deltaY = deltaY;
-      await recordNativeInputRuntime();
-      try {
-        await this.page.moveMouse(Number(point.x), Number(point.y));
-      } catch (error) {
-        await recordNativeInputFailure('move-mouse', error);
-        return { ok: false, reason: 'history-native-wheel-failed' };
+      diagnostics.nativeInput.deltaY = useScrollGesture ? (direction > 0 ? -gestureDistance : gestureDistance) : deltaY;
+      if (useScrollGesture) {
+        if (direction > 0) diagnostics.gestureAttemptsDown += 1; else diagnostics.gestureAttemptsUp += 1;
+        diagnostics.gestureDistance = gestureDistance;
+        diagnostics.gestureSpeed = gestureSpeed;
+        diagnostics.gestureSourceType = 'mouse';
       }
-      try {
-        await this.page.mouseWheel(Number(point.x), Number(point.y), deltaX, deltaY);
-      } catch (error) {
-        await recordNativeInputFailure('mouse-wheel', error);
-        return { ok: false, reason: 'history-native-wheel-failed' };
+      await recordNativeInputRuntime();
+      if (useScrollGesture) {
+        try {
+          await this.page.scrollGesture({
+            x: Number(point.x),
+            y: Number(point.y),
+            xDistance: 0,
+            yDistance: direction > 0 ? -gestureDistance : gestureDistance,
+            speed: gestureSpeed,
+            preventFling: true,
+            gestureSourceType: 'mouse'
+          });
+        } catch (error) {
+          await recordNativeInputFailure('scroll-gesture', error);
+          return { ok: false, reason: 'history-native-wheel-failed' };
+        }
+      } else {
+        try {
+          await this.page.moveMouse(Number(point.x), Number(point.y));
+        } catch (error) {
+          await recordNativeInputFailure('move-mouse', error);
+          return { ok: false, reason: 'history-native-wheel-failed' };
+        }
+        try {
+          await this.page.mouseWheel(Number(point.x), Number(point.y), deltaX, deltaY);
+        } catch (error) {
+          await recordNativeInputFailure('mouse-wheel', error);
+          return { ok: false, reason: 'history-native-wheel-failed' };
+        }
       }
       let next;
       try {
@@ -2040,15 +2081,15 @@ export class ChatGPTController {
       else {
         const firstDirection = current.scroller.atBottom ? -1 : 1;
         const first = await nativeWheel(firstDirection, current);
-        if (firstDirection < 0) diagnostics.firstNativeUp = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, range: first.range || conversationTurnRange(first.state?.turns) };
-        else diagnostics.firstNativeDown = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, range: first.range || conversationTurnRange(first.state?.turns) };
+        if (firstDirection < 0) diagnostics.firstNativeUp = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, beforeRange: first.beforeRange || null, range: first.range || conversationTurnRange(first.state?.turns) };
+        else diagnostics.firstNativeDown = { changed: first.windowChanged === true, physicalChanged: first.physicalChanged === true, beforeRange: first.beforeRange || null, range: first.range || conversationTurnRange(first.state?.turns) };
         if (!first.ok) reason = first.reason;
         else if (first.windowChanged) diagnostics.nativeScrollControlProven = true;
         else {
           const oppositeDirection = firstDirection < 0 ? 1 : -1;
           const second = await nativeWheel(oppositeDirection, current);
-          if (oppositeDirection < 0) diagnostics.firstNativeUp = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, range: second.range || conversationTurnRange(second.state?.turns) };
-          else diagnostics.firstNativeDown = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, range: second.range || conversationTurnRange(second.state?.turns) };
+          if (oppositeDirection < 0) diagnostics.firstNativeUp = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, beforeRange: second.beforeRange || null, range: second.range || conversationTurnRange(second.state?.turns) };
+          else diagnostics.firstNativeDown = { changed: second.windowChanged === true, physicalChanged: second.physicalChanged === true, beforeRange: second.beforeRange || null, range: second.range || conversationTurnRange(second.state?.turns) };
           if (!second.ok) reason = second.reason;
           else if (second.windowChanged) diagnostics.nativeScrollControlProven = true;
           else reason = 'history-native-scroll-no-progress';

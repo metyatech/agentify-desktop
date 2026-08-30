@@ -20,6 +20,8 @@ export const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
 export const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = MAX_CONVERSATION_HISTORY_TIMEOUT_MS;
 export const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = MAX_CONVERSATION_HISTORY_ITERATIONS;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
+const CONVERSATION_HISTORY_SCROLL_POLL_MS = 50;
+const CONVERSATION_HISTORY_SCROLL_SETTLE_MAX_MS = 220;
 const CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS = 540;
 const CONVERSATION_HISTORY_TOP_STABLE_SAMPLES = 4;
 const CONVERSATION_HISTORY_RESTORE_ATTEMPTS = 4;
@@ -164,11 +166,13 @@ function historyMetadata({ mode, complete = false, reason = null, startReached =
   return metadata;
 }
 
-export function mergeConversationSnapshots(snapshots = []) {
+function mergeConversationSnapshotsLegacy(snapshots = []) {
   const records = new Map();
   const positions = new Map();
   const edges = new Map();
   const indegree = new Map();
+  const orderPairs = new Set();
+  const reasonCounts = { durableIdentityConflict: 0, fallbackIdentityConflict: 0, duplicateIdentityInSnapshot: 0, orderConflict: 0, cycle: 0, disconnectedWindow: 0, invalidObservation: 0 };
   let ambiguous = false;
   let continuous = true;
   let previousKeys = null;
@@ -185,17 +189,20 @@ export function mergeConversationSnapshots(snapshots = []) {
     const observations = Array.isArray(snapshot) ? snapshot : snapshot?.turns;
     if (!Array.isArray(observations) || observations.length === 0) {
       continuous = false;
+      reasonCounts.disconnectedWindow += 1;
       continue;
     }
     const keys = [];
     for (const [localIndex, observation] of observations.entries()) {
       if (observation?.role !== "user" && observation?.role !== "assistant") {
         ambiguous = true;
+        reasonCounts.invalidObservation += 1;
         continue;
       }
       const text = normalizeConversationText(observation.text);
       if (!text) {
         ambiguous = true;
+        reasonCounts.invalidObservation += 1;
         continue;
       }
       const messageId = String(observation.messageId || "").trim();
@@ -205,10 +212,11 @@ export function mergeConversationSnapshots(snapshots = []) {
         ? `message:${messageId}`
         : turnId
           ? `turn:${turnId}`
-          : positionHint !== null
-            ? `position:${positionHint}`
-            : String(observation.fingerprint || `${observation.role}\u0000${text}\u0000${localIndex}`);
-      if (keys.includes(key)) ambiguous = true;
+          : `fingerprint:${String(observation.fingerprint || `${observation.role}\u0000${text}`).slice(0, 256)}`;
+      if (keys.includes(key)) {
+        ambiguous = true;
+        reasonCounts.duplicateIdentityInSnapshot += 1;
+      }
       keys.push(key);
       const existing = records.get(key);
       const value = { ...observation, text, messageId: messageId || null, turnId: turnId || null, positionHint };
@@ -269,6 +277,115 @@ export function mergeConversationSnapshots(snapshots = []) {
   return { turns, ambiguous, continuous, observedTurnCount: records.size };
 }
 
+export function mergeConversationSnapshots(snapshots = []) {
+  const records = new Map();
+  const edges = new Map();
+  const indegree = new Map();
+  const orderPairs = new Set();
+  const reasonCounts = { durableIdentityConflict: 0, fallbackIdentityConflict: 0, duplicateIdentityInSnapshot: 0, orderConflict: 0, cycle: 0, disconnectedWindow: 0, invalidObservation: 0 };
+  let ambiguous = false;
+  let continuous = true;
+  let previousKeys = null;
+  const addEdge = (from, to) => {
+    if (!edges.has(from)) edges.set(from, new Set());
+    if (!edges.get(from).has(to)) {
+      edges.get(from).add(to);
+      indegree.set(to, (indegree.get(to) || 0) + 1);
+    }
+  };
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    const observations = Array.isArray(snapshot) ? snapshot : snapshot?.turns;
+    if (!Array.isArray(observations) || observations.length === 0) {
+      continuous = false;
+      reasonCounts.disconnectedWindow += 1;
+      continue;
+    }
+    const keys = [];
+    for (const observation of observations) {
+      if (observation?.role !== 'user' && observation?.role !== 'assistant') {
+        ambiguous = true;
+        reasonCounts.invalidObservation += 1;
+        continue;
+      }
+      const text = normalizeConversationText(observation.text);
+      if (!text) {
+        ambiguous = true;
+        reasonCounts.invalidObservation += 1;
+        continue;
+      }
+      const messageId = String(observation.messageId || '').trim();
+      const turnId = String(observation.turnId || '').trim();
+      const positionHint = Number.isInteger(observation.positionHint) ? observation.positionHint : null;
+      const key = messageId
+        ? `message:${messageId}`
+        : turnId
+          ? `turn:${turnId}`
+          : `fingerprint:${String(observation.fingerprint || `${observation.role}\u0000${text}`).slice(0, 256)}`;
+      if (keys.includes(key)) {
+        ambiguous = true;
+        reasonCounts.duplicateIdentityInSnapshot += 1;
+      }
+      keys.push(key);
+      const value = { ...observation, text, messageId: messageId || null, turnId: turnId || null, positionHint };
+      const existing = records.get(key);
+      if (existing && (existing.role !== value.role || existing.text !== value.text)) {
+        ambiguous = true;
+        if (key.startsWith('fingerprint:')) reasonCounts.fallbackIdentityConflict += 1;
+        else reasonCounts.durableIdentityConflict += 1;
+      } else if (!existing) {
+        records.set(key, { ...value, firstSeen: records.size });
+        indegree.set(key, indegree.get(key) || 0);
+      }
+    }
+    if (previousKeys && !keys.some((key) => previousKeys.includes(key))) {
+      continuous = false;
+      reasonCounts.disconnectedWindow += 1;
+    }
+    for (let left = 0; left < keys.length; left += 1) {
+      for (let right = left + 1; right < keys.length; right += 1) {
+        const pair = `${keys[left]}\u0000${keys[right]}`;
+        const reverse = `${keys[right]}\u0000${keys[left]}`;
+        if (orderPairs.has(reverse) && !orderPairs.has(pair)) {
+          ambiguous = true;
+          reasonCounts.orderConflict += 1;
+        }
+        orderPairs.add(pair);
+      }
+    }
+    for (let index = 1; index < keys.length; index += 1) addEdge(keys[index - 1], keys[index]);
+    previousKeys = keys;
+  }
+  const queue = [...records.keys()].filter((key) => (indegree.get(key) || 0) === 0);
+  queue.sort((left, right) => records.get(left).firstSeen - records.get(right).firstSeen);
+  const orderedKeys = [];
+  while (queue.length) {
+    const key = queue.shift();
+    orderedKeys.push(key);
+    for (const next of edges.get(key) || []) {
+      indegree.set(next, indegree.get(next) - 1);
+      if (indegree.get(next) === 0) queue.push(next);
+    }
+    queue.sort((left, right) => records.get(left).firstSeen - records.get(right).firstSeen);
+  }
+  if (orderedKeys.length !== records.size) {
+    ambiguous = true;
+    reasonCounts.cycle += 1;
+  }
+  const turns = orderedKeys.map((key, index) => {
+    const record = records.get(key);
+    const turnIndex = Number.isInteger(record.positionHint) ? record.positionHint : index;
+    return {
+      id: record.messageId || record.turnId || fallbackConversationTurnId({ role: record.role, index: turnIndex, text: record.text }),
+      role: record.role,
+      text: record.text,
+      index: turnIndex,
+      messageId: record.messageId || null,
+      turnId: record.turnId || null
+    };
+  });
+  return { turns, ambiguous, continuous, observedTurnCount: records.size, mergeDiagnostics: { ambiguous, continuous, reasonCounts } };
+}
+
 function validateConversationHistoryOptions({ historyMode, historyTimeoutMs, historyMaxIterations }) {
   if (historyMode !== "visible" && historyMode !== "complete") throw new Error("conversation_history_mode_invalid");
   if (!Number.isInteger(historyTimeoutMs) || historyTimeoutMs < 1 || historyTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS) throw new Error("conversation_history_timeout_invalid");
@@ -287,7 +404,15 @@ function conversationWindowSignature(turns = []) {
     turn?.role || null,
     turn?.messageId || turn?.turnId || '',
     Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
-    textDigest(normalizeConversationText(turn?.text))
+    turn?.textDigest || textDigest(normalizeConversationText(turn?.text))
+  ]));
+}
+
+function conversationWindowIdentitySignature(turns = []) {
+  return JSON.stringify((Array.isArray(turns) ? turns : []).map((turn) => [
+    turn?.role || null,
+    turn?.messageId || turn?.turnId || '',
+    Number.isInteger(turn?.positionHint) ? turn.positionHint : null
   ]));
 }
 
@@ -388,7 +513,7 @@ function conversationLayoutSummaryReady(summary) {
 }
 
 function conversationTailSignature(turns = []) {
-  return conversationWindowSignature((Array.isArray(turns) ? turns : []).slice(-3));
+  return conversationWindowIdentitySignature((Array.isArray(turns) ? turns : []).slice(-3));
 }
 
 export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
@@ -857,6 +982,98 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
         atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
         point
       } : { ...resolved.diagnostic, atTop: false, atBottom: false, point: null }
+    };
+  })()`;
+}
+
+export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars }) {
+  return `(() => {
+    const traversalRead = true;
+    const maxTurns = ${maxTurns};
+    const maxCharsPerTurn = ${maxCharsPerTurn};
+    const maxTotalChars = ${maxTotalChars};
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
+    const normalize = (value) => String(value || '').replace(/\\u0000/g, '').replace(/\\s+/g, ' ').trim();
+    const digest = (value) => {
+      let hash = 2166136261;
+      for (const char of String(value || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
+      return (hash >>> 0).toString(16).padStart(8, '0');
+    };
+    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
+      let parent = node.parentElement;
+      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
+      return true;
+    });
+    const parsePosition = (node) => {
+      let current = node;
+      while (current) {
+        for (const value of [current.id, current.getAttribute?.('data-testid'), current.getAttribute?.('data-conversation-turn'), current.getAttribute?.('data-turn')]) {
+          const match = String(value || '').match(/conversation-turn-(\\d+)/i);
+          if (match) return Number(match[1]);
+        }
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
+    const isScrollable = (node) => {
+      if (!node) return false;
+      const style = getComputedStyle(node);
+      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && Number(node.scrollHeight) > Number(node.clientHeight);
+    };
+    const nodes = messageNodes();
+    const chains = nodes.map((node) => {
+      const chain = [];
+      let current = node.parentElement;
+      while (current) { chain.push(current); current = current.parentElement; }
+      if (document.scrollingElement && !chain.includes(document.scrollingElement)) chain.push(document.scrollingElement);
+      return chain;
+    });
+    const common = chains.length ? chains[0].filter((node) => chains.every((chain) => chain.includes(node))) : [];
+    const candidates = common.filter((node) => !isNavigationRegion(node) && isScrollable(node)).map((node) => ({ node, distance: Math.max(...chains.map((chain) => chain.indexOf(node))), descendants: nodes.filter((message) => node.contains?.(message)).length })).filter((candidate) => candidate.descendants > 0);
+    candidates.sort((left, right) => left.distance - right.distance);
+    const nearestDistance = candidates[0]?.distance;
+    const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
+    const selected = nearest.length === 1 ? nearest[0].node : null;
+    const inScroller = selected ? nodes.filter((node) => selected.contains?.(node)) : [];
+    const turns = inScroller.map((node, domIndex) => {
+      const role = node.getAttribute('data-message-author-role');
+      const rawText = String(node.innerText || node.textContent || '');
+      const text = normalize(rawText.slice(0, 512));
+      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
+      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
+      return { role, messageId: messageId || null, turnId: turnId || null, positionHint: parsePosition(node), textDigest: digest(text), textLength: rawText.length, domIndex };
+    }).filter((turn) => turn.role === 'user' || turn.role === 'assistant');
+    const values = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
+    const range = { min: values.length ? Math.min(...values) : null, max: values.length ? Math.max(...values) : null };
+    const totalChars = turns.reduce((sum, turn) => sum + turn.textLength, 0);
+    const limitKind = turns.some((turn) => turn.textLength > maxCharsPerTurn) ? 'per-turn' : totalChars > maxTotalChars || turns.length > maxTurns ? 'total' : null;
+    const rect = selected?.getBoundingClientRect?.();
+    const viewportWidth = Number(globalThis.innerWidth || document.documentElement?.clientWidth || 0);
+    const viewportHeight = Number(globalThis.innerHeight || document.documentElement?.clientHeight || 0);
+    const validRect = rect && Number.isFinite(rect.left) && Number.isFinite(rect.top) && Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 20 && rect.height > 20;
+    const left = validRect ? Math.max(0, rect.left) : 0;
+    const top = validRect ? Math.max(0, rect.top) : 0;
+    const right = validRect ? Math.min(viewportWidth || rect.right, rect.right) : 0;
+    const bottom = validRect ? Math.min(viewportHeight || rect.bottom, rect.bottom) : 0;
+    const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
+    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, turn.textDigest]));
+    const messagePositionZeroCount = turns.filter((turn) => turn.positionHint === 0).length;
+    const positionZeroMarkerCount = selected ? Array.from(document.querySelectorAll(markerSelector)).filter((node) => selected.contains?.(node) && parsePosition(node) === 0).length : 0;
+    const first = turns[0] || null;
+    return {
+      url: location.href,
+      turns: turns.slice(-maxTurns),
+      limitExceeded: !!limitKind,
+      limitKind,
+      loading,
+      windowSignature: signature,
+      signature,
+      range,
+      startBoundary: { firstMessagePosition: Number.isInteger(first?.positionHint) ? first.positionHint : null, firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null, positionZeroMessageNodeCount: messagePositionZeroCount, positionZeroMarkerInsideScrollerCount: positionZeroMarkerCount, positionOneMessageNodeCount: turns.filter((turn) => turn.positionHint === 1).length },
+      scroller: selected ? { candidateCount: candidates.length, selectedMessageDescendantCount: nearest[0].descendants, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: candidates.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
     };
   })()`;
 }
@@ -3350,14 +3567,28 @@ export class ChatGPTController {
         final: null
       },
       conversationRestore: {
+        mode: null,
+        targetAtBottom: false,
+        anchorIdentityPresent: false,
         attempts: 0,
         verified: false,
         initialDistanceFromBottom: null,
         finalDistanceFromBottom: null,
         distanceMatched: false,
+        bottomMatched: false,
+        anchorMatched: false,
         signatureMatched: false,
         lastFailureReason: null
       },
+      timing: {
+        historyElapsedMs: 0,
+        traversalElapsedMs: 0,
+        topProofElapsedMs: 0,
+        tailProofElapsedMs: 0,
+        restoreElapsedMs: 0
+      },
+      reads: { lightweightReadCount: 0, fullReadCount: 0 },
+      wheels: { total: 0, up: 0, down: 0 },
       urlStable: true
     };
     let current = null;
@@ -3365,7 +3596,12 @@ export class ChatGPTController {
     let initialScrollTop = null;
     let initialDistanceFromBottom = null;
     let originalWindowSignature = null;
+    let restoreMode = null;
     let historyStartedAt = null;
+    let traversalStartedAt = null;
+    let tailProofStartedAt = null;
+    let topProofStartedAt = null;
+    let restoreStartedAt = null;
     let reason = null;
     let windowNormalizationApplied = false;
     let startReached = false;
@@ -3387,7 +3623,14 @@ export class ChatGPTController {
       return stable;
     };
     const historyElapsedMs = () => Date.now() - (historyStartedAt ?? operationStartedAt);
-    const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
+    const readWindow = async () => {
+      diagnostics.reads.fullReadCount += 1;
+      return await this.#eval(buildConversationWindowReadScript(limits));
+    };
+    const readTraversal = async () => {
+      diagnostics.reads.lightweightReadCount += 1;
+      return await this.#eval(buildConversationTraversalReadScript(limits));
+    };
     const recordNativeInputRuntime = async () => {
       if (typeof this.page?.getNativeInputDiagnostics !== 'function') return;
       try {
@@ -3484,6 +3727,12 @@ export class ChatGPTController {
           initialScrollTop = Number(current?.scroller?.scrollTop);
           initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
           originalWindowSignature = conversationWindowSignature(current?.turns);
+          restoreMode = current?.scroller?.atBottom === true ? 'bottom' : 'anchored-window';
+          diagnostics.conversationRestore.mode = restoreMode;
+          diagnostics.conversationRestore.targetAtBottom = restoreMode === 'bottom';
+          diagnostics.conversationRestore.anchorIdentityPresent = restoreMode !== 'bottom'
+            && Array.isArray(current?.turns)
+            && current.turns.some((turn) => Boolean(turn?.messageId || turn?.turnId));
           addSnapshot(current);
           diagnostics.initialRange = conversationTurnRange(current?.turns);
           diagnostics.observedRange = { ...diagnostics.initialRange };
@@ -3497,8 +3746,8 @@ export class ChatGPTController {
       reason ||= isChromeCdp && windowNormalizationApplied ? 'history-native-window-not-ready' : 'history-native-scroll-unproven';
     }
     const recordWheelResult = (before, after, direction) => {
-      const beforeSignature = conversationWindowSignature(before?.turns);
-      const afterSignature = conversationWindowSignature(after?.turns);
+      const beforeSignature = conversationWindowIdentitySignature(before?.turns);
+      const afterSignature = conversationWindowIdentitySignature(after?.turns);
       const windowChanged = beforeSignature !== afterSignature;
       const physicalChanged = Number(before?.scroller?.scrollTop) !== Number(after?.scroller?.scrollTop);
       if (windowChanged) diagnostics.conversationWindowChangeCount += 1;
@@ -3528,13 +3777,26 @@ export class ChatGPTController {
           return { ok: false, reason: 'history-native-window-not-ready' };
         }
       }
-      const point = state?.scroller?.point;
+      let beforeState;
+      try {
+        beforeState = await readTraversal();
+      } catch (error) {
+        await recordNativeInputFailure('post-wheel-read', error);
+        return { ok: false, reason: 'history-native-wheel-failed' };
+      }
+      if (!currentUrlIsStable(beforeState)) return { ok: false, reason: 'conversation-changed', state: beforeState };
+      if (beforeState?.limitExceeded) return { ok: false, reason: beforeState.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large', state: beforeState };
+      if (beforeState?.scroller?.candidateCount !== 1) return { ok: false, reason: beforeState?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found', state: beforeState };
+      current = beforeState;
+      const point = beforeState?.scroller?.point;
       if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) return { ok: false, reason: 'scroll-target-invalid' };
       iterations += 1;
       if (direction > 0) diagnostics.wheelDownAttempts += 1; else diagnostics.wheelUpAttempts += 1;
+      diagnostics.wheels.total += 1;
+      if (direction > 0) diagnostics.wheels.down += 1; else diagnostics.wheels.up += 1;
       const deltaX = 0;
       const deltaY = direction > 0 ? 720 : -720;
-      const visibleHeight = Number(state?.scroller?.clientHeight);
+      const visibleHeight = Number(beforeState?.scroller?.clientHeight);
       const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
       const gestureSpeed = 1_000;
       const gestureSourceType = 'touch';
@@ -3580,16 +3842,31 @@ export class ChatGPTController {
       }
       let next;
       try {
-        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
-        next = await this.#eval(buildConversationWindowReadScript(limits));
+        const deadline = Date.now() + CONVERSATION_HISTORY_SCROLL_SETTLE_MAX_MS;
+        let traversal = null;
+        do {
+          traversal = await readTraversal();
+          if (currentUrlIsStable(traversal) === false) break;
+          const changed = conversationWindowIdentitySignature(beforeState.turns) !== conversationWindowIdentitySignature(traversal.turns)
+            || Number(beforeState.scroller?.scrollTop) !== Number(traversal.scroller?.scrollTop)
+            || beforeState.scroller?.atTop !== traversal.scroller?.atTop
+            || beforeState.scroller?.atBottom !== traversal.scroller?.atBottom
+            || beforeState.loading !== traversal.loading;
+          if (changed || Date.now() >= deadline) break;
+          await sleep(CONVERSATION_HISTORY_SCROLL_POLL_MS);
+        } while (Date.now() <= deadline);
+        if (!traversal || !currentUrlIsStable(traversal)) return { ok: false, reason: 'conversation-changed', state: traversal };
+        next = conversationWindowIdentitySignature(beforeState.turns) !== conversationWindowIdentitySignature(traversal.turns)
+          ? await readWindow()
+          : traversal;
       } catch (error) {
         await recordNativeInputFailure('post-wheel-read', error);
         return { ok: false, reason: 'history-native-wheel-failed' };
       }
       if (!currentUrlIsStable(next)) return { ok: false, reason: 'conversation-changed', state: next };
       if (next?.limitExceeded) return { ok: false, reason: next.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large', state: next };
-      const result = recordWheelResult(state, next, direction);
-      addSnapshot(next);
+      const result = recordWheelResult(beforeState, next, direction);
+      if (result.windowChanged) addSnapshot(next);
       current = next;
       return { ok: true, state: next, ...result };
     };
@@ -3630,7 +3907,8 @@ export class ChatGPTController {
           restoreDiagnostics.lastFailureReason = 'scroller-missing';
           continue;
         }
-        const result = await this.#eval(buildRestoreConversationScrollScript(restoreDiagnostics.initialDistanceFromBottom)).catch(() => null);
+        const targetDistance = restoreDiagnostics.mode === 'bottom' ? 0 : restoreDiagnostics.initialDistanceFromBottom;
+        const result = await this.#eval(buildRestoreConversationScrollScript(targetDistance)).catch(() => null);
         if (result?.ok !== true) {
           restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
           continue;
@@ -3657,17 +3935,23 @@ export class ChatGPTController {
           continue;
         }
         const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
-        const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - restoreDiagnostics.initialDistanceFromBottom) <= 2;
-        const signatureMatched = conversationWindowSignature(restored.turns) === originalWindowSignature;
+        const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - targetDistance) <= 2;
+        const bottomMatched = restoreDiagnostics.mode === 'bottom' && restored.scroller.atBottom === true && restored.loading === false;
+        const signatureMatched = restoreDiagnostics.mode === 'bottom' ? null : conversationWindowSignature(restored.turns) === originalWindowSignature;
+        const anchorMatched = restoreDiagnostics.mode === 'bottom' ? false : signatureMatched;
         restoreDiagnostics.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
         restoreDiagnostics.distanceMatched = distanceMatched;
+        restoreDiagnostics.bottomMatched = bottomMatched;
+        restoreDiagnostics.anchorMatched = anchorMatched;
         restoreDiagnostics.signatureMatched = signatureMatched;
-        if (distanceMatched && signatureMatched) {
+        if (distanceMatched && (restoreDiagnostics.mode === 'bottom' ? bottomMatched : signatureMatched)) {
           restoreDiagnostics.verified = true;
           restoreDiagnostics.lastFailureReason = null;
           return true;
         }
-        restoreDiagnostics.lastFailureReason = signatureMatched ? 'distance-mismatch' : 'signature-mismatch';
+        restoreDiagnostics.lastFailureReason = restoreDiagnostics.mode === 'bottom'
+          ? (distanceMatched ? 'bottom-mismatch' : 'distance-mismatch')
+          : (signatureMatched ? 'distance-mismatch' : 'signature-mismatch');
       }
       if (lastState && Number.isFinite(Number(lastState.scroller?.scrollHeight)) && Number.isFinite(Number(lastState.scroller?.clientHeight)) && Number.isFinite(Number(lastState.scroller?.scrollTop))) {
         restoreDiagnostics.finalDistanceFromBottom = Number(lastState.scroller.scrollHeight) - Number(lastState.scroller.clientHeight) - Number(lastState.scroller.scrollTop);
@@ -3705,6 +3989,7 @@ export class ChatGPTController {
       } else if (!initialUrl || !current?.scroller || current.scroller.candidateCount === 0) reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
       else {
+        traversalStartedAt = Date.now();
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;
@@ -3747,6 +4032,7 @@ export class ChatGPTController {
       }
 
       if (!reason) {
+        tailProofStartedAt = Date.now();
         let tailStableCount = 0;
         let previousTail = null;
         while (!reason && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
@@ -3757,8 +4043,13 @@ export class ChatGPTController {
             tailStableCount = signature === previousTail ? tailStableCount + 1 : 1;
             previousTail = signature;
             if (tailStableCount >= 3) {
-              tailSnapshot = result.state;
-              diagnostics.tailRange = conversationTurnRange(result.state.turns);
+              const settledTail = await readWindow();
+              if (!currentUrlIsStable(settledTail)) { reason = 'conversation-changed'; break; }
+              if (settledTail?.limitExceeded) { reason = settledTail.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
+              tailSnapshot = settledTail;
+              current = settledTail;
+              addSnapshot(settledTail);
+              diagnostics.tailRange = conversationTurnRange(settledTail.turns);
               diagnostics.tailProven = true;
               break;
             }
@@ -3768,6 +4059,7 @@ export class ChatGPTController {
       }
 
       if (!reason && diagnostics.tailProven) {
+        topProofStartedAt = Date.now();
         let noProgressCount = 0;
         while (iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
           if (current?.scroller?.atTop && !current.loading) {
@@ -3829,6 +4121,7 @@ export class ChatGPTController {
         }
       }
     } finally {
+      restoreStartedAt = Date.now();
       diagnostics.scrollRestored = await restore();
       const windowRestored = await restoreWindow();
       if (!windowRestored && !reason) reason = 'history-window-restore-failed';
@@ -3863,6 +4156,14 @@ export class ChatGPTController {
       tailProven: diagnostics.tailProven,
       startProven: diagnostics.startProven
     };
+    const clockStart = historyStartedAt ?? operationStartedAt;
+    const now = Date.now();
+    const elapsed = Math.max(0, now - clockStart);
+    diagnostics.timing.historyElapsedMs = elapsed;
+    diagnostics.timing.traversalElapsedMs = traversalStartedAt ? Math.max(0, (tailProofStartedAt || topProofStartedAt || restoreStartedAt || now) - traversalStartedAt) : 0;
+    diagnostics.timing.tailProofElapsedMs = tailProofStartedAt ? Math.max(0, (topProofStartedAt || restoreStartedAt || now) - tailProofStartedAt) : 0;
+    diagnostics.timing.topProofElapsedMs = topProofStartedAt ? Math.max(0, (restoreStartedAt || now) - topProofStartedAt) : 0;
+    diagnostics.timing.restoreElapsedMs = restoreStartedAt ? Math.max(0, now - restoreStartedAt) : 0;
     return {
       snapshots,
       startReached,
@@ -4031,6 +4332,7 @@ export class ChatGPTController {
           if (result.diagnostics && typeof result.diagnostics === 'object') {
             result.diagnostics.mergeAmbiguous = merged.ambiguous;
             result.diagnostics.mergeContinuous = merged.continuous;
+            result.diagnostics.mergeDiagnostics = merged.mergeDiagnostics;
           }
           history = historyMetadata({
             mode,

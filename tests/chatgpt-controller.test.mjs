@@ -10,6 +10,7 @@ import {
   ChatGPTController,
   DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+  buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
   conversationStartBoundaryProof,
   mergeConversationSnapshots,
@@ -739,22 +740,26 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
           : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
         if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollHeight))) scrollHeightOverride = Number(planned.scrollHeight);
         if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
-        else windowIndex = originalWindowIndex;
+        else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
         scrollTopOverride = planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollTop))
           ? Number(planned.scrollTop)
           : (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400) - 400 - distance;
         return { ok: true, scrollTop: windowIndex * 250 };
       }
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
-      readCount += 1;
+      const traversalRead = js.includes('const traversalRead = true;');
+      if (!traversalRead) readCount += 1;
       const state = snapshot();
-      const layoutOverride = Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
+      const layoutOverride = !traversalRead && Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
         ? layoutSnapshots[readCount - 1]
         : null;
       if (layoutOverride) {
         const { scroller: layoutScroller, ...layoutFields } = layoutOverride;
         Object.assign(state, layoutFields);
-        if (layoutScroller && typeof layoutScroller === 'object') Object.assign(state.scroller, layoutScroller);
+        if (layoutScroller && typeof layoutScroller === 'object') {
+          Object.assign(state.scroller, layoutScroller);
+          if (Number.isFinite(Number(layoutScroller.scrollTop))) scrollTopOverride = Number(layoutScroller.scrollTop);
+        }
       }
       if (readCount === limitExceededAtRead) return { ...state, limitExceeded: true, limitKind };
       return state;
@@ -1353,6 +1358,7 @@ test('chatgpt-controller: Chrome proof keeps the same direction across physical-
   assert.equal(result.history.diagnostics.firstNativeUp.changed, false);
   assert.equal(result.history.diagnostics.firstNativeUp.range.min, 20);
   assert.equal(result.history.diagnostics.wheelUpAttempts >= 2, true);
+  assert.ok(result.history.diagnostics.reads.lightweightReadCount > result.history.diagnostics.reads.fullReadCount);
   assert.equal(wheels[0].endsWith(':0:-720'), true);
   assert.equal(wheels[1].endsWith(':0:-720'), true);
 });
@@ -1420,6 +1426,9 @@ test('chatgpt-controller: complete history uses the settled normalized baseline 
   assert.equal(diagnostics.historyStartedAfterNormalizedBaseline, true);
   assert.equal(diagnostics.wheelUpAttempts > 0, true);
   assert.equal(harness.getWheelCount() > 0, true);
+  assert.equal(diagnostics.conversationRestore.mode, 'bottom');
+  assert.equal(diagnostics.conversationRestore.bottomMatched, true);
+  assert.equal(diagnostics.conversationRestore.signatureMatched, null);
 });
 
 test('chatgpt-controller: conversation restore converges after a transient signature mismatch', async () => {
@@ -1438,15 +1447,14 @@ test('chatgpt-controller: conversation restore converges after a transient signa
   });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.scrollRestored, true);
-  assert.deepEqual(result.history.diagnostics.conversationRestore, {
-    attempts: 2,
-    verified: true,
-    initialDistanceFromBottom: 500,
-    finalDistanceFromBottom: 500,
-    distanceMatched: true,
-    signatureMatched: true,
-    lastFailureReason: null
-  });
+  assert.equal(result.history.diagnostics.conversationRestore.mode, 'anchored-window');
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 2);
+  assert.equal(result.history.diagnostics.conversationRestore.verified, true);
+  assert.equal(result.history.diagnostics.conversationRestore.initialDistanceFromBottom, 500);
+  assert.equal(result.history.diagnostics.conversationRestore.finalDistanceFromBottom, 500);
+  assert.equal(result.history.diagnostics.conversationRestore.distanceMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, null);
   assert.equal(harness.getRestoreCount(), 2);
 });
 
@@ -2263,11 +2271,47 @@ test('chatgpt-controller: complete history detects position gaps and conflicts',
     [{ role: 'user', text: 'turn-0', messageId: 'm0', positionHint: 0 }, { role: 'assistant', text: 'turn-4', messageId: 'm4', positionHint: 4 }]
   ]);
   assert.equal(gap.continuous, false);
-  const conflict = mergeConversationSnapshots([[
+  const samePosition = mergeConversationSnapshots([[
     { role: 'user', text: 'first', messageId: 'm1', positionHint: 3 },
     { role: 'assistant', text: 'different', messageId: 'm2', positionHint: 3 }
   ]]);
+  assert.equal(samePosition.ambiguous, false);
+  const conflict = mergeConversationSnapshots([[
+    { role: 'user', text: 'first', messageId: 'm1', positionHint: 3 }
+  ], [
+    { role: 'user', text: 'changed', messageId: 'm1', positionHint: 3 }
+  ]]);
   assert.equal(conflict.ambiguous, true);
+});
+
+test('chatgpt-controller: merge identity ignores position hints and reports real conflicts', () => {
+  const samePosition = mergeConversationSnapshots([[
+    { role: 'user', text: 'a', messageId: 'm-a', positionHint: 7 },
+    { role: 'assistant', text: 'b', messageId: 'm-b', positionHint: 7 }
+  ]]);
+  assert.equal(samePosition.ambiguous, false);
+  const gapped = mergeConversationSnapshots([
+    [{ role: 'user', text: 'a', messageId: 'm-a', positionHint: 1 }, { role: 'assistant', text: 'c', messageId: 'm-c', positionHint: 9 }],
+    [{ role: 'assistant', text: 'c', messageId: 'm-c', positionHint: 9 }, { role: 'user', text: 'd', messageId: 'm-d', positionHint: 16 }]
+  ]);
+  assert.equal(gapped.continuous, true);
+  const disconnected = mergeConversationSnapshots([
+    [{ role: 'user', text: 'a', messageId: 'm-a' }],
+    [{ role: 'assistant', text: 'b', messageId: 'm-b' }]
+  ]);
+  assert.equal(disconnected.continuous, false);
+  const orderConflict = mergeConversationSnapshots([
+    [{ role: 'user', text: 'a', messageId: 'm-a' }, { role: 'assistant', text: 'b', messageId: 'm-b' }],
+    [{ role: 'assistant', text: 'b', messageId: 'm-b' }, { role: 'user', text: 'a', messageId: 'm-a' }]
+  ]);
+  assert.equal(orderConflict.ambiguous, true);
+  assert.ok(orderConflict.mergeDiagnostics.reasonCounts.orderConflict > 0);
+  const fallbackConflict = mergeConversationSnapshots([
+    [{ role: 'user', text: 'a', fingerprint: 'same' }],
+    [{ role: 'assistant', text: 'b', fingerprint: 'same' }]
+  ]);
+  assert.equal(fallbackConflict.ambiguous, true);
+  assert.ok(fallbackConflict.mergeDiagnostics.reasonCounts.fallbackIdentityConflict > 0);
 });
 
 test('chatgpt-controller: complete history window script resolves a message ancestor and exposes a native wheel target', () => {
@@ -2280,6 +2324,13 @@ test('chatgpt-controller: complete history window script resolves a message ance
   assert.match(source, /common\.filter\(\(node\) => !isNavigationRegion\(node\) && isScrollable\(node\)\)/u);
   assert.match(source, /getBoundingClientRect/u);
   assert.doesNotMatch(source, /scrollTop\s*=\s*target/u);
+});
+
+test('chatgpt-controller: traversal read is lightweight and carries bounded identity state', () => {
+  const source = buildConversationTraversalReadScript({ maxTurns: 10, maxCharsPerTurn: 1000, maxTotalChars: 5000 });
+  assert.match(source, /const traversalRead = true;/u);
+  assert.match(source, /textDigest/u);
+  assert.doesNotMatch(source, /cloneNode/u);
 });
 
 test('chatgpt-controller: complete history backfills from the tail through virtualization and restores a middle position', async () => {

@@ -226,6 +226,23 @@ test('http-api: scroll visibility probe is authenticated, tab-scoped, and bounde
           range: { min: 6, max: 10 },
           windowSignature: 'b'.repeat(32)
         },
+        normalizationPhysicalScrollChanged: false,
+        normalizationConversationWindowChanged: false,
+        gestureAttemptLimit: 4,
+        gestureAttempts: 1,
+        steps: [{
+          attempt: 1,
+          gestureDistance: 280,
+          gestureSpeed: 1000,
+          beforeRange: { min: 6, max: 10 },
+          afterRange: { min: 5, max: 9 },
+          beforeScrollTop: 600,
+          afterScrollTop: 320,
+          physicalScrollChanged: true,
+          conversationWindowChanged: true,
+          commandSucceeded: true
+        }],
+        firstWindowChangeAttempt: 1,
         gestureAttempted: true,
         gestureSourceType: 'touch',
         gestureDirection: 'older/up',
@@ -281,6 +298,11 @@ test('http-api: scroll visibility probe is authenticated, tab-scoped, and bounde
   assert.equal(data.backend, 'chrome-cdp');
   assert.equal(data.reason, 'probe-success-window-changed');
   assert.equal(data.gestureSourceType, 'touch');
+  assert.equal(data.gestureAttemptLimit, 4);
+  assert.equal(data.gestureAttempts, 1);
+  assert.equal(data.steps.length, 1);
+  assert.equal(data.steps[0].commandSucceeded, true);
+  assert.equal(data.firstWindowChangeAttempt, 1);
   assert.equal(data.afterGesture.range.min, 5);
   assert.equal(Object.hasOwn(data, 'windowId'), false);
   assert.equal(JSON.stringify(data).includes('must-not-escape'), false);

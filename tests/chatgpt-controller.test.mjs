@@ -658,7 +658,20 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, originalWindowIndex };
 }
 
-function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible', windowChanges = true, gestureError = null, readAfterGestureError = false, restoreFailures = 0, changeUrlOnGesture = false } = {}) {
+function createScrollVisibilityProbePage({
+  visibilityAfterNormalize = 'visible',
+  windowChanges = true,
+  gestureError = null,
+  readAfterGestureError = false,
+  restoreFailures = 0,
+  changeUrlOnGesture = false,
+  changeUrlAtGesture = null,
+  initialScrollTop = 600,
+  normalizedScrollTop = 600,
+  normalizedRange = { min: 6, max: 10 },
+  gesturePlan = null,
+  hideAfterGesture = null
+} = {}) {
   const events = [];
   let browserWindowState = 'minimized';
   let adapterMinimized = true;
@@ -666,8 +679,9 @@ function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible',
   let hidden = true;
   let hasFocus = false;
   let range = { min: 6, max: 10 };
+  let scrollTop = initialScrollTop;
   let url = 'https://chatgpt.com/c/scroll-visibility-probe';
-  let gestureDone = false;
+  let gestureCount = 0;
   let restoreAttempts = 0;
   const snapshot = () => ({
     url,
@@ -684,7 +698,7 @@ function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible',
       selected: { tagName: 'DIV', id: 'conversation-scroll', className: 'conversation-scroll-region', role: '', overflowY: 'auto' },
       selectedPath: 'body>main>div#conversation-scroll',
       candidates: [],
-      scrollTop: 600,
+      scrollTop,
       scrollHeight: 1_400,
       clientHeight: 400,
       atTop: false,
@@ -696,14 +710,26 @@ function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible',
     events,
     onEvaluate: async (js) => {
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_probe_eval:${js.slice(0, 80)}`);
-      if (gestureDone && readAfterGestureError) throw new Error('post_gesture_read_failed');
+      if (gestureCount > 0 && readAfterGestureError) throw new Error('post_gesture_read_failed');
       return snapshot();
     },
     onScrollGesture: async ({ yDistance }) => {
-      gestureDone = true;
+      gestureCount += 1;
       if (gestureError) throw gestureError;
-      if (changeUrlOnGesture) url = 'https://chatgpt.com/c/changed';
-      if (windowChanges && yDistance > 0) range = { min: 5, max: 9 };
+      if (changeUrlOnGesture || changeUrlAtGesture === gestureCount) url = 'https://chatgpt.com/c/changed';
+      const planned = typeof gesturePlan === 'function'
+        ? await gesturePlan({ attempt: gestureCount, yDistance, range: { ...range }, scrollTop })
+        : Array.isArray(gesturePlan) ? gesturePlan[gestureCount - 1] : null;
+      if (planned && typeof planned === 'object') {
+        if (planned.range) range = { min: planned.range.min, max: planned.range.max };
+        if (planned.scrollTop !== undefined) scrollTop = planned.scrollTop;
+      } else if (windowChanges && yDistance > 0) {
+        range = { min: 5, max: 9 };
+      }
+      if (hideAfterGesture === gestureCount) {
+        visibilityState = 'hidden';
+        hidden = true;
+      }
     },
     nativeInputDiagnostics: () => ({})
   });
@@ -720,6 +746,8 @@ function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible',
   page.temporarilyUnminimizeForProbe = async () => {
     browserWindowState = 'normal';
     adapterMinimized = false;
+    scrollTop = normalizedScrollTop;
+    range = { ...normalizedRange };
     if (visibilityAfterNormalize === 'visible') {
       visibilityState = 'visible';
       hidden = false;
@@ -733,7 +761,7 @@ function createScrollVisibilityProbePage({ visibilityAfterNormalize = 'visible',
     visibilityState = 'hidden';
     hidden = true;
   };
-  return { page, events, getRestoreAttempts: () => restoreAttempts };
+  return { page, events, getRestoreAttempts: () => restoreAttempts, getGestureCount: () => gestureCount };
 }
 
 async function captureActualTypePromptEvaluation(userTurns) {
@@ -1117,6 +1145,9 @@ test('chatgpt-controller: visibility probe normalizes once, performs one older t
   assert.equal(result.before.documentVisibilityState, 'hidden');
   assert.equal(result.normalized.browserWindowState, 'normal');
   assert.equal(result.normalized.documentVisibilityState, 'visible');
+  assert.equal(result.normalizationPhysicalScrollChanged, false);
+  assert.equal(result.normalizationConversationWindowChanged, false);
+  assert.equal(result.gestureAttempts, 1);
   assert.equal(result.gestureAttempted, true);
   assert.equal(result.gestureSourceType, 'touch');
   assert.equal(result.gestureDirection, 'older/up');
@@ -1149,9 +1180,89 @@ test('chatgpt-controller: visibility probe reports one-gesture no progress and r
   assert.equal(result.gestureAttempted, true);
   assert.equal(result.gestureCommandSucceeded, true);
   assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.gestureAttempts, 4);
+  assert.equal(result.steps.length, 4);
+  assert.equal(result.physicalScrollChanged, false);
   assert.equal(result.reason, 'probe-window-no-progress');
   assert.equal(result.restoreVerified, true);
-  assert.equal(harness.events.filter((event) => event.startsWith('scroll-gesture:')).length, 1);
+  assert.equal(harness.events.filter((event) => event.startsWith('scroll-gesture:')).length, 4);
+});
+
+test('chatgpt-controller: visibility probe attributes normalization-only scroll changes separately', async () => {
+  const harness = createScrollVisibilityProbePage({ initialScrollTop: 100, normalizedScrollTop: 200, windowChanges: false });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.normalizationPhysicalScrollChanged, true);
+  assert.equal(result.steps.every((step) => step.physicalScrollChanged === false), true);
+  assert.equal(result.physicalScrollChanged, false);
+  assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: visibility probe attributes normalization-only window changes separately', async () => {
+  const harness = createScrollVisibilityProbePage({ normalizedRange: { min: 5, max: 9 }, windowChanges: false });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.normalizationConversationWindowChanged, true);
+  assert.equal(result.steps.every((step) => step.conversationWindowChanged === false), true);
+  assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: visibility probe stops after the first eventual window transition', async () => {
+  const harness = createScrollVisibilityProbePage({
+    windowChanges: false,
+    gesturePlan: [
+      { scrollTop: 610 },
+      { scrollTop: 620 },
+      { range: { min: 5, max: 9 }, scrollTop: 630 },
+      { range: { min: 4, max: 8 }, scrollTop: 640 }
+    ]
+  });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.gestureAttempts, 3);
+  assert.equal(result.steps.length, 3);
+  assert.equal(result.firstWindowChangeAttempt, 3);
+  assert.equal(result.conversationWindowChanged, true);
+  assert.equal(result.physicalScrollChanged, true);
+  assert.equal(result.reason, 'probe-success-window-changed');
+  assert.equal(harness.getGestureCount(), 3);
+});
+
+test('chatgpt-controller: visibility probe records four physical-only steps without treating them as a window transition', async () => {
+  const harness = createScrollVisibilityProbePage({
+    windowChanges: false,
+    gesturePlan: [
+      { scrollTop: 610 },
+      { scrollTop: 620 },
+      { scrollTop: 630 },
+      { scrollTop: 640 }
+    ]
+  });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.gestureAttempts, 4);
+  assert.equal(result.steps.length, 4);
+  assert.equal(result.steps.every((step) => step.physicalScrollChanged), true);
+  assert.equal(result.physicalScrollChanged, true);
+  assert.equal(result.conversationWindowChanged, false);
+  assert.equal(result.reason, 'probe-window-no-progress');
+});
+
+test('chatgpt-controller: visibility probe stops at the second gesture when the URL changes', async () => {
+  const harness = createScrollVisibilityProbePage({ windowChanges: false, changeUrlAtGesture: 2 });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.gestureAttempts, 2);
+  assert.equal(harness.getGestureCount(), 2);
+  assert.equal(result.reason, 'probe-conversation-changed');
+  assert.equal(result.urlStable, false);
+  assert.equal(result.restoreVerified, true);
+});
+
+test('chatgpt-controller: visibility probe does not send the next gesture after visibility is lost', async () => {
+  const harness = createScrollVisibilityProbePage({ windowChanges: false, hideAfterGesture: 1 });
+  const result = await createController(harness.page).probeScrollVisibility();
+  assert.equal(result.gestureAttempts, 1);
+  assert.equal(harness.getGestureCount(), 1);
+  assert.equal(result.reason, 'probe-precondition-failed');
+  assert.equal(result.restoreVerified, true);
 });
 
 test('chatgpt-controller: visibility probe restores after gesture and post-read failures', async () => {

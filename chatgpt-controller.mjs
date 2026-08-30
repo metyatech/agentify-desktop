@@ -40,6 +40,7 @@ const SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS = 1_500;
 const SCROLL_VISIBILITY_PROBE_POLL_MS = 100;
 const SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS = 100;
 const SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS = 2;
+const SCROLL_VISIBILITY_PROBE_MAX_GESTURES = 4;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
 
 let latestProviderStopGeneration = 0;
@@ -1924,6 +1925,12 @@ export class ChatGPTController {
         preconditionPassed: false,
         before: null,
         normalized: null,
+        normalizationPhysicalScrollChanged: false,
+        normalizationConversationWindowChanged: false,
+        gestureAttemptLimit: SCROLL_VISIBILITY_PROBE_MAX_GESTURES,
+        gestureAttempts: 0,
+        steps: [],
+        firstWindowChangeAttempt: null,
         gestureAttempted: false,
         gestureSourceType: null,
         gestureDirection: null,
@@ -1942,6 +1949,7 @@ export class ChatGPTController {
       let normalizationAttempted = false;
       let initialUrl = '';
       let beforeWindow = null;
+      let currentWindow = null;
 
       const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
       const readUrl = async () => String(await this.page.getUrl()).trim();
@@ -2020,37 +2028,103 @@ export class ChatGPTController {
           return result;
         }
 
-        const point = normalizedWindow?.scroller?.point;
-        const visibleHeight = Number(normalizedWindow?.scroller?.clientHeight);
-        const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
-        result.gestureAttempted = true;
+        currentWindow = normalizedWindow;
+        result.normalizationPhysicalScrollChanged = result.before?.scrollTop !== result.normalized?.scrollTop;
+        result.normalizationConversationWindowChanged = result.before?.windowSignature !== result.normalized?.windowSignature;
         result.gestureSourceType = 'touch';
         result.gestureDirection = 'older/up';
-        result.gestureDistance = gestureDistance;
         result.gestureSpeed = 1_000;
-        if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
-          result.reason = 'probe-gesture-failed';
-          return result;
-        }
-        await this.page.scrollGesture({
-          x: Number(point.x),
-          y: Number(point.y),
-          xDistance: 0,
-          yDistance: gestureDistance,
-          speed: result.gestureSpeed,
-          preventFling: true,
-          gestureSourceType: result.gestureSourceType
-        });
-        result.gestureCommandSucceeded = true;
-        await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
-        const afterWindow = await readWindow();
-        if (!(await stableAgainstInitialUrl(afterWindow?.url))) {
-          result.reason = 'probe-conversation-changed';
-        } else {
-          result.afterGesture = probeWindowSummary(afterWindow);
-          result.physicalScrollChanged = result.before?.scrollTop !== result.afterGesture.scrollTop;
-          result.conversationWindowChanged = result.before?.windowSignature !== result.afterGesture.windowSignature;
-          result.reason = result.conversationWindowChanged ? 'probe-success-window-changed' : 'probe-window-no-progress';
+
+        for (let attempt = 1; attempt <= SCROLL_VISIBILITY_PROBE_MAX_GESTURES; attempt += 1) {
+          const gestureNative = await readNative();
+          const gestureWindow = await readWindow();
+          if (!(await stableAgainstInitialUrl(gestureWindow?.url))) {
+            result.reason = 'probe-conversation-changed';
+            break;
+          }
+          if (gestureNative?.pageClosed !== false
+            || gestureNative?.browserWindowState !== 'normal'
+            || gestureNative?.documentVisibilityState !== 'visible'
+            || gestureNative?.documentHidden !== false
+            || !gestureWindow?.scroller
+            || gestureWindow.scroller.candidateCount !== 1) {
+            result.reason = 'probe-precondition-failed';
+            break;
+          }
+
+          currentWindow = gestureWindow;
+          const point = currentWindow?.scroller?.point;
+          const visibleHeight = Number(currentWindow?.scroller?.clientHeight);
+          const gestureDistance = Math.max(120, Math.min(600, Number.isFinite(visibleHeight) && visibleHeight > 0 ? Math.floor(visibleHeight * 0.7) : 480));
+          const beforeStep = probeWindowSummary(currentWindow);
+          const step = {
+            attempt,
+            gestureDistance,
+            gestureSpeed: result.gestureSpeed,
+            beforeRange: beforeStep.range,
+            afterRange: null,
+            beforeScrollTop: beforeStep.scrollTop,
+            afterScrollTop: null,
+            physicalScrollChanged: false,
+            conversationWindowChanged: false,
+            commandSucceeded: false
+          };
+          result.steps.push(step);
+          result.gestureAttempts = attempt;
+          result.gestureAttempted = true;
+          result.gestureDistance = gestureDistance;
+
+          if (!point || !Number.isFinite(Number(point.x)) || !Number.isFinite(Number(point.y))) {
+            result.reason = 'probe-gesture-failed';
+            break;
+          }
+
+          try {
+            await this.page.scrollGesture({
+              x: Number(point.x),
+              y: Number(point.y),
+              xDistance: 0,
+              yDistance: gestureDistance,
+              speed: result.gestureSpeed,
+              preventFling: true,
+              gestureSourceType: result.gestureSourceType
+            });
+            step.commandSucceeded = true;
+            result.gestureCommandSucceeded = true;
+          } catch (error) {
+            result.gestureCommandSucceeded = false;
+            result.reason = 'probe-gesture-failed';
+            break;
+          }
+
+          await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+          let afterWindow;
+          try {
+            afterWindow = await readWindow();
+          } catch (error) {
+            result.reason = 'probe-gesture-failed';
+            break;
+          }
+          if (!(await stableAgainstInitialUrl(afterWindow?.url))) {
+            result.reason = 'probe-conversation-changed';
+            break;
+          }
+
+          const afterStep = probeWindowSummary(afterWindow);
+          step.afterRange = afterStep.range;
+          step.afterScrollTop = afterStep.scrollTop;
+          step.physicalScrollChanged = beforeStep.scrollTop !== afterStep.scrollTop;
+          step.conversationWindowChanged = beforeStep.windowSignature !== afterStep.windowSignature;
+          result.afterGesture = afterStep;
+          result.physicalScrollChanged ||= step.physicalScrollChanged;
+          result.conversationWindowChanged ||= step.conversationWindowChanged;
+          if (step.conversationWindowChanged) {
+            result.firstWindowChangeAttempt = attempt;
+            result.reason = 'probe-success-window-changed';
+            break;
+          }
+          currentWindow = afterWindow;
+          if (attempt === SCROLL_VISIBILITY_PROBE_MAX_GESTURES) result.reason = 'probe-window-no-progress';
         }
       } catch (error) {
         if (!result.reason) result.reason = result.gestureAttempted ? 'probe-gesture-failed' : 'probe-precondition-failed';

@@ -396,6 +396,20 @@ function sanitizeScrollVisibilityProbe(value) {
         ...(includeWindow ? window(item) : {})
       }
     : null;
+  const step = (item) => item && typeof item === 'object'
+    ? {
+        attempt: boundedNumber(item.attempt, { min: 1, max: 4, integer: true }),
+        gestureDistance: boundedNumber(item.gestureDistance, { min: 0, max: 600 }),
+        gestureSpeed: boundedNumber(item.gestureSpeed, { min: 0, max: 5_000 }),
+        beforeRange: range(item.beforeRange),
+        afterRange: range(item.afterRange),
+        beforeScrollTop: boundedNumber(item.beforeScrollTop),
+        afterScrollTop: boundedNumber(item.afterScrollTop),
+        physicalScrollChanged: item.physicalScrollChanged === true,
+        conversationWindowChanged: item.conversationWindowChanged === true,
+        commandSucceeded: item.commandSucceeded === true
+      }
+    : null;
   const gestureDirection = data.gestureDirection === 'older/up' ? data.gestureDirection : null;
   const source = data.gestureSourceType === 'touch' ? data.gestureSourceType : null;
   const reason = String(data.reason || '').trim();
@@ -404,6 +418,12 @@ function sanitizeScrollVisibilityProbe(value) {
     preconditionPassed: data.preconditionPassed === true,
     before: stage(data.before),
     normalized: stage(data.normalized),
+    normalizationPhysicalScrollChanged: data.normalizationPhysicalScrollChanged === true,
+    normalizationConversationWindowChanged: data.normalizationConversationWindowChanged === true,
+    gestureAttemptLimit: boundedNumber(data.gestureAttemptLimit, { min: 0, max: 4, integer: true }) || 0,
+    gestureAttempts: boundedNumber(data.gestureAttempts, { min: 0, max: 4, integer: true }) || 0,
+    steps: Array.isArray(data.steps) ? data.steps.slice(0, 4).map(step).filter(Boolean) : [],
+    firstWindowChangeAttempt: boundedNumber(data.firstWindowChangeAttempt, { min: 1, max: 4, integer: true }),
     gestureAttempted: data.gestureAttempted === true,
     gestureSourceType: source,
     gestureDirection,

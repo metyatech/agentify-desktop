@@ -410,6 +410,26 @@ the minimized state in a `finally` path. Caller input is limited to `key` or
 `tabId`; delta, direction, count, and window state are not configurable. This
 probe does not run complete-history backfill or send a message.
 
+For production debugging of ChatGPT's physical top and conversation turn
+markers, use the bounded authenticated endpoint below:
+
+```text
+POST /conversation/start-marker-diagnostics
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"key":"autopilot-production"}
+```
+
+This operation serializes on the existing controller mutex, temporarily
+normalizes only a minimized Chrome/CDP window, walks upward with at most 24
+older-direction mouse-wheel inputs, and restores both the conversation scroll
+and original window state in cleanup. It reports bounded marker, ancestor,
+sibling, position-order, top-stability, and restoration diagnostics. It is
+production-debug-only, does not run complete-history, does not infer or change
+start-proof semantics, and never sends messages or exposes a general-purpose
+window/input-control API.
+
 ## Windows Notes
 
 Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.

@@ -47,6 +47,9 @@ const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X = 0;
 const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y = -720;
 const MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS = 8;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
+const START_MARKER_PROBE_MAX_WHEELS = 24;
+const START_MARKER_PROBE_TOP_SAMPLES = 3;
+const START_MARKER_PROBE_TOP_SAMPLE_WAIT_MS = 240;
 
 let latestProviderStopGeneration = 0;
 
@@ -753,6 +756,257 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
         atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
         point
       } : { ...resolved.diagnostic, atTop: false, atBottom: false, point: null }
+    };
+  })()`;
+}
+
+export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxCharsPerTurn, maxTotalChars }) {
+  return `(() => {
+    const maxTurns = ${maxTurns};
+    const maxCharsPerTurn = ${maxCharsPerTurn};
+    const maxTotalChars = ${maxTotalChars};
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
+    const excludedSelector = [
+      'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
+      '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
+      '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
+      '[aria-label*="composer" i]'
+    ].join(',');
+    const normalize = (value) => String(value || '').replace(/\\u0000/g, '').replace(/\\r\\n?/g, '\\n').split('\\n').map((line) => line.replace(/[ \\t]+$/u, '')).join('\\n').trim();
+    const digest = (value) => {
+      let hash = 2166136261;
+      for (const char of String(value || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
+      return (hash >>> 0).toString(16).padStart(8, '0');
+    };
+    const bounded = (value, max = 160) => String(value || '').replace(/[\\u0000-\\u001f\\u007f]/gu, ' ').replace(/\\s+/gu, ' ').trim().slice(0, max);
+    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
+      let parent = node.parentElement;
+      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
+      return true;
+    });
+    const visibleText = (node) => {
+      const clone = node.cloneNode(true);
+      if (clone.matches?.(excludedSelector)) clone.remove(); else clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
+      return normalize(clone.innerText || clone.textContent || '');
+    };
+    const parsePositionWithSource = (node) => {
+      let current = node;
+      let depth = 0;
+      while (current) {
+        for (const [attributeName, value] of [
+          ['id', current.id],
+          ['data-testid', current.getAttribute?.('data-testid')],
+          ['data-conversation-turn', current.getAttribute?.('data-conversation-turn')],
+          ['data-turn', current.getAttribute?.('data-turn')]
+        ]) {
+          const match = String(value || '').match(/conversation-turn-(\\d+)/i);
+          if (match) return {
+            depth,
+            attributeName,
+            rawValue: bounded(value, 120),
+            parsedPosition: Number(match[1]),
+            node: current
+          };
+        }
+        current = current.parentElement;
+        depth += 1;
+      }
+      return { depth: null, attributeName: null, rawValue: null, parsedPosition: null, node: null };
+    };
+    const styleState = (node) => {
+      const style = getComputedStyle(node);
+      return {
+        hidden: node.hasAttribute?.('hidden') === true,
+        ariaHidden: node.getAttribute?.('aria-hidden') === 'true',
+        display: bounded(style?.display, 16),
+        visibility: bounded(style?.visibility, 16)
+      };
+    };
+    const messageCounts = (node, messages) => ({
+      user: messages.filter((message) => node.contains?.(message) && message.getAttribute('data-message-author-role') === 'user').length,
+      assistant: messages.filter((message) => node.contains?.(message) && message.getAttribute('data-message-author-role') === 'assistant').length
+    });
+    const markerAttributes = (node) => ({
+      tagName: bounded(node?.tagName, 32),
+      id: bounded(node?.id, 120),
+      dataTestId: bounded(node?.getAttribute?.('data-testid'), 120),
+      dataConversationTurn: bounded(node?.getAttribute?.('data-conversation-turn'), 120),
+      dataTurn: bounded(node?.getAttribute?.('data-turn'), 120)
+    });
+    const markerRecord = (node, messages, insideScroller = false) => {
+      const source = parsePositionWithSource(node);
+      const rect = node.getBoundingClientRect?.();
+      return {
+        ...markerAttributes(node),
+        parsedPosition: Number.isInteger(source.parsedPosition) ? source.parsedPosition : null,
+        insideSelectedScroller: insideScroller,
+        containsUserMessageCount: messageCounts(node, messages).user,
+        containsAssistantMessageCount: messageCounts(node, messages).assistant,
+        ...styleState(node),
+        rect: rect && Number.isFinite(rect.top) && Number.isFinite(rect.height) ? { top: Math.round(rect.top), height: Math.round(rect.height) } : null
+      };
+    };
+    const parsePosition = (node) => parsePositionWithSource(node).parsedPosition;
+    const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
+    const isScrollable = (node) => {
+      if (!node) return false;
+      const style = getComputedStyle(node);
+      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && Number(node.scrollHeight) > Number(node.clientHeight);
+    };
+    const resolveScroller = (messages) => {
+      const chains = messages.map((node) => {
+        const chain = [];
+        let current = node.parentElement;
+        while (current) { chain.push(current); current = current.parentElement; }
+        if (document.scrollingElement && !chain.includes(document.scrollingElement)) chain.push(document.scrollingElement);
+        return chain;
+      });
+      const common = chains.length ? chains[0].filter((node) => chains.every((chain) => chain.includes(node))) : [];
+      const candidates = common.filter((node) => !isNavigationRegion(node) && isScrollable(node)).map((node) => ({
+        node,
+        distance: Math.max(...chains.map((chain) => chain.indexOf(node))),
+        descendants: messages.filter((message) => node.contains?.(message)).length
+      })).filter((candidate) => candidate.descendants > 0);
+      candidates.sort((left, right) => left.distance - right.distance);
+      const nearestDistance = candidates[0]?.distance;
+      const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
+      return { selected: nearest.length === 1 ? nearest[0].node : null, candidates, ambiguous: nearest.length > 1 };
+    };
+    const messages = messageNodes();
+    const resolved = resolveScroller(messages);
+    const scroller = resolved.selected;
+    const turns = messages.map((node, domIndex) => {
+      const role = node.getAttribute('data-message-author-role');
+      const text = visibleText(node);
+      const source = parsePositionWithSource(node);
+      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
+      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
+      return { node, domIndex, role, text, position: Number.isInteger(source.parsedPosition) ? source.parsedPosition : null, source, messageId: !!messageId, turnId: !!turnId };
+    }).filter((turn) => (turn.role === 'user' || turn.role === 'assistant') && turn.text);
+    const markerNodes = Array.from(document.querySelectorAll(markerSelector));
+    const markers = markerNodes.slice(0, 40).map((node) => markerRecord(node, messages, !!scroller?.contains?.(node)));
+    const positions = markers.map((marker) => marker.parsedPosition).filter((value) => Number.isInteger(value));
+    const uniquePositions = [...new Set(positions)].sort((left, right) => left - right).slice(0, 50);
+    const scrollerMarkers = scroller
+      ? markerNodes.filter((node) => scroller.contains?.(node)).slice(0, 30).map((node) => {
+        const source = parsePositionWithSource(node);
+        return {
+          parsedPosition: Number.isInteger(source.parsedPosition) ? source.parsedPosition : null,
+          id: bounded(node.id, 120),
+          dataTestId: bounded(node.getAttribute?.('data-testid'), 120),
+          roleCounts: messageCounts(node, messages),
+          hidden: styleState(node).hidden
+        };
+      })
+      : [];
+    const first = turns[0] || null;
+    const firstSource = first?.source || { depth: null, attributeName: null, rawValue: null, parsedPosition: null, node: null };
+    const ancestors = [];
+    let ancestor = first?.node || null;
+    let ancestorDepth = 0;
+    while (ancestor && ancestors.length < 12) {
+      const attrs = markerAttributes(ancestor);
+      ancestors.push({
+        depth: ancestorDepth,
+        ...attrs,
+        dataMessageIdPresent: !!ancestor.getAttribute?.('data-message-id'),
+        dataTurnIdPresent: !!ancestor.getAttribute?.('data-turn-id'),
+        ...styleState(ancestor)
+      });
+      ancestor = ancestor.parentElement;
+      ancestorDepth += 1;
+    }
+    const previousSiblings = [];
+    let sibling = firstSource.node?.previousElementSibling || null;
+    while (sibling && previousSiblings.length < 5) {
+      const source = parsePositionWithSource(sibling);
+      previousSiblings.push({
+        ...markerAttributes(sibling),
+        parsedPosition: Number.isInteger(source.parsedPosition) ? source.parsedPosition : null,
+        ...messageCounts(sibling, messages),
+        ...styleState(sibling),
+        textLength: Math.min(normalize(sibling.innerText || sibling.textContent || '').length, maxTotalChars)
+      });
+      sibling = sibling.previousElementSibling;
+    }
+    const messagePositionOrder = turns.slice(0, 20).map((turn) => ({ role: turn.role, position: turn.position }));
+    const textMessages = turns.slice(0, 5).map((turn) => ({
+      domIndex: turn.domIndex,
+      role: turn.role,
+      parsedPosition: turn.position,
+      messageIdPresent: turn.messageId,
+      turnIdPresent: turn.turnId,
+      textLength: Math.min(turn.text.length, maxTotalChars),
+      textDigest: digest(turn.text),
+      textPrefix: bounded(turn.text, 120)
+    }));
+    const rangeValues = turns.map((turn) => turn.position).filter((value) => Number.isInteger(value));
+    const range = { min: rangeValues.length ? Math.min(...rangeValues) : null, max: rangeValues.length ? Math.max(...rangeValues) : null };
+    const totalChars = turns.reduce((sum, turn) => sum + turn.text.length, 0);
+    const limitKind = turns.some((turn) => turn.text.length > maxCharsPerTurn)
+      ? 'per-turn'
+      : totalChars > maxTotalChars || turns.length > maxTurns ? 'total' : null;
+    const rect = scroller?.getBoundingClientRect?.();
+    const viewportWidth = Number(globalThis.innerWidth || document.documentElement?.clientWidth || 0);
+    const viewportHeight = Number(globalThis.innerHeight || document.documentElement?.clientHeight || 0);
+    const validRect = rect && Number.isFinite(rect.left) && Number.isFinite(rect.top) && Number.isFinite(rect.width) && Number.isFinite(rect.height) && rect.width > 20 && rect.height > 20;
+    const left = validRect ? Math.max(0, rect.left) : 0;
+    const top = validRect ? Math.max(0, rect.top) : 0;
+    const right = validRect ? Math.min(viewportWidth || rect.right, rect.right) : 0;
+    const bottom = validRect ? Math.min(viewportHeight || rect.bottom, rect.bottom) : 0;
+    const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
+    const windowSignature = digest(JSON.stringify(turns.map((turn) => [turn.role, turn.messageId, turn.turnId, turn.position, digest(turn.text)])));
+    const structuralSignature = digest(JSON.stringify({ positions: uniquePositions, first: textMessages[0]?.parsedPosition ?? null, markerCount: markers.length }));
+    return {
+      url: location.href,
+      limitExceeded: !!limitKind,
+      limitKind,
+      loading: Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0,
+      range,
+      windowSignature,
+      structuralSignature,
+      scroller: scroller ? {
+        candidateCount: resolved.candidates.length,
+        selectedMessageDescendantCount: resolved.candidates.filter((candidate) => candidate.node === scroller)[0]?.descendants || 0,
+        scrollTop: Number(scroller.scrollTop),
+        scrollHeight: Number(scroller.scrollHeight),
+        clientHeight: Number(scroller.clientHeight),
+        atTop: Number(scroller.scrollTop) <= 1,
+        atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
+        point
+      } : { candidateCount: resolved.candidates.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
+      markers,
+      markerPositions: {
+        minimum: positions.length ? Math.min(...positions) : null,
+        maximum: positions.length ? Math.max(...positions) : null,
+        uniquePositions,
+        hasPosition0: uniquePositions.includes(0),
+        hasPosition1: uniquePositions.includes(1)
+      },
+      turnZero: {
+        elementCount: markers.filter((marker) => marker.parsedPosition === 0).length,
+        insideScrollerCount: markers.filter((marker) => marker.parsedPosition === 0 && marker.insideSelectedScroller).length,
+        visibleElementCount: markers.filter((marker) => marker.parsedPosition === 0 && !marker.hidden && !marker.ariaHidden && marker.display !== 'none' && marker.visibility !== 'hidden').length,
+        containsUserMessage: markers.some((marker) => marker.parsedPosition === 0 && marker.containsUserMessageCount > 0),
+        containsAssistantMessage: markers.some((marker) => marker.parsedPosition === 0 && marker.containsAssistantMessageCount > 0),
+        rawMarkers: markers.filter((marker) => marker.parsedPosition === 0).slice(0, 5).map((marker) => ({ tagName: marker.tagName, id: marker.id, dataTestId: marker.dataTestId, dataConversationTurn: marker.dataConversationTurn, dataTurn: marker.dataTurn }))
+      },
+      positionOne: {
+        elementCount: markers.filter((marker) => marker.parsedPosition === 1).length,
+        containsUserMessage: markers.some((marker) => marker.parsedPosition === 1 && marker.containsUserMessageCount > 0),
+        containsAssistantMessage: markers.some((marker) => marker.parsedPosition === 1 && marker.containsAssistantMessageCount > 0)
+      },
+      firstMessagePosition: first?.position ?? null,
+      firstMessageRole: first?.role || null,
+      positionSource: firstSource.node ? { depth: firstSource.depth, attributeName: firstSource.attributeName, rawValue: firstSource.rawValue, parsedPosition: firstSource.parsedPosition } : null,
+      firstMessages: textMessages,
+      firstMessageAncestors: ancestors,
+      previousSiblings,
+      scrollerMarkerOrder: scrollerMarkers,
+      messagePositionOrder,
+      turnZeroElementExists: markers.some((marker) => marker.parsedPosition === 0),
+      turnZeroContainsConversationMessage: markers.some((marker) => marker.parsedPosition === 0 && (marker.containsUserMessageCount > 0 || marker.containsAssistantMessageCount > 0))
     };
   })()`;
 }
@@ -2491,6 +2745,305 @@ export class ChatGPTController {
         }
       }
       finalizeSummary();
+      return result;
+    });
+  }
+
+  async diagnoseConversationStartMarkers() {
+    return await this.runExclusive(async () => {
+      const limits = { maxTurns: 50, maxCharsPerTurn: 100_000, maxTotalChars: 1_000_000 };
+      const result = {
+        backend: null,
+        preconditionPassed: false,
+        before: null,
+        normalized: null,
+        initial: null,
+        wheelAttemptLimit: START_MARKER_PROBE_MAX_WHEELS,
+        wheelAttempts: 0,
+        physicalTopReached: false,
+        physicalTopStable: false,
+        stableTop: null,
+        markerPositions: null,
+        turnZero: null,
+        positionOne: null,
+        firstMessagePosition: null,
+        firstMessageRole: null,
+        positionSource: null,
+        firstMessages: [],
+        firstMessageAncestors: [],
+        previousSiblings: [],
+        scrollerMarkerOrder: [],
+        messagePositionOrder: [],
+        turnZeroElementExists: false,
+        turnZeroContainsConversationMessage: false,
+        conversationRestore: {
+          attempts: 0,
+          verified: false,
+          initialDistanceFromBottom: null,
+          finalDistanceFromBottom: null,
+          distanceMatched: false,
+          signatureMatched: false,
+          lastFailureReason: null
+        },
+        windowLifecycle: {
+          originalWindowState: null,
+          originalAdapterMinimized: null,
+          originalVisibilityState: null,
+          originalHidden: null,
+          originalHasFocus: null,
+          normalizationApplied: false,
+          normalizedWindowState: null,
+          normalizedAdapterMinimized: null,
+          normalizedVisibilityState: null,
+          normalizedHidden: null,
+          normalizedHasFocus: null,
+          restoreAttempts: 0,
+          restoreVerified: false,
+          restoredWindowState: null,
+          restoredAdapterMinimized: null,
+          restoredVisibilityState: null,
+          restoredHidden: null,
+          restoredHasFocus: null
+        },
+        urlStable: true,
+        reason: null
+      };
+      let initialUrl = '';
+      let normalizedBaseline = null;
+      let normalizationApplied = false;
+
+      const readUrl = async () => String(await this.page.getUrl()).trim();
+      const readNative = async () => await this.getNativeInputDiagnostics();
+      const readWindow = async () => await this.#eval(buildConversationStartMarkerDiagnosticScript(limits));
+      const stateSummary = (native, window) => ({
+        browserWindowState: ['normal', 'minimized', 'maximized', 'fullscreen'].includes(native?.browserWindowState) ? native.browserWindowState : null,
+        adapterMinimized: typeof native?.adapterMinimized === 'boolean' ? native.adapterMinimized : null,
+        documentVisibilityState: ['visible', 'hidden'].includes(native?.documentVisibilityState) ? native.documentVisibilityState : null,
+        documentHidden: typeof native?.documentHidden === 'boolean' ? native.documentHidden : null,
+        documentHasFocus: typeof native?.documentHasFocus === 'boolean' ? native.documentHasFocus : null,
+        range: window?.range || { min: null, max: null },
+        scrollTop: Number.isFinite(Number(window?.scroller?.scrollTop)) ? Number(window.scroller.scrollTop) : null,
+        scrollHeight: Number.isFinite(Number(window?.scroller?.scrollHeight)) ? Number(window.scroller.scrollHeight) : null,
+        clientHeight: Number.isFinite(Number(window?.scroller?.clientHeight)) ? Number(window.scroller.clientHeight) : null,
+        atTop: typeof window?.scroller?.atTop === 'boolean' ? window.scroller.atTop : null,
+        atBottom: typeof window?.scroller?.atBottom === 'boolean' ? window.scroller.atBottom : null,
+        windowSignature: typeof window?.windowSignature === 'string' ? window.windowSignature : null,
+        structuralSignature: typeof window?.structuralSignature === 'string' ? window.structuralSignature : null,
+        loading: window?.loading === true,
+        candidateCount: Number.isInteger(window?.scroller?.candidateCount) ? window.scroller.candidateCount : 0,
+        point: window?.scroller?.point || null
+      });
+      const validPoint = (point) => point && Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y)) && Number(point.x) >= 0 && Number(point.y) >= 0;
+      const sameUrl = async (stateUrl = null) => {
+        const currentUrl = stateUrl == null ? await readUrl() : String(stateUrl || '').trim();
+        if (!initialUrl || currentUrl !== initialUrl) {
+          result.urlStable = false;
+          result.reason ||= 'probe-conversation-changed';
+          return false;
+        }
+        return true;
+      };
+      const copyStructure = (state) => {
+        if (!state || typeof state !== 'object') return;
+        for (const field of [
+          'markerPositions', 'turnZero', 'positionOne', 'firstMessagePosition', 'firstMessageRole', 'positionSource',
+          'firstMessages', 'firstMessageAncestors', 'previousSiblings', 'scrollerMarkerOrder', 'messagePositionOrder',
+          'turnZeroElementExists', 'turnZeroContainsConversationMessage'
+        ]) {
+          if (state[field] !== undefined) result[field] = state[field];
+        }
+      };
+      const recordLifecycle = (prefix, native) => {
+        const lifecycle = result.windowLifecycle;
+        lifecycle[`${prefix}WindowState`] = ['normal', 'minimized', 'maximized', 'fullscreen'].includes(native?.browserWindowState) ? native.browserWindowState : null;
+        lifecycle[`${prefix}AdapterMinimized`] = typeof native?.adapterMinimized === 'boolean' ? native.adapterMinimized : null;
+        lifecycle[`${prefix}VisibilityState`] = ['visible', 'hidden'].includes(native?.documentVisibilityState) ? native.documentVisibilityState : null;
+        lifecycle[`${prefix}Hidden`] = typeof native?.documentHidden === 'boolean' ? native.documentHidden : null;
+        lifecycle[`${prefix}HasFocus`] = typeof native?.documentHasFocus === 'boolean' ? native.documentHasFocus : null;
+      };
+      const readStage = async () => {
+        const [native, window] = await Promise.all([readNative(), readWindow()]);
+        await sameUrl(window?.url);
+        return { native, window, summary: stateSummary(native, window) };
+      };
+      const restoreConversation = async () => {
+        const restore = result.conversationRestore;
+        const distance = normalizedBaseline?.scroller
+          ? Number(normalizedBaseline.scroller.scrollHeight) - Number(normalizedBaseline.scroller.clientHeight) - Number(normalizedBaseline.scroller.scrollTop)
+          : NaN;
+        restore.initialDistanceFromBottom = Number.isFinite(distance) && distance >= 0 ? distance : null;
+        const baselineSignature = normalizedBaseline?.windowSignature || null;
+        if (restore.initialDistanceFromBottom === null || !baselineSignature) {
+          restore.lastFailureReason = 'scroller-missing';
+          return false;
+        }
+        let last = null;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          restore.attempts += 1;
+          let current = null;
+          try { current = await readWindow(); } catch { restore.lastFailureReason = 'read-failed'; continue; }
+          if (!await sameUrl(current?.url)) { restore.lastFailureReason = 'url-changed'; break; }
+          if (current?.limitExceeded) { restore.lastFailureReason = 'limit-exceeded'; continue; }
+          if (current?.scroller?.candidateCount !== 1) { restore.lastFailureReason = current?.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing'; continue; }
+          const command = await this.#eval(buildRestoreConversationScrollScript(restore.initialDistanceFromBottom)).catch(() => null);
+          if (command?.ok !== true) { restore.lastFailureReason = command?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed'; continue; }
+          await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
+          try { last = await readWindow(); } catch { restore.lastFailureReason = 'read-failed'; continue; }
+          if (!await sameUrl(last?.url)) { restore.lastFailureReason = 'url-changed'; break; }
+          if (last?.limitExceeded) { restore.lastFailureReason = 'limit-exceeded'; continue; }
+          const restoredDistance = Number(last?.scroller?.scrollHeight) - Number(last?.scroller?.clientHeight) - Number(last?.scroller?.scrollTop);
+          const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - restore.initialDistanceFromBottom) <= 2;
+          const signatureMatched = last?.windowSignature === baselineSignature;
+          restore.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
+          restore.distanceMatched = distanceMatched;
+          restore.signatureMatched = signatureMatched;
+          if (distanceMatched && signatureMatched) {
+            restore.verified = true;
+            restore.lastFailureReason = null;
+            return true;
+          }
+          restore.lastFailureReason = signatureMatched ? 'distance-mismatch' : 'signature-mismatch';
+        }
+        if (last?.scroller) {
+          const finalDistance = Number(last.scroller.scrollHeight) - Number(last.scroller.clientHeight) - Number(last.scroller.scrollTop);
+          restore.finalDistanceFromBottom = Number.isFinite(finalDistance) ? finalDistance : null;
+        }
+        return false;
+      };
+      const restoreWindow = async () => {
+        if (!normalizationApplied) { result.windowLifecycle.restoreVerified = true; return true; }
+        let verified = false;
+        for (let attempt = 0; attempt < SCROLL_VISIBILITY_PROBE_MAX_RESTORE_ATTEMPTS && !verified; attempt += 1) {
+          result.windowLifecycle.restoreAttempts += 1;
+          try { await this.page.restoreMinimizedForProbe(); } catch {}
+          await sleep(SCROLL_VISIBILITY_PROBE_RESTORE_WAIT_MS);
+          try {
+            const native = await readNative();
+            recordLifecycle('restored', native);
+            verified = native?.browserWindowState === 'minimized' && native?.adapterMinimized === true && native?.documentVisibilityState === 'hidden' && native?.documentHidden === true;
+          } catch {}
+        }
+        result.windowLifecycle.restoreVerified = verified;
+        return verified;
+      };
+
+      try {
+        initialUrl = await readUrl();
+        const beforeStage = await readStage();
+        const beforeNative = beforeStage.native;
+        result.backend = beforeNative?.backend === 'chrome-cdp' ? 'chrome-cdp' : null;
+        result.before = beforeStage.summary;
+        result.initial = beforeStage.summary;
+        result.windowLifecycle.originalWindowState = ['normal', 'minimized', 'maximized', 'fullscreen'].includes(beforeNative?.browserWindowState) ? beforeNative.browserWindowState : null;
+        result.windowLifecycle.originalAdapterMinimized = typeof beforeNative?.adapterMinimized === 'boolean' ? beforeNative.adapterMinimized : null;
+        result.windowLifecycle.originalVisibilityState = ['visible', 'hidden'].includes(beforeNative?.documentVisibilityState) ? beforeNative.documentVisibilityState : null;
+        result.windowLifecycle.originalHidden = typeof beforeNative?.documentHidden === 'boolean' ? beforeNative.documentHidden : null;
+        result.windowLifecycle.originalHasFocus = typeof beforeNative?.documentHasFocus === 'boolean' ? beforeNative.documentHasFocus : null;
+        result.preconditionPassed = result.backend === 'chrome-cdp'
+          && beforeNative?.pageClosed === false
+          && beforeNative?.browserWindowState === 'minimized'
+          && beforeNative?.adapterMinimized === true
+          && beforeStage.window?.scroller?.candidateCount === 1
+          && typeof this.page?.temporarilyUnminimizeForProbe === 'function'
+          && typeof this.page?.restoreMinimizedForProbe === 'function'
+          && typeof this.page?.moveMouse === 'function'
+          && typeof this.page?.mouseWheel === 'function';
+        if (!result.preconditionPassed) { result.reason = 'probe-precondition-failed'; return result; }
+
+        normalizationApplied = true;
+        result.windowLifecycle.normalizationApplied = true;
+        await this.page.temporarilyUnminimizeForProbe();
+        const deadline = Date.now() + SCROLL_VISIBILITY_PROBE_NORMALIZE_TIMEOUT_MS;
+        let normalizedStage = null;
+        while (Date.now() <= deadline) {
+          normalizedStage = await readStage();
+          recordLifecycle('normalized', normalizedStage.native);
+          if (normalizedStage.native?.browserWindowState === 'normal'
+            && normalizedStage.native?.documentVisibilityState === 'visible'
+            && normalizedStage.native?.documentHidden === false
+            && normalizedStage.native?.documentHasFocus === true) break;
+          if (Date.now() + SCROLL_VISIBILITY_PROBE_POLL_MS > deadline) break;
+          await sleep(SCROLL_VISIBILITY_PROBE_POLL_MS);
+        }
+        if (!normalizedStage || normalizedStage.native?.browserWindowState !== 'normal' || normalizedStage.native?.documentVisibilityState !== 'visible' || normalizedStage.native?.documentHidden !== false || normalizedStage.native?.documentHasFocus !== true) {
+          result.reason = !result.urlStable ? 'probe-conversation-changed' : normalizedStage?.native?.documentHasFocus !== true ? 'probe-normalized-but-unfocused' : 'probe-normalized-but-hidden';
+          return result;
+        }
+        normalizedBaseline = normalizedStage.window;
+        result.normalized = normalizedStage.summary;
+        result.initial = normalizedStage.summary;
+        const baseline = normalizedStage.window;
+        result.initial = normalizedStage.summary;
+        copyStructure(baseline);
+        if (!baseline?.scroller || baseline.scroller.candidateCount !== 1) { result.reason = baseline?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found'; return result; }
+        if (baseline.limitExceeded) { result.reason = baseline.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; return result; }
+        let current = baseline;
+        const atTop = (state) => state?.scroller?.atTop === true || Number(state?.scroller?.scrollTop) <= 1;
+        if (!atTop(current)) {
+          for (let attempt = 1; attempt <= START_MARKER_PROBE_MAX_WHEELS; attempt += 1) {
+            const step = await readStage();
+            current = step.window;
+            if (!result.urlStable) break;
+            if (step.native?.pageClosed !== false || step.native?.browserWindowState !== 'normal' || step.native?.documentVisibilityState !== 'visible' || step.native?.documentHidden !== false || step.native?.documentHasFocus !== true) { result.reason = 'probe-precondition-failed'; break; }
+            if (current?.limitExceeded) { result.reason = current.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
+            if (current?.scroller?.candidateCount !== 1 || !validPoint(current.scroller.point)) { result.reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found'; break; }
+            try {
+              await this.page.moveMouse(Number(current.scroller.point.x), Number(current.scroller.point.y));
+              await this.page.mouseWheel(Number(current.scroller.point.x), Number(current.scroller.point.y), 0, -720);
+              result.wheelAttempts = attempt;
+            } catch {
+              result.wheelAttempts = attempt;
+              result.reason = 'probe-wheel-failed';
+              break;
+            }
+            await sleep(CONVERSATION_HISTORY_SCROLL_WAIT_MS);
+            let after = null;
+            try { after = await readWindow(); } catch { result.reason = 'probe-wheel-failed'; break; }
+            result.wheelAttempts = attempt;
+            if (!await sameUrl(after?.url)) break;
+            if (after?.limitExceeded) { result.reason = after.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
+            current = after;
+            if (atTop(current)) { result.physicalTopReached = true; break; }
+          }
+          if (!result.physicalTopReached && !result.reason) result.reason = 'probe-top-not-reached';
+        } else result.physicalTopReached = true;
+
+        if (result.physicalTopReached && !result.reason) {
+          let stableCount = 0;
+          let previousWindow = null;
+          let previousStructure = null;
+          for (let sample = 0; sample < START_MARKER_PROBE_TOP_SAMPLES; sample += 1) {
+            if (sample > 0) await sleep(START_MARKER_PROBE_TOP_SAMPLE_WAIT_MS);
+            const top = await readStage();
+            if (!await sameUrl(top.window?.url)) break;
+            if (top.window?.limitExceeded) { result.reason = top.window.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
+            const stable = atTop(top.window) && top.window.loading === false && top.window.windowSignature === previousWindow && top.window.structuralSignature === previousStructure;
+            previousWindow = top.window?.windowSignature || null;
+            previousStructure = top.window?.structuralSignature || null;
+            if (stable || sample === 0) stableCount += 1;
+            else stableCount = 1;
+            current = top.window;
+            result.stableTop = top.summary;
+            copyStructure(top.window);
+            if (stableCount >= START_MARKER_PROBE_TOP_SAMPLES) { result.physicalTopStable = true; break; }
+          }
+          if (!result.physicalTopStable && !result.reason) result.reason = 'probe-top-not-stable';
+        }
+        if (result.physicalTopStable) result.reason = null;
+      } catch {
+        result.reason ||= normalizationApplied ? 'probe-diagnostic-failed' : 'probe-precondition-failed';
+      } finally {
+        if (normalizationApplied) {
+          if (!result.reason || result.reason.startsWith('probe-')) {
+            let restored = false;
+            try { restored = await restoreConversation(); } catch { result.conversationRestore.lastFailureReason ||= 'read-failed'; }
+            if (!restored && !result.reason) result.reason = 'probe-conversation-restore-failed';
+          }
+          let windowRestored = false;
+          try { windowRestored = await restoreWindow(); } catch {}
+          if (!windowRestored && !result.reason) result.reason = 'probe-window-restore-failed';
+        }
+      }
       return result;
     });
   }

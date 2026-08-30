@@ -246,6 +246,8 @@ export function mapErrorToHttp(error) {
   if (msg === 'ambiguous_conversation_tab') return { code: 400, body: { error: 'ambiguous_conversation_tab' } };
   if (msg === 'chatgpt_tab_required') return { code: 409, body: { error: 'chatgpt_tab_required' } };
   if (msg === 'conversation_controller_unavailable') return { code: 409, body: { error: 'conversation_controller_unavailable' } };
+  if (msg === 'start_marker_diagnostic_input_invalid') return { code: 400, body: { error: 'start_marker_diagnostic_input_invalid' } };
+  if (msg === 'start_marker_diagnostics_unavailable') return { code: 409, body: { error: 'start_marker_diagnostics_unavailable' } };
   if (msg === 'conversation_history_mode_invalid') return { code: 400, body: { error: 'conversation_history_mode_invalid' } };
   if (msg === 'conversation_history_timeout_invalid') return { code: 400, body: { error: 'conversation_history_timeout_invalid' } };
   if (msg === 'conversation_history_iterations_invalid') return { code: 400, body: { error: 'conversation_history_iterations_invalid' } };
@@ -556,6 +558,86 @@ function sanitizeMouseWheelVisibilityProbe(value) {
     restored: stage(data.restored, false),
     urlStable: data.urlStable !== false,
     reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
+  };
+}
+
+function sanitizeConversationStartMarkerDiagnostic(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const states = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
+  const visibilityStates = new Set(['visible', 'hidden']);
+  const number = (item, { min = -1_000_000, max = 1_000_000, integer = false } = {}) => {
+    const parsed = Number(item);
+    if (!Number.isFinite(parsed) || parsed < min || parsed > max) return null;
+    return integer ? Math.trunc(parsed) : parsed;
+  };
+  const bool = (item) => typeof item === 'boolean' ? item : null;
+  const text = (item, max = 120) => typeof item === 'string' ? item.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, max) || null : null;
+  const state = (item) => item && typeof item === 'object' ? {
+    browserWindowState: states.has(item.browserWindowState) ? item.browserWindowState : null,
+    adapterMinimized: bool(item.adapterMinimized),
+    documentVisibilityState: visibilityStates.has(item.documentVisibilityState) ? item.documentVisibilityState : null,
+    documentHidden: bool(item.documentHidden),
+    documentHasFocus: bool(item.documentHasFocus),
+    range: { min: number(item.range?.min, { min: 0, max: 1_000_000, integer: true }), max: number(item.range?.max, { min: 0, max: 1_000_000, integer: true }) },
+    scrollTop: number(item.scrollTop),
+    scrollHeight: number(item.scrollHeight, { min: 0 }),
+    clientHeight: number(item.clientHeight, { min: 0 }),
+    atTop: bool(item.atTop),
+    atBottom: bool(item.atBottom),
+    windowSignature: /^[a-f0-9]{1,64}$/u.test(String(item.windowSignature || '')) ? item.windowSignature : null,
+    structuralSignature: /^[a-f0-9]{1,64}$/u.test(String(item.structuralSignature || '')) ? item.structuralSignature : null,
+    loading: bool(item.loading),
+    candidateCount: number(item.candidateCount, { min: 0, max: 8, integer: true }),
+    point: item.point && typeof item.point === 'object' ? { x: number(item.point.x, { min: 0, max: 10_000 }), y: number(item.point.y, { min: 0, max: 10_000 }) } : null
+  } : null;
+  const attrs = (item) => item && typeof item === 'object' ? {
+    tagName: text(item.tagName, 32), id: text(item.id), dataTestId: text(item.dataTestId),
+    dataConversationTurn: text(item.dataConversationTurn), dataTurn: text(item.dataTurn)
+  } : null;
+  const marker = (item) => item && typeof item === 'object' ? {
+    ...attrs(item), parsedPosition: number(item.parsedPosition, { min: 0, max: 1_000_000, integer: true }),
+    insideSelectedScroller: item.insideSelectedScroller === true,
+    containsUserMessageCount: number(item.containsUserMessageCount, { min: 0, max: 100, integer: true }) || 0,
+    containsAssistantMessageCount: number(item.containsAssistantMessageCount, { min: 0, max: 100, integer: true }) || 0,
+    hidden: item.hidden === true, ariaHidden: item.ariaHidden === true,
+    display: text(item.display, 16), visibility: text(item.visibility, 16),
+    rect: item.rect && typeof item.rect === 'object' ? { top: number(item.rect.top), height: number(item.rect.height, { min: 0 }) } : null
+  } : null;
+  const rawMarker = (item) => item && typeof item === 'object' ? attrs(item) : null;
+  const markerList = (items, max) => Array.isArray(items) ? items.slice(0, max).map(marker).filter(Boolean) : [];
+  const source = (item) => item && typeof item === 'object' ? {
+    depth: number(item.depth, { min: 0, max: 12, integer: true }), attributeName: ['id', 'data-testid', 'data-conversation-turn', 'data-turn'].includes(item.attributeName) ? item.attributeName : null,
+    rawValue: text(item.rawValue), parsedPosition: number(item.parsedPosition, { min: 0, max: 1_000_000, integer: true })
+  } : null;
+  const messages = Array.isArray(data.firstMessages) ? data.firstMessages.slice(0, 5).map((item) => ({
+    domIndex: number(item.domIndex, { min: 0, max: 1_000_000, integer: true }), role: item.role === 'user' || item.role === 'assistant' ? item.role : null,
+    parsedPosition: number(item.parsedPosition, { min: 0, max: 1_000_000, integer: true }), messageIdPresent: item.messageIdPresent === true, turnIdPresent: item.turnIdPresent === true,
+    textLength: number(item.textLength, { min: 0, max: 1_000_000, integer: true }), textDigest: /^[a-f0-9]{1,16}$/u.test(String(item.textDigest || '')) ? item.textDigest : null, textPrefix: text(item.textPrefix, 120)
+  })) : [];
+  const ancestors = Array.isArray(data.firstMessageAncestors) ? data.firstMessageAncestors.slice(0, 12).map((item) => ({ ...attrs(item), depth: number(item.depth, { min: 0, max: 12, integer: true }), dataMessageIdPresent: item.dataMessageIdPresent === true, dataTurnIdPresent: item.dataTurnIdPresent === true, hidden: item.hidden === true, ariaHidden: item.ariaHidden === true, display: text(item.display, 16), visibility: text(item.visibility, 16) })) : [];
+  const siblings = Array.isArray(data.previousSiblings) ? data.previousSiblings.slice(0, 5).map((item) => ({ ...attrs(item), parsedPosition: number(item.parsedPosition, { min: 0, max: 1_000_000, integer: true }), user: number(item.user, { min: 0, max: 100, integer: true }) || 0, assistant: number(item.assistant, { min: 0, max: 100, integer: true }) || 0, hidden: item.hidden === true, ariaHidden: item.ariaHidden === true, display: text(item.display, 16), visibility: text(item.visibility, 16), textLength: number(item.textLength, { min: 0, max: 1_000_000, integer: true }) })) : [];
+  const scrollerOrder = Array.isArray(data.scrollerMarkerOrder) ? data.scrollerMarkerOrder.slice(0, 30).map((item) => ({ parsedPosition: number(item.parsedPosition, { min: 0, max: 1_000_000, integer: true }), id: text(item.id), dataTestId: text(item.dataTestId), roleCounts: { user: number(item.roleCounts?.user, { min: 0, max: 100, integer: true }) || 0, assistant: number(item.roleCounts?.assistant, { min: 0, max: 100, integer: true }) || 0 }, hidden: item.hidden === true })) : [];
+  const positionOrder = Array.isArray(data.messagePositionOrder) ? data.messagePositionOrder.slice(0, 20).map((item) => ({ role: item.role === 'user' || item.role === 'assistant' ? item.role : null, position: number(item.position, { min: 0, max: 1_000_000, integer: true }) })) : [];
+  const compactSummary = (item) => item && typeof item === 'object' ? {
+    elementCount: number(item.elementCount, { min: 0, max: 40, integer: true }) || 0, insideScrollerCount: number(item.insideScrollerCount, { min: 0, max: 40, integer: true }) || 0, visibleElementCount: number(item.visibleElementCount, { min: 0, max: 40, integer: true }) || 0,
+    containsUserMessage: item.containsUserMessage === true, containsAssistantMessage: item.containsAssistantMessage === true,
+    rawMarkers: Array.isArray(item.rawMarkers) ? item.rawMarkers.slice(0, 5).map(rawMarker).filter(Boolean) : []
+  } : null;
+  const lifecycle = (item) => item && typeof item === 'object' ? {
+    originalWindowState: states.has(item.originalWindowState) ? item.originalWindowState : null, originalAdapterMinimized: bool(item.originalAdapterMinimized), originalVisibilityState: visibilityStates.has(item.originalVisibilityState) ? item.originalVisibilityState : null, originalHidden: bool(item.originalHidden), originalHasFocus: bool(item.originalHasFocus),
+    normalizationApplied: item.normalizationApplied === true, normalizedWindowState: states.has(item.normalizedWindowState) ? item.normalizedWindowState : null, normalizedAdapterMinimized: bool(item.normalizedAdapterMinimized), normalizedVisibilityState: visibilityStates.has(item.normalizedVisibilityState) ? item.normalizedVisibilityState : null, normalizedHidden: bool(item.normalizedHidden), normalizedHasFocus: bool(item.normalizedHasFocus),
+    restoreAttempts: number(item.restoreAttempts, { min: 0, max: 2, integer: true }) || 0, restoreVerified: item.restoreVerified === true, restoredWindowState: states.has(item.restoredWindowState) ? item.restoredWindowState : null, restoredAdapterMinimized: bool(item.restoredAdapterMinimized), restoredVisibilityState: visibilityStates.has(item.restoredVisibilityState) ? item.restoredVisibilityState : null, restoredHidden: bool(item.restoredHidden), restoredHasFocus: bool(item.restoredHasFocus)
+  } : null;
+  const restore = data.conversationRestore && typeof data.conversationRestore === 'object' ? {
+    attempts: number(data.conversationRestore.attempts, { min: 0, max: 4, integer: true }) || 0, verified: data.conversationRestore.verified === true, initialDistanceFromBottom: number(data.conversationRestore.initialDistanceFromBottom, { min: 0 }), finalDistanceFromBottom: number(data.conversationRestore.finalDistanceFromBottom, { min: 0 }), distanceMatched: data.conversationRestore.distanceMatched === true, signatureMatched: data.conversationRestore.signatureMatched === true, lastFailureReason: text(data.conversationRestore.lastFailureReason, 64)
+  } : null;
+  const positions = data.markerPositions && typeof data.markerPositions === 'object' ? { minimum: number(data.markerPositions.minimum, { min: 0, max: 1_000_000, integer: true }), maximum: number(data.markerPositions.maximum, { min: 0, max: 1_000_000, integer: true }), uniquePositions: Array.isArray(data.markerPositions.uniquePositions) ? data.markerPositions.uniquePositions.slice(0, 50).map((item) => number(item, { min: 0, max: 1_000_000, integer: true })).filter((item) => item !== null) : [], hasPosition0: data.markerPositions.hasPosition0 === true, hasPosition1: data.markerPositions.hasPosition1 === true } : null;
+  const reason = String(data.reason || '').trim();
+  return {
+    backend: data.backend === 'chrome-cdp' ? data.backend : null, preconditionPassed: data.preconditionPassed === true,
+    before: state(data.before), normalized: state(data.normalized), initial: state(data.initial), wheelAttemptLimit: number(data.wheelAttemptLimit, { min: 0, max: 24, integer: true }) || 0, wheelAttempts: number(data.wheelAttempts, { min: 0, max: 24, integer: true }) || 0, physicalTopReached: data.physicalTopReached === true, physicalTopStable: data.physicalTopStable === true, stableTop: state(data.stableTop),
+    markerPositions: positions, turnZero: compactSummary(data.turnZero), positionOne: compactSummary(data.positionOne), firstMessagePosition: number(data.firstMessagePosition, { min: 0, max: 1_000_000, integer: true }), firstMessageRole: data.firstMessageRole === 'user' || data.firstMessageRole === 'assistant' ? data.firstMessageRole : null, positionSource: source(data.positionSource), firstMessages: messages, firstMessageAncestors: ancestors, previousSiblings: siblings, scrollerMarkerOrder: scrollerOrder, messagePositionOrder: positionOrder, turnZeroElementExists: data.turnZeroElementExists === true, turnZeroContainsConversationMessage: data.turnZeroContainsConversationMessage === true,
+    conversationRestore: restore, windowLifecycle: lifecycle(data.windowLifecycle), urlStable: data.urlStable !== false, reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
   };
 }
 
@@ -1380,6 +1462,26 @@ export function startHttpApi({
         }
         const probe = await controller.probeMouseWheelVisibility();
         return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeMouseWheelVisibilityProbe(probe) });
+      }
+      if (url.pathname === '/conversation/start-marker-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 8 * 1024 });
+        const keys = body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body) : [];
+        if (keys.some((key) => key !== 'key' && key !== 'tabId')) throw new Error('start_marker_diagnostic_input_invalid');
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.diagnoseConversationStartMarkers !== 'function') throw new Error('start_marker_diagnostics_unavailable');
+        const diagnostic = await controller.diagnoseConversationStartMarkers();
+        return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeConversationStartMarkerDiagnostic(diagnostic) }, { maxBytes: 512 * 1024 });
       }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
         const bundles = await listBundles(stateDir);

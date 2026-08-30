@@ -208,6 +208,78 @@ function createController(page, options = {}) {
   return new ChatGPTController({ page, selectors, ...options });
 }
 
+function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelSnapshots = [] } = {}) {
+  const events = [];
+  let phase = 'before';
+  let wheelIndex = 0;
+  let windowState = 'minimized';
+  let adapterMinimized = true;
+  let visibilityState = 'hidden';
+  let hidden = true;
+  let hasFocus = false;
+  const base = structuredClone(snapshot);
+  const currentSnapshot = () => {
+    if (phase === 'normalized') return structuredClone(base);
+    if (phase === 'wheel') return structuredClone(wheelSnapshots[Math.min(wheelIndex - 1, wheelSnapshots.length - 1)] || base);
+    if (phase === 'restored') return structuredClone(base);
+    return structuredClone(base);
+  };
+  const page = createPage({
+    events,
+    onEvaluate: async (js) => {
+      if (js.includes('const targetDistance =')) {
+        events.push('conversation-scroll-restore');
+        phase = 'restored';
+        return { ok: true };
+      }
+      if (js.includes('const markerSelector =')) return currentSnapshot();
+      throw new Error(`unexpected_start_marker_eval:${js.slice(0, 80)}`);
+    },
+    onMouseWheel: async (_x, _y, _dx, dy) => {
+      assert.equal(dy, -720);
+      wheelIndex += 1;
+      phase = 'wheel';
+    }
+  });
+  page.getUrl = async () => base.url;
+  page.getNativeInputDiagnostics = async () => ({
+    backend: 'chrome-cdp', pageClosed: false, browserWindowState: windowState,
+    adapterMinimized, documentVisibilityState: visibilityState,
+    documentHidden: hidden, documentHasFocus: hasFocus
+  });
+  page.temporarilyUnminimizeForProbe = async () => {
+    events.push('window-state:normal');
+    windowState = 'normal'; adapterMinimized = false; visibilityState = 'visible'; hidden = false; hasFocus = true; phase = 'normalized';
+  };
+  page.restoreMinimizedForProbe = async () => {
+    events.push('window-state:minimized');
+    windowState = 'minimized'; adapterMinimized = true; visibilityState = 'hidden'; hidden = true; hasFocus = false;
+  };
+  if (!initialAtTop) base.scroller.atTop = false;
+  return { page, events, getWheelCount: () => wheelIndex };
+}
+
+function startMarkerSnapshot({ range = { min: 1, max: 3 }, atTop = true, scrollTop = 0, markerPositions = [1, 2, 3], turnZero = null, firstMessagePosition = 1, firstMessageRole = 'user', windowSignature = 'aaa11111', structuralSignature = 'bbb22222' } = {}) {
+  const positions = markerPositions.map((position) => ({ parsedPosition: position, insideSelectedScroller: true }));
+  const zero = turnZero || { elementCount: 0, insideScrollerCount: 0, visibleElementCount: 0, containsUserMessage: false, containsAssistantMessage: false, rawMarkers: [] };
+  return {
+    url: 'https://chatgpt.com/c/start-marker-test', limitExceeded: false, limitKind: null, loading: false,
+    range, windowSignature, structuralSignature,
+    scroller: { candidateCount: 1, selectedMessageDescendantCount: 3, scrollTop, scrollHeight: 1_000, clientHeight: 400, atTop, atBottom: false, point: { x: 500, y: 300 } },
+    markerPositions: { minimum: Math.min(...markerPositions), maximum: Math.max(...markerPositions), uniquePositions: markerPositions, hasPosition0: markerPositions.includes(0), hasPosition1: markerPositions.includes(1) },
+    turnZero: zero,
+    positionOne: { elementCount: markerPositions.includes(1) ? 1 : 0, containsUserMessage: firstMessagePosition === 1, containsAssistantMessage: firstMessagePosition === 1 && firstMessageRole === 'assistant', rawMarkers: [] },
+    firstMessagePosition, firstMessageRole,
+    positionSource: { depth: 1, attributeName: 'id', rawValue: `conversation-turn-${firstMessagePosition}`, parsedPosition: firstMessagePosition },
+    firstMessages: [{ domIndex: 0, role: firstMessageRole, parsedPosition: firstMessagePosition, messageIdPresent: true, turnIdPresent: false, textLength: 5, textDigest: 'abcd1234', textPrefix: 'first' }],
+    firstMessageAncestors: [{ depth: 0, tagName: 'DIV', id: `conversation-turn-${firstMessagePosition}`, dataTestId: null, dataConversationTurn: null, dataTurn: null, dataMessageIdPresent: false, dataTurnIdPresent: false, hidden: false, ariaHidden: false, display: 'block', visibility: 'visible' }],
+    previousSiblings: [], scrollerMarkerOrder: positions.map((item) => ({ ...item, id: `conversation-turn-${item.parsedPosition}`, dataTestId: null, roleCounts: { user: 1, assistant: 0 }, hidden: false })),
+    messagePositionOrder: [{ role: firstMessageRole, position: firstMessagePosition }],
+    turnZeroElementExists: zero.elementCount > 0,
+    turnZeroContainsConversationMessage: zero.containsUserMessage || zero.containsAssistantMessage
+  };
+}
+
 function createPromptExpressionContext(userTurns = [], initialPromptText = '') {
   const focused = { value: false };
   const prompt = {
@@ -7866,4 +7938,57 @@ test('chatgpt-controller: revalidates FileList names as a case-insensitive dupli
     ),
     false
   );
+});
+
+test('chatgpt-controller: start-marker diagnostic reports one-origin messages without changing start proof', async () => {
+  const harness = createStartMarkerDiagnosticPage({ snapshot: startMarkerSnapshot() });
+  const result = await createController(harness.page).diagnoseConversationStartMarkers();
+  assert.equal(result.preconditionPassed, true);
+  assert.equal(result.physicalTopReached, true);
+  assert.equal(result.physicalTopStable, true);
+  assert.equal(result.turnZeroElementExists, false);
+  assert.equal(result.firstMessagePosition, 1);
+  assert.equal(result.firstMessageRole, 'user');
+  assert.deepEqual(result.messagePositionOrder, [{ role: 'user', position: 1 }]);
+  assert.equal(result.conversationRestore.verified, true);
+  assert.equal(result.windowLifecycle.restoreVerified, true);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(result.reason, null);
+  assert.equal(harness.events.some((event) => event.startsWith('scroll-gesture:')), false);
+  assert.equal(harness.events.some((event) => event.startsWith('key:')), false);
+  assert.equal(harness.events.some((event) => event.startsWith('files-set:')), false);
+});
+
+test('chatgpt-controller: start-marker diagnostic distinguishes message turn zero from hidden non-message turn zero', async () => {
+  const actualZero = createStartMarkerDiagnosticPage({
+    snapshot: startMarkerSnapshot({ range: { min: 0, max: 1 }, markerPositions: [0, 1], firstMessagePosition: 0, firstMessageRole: 'user', turnZero: { elementCount: 1, insideScrollerCount: 1, visibleElementCount: 1, containsUserMessage: true, containsAssistantMessage: false, rawMarkers: [{ tagName: 'DIV', id: 'conversation-turn-0' }] } })
+  });
+  const actualZeroResult = await createController(actualZero.page).diagnoseConversationStartMarkers();
+  assert.equal(actualZeroResult.turnZeroElementExists, true);
+  assert.equal(actualZeroResult.turnZeroContainsConversationMessage, true);
+  assert.equal(actualZeroResult.firstMessagePosition, 0);
+
+  const hiddenZero = createStartMarkerDiagnosticPage({
+    snapshot: startMarkerSnapshot({ turnZero: { elementCount: 1, insideScrollerCount: 1, visibleElementCount: 0, containsUserMessage: false, containsAssistantMessage: false, rawMarkers: [{ tagName: 'DIV', id: 'conversation-turn-0' }] } })
+  });
+  const hiddenZeroResult = await createController(hiddenZero.page).diagnoseConversationStartMarkers();
+  assert.equal(hiddenZeroResult.turnZeroElementExists, true);
+  assert.equal(hiddenZeroResult.turnZeroContainsConversationMessage, false);
+  assert.equal(hiddenZeroResult.firstMessagePosition, 1);
+});
+
+test('chatgpt-controller: start-marker diagnostic uses bounded older traversal and stops on the physical top', async () => {
+  const base = startMarkerSnapshot({ atTop: false, scrollTop: 500 });
+  const first = startMarkerSnapshot({ atTop: false, scrollTop: 500, windowSignature: 'ccc33333', structuralSignature: 'ddd44444' });
+  const top = startMarkerSnapshot({ atTop: true, scrollTop: 0, markerPositions: [1, 2], windowSignature: 'eee55555', structuralSignature: 'fff66666' });
+  const harness = createStartMarkerDiagnosticPage({ snapshot: base, initialAtTop: false, wheelSnapshots: [first, top] });
+  const result = await createController(harness.page).diagnoseConversationStartMarkers();
+  assert.equal(result.wheelAttempts, 2);
+  assert.equal(result.physicalTopReached, true);
+  assert.equal(result.physicalTopStable, true);
+  assert.equal(harness.getWheelCount(), 2);
+  assert.equal(result.reason, null);
+  assert.equal(result.windowLifecycle.restoreVerified, true);
+  assert.equal(result.events?.includes('window-state:minimized') ?? harness.events.includes('window-state:minimized'), true);
+  assert.equal(harness.events.some((event) => event.startsWith('scroll-gesture:')), false);
 });

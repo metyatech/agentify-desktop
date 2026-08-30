@@ -4298,3 +4298,37 @@ test('http-api: conversation turns rejects duplicate keyed tabs before controlle
   assert.equal(duplicate.data.error, 'tab_not_found');
   assert.equal(reads, 0);
 });
+
+test('http-api: start-marker diagnostics accepts only a tab selector and returns bounded structural data', async (t) => {
+  let calls = 0;
+  const controller = {
+    diagnoseConversationStartMarkers: async () => {
+      calls += 1;
+      return {
+        backend: 'chrome-cdp', preconditionPassed: true, urlStable: true, reason: null,
+        firstMessagePosition: 1, firstMessageRole: 'user', turnZeroElementExists: false,
+        markerPositions: { minimum: 1, maximum: 2, uniquePositions: [1, 2], hasPosition0: false, hasPosition1: true },
+        firstMessages: [{ role: 'user', parsedPosition: 1, textPrefix: 'bounded' }],
+        windowLifecycle: { originalWindowState: 'minimized', normalizationApplied: true, restoreAttempts: 1, restoreVerified: true }
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 'chat-1', serverId: 'sid-test', stateDir: '/tmp', getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const accepted = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/start-marker-diagnostics', body: { key: 'autopilot-production' } });
+  assert.equal(accepted.res.status, 200);
+  assert.equal(accepted.data.firstMessagePosition, 1);
+  assert.equal(accepted.data.turnZeroElementExists, false);
+  assert.equal(accepted.data.url, undefined);
+  assert.equal(calls, 1);
+
+  const rejected = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/start-marker-diagnostics', body: { key: 'autopilot-production', markerSelector: '*' } });
+  assert.equal(rejected.res.status, 400);
+  assert.equal(rejected.data.error, 'start_marker_diagnostic_input_invalid');
+  assert.equal(calls, 1);
+});

@@ -11,6 +11,7 @@ import {
   DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
   buildConversationWindowReadScript,
+  conversationStartBoundaryProof,
   mergeConversationSnapshots,
   hasSameChatGPTAttachmentFileNameMultiset,
   isChatGPTAttachmentCardDisplayName,
@@ -665,7 +666,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
   const windows = [
     [0, 1, 2, 3, 4, 5, 6],
@@ -689,11 +690,12 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   let hidden = backend === 'chrome-cdp' ? visibilityState === 'hidden' : null;
   let hasFocus = backend === 'chrome-cdp' ? initialState !== 'minimized' : null;
   const snapshot = () => {
-    const positions = windows[windowIndex];
+    const rawPositions = windows[windowIndex];
+    const positions = rawPositions.map((position) => position + positionOffset);
     return {
       url,
       turns: positions.map((position) => ({
-        role: position % 2 ? 'assistant' : 'user',
+        role: rawPositions[positions.indexOf(position)] % 2 ? 'assistant' : 'user',
         text: `turn-${position}`,
         messageId: `message-${position}`,
         turnId: null,
@@ -702,7 +704,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
       limitExceeded: false,
       limitKind: null,
       loading: false,
-      range: { min: positions[0], max: positions.at(-1) },
+      range: positionHints ? { min: positions[0], max: positions.at(-1) } : { min: null, max: null },
+      startBoundary: {
+        firstMessagePosition: positionHints ? positions[0] : null,
+        firstMessageRole: positionHints ? (rawPositions[0] % 2 ? 'assistant' : 'user') : null,
+        positionZeroMessageNodeCount: positionHints && positions.includes(0) ? 1 : 0,
+        positionZeroMarkerInsideScrollerCount: positionHints && positions.includes(0) ? 1 : 0,
+        positionOneMessageNodeCount: positionHints && positions.includes(1) ? 1 : 0
+      },
       scroller: {
         candidateCount: 1,
         selectedMessageDescendantCount: positions.length,
@@ -2177,6 +2186,60 @@ test('chatgpt-controller: complete history proves an already-tail start with a n
   assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
   assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: start boundary proof accepts strict one-origin evidence without requiring contiguous positions', () => {
+  const proof = conversationStartBoundaryProof({
+    range: { min: 1, max: 20 },
+    startBoundary: {
+      firstMessagePosition: 1,
+      firstMessageRole: 'user',
+      positionZeroMessageNodeCount: 0,
+      positionZeroMarkerInsideScrollerCount: 0,
+      positionOneMessageNodeCount: 1
+    }
+  }, { physicalTopStable: true });
+  assert.deepEqual(proof, {
+    proven: true,
+    mode: 'one-origin',
+    rangeMin: 1,
+    firstMessagePosition: 1,
+    firstMessageRole: 'user',
+    positionZeroMessageNodeCount: 0,
+    positionZeroMarkerInsideScrollerCount: 0,
+    positionOneMessageNodeCount: 1
+  });
+});
+
+test('chatgpt-controller: start boundary proof rejects incomplete one-origin evidence', () => {
+  const base = {
+    range: { min: 1, max: 20 },
+    startBoundary: {
+      firstMessagePosition: 1,
+      firstMessageRole: 'user',
+      positionZeroMessageNodeCount: 0,
+      positionZeroMarkerInsideScrollerCount: 0
+    }
+  };
+  assert.equal(conversationStartBoundaryProof(base, { physicalTopStable: false }).proven, false);
+  assert.equal(conversationStartBoundaryProof({ ...base, startBoundary: { ...base.startBoundary, firstMessageRole: 'assistant' } }, { physicalTopStable: true }).proven, false);
+  assert.equal(conversationStartBoundaryProof({ ...base, startBoundary: { ...base.startBoundary, positionZeroMessageNodeCount: 1 } }, { physicalTopStable: true }).proven, false);
+  assert.equal(conversationStartBoundaryProof({ ...base, startBoundary: { ...base.startBoundary, positionZeroMarkerInsideScrollerCount: 1 } }, { physicalTopStable: true }).proven, false);
+  assert.equal(conversationStartBoundaryProof({ range: { min: 2, max: 20 }, startBoundary: base.startBoundary }, { physicalTopStable: true }).proven, false);
+  assert.equal(conversationStartBoundaryProof({ range: { min: null, max: null }, startBoundary: base.startBoundary }, { physicalTopStable: true }).proven, false);
+});
+
+test('chatgpt-controller: complete history accepts one-origin start evidence while preserving position gaps', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, positionOffset: 1 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.diagnostics.startProven, true);
+  assert.equal(result.history.diagnostics.startProofMode, 'one-origin');
+  assert.equal(result.history.diagnostics.startBoundary.rangeMin, 1);
+  assert.equal(result.history.diagnostics.startBoundary.firstMessagePosition, 1);
+  assert.equal(result.history.diagnostics.startBoundary.firstMessageRole, 'user');
+  assert.equal(result.history.diagnostics.startBoundary.positionZeroMessageNodeCount, 0);
+  assert.equal(result.history.diagnostics.startBoundary.positionZeroMarkerInsideScrollerCount, 0);
 });
 
 test('chatgpt-controller: complete history remains incomplete when the UI start position is not proven', async () => {

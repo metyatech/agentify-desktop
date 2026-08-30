@@ -4307,8 +4307,12 @@ test('http-api: start-marker diagnostics accepts only a tab selector and returns
       return {
         backend: 'chrome-cdp', preconditionPassed: true, urlStable: true, reason: null,
         firstMessagePosition: 1, firstMessageRole: 'user', turnZeroElementExists: false,
+        startProofMode: 'one-origin',
+        startBoundary: { rangeMin: null, firstMessagePosition: 1, firstMessageRole: 'user', positionZeroMessageNodeCount: null, positionZeroMarkerInsideScrollerCount: null, positionOneMessageNodeCount: 1 },
         markerPositions: { minimum: 1, maximum: 2, uniquePositions: [1, 2], hasPosition0: false, hasPosition1: true },
-        firstMessages: [{ role: 'user', parsedPosition: 1, textPrefix: 'bounded' }],
+        firstMessages: [{ role: 'user', parsedPosition: null, textPrefix: 'bounded' }],
+        positionSource: { parsedPosition: null },
+        previousSiblings: [{ parsedPosition: null, user: false, assistant: false }],
         windowLifecycle: { originalWindowState: 'minimized', normalizationApplied: true, restoreAttempts: 1, restoreVerified: true }
       };
     }
@@ -4324,6 +4328,13 @@ test('http-api: start-marker diagnostics accepts only a tab selector and returns
   assert.equal(accepted.res.status, 200);
   assert.equal(accepted.data.firstMessagePosition, 1);
   assert.equal(accepted.data.turnZeroElementExists, false);
+  assert.equal(accepted.data.startProofMode, 'one-origin');
+  assert.equal(accepted.data.startBoundary.rangeMin, null);
+  assert.equal(accepted.data.startBoundary.positionZeroMessageNodeCount, null);
+  assert.equal(accepted.data.firstMessages[0].parsedPosition, null);
+  assert.equal(accepted.data.positionSource.parsedPosition, null);
+  assert.equal(accepted.data.previousSiblings[0].parsedPosition, null);
+  assert.equal(accepted.data.reason, null);
   assert.equal(accepted.data.url, undefined);
   assert.equal(calls, 1);
 

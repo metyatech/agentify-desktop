@@ -347,6 +347,10 @@ diagnostics. `history.complete: true` proves a continuous, stable sequence from
 conversation start through the latest turn observed at read start. Timeouts,
 loading stalls, gaps, ambiguity, and limits remain incomplete; the default
 `visible` mode preserves the prior current-DOM-window response shape.
+Start-boundary proof accepts either an explicit zero-origin position or strict
+one-origin evidence (the first extracted message is a user at position 1 and
+the selected scroller has no position-0 message or turn marker); position
+hints remain opaque and non-contiguous.
 For Chrome/CDP, complete mode temporarily normalizes a minimized window only
 when the page becomes visible and focused, uses the native mouse-wheel path for
 history movement, and restores the conversation scroll with bounded convergence

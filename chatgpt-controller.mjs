@@ -291,6 +291,42 @@ function conversationWindowSignature(turns = []) {
   ]));
 }
 
+export function conversationStartBoundaryProof(state, { physicalTopStable = false } = {}) {
+  const boundary = state?.startBoundary || {};
+  const rangeMin = Number.isInteger(state?.range?.min) ? state.range.min : null;
+  const firstMessagePosition = Number.isInteger(boundary.firstMessagePosition)
+    ? boundary.firstMessagePosition
+    : Number.isInteger(state?.firstMessagePosition) ? state.firstMessagePosition : null;
+  const firstMessageRole = boundary.firstMessageRole === 'user' || boundary.firstMessageRole === 'assistant'
+    ? boundary.firstMessageRole
+    : state?.firstMessageRole === 'user' || state?.firstMessageRole === 'assistant' ? state.firstMessageRole : null;
+  const positionZeroMessageNodeCount = Number.isInteger(boundary.positionZeroMessageNodeCount)
+    ? boundary.positionZeroMessageNodeCount
+    : null;
+  const positionZeroMarkerInsideScrollerCount = Number.isInteger(boundary.positionZeroMarkerInsideScrollerCount)
+    ? boundary.positionZeroMarkerInsideScrollerCount
+    : null;
+  const positionOneMessageNodeCount = Number.isInteger(boundary.positionOneMessageNodeCount)
+    ? boundary.positionOneMessageNodeCount
+    : null;
+  const evidence = {
+    rangeMin,
+    firstMessagePosition,
+    firstMessageRole,
+    positionZeroMessageNodeCount,
+    positionZeroMarkerInsideScrollerCount,
+    positionOneMessageNodeCount
+  };
+  if (!physicalTopStable) return { proven: false, mode: null, ...evidence };
+  if (rangeMin === 0) return { proven: true, mode: 'zero-origin', ...evidence };
+  const oneOrigin = rangeMin === 1
+    && firstMessagePosition === 1
+    && firstMessageRole === 'user'
+    && positionZeroMessageNodeCount === 0
+    && positionZeroMarkerInsideScrollerCount === 0;
+  return { proven: oneOrigin, mode: oneOrigin ? 'one-origin' : null, ...evidence };
+}
+
 function probeWindowSummary(state) {
   const scroller = state?.scroller;
   const range = conversationTurnRange(state?.turns);
@@ -662,6 +698,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     const maxCharsPerTurn = ${maxCharsPerTurn};
     const maxTotalChars = ${maxTotalChars};
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
     const excludedSelector = [
       'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
       '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
@@ -768,6 +805,15 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     const resolved = resolveConversationScroller();
     const scroller = resolved.selected?.node || null;
     const turns = extract();
+    const messageNodesInScroller = scroller
+      ? messageNodes().filter((node) => node === scroller || scroller.contains?.(node))
+      : [];
+    const positionZeroMessageNodeCount = messageNodesInScroller.filter((node) => parsePosition(node) === 0).length;
+    const positionOneMessageNodeCount = messageNodesInScroller.filter((node) => parsePosition(node) === 1).length;
+    const positionZeroMarkerInsideScrollerCount = scroller
+      ? Array.from(document.querySelectorAll(markerSelector)).filter((node) => (node === scroller || scroller.contains?.(node)) && parsePosition(node) === 0).length
+      : 0;
+    const firstMessage = turns[0] || null;
     const values = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
     const range = { min: values.length ? Math.min(...values) : null, max: values.length ? Math.max(...values) : null };
     const totalChars = turns.reduce((sum, turn) => sum + turn.text.length, 0);
@@ -795,6 +841,13 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       loading: Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0,
       signature,
       range,
+      startBoundary: {
+        firstMessagePosition: Number.isInteger(firstMessage?.positionHint) ? firstMessage.positionHint : null,
+        firstMessageRole: firstMessage?.role === 'user' || firstMessage?.role === 'assistant' ? firstMessage.role : null,
+        positionZeroMessageNodeCount,
+        positionZeroMarkerInsideScrollerCount,
+        positionOneMessageNodeCount
+      },
       scroller: scroller ? {
         ...resolved.diagnostic,
         scrollTop: Number(scroller.scrollTop),
@@ -3242,6 +3295,8 @@ export class ChatGPTController {
       oldestProgression: [],
       tailProven: false,
       startProven: false,
+      startProofMode: null,
+      startBoundary: null,
       conversationWindowChangeCount: 0,
       physicalScrollChangeCount: 0,
       nativeInput: {
@@ -3302,7 +3357,8 @@ export class ChatGPTController {
         distanceMatched: false,
         signatureMatched: false,
         lastFailureReason: null
-      }
+      },
+      urlStable: true
     };
     let current = null;
     let initialUrl = '';
@@ -3325,7 +3381,11 @@ export class ChatGPTController {
         : diagnostics.observedRange;
       return range;
     };
-    const currentUrlIsStable = (state) => String(state?.url || '') === initialUrl;
+    const currentUrlIsStable = (state) => {
+      const stable = String(state?.url || '') === initialUrl;
+      if (!stable) diagnostics.urlStable = false;
+      return stable;
+    };
     const historyElapsedMs = () => Date.now() - (historyStartedAt ?? operationStartedAt);
     const readWindow = async () => await this.#eval(buildConversationWindowReadScript(limits));
     const recordNativeInputRuntime = async () => {
@@ -3727,8 +3787,10 @@ export class ChatGPTController {
               previousTop = signature;
               current = settled;
               if (stableTopCount >= CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
-                const range = conversationTurnRange(settled.turns);
-                diagnostics.startProven = range.min === 0;
+                const proof = conversationStartBoundaryProof(settled, { physicalTopStable: true });
+                diagnostics.startBoundary = proof;
+                diagnostics.startProofMode = proof.mode;
+                diagnostics.startProven = proof.proven;
                 startReached = diagnostics.startProven;
                 snapshotStable = true;
                 reason = diagnostics.startProven ? null : 'history-start-unproven';
@@ -3966,6 +4028,10 @@ export class ChatGPTController {
           if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
           if (!reason && !merged.continuous) reason = 'history-gap';
           if (!reason && turns.length > limits.maxTurns) reason = 'turn-limit';
+          if (result.diagnostics && typeof result.diagnostics === 'object') {
+            result.diagnostics.mergeAmbiguous = merged.ambiguous;
+            result.diagnostics.mergeContinuous = merged.continuous;
+          }
           history = historyMetadata({
             mode,
             complete: !reason && result.tailProven === true && result.startReached === true && result.startPositionProof === true && result.snapshotStable === true && merged.continuous && !merged.ambiguous,

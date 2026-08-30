@@ -566,6 +566,7 @@ function sanitizeConversationStartMarkerDiagnostic(value) {
   const states = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
   const visibilityStates = new Set(['visible', 'hidden']);
   const number = (item, { min = -1_000_000, max = 1_000_000, integer = false } = {}) => {
+    if (item === null || item === undefined || typeof item === 'boolean' || (typeof item === 'string' && item.trim() === '')) return null;
     const parsed = Number(item);
     if (!Number.isFinite(parsed) || parsed < min || parsed > max) return null;
     return integer ? Math.trunc(parsed) : parsed;
@@ -628,6 +629,14 @@ function sanitizeConversationStartMarkerDiagnostic(value) {
     normalizationApplied: item.normalizationApplied === true, normalizedWindowState: states.has(item.normalizedWindowState) ? item.normalizedWindowState : null, normalizedAdapterMinimized: bool(item.normalizedAdapterMinimized), normalizedVisibilityState: visibilityStates.has(item.normalizedVisibilityState) ? item.normalizedVisibilityState : null, normalizedHidden: bool(item.normalizedHidden), normalizedHasFocus: bool(item.normalizedHasFocus),
     restoreAttempts: number(item.restoreAttempts, { min: 0, max: 2, integer: true }) || 0, restoreVerified: item.restoreVerified === true, restoredWindowState: states.has(item.restoredWindowState) ? item.restoredWindowState : null, restoredAdapterMinimized: bool(item.restoredAdapterMinimized), restoredVisibilityState: visibilityStates.has(item.restoredVisibilityState) ? item.restoredVisibilityState : null, restoredHidden: bool(item.restoredHidden), restoredHasFocus: bool(item.restoredHasFocus)
   } : null;
+  const startBoundary = item => item && typeof item === 'object' ? {
+    rangeMin: number(item.rangeMin, { min: 0, max: 1_000_000, integer: true }),
+    firstMessagePosition: number(item.firstMessagePosition, { min: 0, max: 1_000_000, integer: true }),
+    firstMessageRole: item.firstMessageRole === 'user' || item.firstMessageRole === 'assistant' ? item.firstMessageRole : null,
+    positionZeroMessageNodeCount: number(item.positionZeroMessageNodeCount, { min: 0, max: 100, integer: true }),
+    positionZeroMarkerInsideScrollerCount: number(item.positionZeroMarkerInsideScrollerCount, { min: 0, max: 100, integer: true }),
+    positionOneMessageNodeCount: number(item.positionOneMessageNodeCount, { min: 0, max: 100, integer: true })
+  } : null;
   const layoutSettle = data.layoutSettle && typeof data.layoutSettle === 'object' ? {
     attempted: data.layoutSettle.attempted === true,
     timeoutMs: number(data.layoutSettle.timeoutMs, { min: 1, max: 2_000, integer: true }),
@@ -648,7 +657,13 @@ function sanitizeConversationStartMarkerDiagnostic(value) {
     backend: data.backend === 'chrome-cdp' ? data.backend : null, preconditionPassed: data.preconditionPassed === true,
     before: state(data.before), normalized: state(data.normalized), initial: state(data.initial), wheelAttemptLimit: number(data.wheelAttemptLimit, { min: 0, max: 24, integer: true }) || 0, wheelAttempts: number(data.wheelAttempts, { min: 0, max: 24, integer: true }) || 0, physicalTopReached: data.physicalTopReached === true, physicalTopStable: data.physicalTopStable === true, stableTop: state(data.stableTop),
     markerPositions: positions, turnZero: compactSummary(data.turnZero), positionOne: compactSummary(data.positionOne), firstMessagePosition: number(data.firstMessagePosition, { min: 0, max: 1_000_000, integer: true }), firstMessageRole: data.firstMessageRole === 'user' || data.firstMessageRole === 'assistant' ? data.firstMessageRole : null, positionSource: source(data.positionSource), firstMessages: messages, firstMessageAncestors: ancestors, previousSiblings: siblings, scrollerMarkerOrder: scrollerOrder, messagePositionOrder: positionOrder, turnZeroElementExists: data.turnZeroElementExists === true, turnZeroContainsConversationMessage: data.turnZeroContainsConversationMessage === true,
-    layoutSettle, conversationRestore: restore, windowLifecycle: lifecycle(data.windowLifecycle), urlStable: data.urlStable !== false, reason: /^[a-z][a-z0-9-]{0,63}$/u.test(reason) ? reason : 'probe-precondition-failed'
+    startProofMode: ['zero-origin', 'one-origin'].includes(data.startProofMode) ? data.startProofMode : null,
+    startBoundary: startBoundary(data.startBoundary),
+    layoutSettle, conversationRestore: restore, windowLifecycle: lifecycle(data.windowLifecycle), urlStable: data.urlStable !== false, reason: (() => {
+      const rawReason = typeof data.reason === 'string' ? data.reason.trim() : '';
+      if (!rawReason) return null;
+      return /^[a-z][a-z0-9-]{0,63}$/u.test(rawReason) ? rawReason : 'probe-diagnostic-failed';
+    })()
   };
 }
 

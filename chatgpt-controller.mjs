@@ -26,6 +26,8 @@ const CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS = 540;
 const CONVERSATION_HISTORY_TOP_STABLE_SAMPLES = 4;
 const CONVERSATION_HISTORY_RESTORE_ATTEMPTS = 4;
 const CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS = 240;
+const CONVERSATION_HISTORY_TAIL_RECHECK_WAIT_MS = 200;
+const CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES = 3;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -3580,6 +3582,22 @@ export class ChatGPTController {
         signatureMatched: false,
         lastFailureReason: null
       },
+      tailRecheck: {
+        attempted: false,
+        mode: null,
+        sampleCount: 0,
+        requiredStableSamples: CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES,
+        stableSampleCount: 0,
+        verified: false,
+        baselineSignature: null,
+        restoredSignature: null,
+        atBottom: false,
+        loading: null,
+        reason: null
+      },
+      iterationLimitReached: false,
+      iterationLimitReachedAtTop: false,
+      topProofStartedAtIteration: null,
       timing: {
         historyElapsedMs: 0,
         traversalElapsedMs: 0,
@@ -3607,6 +3625,7 @@ export class ChatGPTController {
     let startReached = false;
     let snapshotStable = false;
     let tailSnapshot = null;
+    let tailBaselineSignature = null;
     let iterations = 0;
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
@@ -3958,6 +3977,62 @@ export class ChatGPTController {
       }
       return false;
     };
+    const recheckTail = async () => {
+      const recheck = diagnostics.tailRecheck;
+      recheck.attempted = true;
+      recheck.mode = restoreMode;
+      if (restoreMode !== 'bottom') {
+        recheck.reason = 'not-applicable';
+        return true;
+      }
+      if (!tailBaselineSignature) {
+        recheck.reason = 'tail-baseline-missing';
+        return false;
+      }
+      let stableCount = 0;
+      for (let sample = 0; sample < CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES; sample += 1) {
+        if (sample > 0) await sleep(CONVERSATION_HISTORY_TAIL_RECHECK_WAIT_MS);
+        let state = null;
+        try {
+          state = await readWindow();
+        } catch {
+          recheck.reason = 'read-failed';
+          break;
+        }
+        recheck.sampleCount += 1;
+        if (!currentUrlIsStable(state)) {
+          recheck.reason = 'url-changed';
+          break;
+        }
+        if (state?.limitExceeded) {
+          recheck.reason = 'limit-exceeded';
+          break;
+        }
+        if (state?.scroller?.candidateCount !== 1) {
+          recheck.reason = state?.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
+          break;
+        }
+        const signature = conversationTailSignature(state.turns);
+        const atBottom = state.scroller.atBottom === true;
+        const loading = state.loading === true;
+        recheck.restoredSignature = textDigest(signature).slice(0, 32);
+        recheck.atBottom = atBottom;
+        recheck.loading = loading;
+        if (atBottom && !loading && signature === tailBaselineSignature) {
+          stableCount += 1;
+        } else {
+          stableCount = 0;
+        }
+        recheck.stableSampleCount = stableCount;
+        if (stableCount >= CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES) {
+          recheck.verified = true;
+          recheck.reason = null;
+          return true;
+        }
+      }
+      if (!recheck.reason) recheck.reason = recheck.atBottom ? 'signature-mismatch' : 'bottom-unverified';
+      return false;
+    };
     const restoreWindow = async () => {
       if (!windowNormalizationApplied) {
         diagnostics.windowLifecycle.restoreVerified = true;
@@ -4047,6 +4122,8 @@ export class ChatGPTController {
               if (!currentUrlIsStable(settledTail)) { reason = 'conversation-changed'; break; }
               if (settledTail?.limitExceeded) { reason = settledTail.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
               tailSnapshot = settledTail;
+              tailBaselineSignature = conversationTailSignature(settledTail.turns);
+              diagnostics.tailRecheck.baselineSignature = textDigest(tailBaselineSignature).slice(0, 32);
               current = settledTail;
               addSnapshot(settledTail);
               diagnostics.tailRange = conversationTurnRange(settledTail.turns);
@@ -4060,9 +4137,12 @@ export class ChatGPTController {
 
       if (!reason && diagnostics.tailProven) {
         topProofStartedAt = Date.now();
+        diagnostics.topProofStartedAtIteration = iterations;
         let noProgressCount = 0;
-        while (iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
+        while (historyElapsedMs() <= historyTimeoutMs && !reason) {
           if (current?.scroller?.atTop && !current.loading) {
+            diagnostics.iterationLimitReached = iterations >= historyMaxIterations;
+            diagnostics.iterationLimitReachedAtTop = diagnostics.iterationLimitReached;
             let stableTopCount = 0;
             let previousTop = null;
             for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && historyElapsedMs() <= historyTimeoutMs; sample += 1) {
@@ -4091,6 +4171,12 @@ export class ChatGPTController {
             }
             if (reason || startReached) break;
           }
+          if (iterations >= historyMaxIterations) {
+            diagnostics.iterationLimitReached = true;
+            diagnostics.iterationLimitReachedAtTop = current?.scroller?.atTop === true;
+            reason = 'history-iteration-limit';
+            break;
+          }
           const before = current;
           const result = await nativeWheel(-1, current);
           if (!result.ok) { reason = result.reason; break; }
@@ -4103,7 +4189,7 @@ export class ChatGPTController {
         if (!startReached && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-start-unproven';
       }
 
-      if (!reason && startReached && tailSnapshot) {
+      if (!reason && startReached && tailSnapshot && restoreMode !== 'bottom') {
         const tailBaseline = conversationTailSignature(tailSnapshot.turns);
         let tailCheck = current;
         let tailCheckAttempts = 0;
@@ -4123,6 +4209,10 @@ export class ChatGPTController {
     } finally {
       restoreStartedAt = Date.now();
       diagnostics.scrollRestored = await restore();
+      if (diagnostics.scrollRestored && restoreMode === 'bottom') {
+        const tailVerified = await recheckTail();
+        if (!tailVerified && !reason) reason = 'conversation-changed';
+      }
       const windowRestored = await restoreWindow();
       if (!windowRestored && !reason) reason = 'history-window-restore-failed';
     }

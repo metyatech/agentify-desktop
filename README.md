@@ -358,8 +358,12 @@ before restoring the original window state; a baseline that starts at the
 latest tail restores to the logical bottom rather than requiring an old
 virtualized window signature. Wheel traversal uses lightweight identity reads
 and captures a full snapshot only for distinct mounted windows or proof
-boundaries. Its default history budget is the existing maximum of 30 seconds
-or 80 iterations, and bounded lifecycle/restore diagnostics are recorded. Both complete mode and the start-marker diagnostic
+boundaries. After complete traversal, a bottom-start baseline is restored and
+verified with bounded read-only tail samples before the original window state
+is restored. The final allowed wheel can feed top stabilization without an
+additional history iteration. Its default history budget is the existing
+maximum of 30 seconds or 80 iterations, and bounded lifecycle/restore
+diagnostics are recorded. Both complete mode and the start-marker diagnostic
 wait for three consecutive stable conversation-layout samples after native
 window readiness before adopting a baseline. Other backends retain their
 existing native scrolling path.

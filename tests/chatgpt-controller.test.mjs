@@ -1311,6 +1311,35 @@ test('chatgpt-controller: Chrome complete history uses mouseWheel and never uses
   assert.equal(harness.getWheelCount() > 0, true);
 });
 
+test('chatgpt-controller: top proof consumes the state from the final allowed wheel', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    mouseWheelPlan: ({ attempt, deltaY }) => {
+      if (deltaY > 0) return { windowIndex: 4, scrollTop: null };
+      if (attempt === 80) return { windowIndex: 0, scrollTop: 0 };
+      if (attempt === 79) return { windowIndex: 1, scrollTop: 250 };
+      if (attempt === 78) return { windowIndex: 2, scrollTop: 500 };
+      return { windowIndex: 3, scrollTop: Math.max(10, 800 - attempt * 10) };
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 30_000,
+    historyMaxIterations: 80
+  });
+  const diagnostics = result.history.diagnostics;
+  assert.equal(harness.getWheelCount(), 80);
+  assert.equal(diagnostics.iterationLimitReached, true);
+  assert.equal(diagnostics.iterationLimitReachedAtTop, true);
+  assert.equal(diagnostics.startProven, true);
+  assert.equal(result.history.startReached, true);
+  assert.equal(result.history.complete, true);
+  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
+});
+
 test('chatgpt-controller: Chrome complete history does not fall back to scrollGesture when mouseWheel fails', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', scrollGesture: true, scrollGestureSource: 'touch' });
   harness.page.mouseWheel = async () => {
@@ -2193,6 +2222,9 @@ test('chatgpt-controller: complete history proves an already-tail start with a n
   assert.equal(result.history.complete, true);
   assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
   assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
+  assert.equal(result.history.diagnostics.tailRecheck.mode, 'bottom');
+  assert.equal(result.history.diagnostics.tailRecheck.verified, true);
+  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 

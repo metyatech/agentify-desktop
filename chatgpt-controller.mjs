@@ -1873,6 +1873,27 @@ export class ChatGPTController {
     return await this.page.getUrl();
   }
 
+  async getNativeInputDiagnostics() {
+    if (typeof this.page?.getNativeInputDiagnostics !== 'function') {
+      return {
+        backend: null,
+        pageClosed: null,
+        browserWindowState: null,
+        boundsKnown: false,
+        adapterMinimized: null,
+        documentVisibilityState: null,
+        documentHidden: null,
+        documentHasFocus: null,
+        windowVisible: null,
+        windowFocused: null,
+        windowMinimized: null,
+        windowDestroyed: null,
+        webContentsDestroyed: null
+      };
+    }
+    return await this.page.getNativeInputDiagnostics();
+  }
+
   async readPageText({ maxChars = 200_000 } = {}) {
     const text = await this.#eval(`(() => {
       const cap = ${maxChars};

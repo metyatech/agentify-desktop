@@ -115,6 +115,76 @@ test('http-api: status returns getStatus output', async (t) => {
   assert.equal(data.url, 'https://chatgpt.com/');
 });
 
+test('http-api: native input diagnostics are read-only, serialized, and bounded', async (t) => {
+  let exclusive = false;
+  const controller = {
+    runExclusive: async (fn) => {
+      assert.equal(exclusive, false);
+      exclusive = true;
+      try {
+        return await fn();
+      } finally {
+        exclusive = false;
+      }
+    },
+    getNativeInputDiagnostics: async () => {
+      assert.equal(exclusive, true);
+      return {
+        backend: 'chrome-cdp',
+        pageClosed: false,
+        browserWindowState: 'minimized',
+        boundsKnown: true,
+        adapterMinimized: true,
+        documentVisibilityState: 'hidden',
+        documentHidden: true,
+        documentHasFocus: false,
+        windowMinimized: true,
+        windowVisible: null,
+        windowFocused: null,
+        windowDestroyed: null,
+        webContentsDestroyed: null,
+        windowId: 42,
+        targetId: 'target-secret'
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'tab-production', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    getControllerById: (id) => {
+      assert.equal(id, 'tab-production');
+      return controller;
+    }
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default',
+    vendors: [{ id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/' }],
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/native-input/diagnostics',
+    body: { key: 'autopilot-production' }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.backend, 'chrome-cdp');
+  assert.equal(data.browserWindowState, 'minimized');
+  assert.equal(data.adapterMinimized, true);
+  assert.equal(data.documentVisibilityState, 'hidden');
+  assert.equal(data.documentHidden, true);
+  assert.equal(data.documentHasFocus, false);
+  assert.equal(Object.hasOwn(data, 'windowId'), false);
+  assert.equal(Object.hasOwn(data, 'targetId'), false);
+});
+
 test('http-api: authenticated autopilot status endpoint validates and stores only snapshots', async (t) => {
   const stored = [];
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };

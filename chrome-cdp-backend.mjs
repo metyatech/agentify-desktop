@@ -51,6 +51,7 @@ const MAX_SCROLL_GESTURE_COORDINATE = 10_000;
 const MAX_SCROLL_GESTURE_DISTANCE = 10_000;
 const MIN_SCROLL_GESTURE_SPEED = 100;
 const MAX_SCROLL_GESTURE_SPEED = 5_000;
+const CHROME_WINDOW_STATES = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
 
 function sanitizeBrowserEvaluationText(value) {
   let text = String(value ?? '')
@@ -700,14 +701,49 @@ class ChromeCdpPageAdapter {
   }
 
   async getNativeInputDiagnostics() {
+    let browserWindowState = null;
+    let boundsKnown = false;
+    if (this.windowId != null && Number.isSafeInteger(this.windowId)) {
+      try {
+        const result = await this.client.send('Browser.getWindowBounds', { windowId: this.windowId });
+        const state = String(result?.bounds?.windowState || '').trim().toLowerCase();
+        if (CHROME_WINDOW_STATES.has(state)) {
+          browserWindowState = state;
+          boundsKnown = true;
+        }
+      } catch {}
+    }
+
+    let documentVisibilityState = null;
+    let documentHidden = null;
+    let documentHasFocus = null;
+    try {
+      const visibility = await this.evaluate(`(() => ({
+        visibilityState: document.visibilityState,
+        hidden: document.hidden,
+        hasFocus: document.hasFocus()
+      }))()`);
+      const state = String(visibility?.visibilityState || '').trim().toLowerCase();
+      if (state === 'visible' || state === 'hidden') documentVisibilityState = state;
+      if (typeof visibility?.hidden === 'boolean') documentHidden = visibility.hidden;
+      if (typeof visibility?.hasFocus === 'boolean') documentHasFocus = visibility.hasFocus;
+    } catch {}
+
+    const adapterMinimized = this.isMinimized();
     return {
       backend: 'chrome-cdp',
       pageClosed: this.isClosed(),
+      browserWindowState,
+      boundsKnown,
+      adapterMinimized,
+      documentVisibilityState,
+      documentHidden,
+      documentHasFocus,
       windowDestroyed: null,
       webContentsDestroyed: null,
       windowVisible: null,
       windowFocused: null,
-      windowMinimized: null
+      windowMinimized: boundsKnown ? browserWindowState === 'minimized' : adapterMinimized
     };
   }
 

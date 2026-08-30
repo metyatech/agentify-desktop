@@ -355,6 +355,22 @@ Markdown, JSON, and code blocks are preserved. The endpoint is intended for the
 ai-autopilot approval watcher and uses the existing loopback and bearer-token
 security boundary.
 
+For read-only browser visibility diagnostics without scrolling, use the
+authenticated endpoint:
+
+```text
+POST /native-input/diagnostics
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"key":"autopilot-production"}
+```
+
+This endpoint serializes the controller operation and reads only bounded window
+state and document visibility/focus values. It does not call scroll, pointer,
+keyboard, focus, bring-to-front, or window-bounds mutation APIs, and it does not
+expose CDP window, target, or session identifiers.
+
 ## Windows Notes
 
 Use Node.js 20 or 22 on Windows. Agentify Desktop is tested against Windows in CI, including the npm CLI launcher path.

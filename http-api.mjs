@@ -332,6 +332,32 @@ async function runExclusive(controller, fn) {
   return await fn();
 }
 
+function sanitizeNativeInputDiagnostics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const windowStates = new Set(['normal', 'minimized', 'maximized', 'fullscreen']);
+  const visibilityStates = new Set(['visible', 'hidden']);
+  const boolOrNull = (item) => typeof item === 'boolean' ? item : null;
+  const enumOrNull = (item, allowed) => {
+    const text = String(item || '').trim().toLowerCase();
+    return allowed.has(text) ? text : null;
+  };
+  return {
+    backend: data.backend === 'chrome-cdp' || data.backend === 'electron' ? data.backend : null,
+    pageClosed: boolOrNull(data.pageClosed),
+    browserWindowState: enumOrNull(data.browserWindowState, windowStates),
+    boundsKnown: data.boundsKnown === true,
+    adapterMinimized: boolOrNull(data.adapterMinimized),
+    documentVisibilityState: enumOrNull(data.documentVisibilityState, visibilityStates),
+    documentHidden: boolOrNull(data.documentHidden),
+    documentHasFocus: boolOrNull(data.documentHasFocus),
+    windowMinimized: boolOrNull(data.windowMinimized),
+    windowVisible: boolOrNull(data.windowVisible),
+    windowFocused: boolOrNull(data.windowFocused),
+    windowDestroyed: boolOrNull(data.windowDestroyed),
+    webContentsDestroyed: boolOrNull(data.webContentsDestroyed)
+  };
+}
+
 function normalizeVendorToken(value) {
   return String(value || '')
     .trim()
@@ -1093,6 +1119,26 @@ export function startHttpApi({
 
       if (url.pathname === '/tabs' && req.method === 'GET') {
         return sendJson(res, 200, { ok: true, tabs: tabs.listTabs(), defaultTabId });
+      }
+      if (url.pathname === '/native-input/diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.getNativeInputDiagnostics !== 'function') {
+          throw new Error('native_input_diagnostics_unavailable');
+        }
+        const diagnostics = await runExclusive(controller, async () => controller.getNativeInputDiagnostics());
+        return sendJson(res, 200, { ok: true, tabId: tab.id, ...sanitizeNativeInputDiagnostics(diagnostics) });
       }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
         const bundles = await listBundles(stateDir);

@@ -683,14 +683,111 @@ test('chrome-cdp-backend: native input diagnostics expose bounded page state', a
   assert.deepEqual(await session.page.getNativeInputDiagnostics(), {
     backend: 'chrome-cdp',
     pageClosed: false,
+    browserWindowState: null,
+    boundsKnown: false,
+    adapterMinimized: true,
+    documentVisibilityState: null,
+    documentHidden: null,
+    documentHasFocus: null,
     windowDestroyed: null,
     webContentsDestroyed: null,
     windowVisible: null,
     windowFocused: null,
-    windowMinimized: null
+    windowMinimized: true
   });
   await session.close();
   assert.equal((await session.page.getNativeInputDiagnostics()).pageClosed, true);
+});
+
+test('chrome-cdp-backend: native input diagnostics read browser bounds and document visibility without mutation', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  calls.length = 0;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Browser.getWindowBounds') {
+      calls.push({ method, params, sessionId });
+      return { bounds: { windowState: 'normal' } };
+    }
+    if (method === 'Runtime.evaluate' && params?.expression?.includes('document.visibilityState')) {
+      return { result: { value: { visibilityState: 'visible', hidden: false, hasFocus: false } } };
+    }
+    return await originalSend(method, params, sessionId);
+  };
+  session.page.minimized = true;
+
+  assert.deepEqual(await session.page.getNativeInputDiagnostics(), {
+    backend: 'chrome-cdp',
+    pageClosed: false,
+    browserWindowState: 'normal',
+    boundsKnown: true,
+    adapterMinimized: true,
+    documentVisibilityState: 'visible',
+    documentHidden: false,
+    documentHasFocus: false,
+    windowDestroyed: null,
+    webContentsDestroyed: null,
+    windowVisible: null,
+    windowFocused: null,
+    windowMinimized: false
+  });
+  assert.equal(calls.some((call) => call.method === 'Browser.getWindowBounds' && call.params?.windowId === 9), true);
+  assert.equal(calls.some((call) => call.method === 'Page.bringToFront'), false);
+  assert.equal(calls.some((call) => call.method === 'Browser.setWindowBounds'), false);
+  assert.equal(calls.some((call) => call.method.startsWith('Input.')), false);
+  await session.close();
+});
+
+test('chrome-cdp-backend: native input diagnostics preserve minimized and unavailable bounds separately', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  calls.length = 0;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Browser.getWindowBounds') throw new Error('bounds_unavailable_with_secret_token');
+    if (method === 'Runtime.evaluate' && params?.expression?.includes('document.visibilityState')) {
+      return { result: { value: { visibilityState: 'hidden', hidden: true, hasFocus: false } } };
+    }
+    return await originalSend(method, params, sessionId);
+  };
+
+  const result = await session.page.getNativeInputDiagnostics();
+  assert.equal(result.browserWindowState, null);
+  assert.equal(result.boundsKnown, false);
+  assert.equal(result.adapterMinimized, true);
+  assert.equal(result.windowMinimized, true);
+  assert.equal(result.documentVisibilityState, 'hidden');
+  assert.equal(result.documentHidden, true);
+  assert.equal(result.documentHasFocus, false);
+  assert.equal(JSON.stringify(result).includes('secret_token'), false);
+  assert.equal(calls.some((call) => call.method.startsWith('Input.')), false);
+  await session.close();
+});
+
+test('chrome-cdp-backend: native input diagnostics report an actual minimized browser window', async () => {
+  const { session, calls } = await createSessionWithFileInputs({});
+  const originalSend = session.page.client.send;
+  calls.length = 0;
+  session.page.client.send = async (method, params, sessionId) => {
+    if (method === 'Browser.getWindowBounds') {
+      calls.push({ method, params, sessionId });
+      return { bounds: { windowState: 'minimized' } };
+    }
+    if (method === 'Runtime.evaluate' && params?.expression?.includes('document.visibilityState')) {
+      return { result: { value: { visibilityState: 'hidden', hidden: true, hasFocus: false } } };
+    }
+    return await originalSend(method, params, sessionId);
+  };
+
+  const result = await session.page.getNativeInputDiagnostics();
+  assert.equal(result.browserWindowState, 'minimized');
+  assert.equal(result.boundsKnown, true);
+  assert.equal(result.adapterMinimized, true);
+  assert.equal(result.windowMinimized, true);
+  assert.equal(result.documentVisibilityState, 'hidden');
+  assert.equal(result.documentHidden, true);
+  assert.equal(result.documentHasFocus, false);
+  assert.equal(calls.some((call) => call.method === 'Browser.getWindowBounds' && call.params?.windowId === 9), true);
+  assert.equal(calls.some((call) => call.method.startsWith('Input.')), false);
+  await session.close();
 });
 
 function staleSessionError() {

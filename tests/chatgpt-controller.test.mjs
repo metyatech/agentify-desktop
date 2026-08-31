@@ -725,7 +725,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
         scrollTop: Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250,
         scrollHeight: Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400,
         clientHeight: 400,
-        atTop: windowIndex === 0,
+        atTop: (Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250) <= 1,
         atBottom: windowIndex === windows.length - 1,
         point: { x: 500, y: 400 }
       }
@@ -734,6 +734,11 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   const page = createPage({
     events,
     onEvaluate: async (js) => {
+      if (js.includes('const operation = "top";')) {
+        events.push('conversation-scroll-top');
+        scrollTopOverride = 0;
+        return { ok: true, scrollTop: 0 };
+      }
       if (js.includes('const targetDistance =')) {
         events.push('conversation-scroll-restore');
         const directTail = js.includes('const operation = "tail";');
@@ -2383,6 +2388,48 @@ test('chatgpt-controller: complete history proves an already-tail start without 
   assert.ok(result.history.diagnostics.tailRecheck.restoredEvidence.length <= 5);
   assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: low range candidate establishes direct top without another native wheel', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    positionOffset: 1,
+    mouseWheelPlan: ({ attempt }) => attempt === 1 ? { windowIndex: 0, scrollTop: 100 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.diagnostics.startProven, true);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 1);
+  assert.equal(result.history.diagnostics.directTop.candidateDetected, true);
+  assert.equal(result.history.diagnostics.directTop.candidateRangeMin, 1);
+  assert.equal(result.history.diagnostics.directTop.attempted, true);
+  assert.equal(result.history.diagnostics.directTop.commandSucceeded, true);
+  assert.equal(result.history.diagnostics.directTop.atTopVerified, true);
+  assert.equal(result.history.diagnostics.directTop.triggeredAtIteration, 1);
+  assert.equal(result.history.diagnostics.startProofMode, 'one-origin');
+  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).length, 1);
+});
+
+test('chatgpt-controller: zero-origin low range candidate also establishes direct top', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    mouseWheelPlan: ({ attempt }) => attempt === 1 ? { windowIndex: 0, scrollTop: 100 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.diagnostics.startProven, true);
+  assert.equal(result.history.diagnostics.directTop.candidateRangeMin, 0);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 1);
+});
+
+test('chatgpt-controller: range min two does not trigger direct top', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    positionOffset: 2,
+    mouseWheelPlan: ({ attempt }) => attempt === 1 ? { windowIndex: 0, scrollTop: 100 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.diagnostics.directTop.candidateDetected, false);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 2);
+  assert.equal(result.history.reason, 'history-start-unproven');
 });
 
 test('chatgpt-controller: start boundary proof accepts strict one-origin evidence without requiring contiguous positions', () => {

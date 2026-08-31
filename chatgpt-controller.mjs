@@ -1399,6 +1399,7 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
   return `(() => {
     const operation = ${JSON.stringify(operation)};
     const targetDistance = ${Math.max(0, Math.trunc(Number(distanceFromBottom) || 0))};
+    const targetTop = operation === 'top' ? 0 : null;
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
     const nodes = Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
       let parent = node.parentElement;
@@ -1428,7 +1429,9 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
     const nearest = distances.filter((item) => item.distance === nearestDistance);
     if (nearest.length !== 1) return { ok: false, reason: nearest.length > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found' };
     const node = nearest[0].node;
-    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - targetDistance);
+    node.scrollTop = targetTop === null
+      ? Math.max(0, node.scrollHeight - node.clientHeight - targetDistance)
+      : targetTop;
     return { ok: true, scrollTop: node.scrollTop };
   })()`;
 }
@@ -3581,6 +3584,18 @@ export class ChatGPTController {
         directVerified: false,
         fallbackUsed: false
       },
+      directTop: {
+        candidateDetected: false,
+        candidateRangeMin: null,
+        attempted: false,
+        commandSucceeded: false,
+        atTopVerified: false,
+        loading: null,
+        sampleCount: 0,
+        stableSampleCount: 0,
+        triggeredAtIteration: null,
+        reason: null
+      },
       observedRange: { min: null, max: null },
       oldestProgression: [],
       tailProven: false,
@@ -4023,6 +4038,55 @@ export class ChatGPTController {
       diagnostics.tailProven = true;
       return true;
     };
+    const establishDirectTop = async (candidateRangeMin) => {
+      const entry = diagnostics.directTop;
+      entry.candidateDetected = true;
+      entry.candidateRangeMin = Number.isInteger(candidateRangeMin) ? candidateRangeMin : null;
+      entry.triggeredAtIteration = iterations;
+      entry.attempted = true;
+      let command = null;
+      try { command = await this.#eval(buildRestoreConversationScrollScript(0, 'top')); } catch { command = null; }
+      if (command?.ok !== true) {
+        entry.reason = 'direct-top-command-failed';
+        reason ||= 'history-direct-top-failed';
+        return false;
+      }
+      entry.commandSucceeded = true;
+      let state = null;
+      try { state = await readWindow(); } catch {
+        entry.reason = 'direct-top-read-failed';
+        reason ||= 'history-direct-top-failed';
+        return false;
+      }
+      entry.sampleCount = 1;
+      if (!currentUrlIsStable(state)) {
+        entry.reason = 'conversation-changed';
+        reason ||= 'conversation-changed';
+        return false;
+      }
+      if (state?.limitExceeded) {
+        entry.reason = state.limitKind === 'per-turn' ? 'conversation-turn-too-large' : 'conversation-too-large';
+        reason ||= state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+        return false;
+      }
+      if (state?.scroller?.candidateCount !== 1) {
+        entry.reason = state?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
+        reason ||= entry.reason;
+        return false;
+      }
+      const before = current;
+      current = state;
+      entry.loading = state.loading === true;
+      entry.atTopVerified = state.scroller.atTop === true;
+      entry.stableSampleCount = entry.atTopVerified && !entry.loading ? 1 : 0;
+      if (entry.atTopVerified && !entry.loading) {
+        if (conversationWindowIdentitySignature(before?.turns) !== conversationWindowIdentitySignature(state.turns)) addSnapshot(state);
+        return true;
+      }
+      entry.reason = entry.loading ? 'direct-top-loading' : 'direct-top-not-verified';
+      reason ||= 'history-direct-top-failed';
+      return false;
+    };
     const restore = async () => {
       const restoreDiagnostics = diagnostics.conversationRestore;
       restoreDiagnostics.initialDistanceFromBottom = Number.isFinite(initialDistanceFromBottom) && initialDistanceFromBottom >= 0
@@ -4237,6 +4301,18 @@ export class ChatGPTController {
           if (proofDirection < 0 && !diagnostics.firstNativeUp) diagnostics.firstNativeUp = entry;
           if (proofDirection > 0 && !diagnostics.firstNativeDown) diagnostics.firstNativeDown = entry;
           if (!result.ok) { reason = result.reason; break; }
+          const candidateMin = result.range?.min;
+          if (proofDirection < 0
+            && !result.state?.scroller?.atTop
+            && (candidateMin === 0 || candidateMin === 1)) {
+            if (!await establishDirectTop(candidateMin)) break;
+            if (result.windowChanged) {
+              diagnostics.nativeScrollControlProven = true;
+              break;
+            }
+            reason = 'history-native-scroll-unproven';
+            break;
+          }
           if (result.windowChanged) {
             diagnostics.nativeScrollControlProven = true;
             break;
@@ -4292,6 +4368,11 @@ export class ChatGPTController {
         diagnostics.topProofStartedAtIteration = iterations;
         let noProgressCount = 0;
         while (historyElapsedMs() <= historyTimeoutMs && !reason) {
+          const currentMin = conversationTurnRange(current?.turns).min;
+          if (!current?.scroller?.atTop
+            && (currentMin === 0 || currentMin === 1)) {
+            if (!await establishDirectTop(currentMin)) break;
+          }
           if (current?.scroller?.atTop && !current.loading) {
             diagnostics.iterationLimitReached = iterations >= historyMaxIterations;
             diagnostics.iterationLimitReachedAtTop = diagnostics.iterationLimitReached;

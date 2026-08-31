@@ -4285,9 +4285,10 @@ export class ChatGPTController {
         // Preserve a preflight failure and only run the history state machine when setup passed.
       } else if (!initialUrl || !current?.scroller || current.scroller.candidateCount === 0) reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
-      else if (!tailOnly) {
+      else {
         traversalStartedAt = Date.now();
         await establishDirectTail();
+        if (!tailOnly) {
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;
@@ -4339,6 +4340,7 @@ export class ChatGPTController {
           if (proofNoProgress >= 2) reason = 'history-native-scroll-no-progress';
         }
         if (!diagnostics.nativeScrollControlProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
+        }
       }
 
       if (!reason && !diagnostics.tailProven) {

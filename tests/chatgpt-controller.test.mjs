@@ -2399,6 +2399,9 @@ test('chatgpt-controller: tail history is bounded and does not require start pro
   assert.equal(result.history.fullHistoryComplete, false);
   assert.equal(result.history.startReached, false);
   assert.equal(result.history.diagnostics.tailProven, true);
+  assert.equal(result.history.diagnostics.tailEntry.directAttempted, true);
+  assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
   assert.equal(result.history.scrollRestored, true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });

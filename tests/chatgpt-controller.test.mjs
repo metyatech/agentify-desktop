@@ -686,6 +686,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
   let restoreCount = 0;
   let scrollTopOverride = null;
   let scrollHeightOverride = null;
+  let loadingOverride = null;
   const initialState = initialBrowserWindowState || (backend === 'chrome-cdp' ? 'minimized' : null);
   let browserWindowState = initialState;
   let adapterMinimized = backend === 'chrome-cdp' ? initialState === 'minimized' : null;
@@ -706,7 +707,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
       })),
       limitExceeded: false,
       limitKind: null,
-      loading: false,
+      loading: loadingOverride === null ? false : loadingOverride,
       range: positionHints ? { min: positions[0], max: positions.at(-1) } : { min: null, max: null },
       startBoundary: {
         firstMessagePosition: positionHints ? positions[0] : null,
@@ -743,6 +744,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
           : typeof restorePlan === 'function'
             ? await restorePlan({ attempt: restoreCount, distance })
             : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
+        loadingOverride = typeof planned?.loading === 'boolean' ? planned.loading : false;
         if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollHeight))) scrollHeightOverride = Number(planned.scrollHeight);
         if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
         else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
@@ -1606,6 +1608,56 @@ test('chatgpt-controller: conversation restore recalculates against changed scro
   assert.equal(result.history.diagnostics.conversationRestore.distanceMatched, true);
   assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, null);
   assert.equal(result.history.diagnostics.conversationRestore.finalDistanceFromBottom, 500);
+});
+
+test('chatgpt-controller: anchored restore waits for loading to finish', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    restorePlan: ({ attempt }) => attempt === 1
+      ? { windowIndex: 4, loading: false }
+      : attempt === 2
+        ? { windowIndex: 2, loading: true }
+        : { windowIndex: 2, loading: false }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  const restore = result.history.diagnostics.conversationRestore;
+  assert.equal(result.history.complete, true);
+  assert.equal(restore.attempts, 3);
+  assert.equal(restore.verified, true);
+  assert.equal(restore.anchorLoadingMatched, true);
+});
+
+test('chatgpt-controller: anchored restore fails closed while loading never finishes', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    restorePlan: ({ attempt }) => attempt === 1
+      ? { windowIndex: 4, loading: false }
+      : { windowIndex: 2, loading: true }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  const restore = result.history.diagnostics.conversationRestore;
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.scrollRestored, false);
+  assert.equal(restore.verified, false);
+  assert.equal(restore.attempts, 4);
+  assert.equal(restore.anchorLoadingMatched, false);
+  assert.equal(restore.lastFailureReason, 'anchor-loading');
 });
 
 test('chatgpt-controller: permanent conversation restore mismatch is bounded and fails closed', async () => {

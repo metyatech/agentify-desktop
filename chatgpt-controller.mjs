@@ -3650,6 +3650,7 @@ export class ChatGPTController {
         distanceMatched: false,
         bottomMatched: false,
         anchorMatched: false,
+        anchorLoadingMatched: false,
         signatureMatched: false,
         anchorSignatureMode: 'semantic-role-text-digest',
         anchorBaselineEvidence: [],
@@ -4087,22 +4088,26 @@ export class ChatGPTController {
           const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
           const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - targetDistance) <= 2;
           const bottomMatched = restored.scroller.atBottom === true && restored.loading === false;
+          const anchorLoadingMatched = restored.loading === false;
           const anchorMatchCount = conversationSemanticAnchorMatchCount(originalSemanticAnchorSignature, restored.turns);
           const anchorMatched = anchorMatchCount === 1;
           restoreDiagnostics.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
           restoreDiagnostics.distanceMatched = distanceMatched;
           restoreDiagnostics.bottomMatched = bottomMatched;
+          restoreDiagnostics.anchorLoadingMatched = anchorLoadingMatched;
           restoreDiagnostics.anchorMatchCount = anchorMatchCount;
           restoreDiagnostics.anchorRestoredEvidence = conversationSemanticAnchorEvidence(restored.turns);
           restoreDiagnostics.anchorMatched = anchorMatched;
           restoreDiagnostics.signatureMatched = restoreDiagnostics.mode === 'bottom' ? null : null;
-          if (validate({ distanceMatched, bottomMatched, anchorMatched, restored })) {
+          if (validate({ distanceMatched, bottomMatched, anchorMatched, anchorLoadingMatched, restored })) {
             current = restored;
             return true;
           }
           restoreDiagnostics.lastFailureReason = targetMode === 'bottom'
             ? (distanceMatched ? 'bottom-mismatch' : 'distance-mismatch')
-            : (distanceMatched ? (anchorMatchCount === 0 ? 'anchor-not-found' : 'anchor-ambiguous') : 'distance-mismatch');
+            : (!anchorLoadingMatched
+              ? 'anchor-loading'
+              : (distanceMatched ? (anchorMatchCount === 0 ? 'anchor-not-found' : 'anchor-ambiguous') : 'distance-mismatch'));
         }
         return false;
       };
@@ -4123,7 +4128,7 @@ export class ChatGPTController {
         restoreDiagnostics.lastFailureReason = null;
         return true;
       }
-      const anchoredRestored = await restoreToTarget(restoreDiagnostics.initialDistanceFromBottom, ({ distanceMatched, anchorMatched }) => distanceMatched && anchorMatched, 'anchor');
+      const anchoredRestored = await restoreToTarget(restoreDiagnostics.initialDistanceFromBottom, ({ distanceMatched, anchorMatched, anchorLoadingMatched }) => distanceMatched && anchorMatched && anchorLoadingMatched, 'anchor');
       if (anchoredRestored) {
         restoreDiagnostics.verified = true;
         restoreDiagnostics.lastFailureReason = null;

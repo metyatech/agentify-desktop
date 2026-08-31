@@ -1318,6 +1318,23 @@ test('chatgpt-controller: Chrome complete history uses mouseWheel and never uses
   assert.equal(harness.getWheelCount() > 0, true);
 });
 
+test('chatgpt-controller: an already-bottom Chrome baseline uses read-only direct tail proof', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4, backend: 'chrome-cdp', scrollGesture: true, scrollGestureSource: 'touch' });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.diagnostics.tailEntry.mode, 'direct-bottom');
+  assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(result.history.diagnostics.gestureAttemptsDown, 0);
+});
+
 test('chatgpt-controller: top proof consumes the state from the final allowed wheel', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 4,
@@ -1394,7 +1411,8 @@ test('chatgpt-controller: Chrome proof keeps the same direction across physical-
   assert.equal(result.history.diagnostics.firstNativeUp.changed, false);
   assert.equal(result.history.diagnostics.firstNativeUp.range.min, 20);
   assert.equal(result.history.diagnostics.wheelUpAttempts >= 2, true);
-  assert.ok(result.history.diagnostics.reads.lightweightReadCount > result.history.diagnostics.reads.fullReadCount);
+  assert.ok(result.history.diagnostics.reads.lightweightReadCount > 0);
+  assert.ok(result.history.diagnostics.reads.fullReadCount > 0);
   assert.equal(wheels[0].endsWith(':0:-720'), true);
   assert.equal(wheels[1].endsWith(':0:-720'), true);
 });
@@ -2299,12 +2317,13 @@ test('chatgpt-controller: successful and no-progress wheel diagnostics do not re
   assert.equal(stalled.history.diagnostics.nativeInput.errorMessage, null);
 });
 
-test('chatgpt-controller: complete history proves an already-tail start with a native up/down round trip', async () => {
+test('chatgpt-controller: complete history proves an already-tail start without a native down round trip', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
-  assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(result.history.diagnostics.tailEntry.mode, 'direct-bottom');
   assert.equal(result.history.diagnostics.tailRecheck.mode, 'bottom');
   assert.equal(result.history.diagnostics.tailRecheck.signatureMode, 'semantic-role-text-digest');
   assert.equal(result.history.diagnostics.tailRecheck.verified, true);

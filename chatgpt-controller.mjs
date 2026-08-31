@@ -4216,7 +4216,7 @@ export class ChatGPTController {
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
       else {
         traversalStartedAt = Date.now();
-        if (current.scroller.atBottom !== true) await establishDirectTail();
+        await establishDirectTail();
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;

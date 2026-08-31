@@ -1414,32 +1414,55 @@ test('chatgpt-controller: complete history defaults use the existing maximum bud
   assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 120);
 });
 
-test('chatgpt-controller: semantic tail signature ignores remounted DOM identities', () => {
+test('chatgpt-controller: semantic tail signature ignores remounted identities and position hints', () => {
   const baseline = conversationSemanticTailSignature([
     { role: 'assistant', messageId: 'old-a', turnId: 'old-t-a', positionHint: 58, text: ' first answer \n' },
     { role: 'user', messageId: 'old-u', turnId: 'old-t-u', positionHint: 59, text: 'follow-up' },
-    { role: 'assistant', messageId: 'old-a2', turnId: 'old-t-a2', positionHint: 60, text: 'final response' }
+    { role: 'assistant', messageId: 'old-a2', turnId: 'old-t-a2', positionHint: 60, text: 'final response' },
+    { role: 'user', messageId: 'old-u2', turnId: 'old-t-u2', positionHint: 64, text: 'one more question' },
+    { role: 'assistant', messageId: 'old-a3', turnId: 'old-t-a3', positionHint: 70, text: 'one more answer' }
   ]);
   const remounted = conversationSemanticTailSignature([
-    { role: 'assistant', messageId: 'new-a', turnId: 'new-t-a', positionHint: 58, text: 'first answer' },
-    { role: 'user', messageId: 'new-u', turnId: 'new-t-u', positionHint: 59, text: 'follow-up' },
-    { role: 'assistant', messageId: 'new-a2', turnId: 'new-t-a2', positionHint: 60, text: 'final response' }
+    { role: 'assistant', messageId: 'new-a', turnId: 'new-t-a', positionHint: 101, text: 'first answer' },
+    { role: 'user', messageId: 'new-u', turnId: 'new-t-u', positionHint: 105, text: 'follow-up' },
+    { role: 'assistant', messageId: 'new-a2', turnId: 'new-t-a2', positionHint: 109, text: 'final response' },
+    { role: 'user', messageId: 'new-u2', turnId: 'new-t-u2', positionHint: 114, text: 'one more question' },
+    { role: 'assistant', messageId: 'new-a3', turnId: 'new-t-a3', positionHint: 120, text: 'one more answer' }
   ]);
   assert.equal(remounted, baseline);
-  assert.notEqual(conversationSemanticTailSignature([
-    { role: 'assistant', positionHint: 58, text: 'first answer' },
-    { role: 'user', positionHint: 59, text: 'follow-up' },
-    { role: 'user', positionHint: 60, text: 'final response' }
+  assert.equal(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 1, text: 'first answer' },
+    { role: 'user', positionHint: 2, text: 'follow-up' },
+    { role: 'assistant', positionHint: 3, text: 'final response' },
+    { role: 'user', positionHint: 4, text: 'one more question' },
+    { role: 'assistant', positionHint: 5, text: 'one more answer' }
   ]), baseline);
   assert.notEqual(conversationSemanticTailSignature([
     { role: 'assistant', positionHint: 58, text: 'first answer' },
     { role: 'user', positionHint: 59, text: 'follow-up' },
-    { role: 'assistant', positionHint: 61, text: 'final response' }
+    { role: 'user', positionHint: 60, text: 'final response' },
+    { role: 'user', positionHint: 64, text: 'one more question' },
+    { role: 'assistant', positionHint: 70, text: 'one more answer' }
   ]), baseline);
   assert.notEqual(conversationSemanticTailSignature([
     { role: 'assistant', positionHint: 58, text: 'changed answer' },
     { role: 'user', positionHint: 59, text: 'follow-up' },
-    { role: 'assistant', positionHint: 60, text: 'final response' }
+    { role: 'assistant', positionHint: 60, text: 'final response' },
+    { role: 'user', positionHint: 64, text: 'one more question' },
+    { role: 'assistant', positionHint: 70, text: 'one more answer' }
+  ]), baseline);
+  assert.notEqual(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 58, text: 'first answer' },
+    { role: 'user', positionHint: 59, text: 'follow-up' },
+    { role: 'assistant', positionHint: 60, text: 'final response' },
+    { role: 'user', positionHint: 64, text: 'one more question' }
+  ]), baseline);
+  assert.notEqual(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 58, text: 'first answer' },
+    { role: 'user', positionHint: 59, text: 'follow-up' },
+    { role: 'user', positionHint: 60, text: 'final response' },
+    { role: 'assistant', positionHint: 64, text: 'one more question' },
+    { role: 'assistant', positionHint: 70, text: 'one more answer' }
   ]), baseline);
 });
 
@@ -2253,8 +2276,10 @@ test('chatgpt-controller: complete history proves an already-tail start with a n
   assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
   assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
   assert.equal(result.history.diagnostics.tailRecheck.mode, 'bottom');
-  assert.equal(result.history.diagnostics.tailRecheck.signatureMode, 'semantic-role-position-text-digest');
+  assert.equal(result.history.diagnostics.tailRecheck.signatureMode, 'semantic-role-text-digest');
   assert.equal(result.history.diagnostics.tailRecheck.verified, true);
+  assert.ok(result.history.diagnostics.tailRecheck.baselineEvidence.length <= 5);
+  assert.ok(result.history.diagnostics.tailRecheck.restoredEvidence.length <= 5);
   assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });

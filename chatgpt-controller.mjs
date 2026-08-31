@@ -519,11 +519,22 @@ function conversationTailSignature(turns = []) {
 }
 
 export function conversationSemanticTailSignature(turns = []) {
-  return JSON.stringify((Array.isArray(turns) ? turns : []).slice(-3).map((turn) => [
+  return JSON.stringify((Array.isArray(turns) ? turns : []).slice(-5).map((turn) => [
     turn?.role || null,
-    Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
     textDigest(normalizeConversationText(turn?.text))
   ]));
+}
+
+function conversationSemanticTailEvidence(turns = []) {
+  return (Array.isArray(turns) ? turns : []).slice(-5).map((turn) => {
+    const normalizedText = normalizeConversationText(turn?.text);
+    return {
+      role: turn?.role || null,
+      positionHint: Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
+      textLength: normalizedText.length,
+      textDigest: textDigest(normalizedText).slice(0, 32)
+    };
+  });
 }
 
 export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
@@ -3593,13 +3604,15 @@ export class ChatGPTController {
       tailRecheck: {
         attempted: false,
         mode: null,
-        signatureMode: 'semantic-role-position-text-digest',
+        signatureMode: 'semantic-role-text-digest',
         sampleCount: 0,
         requiredStableSamples: CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES,
         stableSampleCount: 0,
         verified: false,
         baselineSignature: null,
         restoredSignature: null,
+        baselineEvidence: [],
+        restoredEvidence: [],
         atBottom: false,
         loading: null,
         reason: null
@@ -4022,6 +4035,7 @@ export class ChatGPTController {
           break;
         }
         const signature = conversationSemanticTailSignature(state.turns);
+        recheck.restoredEvidence = conversationSemanticTailEvidence(state.turns);
         const atBottom = state.scroller.atBottom === true;
         const loading = state.loading === true;
         recheck.restoredSignature = textDigest(signature).slice(0, 32);
@@ -4133,6 +4147,7 @@ export class ChatGPTController {
               tailSnapshot = settledTail;
               tailBaselineSignature = conversationSemanticTailSignature(settledTail.turns);
               diagnostics.tailRecheck.baselineSignature = textDigest(tailBaselineSignature).slice(0, 32);
+              diagnostics.tailRecheck.baselineEvidence = conversationSemanticTailEvidence(settledTail.turns);
               current = settledTail;
               addSnapshot(settledTail);
               diagnostics.tailRange = conversationTurnRange(settledTail.turns);

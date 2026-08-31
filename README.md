@@ -367,6 +367,9 @@ diagnostics are recorded. Both complete mode and the start-marker diagnostic
 wait for three consecutive stable conversation-layout samples after native
 window readiness before adopting a baseline. Other backends retain their
 existing native scrolling path.
+Bottom-start tail rechecks compare a bounded semantic tail using role and
+normalized-text digests; position hints remain diagnostic-only for this
+restore comparison.
 Clients should send the resolved `tabId` without duplicating `key` or
 `vendorId`; requests containing both selectors are rejected.
 Only ChatGPT's `data-message-author-role` selectors are used; nested duplicates,

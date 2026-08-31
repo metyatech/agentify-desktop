@@ -1855,7 +1855,7 @@ export function startHttpApi({
           throw new Error('conversation_controller_unavailable');
         }
         const historyMode = body.historyMode === undefined ? 'visible' : String(body.historyMode).trim().toLowerCase();
-        if (historyMode !== 'visible' && historyMode !== 'complete') throw new Error('conversation_history_mode_invalid');
+        if (historyMode !== 'visible' && historyMode !== 'tail' && historyMode !== 'complete') throw new Error('conversation_history_mode_invalid');
         const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
         const historyMaxIterations = strictPositiveIntOr(body.historyMaxIterations, MAX_CONVERSATION_HISTORY_ITERATIONS, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid');
         const result = await controller.readConversationTurns({
@@ -1867,7 +1867,7 @@ export function startHttpApi({
           historyMaxIterations
         });
         if (!result || typeof result.url !== 'string' || !Array.isArray(result.turns) ||
-            (historyMode === 'complete' && (!result.history || result.history.mode !== historyMode))) {
+            ((historyMode === 'complete' || historyMode === 'tail') && (!result.history || result.history.mode !== historyMode))) {
           throw new Error('conversation_controller_unavailable');
         }
         const responseBody = {
@@ -1877,7 +1877,7 @@ export function startHttpApi({
           url: result.url,
           turns: result.turns
         };
-        if (historyMode === 'complete') responseBody.history = result.history;
+        if (historyMode === 'complete' || historyMode === 'tail') responseBody.history = result.history;
         return sendJson(res, 200, responseBody, { maxBytes: 2_000_000 });
       }
 

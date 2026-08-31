@@ -4117,10 +4117,13 @@ test('http-api: conversation turns complete mode returns bounded history metadat
   const controller = {
     readConversationTurns: async (options) => {
       calls.push(options);
+      const tail = options.historyMode === 'tail';
       return {
-        url: 'https://chatgpt.com/c/complete',
+        url: tail ? 'https://chatgpt.com/c/tail' : 'https://chatgpt.com/c/complete',
         turns: [{ id: 'm1', role: 'user', text: 'hello', index: 0 }],
-        history: { mode: 'complete', complete: true, reason: null, startReached: true, snapshotStable: true, iterations: 2, observedTurnCount: 1, returnedTurnCount: 1, scrollRestored: true }
+        history: tail
+          ? { mode: 'tail', complete: false, scopeComplete: true, fullHistoryComplete: false, tailProven: true, reason: null, startReached: false, snapshotStable: true, iterations: 2, observedTurnCount: 1, returnedTurnCount: 1, scrollRestored: true }
+          : { mode: 'complete', complete: true, reason: null, startReached: true, snapshotStable: true, iterations: 2, observedTurnCount: 1, returnedTurnCount: 1, scrollRestored: true }
       };
     }
   };
@@ -4151,6 +4154,11 @@ test('http-api: conversation turns complete mode returns bounded history metadat
   assert.equal(omitted.res.status, 200);
   assert.equal(calls[1].historyTimeoutMs, 30_000);
   assert.equal(calls[1].historyMaxIterations, 120);
+
+  const tail = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'tail' } });
+  assert.equal(tail.res.status, 200);
+  assert.equal(tail.data.history.mode, 'tail');
+  assert.equal(calls[2].historyMode, 'tail');
 
   const invalidMode = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'all' } });
   assert.equal(invalidMode.res.status, 400);

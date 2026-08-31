@@ -28,6 +28,8 @@ const CONVERSATION_HISTORY_RESTORE_ATTEMPTS = 4;
 const CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS = 240;
 const CONVERSATION_HISTORY_TAIL_RECHECK_WAIT_MS = 200;
 const CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES = 3;
+const CONVERSATION_TAIL_TIMEOUT_MS = 5_000;
+const CONVERSATION_TAIL_MAX_ITERATIONS = 16;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -389,7 +391,7 @@ export function mergeConversationSnapshots(snapshots = []) {
 }
 
 function validateConversationHistoryOptions({ historyMode, historyTimeoutMs, historyMaxIterations }) {
-  if (historyMode !== "visible" && historyMode !== "complete") throw new Error("conversation_history_mode_invalid");
+  if (historyMode !== "visible" && historyMode !== "tail" && historyMode !== "complete") throw new Error("conversation_history_mode_invalid");
   if (!Number.isInteger(historyTimeoutMs) || historyTimeoutMs < 1 || historyTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS) throw new Error("conversation_history_timeout_invalid");
   if (!Number.isInteger(historyMaxIterations) || historyMaxIterations < 1 || historyMaxIterations > MAX_CONVERSATION_HISTORY_ITERATIONS) throw new Error("conversation_history_iterations_invalid");
 }
@@ -3548,7 +3550,7 @@ export class ChatGPTController {
     return String(text || '');
   }
 
-  async #readCompleteConversationTurns({ limits, historyTimeoutMs, historyMaxIterations }) {
+  async #readCompleteConversationTurns({ limits, historyTimeoutMs, historyMaxIterations, tailOnly = false }) {
     const operationStartedAt = Date.now();
     const snapshots = [];
     let initialNative = null;
@@ -4283,7 +4285,7 @@ export class ChatGPTController {
         // Preserve a preflight failure and only run the history state machine when setup passed.
       } else if (!initialUrl || !current?.scroller || current.scroller.candidateCount === 0) reason = current?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
-      else {
+      else if (!tailOnly) {
         traversalStartedAt = Date.now();
         await establishDirectTail();
         let proofDirection = current.scroller.atBottom ? -1 : 1;
@@ -4363,7 +4365,32 @@ export class ChatGPTController {
         if (!diagnostics.tailProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-tail-unproven';
       }
 
-      if (!reason && diagnostics.tailProven) {
+      if (!reason && tailOnly && diagnostics.tailProven) {
+        const observedIdentityCount = () => new Set(snapshots.flatMap((snapshot) => (Array.isArray(snapshot) ? snapshot : []), []).map((turn) => {
+          const text = normalizeConversationText(turn?.text);
+          return turn?.messageId
+            ? `message:${turn.messageId}`
+            : turn?.turnId
+              ? `turn:${turn.turnId}`
+              : `fingerprint:${turn?.role || ''}\u0000${text}`;
+        })).size;
+        let noProgressCount = 0;
+        while (!reason && !current?.scroller?.atTop && observedIdentityCount() < limits.maxTurns) {
+          if (historyElapsedMs() > historyTimeoutMs || iterations >= historyMaxIterations) {
+            reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-tail-limit';
+            break;
+          }
+          const before = current;
+          const result = await nativeWheel(-1, before);
+          if (!result.ok) { reason = result.reason; break; }
+          if (result.windowChanged || result.physicalChanged || result.range.min < conversationTurnRange(before?.turns).min) noProgressCount = 0;
+          else noProgressCount += 1;
+          if (noProgressCount >= 3) { reason = 'history-tail-no-progress'; break; }
+        }
+        snapshotStable = diagnostics.tailProven && !reason;
+      }
+
+      if (!reason && diagnostics.tailProven && !tailOnly) {
         topProofStartedAt = Date.now();
         diagnostics.topProofStartedAtIteration = iterations;
         let noProgressCount = 0;
@@ -4516,6 +4543,13 @@ export class ChatGPTController {
           historyTimeoutMs: historyOptions.historyTimeoutMs,
           historyMaxIterations: historyOptions.historyMaxIterations
         })
+        : mode === 'tail'
+          ? await this.#readCompleteConversationTurns({
+            limits,
+            historyTimeoutMs: Math.min(historyOptions.historyTimeoutMs, CONVERSATION_TAIL_TIMEOUT_MS),
+            historyMaxIterations: Math.min(historyOptions.historyMaxIterations, CONVERSATION_TAIL_MAX_ITERATIONS),
+            tailOnly: true
+          })
         : await this.#eval(`(() => {
         const maxTurns = ${limits.maxTurns};
         const maxCharsPerTurn = ${limits.maxCharsPerTurn};
@@ -4654,6 +4688,40 @@ export class ChatGPTController {
         } else {
           const error = new Error('conversation_history_unproven');
           error.data = { reason: 'missing-history-metadata' };
+          throw error;
+        }
+      } else if (mode === 'tail') {
+        if (Array.isArray(result?.snapshots)) {
+          const merged = mergeConversationSnapshots(result.snapshots);
+          turns = merged.turns.slice(-limits.maxTurns);
+          let reason = result.reason || null;
+          if (!reason && result.tailProven !== true) reason = 'history-tail-unproven';
+          if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
+          if (!reason && !merged.continuous) reason = 'history-gap';
+          if (result.diagnostics && typeof result.diagnostics === 'object') {
+            result.diagnostics.mergeAmbiguous = merged.ambiguous;
+            result.diagnostics.mergeContinuous = merged.continuous;
+            result.diagnostics.mergeDiagnostics = merged.mergeDiagnostics;
+          }
+          history = historyMetadata({
+            mode,
+            complete: false,
+            reason,
+            startReached: false,
+            snapshotStable: result.snapshotStable === true,
+            iterations: result.iterations,
+            observedTurnCount: merged.observedTurnCount,
+            returnedTurnCount: turns.length,
+            scrollRestored: result.scrollRestored,
+            diagnostics: result.diagnostics
+          });
+          history.scopeComplete = !reason;
+          history.fullHistoryComplete = false;
+          history.tailProven = result.tailProven === true;
+          history.startReached = false;
+        } else {
+          const error = new Error('conversation_history_unproven');
+          error.data = { reason: 'missing-tail-metadata' };
           throw error;
         }
       }

@@ -2390,6 +2390,19 @@ test('chatgpt-controller: complete history proves an already-tail start without 
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
+test('chatgpt-controller: tail history is bounded and does not require start proof', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.mode, 'tail');
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.fullHistoryComplete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.diagnostics.tailProven, true);
+  assert.equal(result.history.scrollRestored, true);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
 test('chatgpt-controller: low range candidate establishes direct top without another native wheel', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 4,

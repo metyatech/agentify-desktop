@@ -525,6 +525,51 @@ export function conversationSemanticTailSignature(turns = []) {
   ]));
 }
 
+function conversationSemanticAnchorEntries(turns = []) {
+  const source = Array.isArray(turns) ? turns : [];
+  const count = Math.min(3, source.length);
+  const start = Math.max(0, Math.floor((source.length - count) / 2));
+  return source.slice(start, start + count).map((turn) => ({
+    role: turn?.role || null,
+    textDigest: textDigest(normalizeConversationText(turn?.text))
+  }));
+}
+
+export function conversationSemanticAnchorSignature(turns = []) {
+  return JSON.stringify(conversationSemanticAnchorEntries(turns).map((entry) => [entry.role, entry.textDigest]));
+}
+
+function conversationSemanticAnchorEvidence(turns = []) {
+  const source = Array.isArray(turns) ? turns : [];
+  const count = Math.min(3, source.length);
+  const start = Math.max(0, Math.floor((source.length - count) / 2));
+  return source.slice(start, start + count).map((turn) => {
+    const normalizedText = normalizeConversationText(turn?.text);
+    return {
+      role: turn?.role || null,
+      positionHint: Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
+      textLength: normalizedText.length,
+      textDigest: textDigest(normalizedText).slice(0, 32)
+    };
+  });
+}
+
+function conversationSemanticAnchorMatchCount(anchorSignature, turns = []) {
+  if (typeof anchorSignature !== 'string' || !anchorSignature) return 0;
+  let target;
+  try { target = JSON.parse(anchorSignature); } catch { return 0; }
+  if (!Array.isArray(target) || target.length === 0) return 0;
+  const source = (Array.isArray(turns) ? turns : []).map((turn) => [
+    turn?.role || null,
+    textDigest(normalizeConversationText(turn?.text))
+  ]);
+  let matches = 0;
+  for (let index = 0; index <= source.length - target.length; index += 1) {
+    if (JSON.stringify(source.slice(index, index + target.length)) === JSON.stringify(target)) matches += 1;
+  }
+  return matches;
+}
+
 function conversationSemanticTailEvidence(turns = []) {
   return (Array.isArray(turns) ? turns : []).slice(-5).map((turn) => {
     const normalizedText = normalizeConversationText(turn?.text);
@@ -1350,8 +1395,9 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
   })()`;
 }
 
-function buildRestoreConversationScrollScript(distanceFromBottom) {
+function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'restore') {
   return `(() => {
+    const operation = ${JSON.stringify(operation)};
     const targetDistance = ${Math.max(0, Math.trunc(Number(distanceFromBottom) || 0))};
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
     const nodes = Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
@@ -3529,6 +3575,12 @@ export class ChatGPTController {
       firstNativeUp: null,
       firstNativeDown: null,
       tailRange: { min: null, max: null },
+      tailEntry: {
+        mode: null,
+        directAttempted: false,
+        directVerified: false,
+        fallbackUsed: false
+      },
       observedRange: { min: null, max: null },
       oldestProgression: [],
       tailProven: false,
@@ -3599,6 +3651,10 @@ export class ChatGPTController {
         bottomMatched: false,
         anchorMatched: false,
         signatureMatched: false,
+        anchorSignatureMode: 'semantic-role-text-digest',
+        anchorBaselineEvidence: [],
+        anchorRestoredEvidence: [],
+        anchorMatchCount: 0,
         lastFailureReason: null
       },
       tailRecheck: {
@@ -3635,7 +3691,7 @@ export class ChatGPTController {
     let initialUrl = '';
     let initialScrollTop = null;
     let initialDistanceFromBottom = null;
-    let originalWindowSignature = null;
+    let originalSemanticAnchorSignature = null;
     let restoreMode = null;
     let historyStartedAt = null;
     let traversalStartedAt = null;
@@ -3767,13 +3823,15 @@ export class ChatGPTController {
           current = settledLayout.state;
           initialScrollTop = Number(current?.scroller?.scrollTop);
           initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
-          originalWindowSignature = conversationWindowSignature(current?.turns);
+          originalSemanticAnchorSignature = conversationSemanticAnchorSignature(current?.turns);
           restoreMode = current?.scroller?.atBottom === true ? 'bottom' : 'anchored-window';
           diagnostics.conversationRestore.mode = restoreMode;
           diagnostics.conversationRestore.targetAtBottom = restoreMode === 'bottom';
           diagnostics.conversationRestore.anchorIdentityPresent = restoreMode !== 'bottom'
-            && Array.isArray(current?.turns)
-            && current.turns.some((turn) => Boolean(turn?.messageId || turn?.turnId));
+            && originalSemanticAnchorSignature !== '[]';
+          diagnostics.conversationRestore.anchorBaselineEvidence = restoreMode === 'bottom'
+            ? []
+            : conversationSemanticAnchorEvidence(current?.turns);
           addSnapshot(current);
           diagnostics.initialRange = conversationTurnRange(current?.turns);
           diagnostics.observedRange = { ...diagnostics.initialRange };
@@ -3911,6 +3969,59 @@ export class ChatGPTController {
       current = next;
       return { ok: true, state: next, ...result };
     };
+    const setTailBaseline = (state, { replaceSnapshots = false } = {}) => {
+      tailSnapshot = state;
+      tailBaselineSignature = conversationSemanticTailSignature(state?.turns);
+      diagnostics.tailRecheck.baselineSignature = textDigest(tailBaselineSignature).slice(0, 32);
+      diagnostics.tailRecheck.baselineEvidence = conversationSemanticTailEvidence(state?.turns);
+      diagnostics.tailRange = conversationTurnRange(state?.turns);
+      current = state;
+      if (replaceSnapshots) snapshots.length = 0;
+      addSnapshot(state);
+      if (!diagnostics.tailEntry.mode) diagnostics.tailEntry.mode = 'native-wheel-fallback';
+    };
+    const establishDirectTail = async () => {
+      const entry = diagnostics.tailEntry;
+      entry.directAttempted = true;
+      entry.mode = 'direct-bottom';
+      let command = null;
+      try { command = await this.#eval(buildRestoreConversationScrollScript(0, 'tail')); } catch { command = null; }
+      if (command?.ok !== true) {
+        entry.fallbackUsed = true;
+        entry.mode = 'native-wheel-fallback';
+        return false;
+      }
+      let stableCount = 0;
+      let previousSignature = null;
+      let settled = null;
+      for (let sample = 0; sample < CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES; sample += 1) {
+        if (sample > 0) await sleep(CONVERSATION_HISTORY_TAIL_RECHECK_WAIT_MS);
+        let state = null;
+        try { state = await readWindow(); } catch { state = null; }
+        if (state) current = state;
+        if (!state || !currentUrlIsStable(state) || state.limitExceeded || state.scroller?.candidateCount !== 1) {
+          entry.fallbackUsed = true;
+          entry.mode = 'native-wheel-fallback';
+          return false;
+        }
+        const signature = conversationTailSignature(state.turns);
+        if (state.scroller.atBottom === true && state.loading === false) {
+          stableCount = previousSignature === null || signature === previousSignature ? stableCount + 1 : 1;
+        } else stableCount = 0;
+        previousSignature = signature;
+        settled = state;
+        if (stableCount >= CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES) break;
+      }
+      if (stableCount < CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES || !settled) {
+        entry.fallbackUsed = true;
+        entry.mode = 'native-wheel-fallback';
+        return false;
+      }
+      entry.directVerified = true;
+      setTailBaseline(settled, { replaceSnapshots: true });
+      diagnostics.tailProven = true;
+      return true;
+    };
     const restore = async () => {
       const restoreDiagnostics = diagnostics.conversationRestore;
       restoreDiagnostics.initialDistanceFromBottom = Number.isFinite(initialDistanceFromBottom) && initialDistanceFromBottom >= 0
@@ -3920,82 +4031,103 @@ export class ChatGPTController {
         restoreDiagnostics.lastFailureReason = 'scroller-missing';
         return false;
       }
-      let lastState = null;
-      for (let attempt = 0; attempt < CONVERSATION_HISTORY_RESTORE_ATTEMPTS; attempt += 1) {
-        restoreDiagnostics.attempts += 1;
-        let currentState = null;
-        try {
-          currentState = await this.#eval(buildConversationWindowReadScript(limits));
-        } catch {
-          restoreDiagnostics.lastFailureReason = 'read-failed';
-          continue;
+      const restoreToTarget = async (targetDistance, validate, targetMode) => {
+        while (restoreDiagnostics.attempts < CONVERSATION_HISTORY_RESTORE_ATTEMPTS) {
+          restoreDiagnostics.attempts += 1;
+          let currentState = null;
+          try {
+            currentState = await readWindow();
+          } catch {
+            restoreDiagnostics.lastFailureReason = 'read-failed';
+            continue;
+          }
+          if (!currentState || currentState.limitExceeded) {
+            restoreDiagnostics.lastFailureReason = currentState?.limitExceeded ? 'limit-exceeded' : 'read-failed';
+            continue;
+          }
+          if (!currentUrlIsStable(currentState)) {
+            restoreDiagnostics.lastFailureReason = 'url-changed';
+            return false;
+          }
+          if (currentState.scroller?.candidateCount !== 1) {
+            restoreDiagnostics.lastFailureReason = currentState.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
+            continue;
+          }
+          const currentScrollHeight = Number(currentState.scroller?.scrollHeight);
+          const currentClientHeight = Number(currentState.scroller?.clientHeight);
+          if (!Number.isFinite(currentScrollHeight) || !Number.isFinite(currentClientHeight)) {
+            restoreDiagnostics.lastFailureReason = 'scroller-missing';
+            continue;
+          }
+          const result = await this.#eval(buildRestoreConversationScrollScript(targetDistance)).catch(() => null);
+          if (result?.ok !== true) {
+            restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
+            continue;
+          }
+          await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
+          let restored = null;
+          try {
+            restored = await readWindow();
+          } catch {
+            restoreDiagnostics.lastFailureReason = 'read-failed';
+            continue;
+          }
+          if (!restored || restored.limitExceeded) {
+            restoreDiagnostics.lastFailureReason = restored?.limitExceeded ? 'limit-exceeded' : 'read-failed';
+            continue;
+          }
+          if (!currentUrlIsStable(restored)) {
+            restoreDiagnostics.lastFailureReason = 'url-changed';
+            return false;
+          }
+          if (restored.scroller?.candidateCount !== 1) {
+            restoreDiagnostics.lastFailureReason = restored.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
+            continue;
+          }
+          const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
+          const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - targetDistance) <= 2;
+          const bottomMatched = restored.scroller.atBottom === true && restored.loading === false;
+          const anchorMatchCount = conversationSemanticAnchorMatchCount(originalSemanticAnchorSignature, restored.turns);
+          const anchorMatched = anchorMatchCount === 1;
+          restoreDiagnostics.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
+          restoreDiagnostics.distanceMatched = distanceMatched;
+          restoreDiagnostics.bottomMatched = bottomMatched;
+          restoreDiagnostics.anchorMatchCount = anchorMatchCount;
+          restoreDiagnostics.anchorRestoredEvidence = conversationSemanticAnchorEvidence(restored.turns);
+          restoreDiagnostics.anchorMatched = anchorMatched;
+          restoreDiagnostics.signatureMatched = restoreDiagnostics.mode === 'bottom' ? null : null;
+          if (validate({ distanceMatched, bottomMatched, anchorMatched, restored })) {
+            current = restored;
+            return true;
+          }
+          restoreDiagnostics.lastFailureReason = targetMode === 'bottom'
+            ? (distanceMatched ? 'bottom-mismatch' : 'distance-mismatch')
+            : (distanceMatched ? (anchorMatchCount === 0 ? 'anchor-not-found' : 'anchor-ambiguous') : 'distance-mismatch');
         }
-        if (!currentState || currentState.limitExceeded) {
-          restoreDiagnostics.lastFailureReason = currentState?.limitExceeded ? 'limit-exceeded' : 'read-failed';
-          continue;
-        }
-        if (!currentUrlIsStable(currentState)) {
-          restoreDiagnostics.lastFailureReason = 'url-changed';
-          continue;
-        }
-        if (currentState.scroller?.candidateCount !== 1) {
-          restoreDiagnostics.lastFailureReason = currentState.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
-          continue;
-        }
-        const currentScrollHeight = Number(currentState.scroller?.scrollHeight);
-        const currentClientHeight = Number(currentState.scroller?.clientHeight);
-        if (!Number.isFinite(currentScrollHeight) || !Number.isFinite(currentClientHeight)) {
-          restoreDiagnostics.lastFailureReason = 'scroller-missing';
-          continue;
-        }
-        const targetDistance = restoreDiagnostics.mode === 'bottom' ? 0 : restoreDiagnostics.initialDistanceFromBottom;
-        const result = await this.#eval(buildRestoreConversationScrollScript(targetDistance)).catch(() => null);
-        if (result?.ok !== true) {
-          restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
-          continue;
-        }
-        await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
-        let restored = null;
-        try {
-          restored = await this.#eval(buildConversationWindowReadScript(limits));
-        } catch {
-          restoreDiagnostics.lastFailureReason = 'read-failed';
-          continue;
-        }
-        lastState = restored;
-        if (!restored || restored.limitExceeded) {
-          restoreDiagnostics.lastFailureReason = restored?.limitExceeded ? 'limit-exceeded' : 'read-failed';
-          continue;
-        }
-        if (!currentUrlIsStable(restored)) {
-          restoreDiagnostics.lastFailureReason = 'url-changed';
-          continue;
-        }
-        if (restored.scroller?.candidateCount !== 1) {
-          restoreDiagnostics.lastFailureReason = restored.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
-          continue;
-        }
-        const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
-        const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - targetDistance) <= 2;
-        const bottomMatched = restoreDiagnostics.mode === 'bottom' && restored.scroller.atBottom === true && restored.loading === false;
-        const signatureMatched = restoreDiagnostics.mode === 'bottom' ? null : conversationWindowSignature(restored.turns) === originalWindowSignature;
-        const anchorMatched = restoreDiagnostics.mode === 'bottom' ? false : signatureMatched;
-        restoreDiagnostics.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
-        restoreDiagnostics.distanceMatched = distanceMatched;
-        restoreDiagnostics.bottomMatched = bottomMatched;
-        restoreDiagnostics.anchorMatched = anchorMatched;
-        restoreDiagnostics.signatureMatched = signatureMatched;
-        if (distanceMatched && (restoreDiagnostics.mode === 'bottom' ? bottomMatched : signatureMatched)) {
-          restoreDiagnostics.verified = true;
-          restoreDiagnostics.lastFailureReason = null;
-          return true;
-        }
-        restoreDiagnostics.lastFailureReason = restoreDiagnostics.mode === 'bottom'
-          ? (distanceMatched ? 'bottom-mismatch' : 'distance-mismatch')
-          : (signatureMatched ? 'distance-mismatch' : 'signature-mismatch');
+        return false;
+      };
+
+      const bottomRestored = await restoreToTarget(0, ({ distanceMatched, bottomMatched }) => distanceMatched && bottomMatched, 'bottom');
+      if (!bottomRestored) return false;
+      let tailVerified = true;
+      if (tailBaselineSignature) {
+        const recheck = diagnostics.tailRecheck;
+        recheck.sampleCount = 0;
+        recheck.stableSampleCount = 0;
+        recheck.reason = null;
+        tailVerified = await recheckTail();
       }
-      if (lastState && Number.isFinite(Number(lastState.scroller?.scrollHeight)) && Number.isFinite(Number(lastState.scroller?.clientHeight)) && Number.isFinite(Number(lastState.scroller?.scrollTop))) {
-        restoreDiagnostics.finalDistanceFromBottom = Number(lastState.scroller.scrollHeight) - Number(lastState.scroller.clientHeight) - Number(lastState.scroller.scrollTop);
+      if (!tailVerified) return false;
+      if (restoreDiagnostics.mode === 'bottom') {
+        restoreDiagnostics.verified = true;
+        restoreDiagnostics.lastFailureReason = null;
+        return true;
+      }
+      const anchoredRestored = await restoreToTarget(restoreDiagnostics.initialDistanceFromBottom, ({ distanceMatched, anchorMatched }) => distanceMatched && anchorMatched, 'anchor');
+      if (anchoredRestored) {
+        restoreDiagnostics.verified = true;
+        restoreDiagnostics.lastFailureReason = null;
+        return true;
       }
       return false;
     };
@@ -4003,10 +4135,6 @@ export class ChatGPTController {
       const recheck = diagnostics.tailRecheck;
       recheck.attempted = true;
       recheck.mode = restoreMode;
-      if (restoreMode !== 'bottom') {
-        recheck.reason = 'not-applicable';
-        return true;
-      }
       if (!tailBaselineSignature) {
         recheck.reason = 'tail-baseline-missing';
         return false;
@@ -4088,6 +4216,7 @@ export class ChatGPTController {
       else if (!diagnostics.nativeWheelSupported) reason = 'history-native-scroll-unproven';
       else {
         traversalStartedAt = Date.now();
+        if (current.scroller.atBottom !== true) await establishDirectTail();
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;
@@ -4129,7 +4258,7 @@ export class ChatGPTController {
         if (!diagnostics.nativeScrollControlProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
       }
 
-      if (!reason) {
+      if (!reason && !diagnostics.tailProven) {
         tailProofStartedAt = Date.now();
         let tailStableCount = 0;
         let previousTail = null;
@@ -4144,13 +4273,7 @@ export class ChatGPTController {
               const settledTail = await readWindow();
               if (!currentUrlIsStable(settledTail)) { reason = 'conversation-changed'; break; }
               if (settledTail?.limitExceeded) { reason = settledTail.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
-              tailSnapshot = settledTail;
-              tailBaselineSignature = conversationSemanticTailSignature(settledTail.turns);
-              diagnostics.tailRecheck.baselineSignature = textDigest(tailBaselineSignature).slice(0, 32);
-              diagnostics.tailRecheck.baselineEvidence = conversationSemanticTailEvidence(settledTail.turns);
-              current = settledTail;
-              addSnapshot(settledTail);
-              diagnostics.tailRange = conversationTurnRange(settledTail.turns);
+              setTailBaseline(settledTail);
               diagnostics.tailProven = true;
               break;
             }
@@ -4213,30 +4336,9 @@ export class ChatGPTController {
         if (!startReached && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-start-unproven';
       }
 
-      if (!reason && startReached && tailSnapshot && restoreMode !== 'bottom') {
-        const tailBaseline = conversationTailSignature(tailSnapshot.turns);
-        let tailCheck = current;
-        let tailCheckAttempts = 0;
-        while (!tailCheck?.scroller?.atBottom && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
-          const result = await nativeWheel(1, tailCheck);
-          if (!result.ok) { reason = result.reason; break; }
-          tailCheck = result.state;
-          tailCheckAttempts += 1;
-        }
-        if (!reason && tailCheck?.scroller?.atBottom && !tailCheck.loading) {
-          const settledTail = conversationTailSignature(tailCheck.turns);
-          if (settledTail !== tailBaseline) reason = 'conversation-changed';
-        } else if (!reason && tailCheckAttempts > 0) {
-          reason = 'history-tail-unproven';
-        }
-      }
     } finally {
       restoreStartedAt = Date.now();
       diagnostics.scrollRestored = await restore();
-      if (diagnostics.scrollRestored && restoreMode === 'bottom') {
-        const tailVerified = await recheckTail();
-        if (!tailVerified && !reason) reason = 'conversation-changed';
-      }
       const windowRestored = await restoreWindow();
       if (!windowRestored && !reason) reason = 'history-window-restore-failed';
     }

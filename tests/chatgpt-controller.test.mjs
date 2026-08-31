@@ -10,6 +10,7 @@ import {
   ChatGPTController,
   DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+  conversationSemanticAnchorSignature,
   conversationSemanticTailSignature,
   buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
@@ -734,11 +735,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
     onEvaluate: async (js) => {
       if (js.includes('const targetDistance =')) {
         events.push('conversation-scroll-restore');
-        restoreCount += 1;
+        const directTail = js.includes('const operation = "tail";');
+        if (!directTail) restoreCount += 1;
         const distance = Number(/const targetDistance = ([0-9]+)/u.exec(js)?.[1] || 0);
-        const planned = typeof restorePlan === 'function'
-          ? await restorePlan({ attempt: restoreCount, distance })
-          : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
+        const planned = directTail
+          ? null
+          : typeof restorePlan === 'function'
+            ? await restorePlan({ attempt: restoreCount, distance })
+            : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
         if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollHeight))) scrollHeightOverride = Number(planned.scrollHeight);
         if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
         else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
@@ -1298,6 +1302,8 @@ test('chatgpt-controller: Chrome complete history uses mouseWheel and never uses
   assert.equal(result.history.diagnostics.scrollInputMethod, 'chrome-cdp-mouse-wheel');
   assert.equal(result.history.diagnostics.gestureAttemptsDown, 0);
   assert.equal(result.history.diagnostics.gestureAttemptsUp, 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(result.history.diagnostics.tailEntry.mode, 'direct-bottom');
   assert.equal(result.history.diagnostics.windowLifecycle.normalizationApplied, true);
   assert.equal(result.history.diagnostics.windowLifecycle.normalizedWindowState, 'normal');
   assert.equal(result.history.diagnostics.windowLifecycle.normalizedVisibilityState, 'visible');
@@ -1466,6 +1472,28 @@ test('chatgpt-controller: semantic tail signature ignores remounted identities a
   ]), baseline);
 });
 
+test('chatgpt-controller: anchored restore identity is semantic and ignores remounted DOM identities', () => {
+  const baseline = conversationSemanticAnchorSignature([
+    { role: 'user', messageId: 'old-1', turnId: 'old-t1', positionHint: 10, text: 'first' },
+    { role: 'assistant', messageId: 'old-2', turnId: 'old-t2', positionHint: 11, text: 'answer' },
+    { role: 'user', messageId: 'old-3', turnId: 'old-t3', positionHint: 12, text: 'follow-up' },
+    { role: 'assistant', messageId: 'old-4', turnId: 'old-t4', positionHint: 13, text: 'closing' }
+  ]);
+  const remounted = conversationSemanticAnchorSignature([
+    { role: 'user', messageId: 'new-1', turnId: 'new-t1', positionHint: 101, text: 'first' },
+    { role: 'assistant', messageId: 'new-2', turnId: 'new-t2', positionHint: 103, text: 'answer' },
+    { role: 'user', messageId: 'new-3', turnId: 'new-t3', positionHint: 109, text: 'follow-up' },
+    { role: 'assistant', messageId: 'new-4', turnId: 'new-t4', positionHint: 114, text: 'closing' }
+  ]);
+  assert.equal(remounted, baseline);
+  assert.notEqual(conversationSemanticAnchorSignature([
+    { role: 'user', text: 'first' },
+    { role: 'assistant', text: 'answer' },
+    { role: 'assistant', text: 'follow-up' },
+    { role: 'assistant', text: 'closing' }
+  ]), baseline);
+});
+
 test('chatgpt-controller: history budget starts after the normalized baseline', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp' });
   const result = await createController(harness.page).readConversationTurns({
@@ -1530,14 +1558,14 @@ test('chatgpt-controller: conversation restore converges after a transient signa
   assert.equal(result.history.complete, true);
   assert.equal(result.history.scrollRestored, true);
   assert.equal(result.history.diagnostics.conversationRestore.mode, 'anchored-window');
-  assert.equal(result.history.diagnostics.conversationRestore.attempts, 2);
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 3);
   assert.equal(result.history.diagnostics.conversationRestore.verified, true);
   assert.equal(result.history.diagnostics.conversationRestore.initialDistanceFromBottom, 500);
   assert.equal(result.history.diagnostics.conversationRestore.finalDistanceFromBottom, 500);
   assert.equal(result.history.diagnostics.conversationRestore.distanceMatched, true);
-  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, null);
   assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, null);
-  assert.equal(harness.getRestoreCount(), 2);
+  assert.equal(harness.getRestoreCount(), 3);
 });
 
 test('chatgpt-controller: conversation restore recalculates against changed scroll geometry', async () => {
@@ -1556,9 +1584,9 @@ test('chatgpt-controller: conversation restore recalculates against changed scro
   });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.scrollRestored, true);
-  assert.equal(result.history.diagnostics.conversationRestore.attempts, 2);
+  assert.equal(result.history.diagnostics.conversationRestore.attempts, 3);
   assert.equal(result.history.diagnostics.conversationRestore.distanceMatched, true);
-  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, true);
+  assert.equal(result.history.diagnostics.conversationRestore.signatureMatched, null);
   assert.equal(result.history.diagnostics.conversationRestore.finalDistanceFromBottom, 500);
 });
 
@@ -1581,7 +1609,7 @@ test('chatgpt-controller: permanent conversation restore mismatch is bounded and
   assert.equal(result.history.scrollRestored, false);
   assert.equal(result.history.diagnostics.conversationRestore.attempts, 4);
   assert.equal(result.history.diagnostics.conversationRestore.verified, false);
-  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'signature-mismatch');
+  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'bottom-mismatch');
 });
 
 test('chatgpt-controller: primary history timeout is not hidden by restore failure', async () => {
@@ -1603,7 +1631,7 @@ test('chatgpt-controller: primary history timeout is not hidden by restore failu
   assert.equal(result.history.reason, 'timeout');
   assert.equal(result.history.scrollRestored, false);
   assert.equal(result.history.diagnostics.conversationRestore.attempts, 4);
-  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'signature-mismatch');
+  assert.equal(result.history.diagnostics.conversationRestore.lastFailureReason, 'bottom-mismatch');
 });
 
 test('chatgpt-controller: Chrome complete history fails closed before wheel when normalized state is not ready', async () => {
@@ -1625,8 +1653,9 @@ test('chatgpt-controller: Chrome complete history fails closed before wheel when
 test('chatgpt-controller: complete history rejects a limit-exceeded post-wheel snapshot', async () => {
   const harness = createNativeWheelHistoryPage({
     backend: 'chrome-cdp',
-    // Three reads establish the stable normalized baseline; the next read is the post-wheel snapshot.
-    limitExceededAtRead: 4,
+    // Three reads establish the stable normalized baseline; three direct-tail reads follow;
+    // the next full read is the post-wheel snapshot.
+    limitExceededAtRead: 7,
     limitKind: 'per-turn'
   });
   const result = await createController(harness.page).readConversationTurns({
@@ -2245,8 +2274,9 @@ test('chatgpt-controller: post-wheel snapshot failures have their own diagnostic
   harness.page.evaluate = async (js) => {
     if (js.includes('const maxTurns =')) {
       windowReads += 1;
-      // Three reads establish the stable normalized baseline; the next read follows the wheel.
-      if (windowReads === 4) throw Object.assign(new Error('post wheel read failed'), { code: 'POST_READ_FAILED' });
+      // Three reads establish the stable normalized baseline; three direct-tail reads follow;
+      // the next full read follows the native wheel.
+      if (windowReads === 7) throw Object.assign(new Error('post wheel read failed'), { code: 'POST_READ_FAILED' });
     }
     return await originalEvaluate(js);
   };
@@ -2426,7 +2456,9 @@ test('chatgpt-controller: complete history backfills from the tail through virtu
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.diagnostics.scroller.candidateCount, 1);
-  assert.ok(result.history.diagnostics.wheelDownAttempts > 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(result.history.diagnostics.tailEntry.mode, 'direct-bottom');
+  assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
   assert.ok(result.history.diagnostics.wheelUpAttempts > 0);
   assert.equal(result.history.diagnostics.positions.observedMin, 0);
   assert.equal(result.history.diagnostics.positions.observedMax, 24);

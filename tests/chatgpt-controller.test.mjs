@@ -10,6 +10,7 @@ import {
   ChatGPTController,
   DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+  conversationSemanticTailSignature,
   buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
   conversationStartBoundaryProof,
@@ -1410,7 +1411,36 @@ test('chatgpt-controller: Chrome complete history preserves an already-normal wi
 
 test('chatgpt-controller: complete history defaults use the existing maximum budget', () => {
   assert.equal(DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, 30_000);
-  assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 80);
+  assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 120);
+});
+
+test('chatgpt-controller: semantic tail signature ignores remounted DOM identities', () => {
+  const baseline = conversationSemanticTailSignature([
+    { role: 'assistant', messageId: 'old-a', turnId: 'old-t-a', positionHint: 58, text: ' first answer \n' },
+    { role: 'user', messageId: 'old-u', turnId: 'old-t-u', positionHint: 59, text: 'follow-up' },
+    { role: 'assistant', messageId: 'old-a2', turnId: 'old-t-a2', positionHint: 60, text: 'final response' }
+  ]);
+  const remounted = conversationSemanticTailSignature([
+    { role: 'assistant', messageId: 'new-a', turnId: 'new-t-a', positionHint: 58, text: 'first answer' },
+    { role: 'user', messageId: 'new-u', turnId: 'new-t-u', positionHint: 59, text: 'follow-up' },
+    { role: 'assistant', messageId: 'new-a2', turnId: 'new-t-a2', positionHint: 60, text: 'final response' }
+  ]);
+  assert.equal(remounted, baseline);
+  assert.notEqual(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 58, text: 'first answer' },
+    { role: 'user', positionHint: 59, text: 'follow-up' },
+    { role: 'user', positionHint: 60, text: 'final response' }
+  ]), baseline);
+  assert.notEqual(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 58, text: 'first answer' },
+    { role: 'user', positionHint: 59, text: 'follow-up' },
+    { role: 'assistant', positionHint: 61, text: 'final response' }
+  ]), baseline);
+  assert.notEqual(conversationSemanticTailSignature([
+    { role: 'assistant', positionHint: 58, text: 'changed answer' },
+    { role: 'user', positionHint: 59, text: 'follow-up' },
+    { role: 'assistant', positionHint: 60, text: 'final response' }
+  ]), baseline);
 });
 
 test('chatgpt-controller: history budget starts after the normalized baseline', async () => {
@@ -2223,6 +2253,7 @@ test('chatgpt-controller: complete history proves an already-tail start with a n
   assert.equal(result.history.diagnostics.firstNativeUp.changed, true);
   assert.ok(result.history.diagnostics.firstNativeDown?.changed || result.history.diagnostics.wheelDownAttempts > 0);
   assert.equal(result.history.diagnostics.tailRecheck.mode, 'bottom');
+  assert.equal(result.history.diagnostics.tailRecheck.signatureMode, 'semantic-role-position-text-digest');
   assert.equal(result.history.diagnostics.tailRecheck.verified, true);
   assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);

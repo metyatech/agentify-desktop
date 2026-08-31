@@ -4150,11 +4150,11 @@ test('http-api: conversation turns complete mode returns bounded history metadat
   const omitted = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete' } });
   assert.equal(omitted.res.status, 200);
   assert.equal(calls[1].historyTimeoutMs, 30_000);
-  assert.equal(calls[1].historyMaxIterations, 80);
+  assert.equal(calls[1].historyMaxIterations, 120);
 
   const invalidMode = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'all' } });
   assert.equal(invalidMode.res.status, 400);
-  const invalidIterations = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMaxIterations: 81 } });
+  const invalidIterations = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMaxIterations: 121 } });
   assert.equal(invalidIterations.res.status, 400);
 });
 

@@ -16,7 +16,7 @@ export const MAX_CONVERSATION_TURNS = 200;
 export const MAX_CONVERSATION_TURN_CHARS = 200_000;
 export const MAX_CONVERSATION_TOTAL_CHARS = 2_000_000;
 export const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 30_000;
-export const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
+export const MAX_CONVERSATION_HISTORY_ITERATIONS = 120;
 export const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = MAX_CONVERSATION_HISTORY_TIMEOUT_MS;
 export const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = MAX_CONVERSATION_HISTORY_ITERATIONS;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
@@ -516,6 +516,14 @@ function conversationLayoutSummaryReady(summary) {
 
 function conversationTailSignature(turns = []) {
   return conversationWindowIdentitySignature((Array.isArray(turns) ? turns : []).slice(-3));
+}
+
+export function conversationSemanticTailSignature(turns = []) {
+  return JSON.stringify((Array.isArray(turns) ? turns : []).slice(-3).map((turn) => [
+    turn?.role || null,
+    Number.isInteger(turn?.positionHint) ? turn.positionHint : null,
+    textDigest(normalizeConversationText(turn?.text))
+  ]));
 }
 
 export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn, maxTotalChars, historyTimeoutMs, historyMaxIterations }) {
@@ -3585,6 +3593,7 @@ export class ChatGPTController {
       tailRecheck: {
         attempted: false,
         mode: null,
+        signatureMode: 'semantic-role-position-text-digest',
         sampleCount: 0,
         requiredStableSamples: CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES,
         stableSampleCount: 0,
@@ -4012,7 +4021,7 @@ export class ChatGPTController {
           recheck.reason = state?.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
           break;
         }
-        const signature = conversationTailSignature(state.turns);
+        const signature = conversationSemanticTailSignature(state.turns);
         const atBottom = state.scroller.atBottom === true;
         const loading = state.loading === true;
         recheck.restoredSignature = textDigest(signature).slice(0, 32);
@@ -4122,7 +4131,7 @@ export class ChatGPTController {
               if (!currentUrlIsStable(settledTail)) { reason = 'conversation-changed'; break; }
               if (settledTail?.limitExceeded) { reason = settledTail.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; break; }
               tailSnapshot = settledTail;
-              tailBaselineSignature = conversationTailSignature(settledTail.turns);
+              tailBaselineSignature = conversationSemanticTailSignature(settledTail.turns);
               diagnostics.tailRecheck.baselineSignature = textDigest(tailBaselineSignature).slice(0, 32);
               current = settledTail;
               addSnapshot(settledTail);

@@ -18,7 +18,7 @@ const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
 const PROVIDER_STOP_TIMEOUT_MS = 1_000;
 const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
 const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 30_000;
-const MAX_CONVERSATION_HISTORY_ITERATIONS = 80;
+const MAX_CONVERSATION_HISTORY_ITERATIONS = 120;
 
 async function boundedProviderStop(controller, { expectedOperationId, reason = 'user_stop' } = {}) {
   if (!controller || typeof controller.requestStop !== 'function') {

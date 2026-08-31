@@ -377,12 +377,12 @@ export function mergeConversationSnapshots(snapshots = []) {
   }
   const turns = orderedKeys.map((key, index) => {
     const record = records.get(key);
-    const turnIndex = Number.isInteger(record.positionHint) ? record.positionHint : index;
+    const identityIndex = Number.isInteger(record.positionHint) ? record.positionHint : index;
     return {
-      id: record.messageId || record.turnId || fallbackConversationTurnId({ role: record.role, index: turnIndex, text: record.text }),
+      id: record.messageId || record.turnId || fallbackConversationTurnId({ role: record.role, index: identityIndex, text: record.text }),
       role: record.role,
       text: record.text,
-      index: turnIndex,
+      index,
       messageId: record.messageId || null,
       turnId: record.turnId || null
     };
@@ -3693,6 +3693,7 @@ export class ChatGPTController {
       },
       iterationLimitReached: false,
       iterationLimitReachedAtTop: false,
+      tailScopeStopReason: null,
       topProofStartedAtIteration: null,
       timing: {
         historyElapsedMs: 0,
@@ -4378,16 +4379,44 @@ export class ChatGPTController {
         })).size;
         let noProgressCount = 0;
         while (!reason && !current?.scroller?.atTop && observedIdentityCount() < limits.maxTurns) {
-          if (historyElapsedMs() > historyTimeoutMs || iterations >= historyMaxIterations) {
-            reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-tail-limit';
+          if (historyElapsedMs() > historyTimeoutMs) {
+            diagnostics.tailScopeStopReason = 'timeout';
+            break;
+          }
+          if (iterations >= historyMaxIterations) {
+            diagnostics.iterationLimitReached = true;
+            diagnostics.tailScopeStopReason = 'iteration-limit';
             break;
           }
           const before = current;
           const result = await nativeWheel(-1, before);
-          if (!result.ok) { reason = result.reason; break; }
+          if (!result.ok) {
+            if (result.reason === 'timeout') {
+              diagnostics.iterationLimitReached = iterations >= historyMaxIterations;
+              diagnostics.tailScopeStopReason = diagnostics.iterationLimitReached ? 'iteration-limit' : 'timeout';
+              break;
+            }
+            reason = result.reason;
+            break;
+          }
           if (result.windowChanged || result.physicalChanged || result.range.min < conversationTurnRange(before?.turns).min) noProgressCount = 0;
           else noProgressCount += 1;
-          if (noProgressCount >= 3) { reason = 'history-tail-no-progress'; break; }
+          if (noProgressCount >= 3) {
+            diagnostics.tailScopeStopReason = 'no-progress';
+            break;
+          }
+        }
+        if (!reason && !diagnostics.tailScopeStopReason) {
+          diagnostics.tailScopeStopReason = current?.scroller?.atTop
+            ? 'at-top'
+            : observedIdentityCount() >= limits.maxTurns
+              ? 'max-turns'
+              : historyElapsedMs() > historyTimeoutMs
+                ? 'timeout'
+                : iterations >= historyMaxIterations
+                  ? 'iteration-limit'
+                  : null;
+          if (diagnostics.tailScopeStopReason === 'iteration-limit') diagnostics.iterationLimitReached = true;
         }
         snapshotStable = diagnostics.tailProven && !reason;
       }

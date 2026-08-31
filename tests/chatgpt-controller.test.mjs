@@ -669,15 +669,18 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
-  const windows = [
-    [0, 1, 2, 3, 4, 5, 6],
-    [5, 6, 7, 8, 9, 10, 11],
-    [10, 11, 12, 13, 14, 15, 16],
-    [15, 16, 17, 18, 19, 20, 21],
-    [20, 21, 22, 23, 24]
-  ];
+  const windows = windowCount > 5
+    ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: 7 }, (_, offset) => index * 5 + offset))
+    : [
+      [0, 1, 2, 3, 4, 5, 6],
+      [5, 6, 7, 8, 9, 10, 11],
+      [10, 11, 12, 13, 14, 15, 16],
+      [15, 16, 17, 18, 19, 20, 21],
+      [20, 21, 22, 23, 24]
+    ];
+  const defaultScrollHeight = windowCount > 5 ? windowCount * 250 + 400 : 1_400;
   let windowIndex = initialWindow;
   const originalWindowIndex = initialWindow;
   let url = 'https://chatgpt.com/c/native-wheel-test';
@@ -723,7 +726,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
         selectedPath: 'body>main>div#conversation-scroll',
         candidates: [],
         scrollTop: Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250,
-        scrollHeight: Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400,
+        scrollHeight: Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight,
         clientHeight: 400,
         atTop: (Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250) <= 1,
         atBottom: windowIndex === windows.length - 1,
@@ -755,7 +758,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, positionHints = true,
         else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
         scrollTopOverride = planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollTop))
           ? Number(planned.scrollTop)
-          : (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : 1_400) - 400 - distance;
+          : (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight) - 400 - distance;
         return { ok: true, scrollTop: windowIndex * 250 };
       }
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
@@ -2393,6 +2396,8 @@ test('chatgpt-controller: complete history proves an already-tail start without 
 test('chatgpt-controller: tail history is bounded and does not require start proof', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.deepEqual(result.turns.map((turn) => turn.index), Array.from({ length: 25 }, (_, index) => index));
+  assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
   assert.equal(result.history.mode, 'tail');
   assert.equal(result.history.complete, false);
   assert.equal(result.history.scopeComplete, true);
@@ -2404,6 +2409,54 @@ test('chatgpt-controller: tail history is bounded and does not require start pro
   assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
   assert.equal(result.history.scrollRestored, true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: tail history treats iteration budget as a bounded scope stop', async () => {
+  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.fullHistoryComplete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.snapshotStable, true);
+  assert.equal(result.history.diagnostics.tailScopeStopReason, 'iteration-limit');
+  assert.equal(result.history.diagnostics.iterationLimitReached, true);
+  assert.ok(result.turns.length < 100);
+  assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
+});
+
+test('chatgpt-controller: tail history treats a valid upward no-progress boundary as bounded scope', async () => {
+  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19, windowChanges: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.fullHistoryComplete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.snapshotStable, true);
+  assert.equal(result.history.diagnostics.tailScopeStopReason, 'no-progress');
+  assert.equal(result.history.diagnostics.iterationLimitReached, false);
+  assert.equal(result.turns.length, 7);
+  assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
+});
+
+test('chatgpt-controller: tail history keeps conversation changes fail-closed', async () => {
+  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19, changeUrlOnWheel: true });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.reason, 'conversation-changed');
+  assert.equal(result.history.scopeComplete, false);
+  assert.equal(result.history.tailProven, true);
+});
+
+test('chatgpt-controller: tail history keeps an unproven tail fail-closed', async () => {
+  const harness = createNativeWheelHistoryPage({ nativeWheel: false });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.reason, 'history-native-scroll-unproven');
+  assert.equal(result.history.scopeComplete, false);
+  assert.equal(result.history.tailProven, false);
 });
 
 test('chatgpt-controller: low range candidate establishes direct top without another native wheel', async () => {
@@ -2542,11 +2595,27 @@ test('chatgpt-controller: merge identity ignores position hints and reports real
     { role: 'assistant', text: 'b', messageId: 'm-b', positionHint: 7 }
   ]]);
   assert.equal(samePosition.ambiguous, false);
+  assert.deepEqual(samePosition.turns.map((turn) => turn.index), [0, 1]);
+  assert.deepEqual(samePosition.turns.map((turn) => turn.text), ['a', 'b']);
+  assert.deepEqual(samePosition.turns.map((turn) => turn.id), ['m-a', 'm-b']);
   const gapped = mergeConversationSnapshots([
     [{ role: 'user', text: 'a', messageId: 'm-a', positionHint: 1 }, { role: 'assistant', text: 'c', messageId: 'm-c', positionHint: 9 }],
     [{ role: 'assistant', text: 'c', messageId: 'm-c', positionHint: 9 }, { role: 'user', text: 'd', messageId: 'm-d', positionHint: 16 }]
   ]);
   assert.equal(gapped.continuous, true);
+  assert.deepEqual(gapped.turns.map((turn) => turn.index), [0, 1, 2]);
+  assert.deepEqual(gapped.turns.map((turn) => turn.text), ['a', 'c', 'd']);
+  assert.deepEqual(gapped.turns.map((turn) => turn.id), ['m-a', 'm-c', 'm-d']);
+  const stableIds = mergeConversationSnapshots([[
+    { role: 'user', text: 'question', messageId: 'message-1', turnId: 'turn-1', positionHint: 42 },
+    { role: 'assistant', text: 'answer', messageId: null, turnId: 'turn-2', positionHint: 42 }
+  ]]);
+  assert.deepEqual(stableIds.turns.map((turn) => ({ id: turn.id, messageId: turn.messageId, turnId: turn.turnId })), [
+    { id: 'message-1', messageId: 'message-1', turnId: 'turn-1' },
+    { id: 'turn-2', messageId: null, turnId: 'turn-2' }
+  ]);
+  assert.equal(stableIds.ambiguous, false);
+  assert.equal(stableIds.continuous, true);
   const disconnected = mergeConversationSnapshots([
     [{ role: 'user', text: 'a', messageId: 'm-a' }],
     [{ role: 'assistant', text: 'b', messageId: 'm-b' }]

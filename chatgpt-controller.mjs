@@ -145,6 +145,17 @@ function userTurnTextDigest(value) {
     .digest('hex');
 }
 
+function messageDispatchStateForError(run) {
+  if (
+    run?.sendConfirmed ||
+    run?.messageDispatchStarted ||
+    run?.dispatchStateUnknown ||
+    run?.providerStopInputStarted ||
+    ['dispatching', 'dispatched'].includes(run?.dispatchState)
+  ) return 'unknown';
+  return 'not-dispatched';
+}
+
 function fallbackConversationTurnId({ role, index, text }) {
   const digest = crypto
     .createHash('sha256')
@@ -7780,6 +7791,10 @@ export class ChatGPTController {
         const postSendDraft = await this.#settlePostSend(run);
         return { ok: true };
       } catch (error) {
+        error.data = {
+          ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+          messageDispatchState: messageDispatchStateForError(run)
+        };
         if (this.#canCleanupUnsentDraft(run)) {
           try {
             const cleanup = await this.cleanupUnsentDraft({

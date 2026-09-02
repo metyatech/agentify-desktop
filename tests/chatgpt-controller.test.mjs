@@ -3889,6 +3889,7 @@ test('chatgpt-controller: reports every exact submission fallback when no send s
         requestSubmitAttempted: true,
         lastFallbackResult: 'request_submit_with_button',
         sendConfirmed: false,
+        messageDispatchState: 'unknown',
         cleanup: { status: 'skipped', reason: 'user_turn_baseline_unavailable' }
       });
       return true;
@@ -5592,7 +5593,7 @@ test('chatgpt-controller: blocks send when a stale draft exists', async () => {
 
   await assert.rejects(
     createController(page).send({ text: 'send must not attach stale draft', timeoutMs: 5_000 }),
-    (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight'
+    (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.phase === 'attachment_preflight' && error.data?.messageDispatchState === 'not-dispatched'
   );
   assert.equal(events.some((event) => event.startsWith('text:')), false);
   assert.equal(events.includes('normal-send-click'), false);
@@ -7664,8 +7665,13 @@ test('chatgpt-controller: dispatch response loss preserves the sent state and ex
   assert.equal(stop.clicked, true);
   assert.equal(harness.providerStopCount(), 1);
   releaseAction();
-  await assert.rejects(sendPromise, /dispatch_response_lost/u);
+  await assert.rejects(sendPromise, (error) => {
+    assert.match(error.message, /dispatch_response_lost/u);
+    assert.equal(error.data?.messageDispatchState, 'unknown');
+    return true;
+  });
   assert.equal(harness.actionCount(), 1);
+  assert.equal(harness.state().dispatch.state, 'dispatched');
   assert.equal(events.includes('cleanup-draft'), false);
 });
 

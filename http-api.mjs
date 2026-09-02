@@ -101,6 +101,9 @@ function boundedAttachmentErrorList(values) {
 
 function sanitizeAttachmentDiagnostics(value) {
   const data = value && typeof value === 'object' ? value : {};
+  const messageDispatchState = ['not-dispatched', 'unknown', 'confirmed'].includes(data.messageDispatchState)
+    ? data.messageDispatchState
+    : null;
   const states = (Array.isArray(data.attachmentStates) ? data.attachmentStates : []).slice(0, MAX_ATTACHMENT_DIAGNOSTIC_ITEMS).map((state) => ({
     sourceFileName: boundedAttachmentName(state?.sourceFileName || state?.fileName),
     displayName: boundedAttachmentName(state?.displayName),
@@ -139,6 +142,7 @@ function sanitizeAttachmentDiagnostics(value) {
     busy: !!data.busy,
     elapsedMs: Math.max(0, Math.min(120_000, Number(data.elapsedMs) || 0)),
     timeoutMs: Math.max(0, Math.min(120_000, Number(data.timeoutMs) || 0)),
+    messageDispatchState,
     ...(cleanup ? { cleanup } : {})
   };
 }
@@ -1129,6 +1133,18 @@ export function startHttpApi({
         attachmentDiagnostics: sanitizeAttachmentDiagnostics(detail)
       };
     }
+    if (message === 'chatgpt_file_input_state_conflict') {
+      return {
+        ...base,
+        status: 'error',
+        label: 'Run failed',
+        detail: message,
+        messageDispatchState: ['not-dispatched', 'unknown', 'confirmed'].includes(detail?.messageDispatchState)
+          ? detail.messageDispatchState
+          : 'unknown',
+        attachmentDiagnostics: sanitizeAttachmentDiagnostics(detail)
+      };
+    }
     if (message === 'rate_limited') {
       return {
         ...base,
@@ -1795,7 +1811,7 @@ export function startHttpApi({
             finishedAt: Date.now(),
             durationMs: Math.max(0, Date.now() - op.startedAt)
           });
-          return sendJson(res, 200, { ok: true, tabId, result });
+          return sendJson(res, 200, { ok: true, tabId, result, messageDispatchState: 'confirmed' });
         } catch (error) {
           if (tabId) setLastOutcome(tabId, outcomeFromError(error, op));
           throw error;

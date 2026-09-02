@@ -763,6 +763,7 @@ test('http-api: /send calls the mutex-owning controller directly and completes o
   ]);
   assert.equal(response.res.status, 200);
   assert.equal(response.data.result.text, 'one send');
+  assert.equal(response.data.messageDispatchState, 'confirmed');
   assert.equal(sendCalls, 1);
   const status = await req({ port, token: 'secret', method: 'GET', pth: '/status' });
   assert.equal(status.data.activeQuery, null);
@@ -1463,6 +1464,14 @@ test('http-api: attachment state conflict and clear errors keep explicit status 
     assert.equal(mapped.body.error, code);
     assert.equal(mapped.body.data.expectedFileNames[0], 'file.json');
   }
+  const notDispatched = mapErrorToHttp(Object.assign(new Error('chatgpt_file_input_state_conflict'), {
+    data: { messageDispatchState: 'not-dispatched' }
+  }));
+  assert.equal(notDispatched.body.data.messageDispatchState, 'not-dispatched');
+  const unknown = mapErrorToHttp(Object.assign(new Error('chatgpt_file_input_state_conflict'), {
+    data: { messageDispatchState: 'untrusted' }
+  }));
+  assert.equal(unknown.body.data.messageDispatchState, null);
 });
 
 test('http-api: browser evaluation failures retain safe phase and diagnostics on the real handler', async (t) => {

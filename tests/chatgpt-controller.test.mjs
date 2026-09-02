@@ -1444,8 +1444,26 @@ test('chatgpt-controller: Chrome complete history preserves an already-normal wi
 });
 
 test('chatgpt-controller: complete history defaults use the existing maximum budget', () => {
-  assert.equal(DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, 30_000);
-  assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 120);
+  assert.equal(DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, 60_000);
+  assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 240);
+});
+
+test('chatgpt-controller: complete history remains fail-closed when the expanded iteration budget cannot prove the start', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 249, windowCount: 250 });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 60_000,
+    historyMaxIterations: 240
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-iteration-limit');
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.diagnostics.iterationLimitReached, true);
+  assert.equal(result.history.diagnostics.iterationLimitReachedAtTop, false);
+  assert.equal(result.history.diagnostics.historyIterationLimit, 240);
 });
 
 test('chatgpt-controller: semantic tail signature ignores remounted identities and position hints', () => {

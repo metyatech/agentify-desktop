@@ -3780,8 +3780,7 @@ export class ChatGPTController {
         const ready = (native) => ['normal', 'maximized', 'fullscreen'].includes(native?.browserWindowState)
           && native?.pageClosed === false
           && native?.documentVisibilityState === 'visible'
-          && native?.documentHidden === false
-          && native?.documentHasFocus === true;
+          && native?.documentHidden === false;
         if (initialNative?.browserWindowState === 'minimized') {
           if (typeof this.page?.temporarilyUnminimizeForProbe !== 'function') {
             reason = 'history-native-window-not-ready';
@@ -3890,8 +3889,7 @@ export class ChatGPTController {
         if (runtime?.pageClosed !== false
           || !['normal', 'maximized', 'fullscreen'].includes(runtime?.browserWindowState)
           || runtime?.documentVisibilityState !== 'visible'
-          || runtime?.documentHidden !== false
-          || runtime?.documentHasFocus !== true) {
+          || runtime?.documentHidden !== false) {
           return { ok: false, reason: 'history-native-window-not-ready' };
         }
       }

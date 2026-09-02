@@ -669,7 +669,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
   const windows = windowCount > 5
     ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: 7 }, (_, offset) => index * 5 + offset))
@@ -693,9 +693,10 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
   const initialState = initialBrowserWindowState || (backend === 'chrome-cdp' ? 'minimized' : null);
   let browserWindowState = initialState;
   let adapterMinimized = backend === 'chrome-cdp' ? initialState === 'minimized' : null;
-  let visibilityState = backend === 'chrome-cdp' && initialState === 'minimized' ? 'hidden' : backend === 'chrome-cdp' ? 'visible' : null;
-  let hidden = backend === 'chrome-cdp' ? visibilityState === 'hidden' : null;
-  let hasFocus = backend === 'chrome-cdp' ? initialState !== 'minimized' : null;
+  let visibilityState = backend === 'chrome-cdp' ? (initialVisibilityState || (initialState === 'minimized' ? 'hidden' : 'visible')) : null;
+  let hidden = backend === 'chrome-cdp' ? (initialDocumentHidden ?? visibilityState === 'hidden') : null;
+  let hasFocus = backend === 'chrome-cdp' ? (initialDocumentHasFocus ?? initialState !== 'minimized') : null;
+  let nativeDiagnosticsCount = 0;
   const snapshot = () => {
     const rawPositions = windows[windowIndex];
     const positions = rawPositions.map((position) => position + positionOffset);
@@ -811,15 +812,22 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
   });
   page.getUrl = async () => url;
   if (backend === 'chrome-cdp') {
-    page.getNativeInputDiagnostics = async () => ({
-      backend,
-      pageClosed: false,
-      browserWindowState,
-      adapterMinimized,
-      documentVisibilityState: visibilityState,
-      documentHidden: hidden,
-      documentHasFocus: hasFocus
-    });
+    page.getNativeInputDiagnostics = async () => {
+      nativeDiagnosticsCount += 1;
+      const base = {
+        backend,
+        pageClosed: initialPageClosed,
+        browserWindowState,
+        adapterMinimized,
+        documentVisibilityState: visibilityState,
+        documentHidden: hidden,
+        documentHasFocus: hasFocus
+      };
+      const planned = typeof nativeDiagnosticsPlan === 'function'
+        ? await nativeDiagnosticsPlan({ count: nativeDiagnosticsCount, state: { ...base } })
+        : null;
+      return planned && typeof planned === 'object' ? { ...base, ...planned } : base;
+    };
     page.temporarilyUnminimizeForProbe = async () => {
       events.push('window-state:normal');
       browserWindowState = 'normal';
@@ -1427,8 +1435,8 @@ test('chatgpt-controller: Chrome proof keeps the same direction across physical-
   assert.equal(wheels[1].endsWith(':0:-720'), true);
 });
 
-test('chatgpt-controller: Chrome complete history preserves an already-normal window', async () => {
-  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', initialBrowserWindowState: 'normal' });
+test('chatgpt-controller: Chrome complete history accepts visible unfocused windows and dispatches targeted wheels', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp', initialBrowserWindowState: 'normal', initialDocumentHasFocus: false });
   const result = await createController(harness.page).readConversationTurns({
     maxTurns: 50,
     maxCharsPerTurn: 1000,
@@ -1441,6 +1449,39 @@ test('chatgpt-controller: Chrome complete history preserves an already-normal wi
   assert.equal(result.history.diagnostics.windowLifecycle.normalizationApplied, false);
   assert.equal(result.history.diagnostics.windowLifecycle.restoreAttempts, 0);
   assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+  assert.equal(result.history.diagnostics.windowLifecycle.originalHasFocus, false);
+  assert.equal(harness.events.some((event) => event.startsWith('mouse-wheel:')), true);
+});
+
+test('chatgpt-controller: complete history remains fail-closed for hidden, closed, and runtime-hidden Chrome pages', async () => {
+  const hidden = createNativeWheelHistoryPage({
+    backend: 'chrome-cdp',
+    initialBrowserWindowState: 'normal',
+    initialDocumentHasFocus: false,
+    initialVisibilityState: 'hidden',
+    initialDocumentHidden: true
+  });
+  const hiddenResult = await createController(hidden.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(hiddenResult.history.complete, false);
+  assert.equal(hiddenResult.history.reason, 'history-native-window-not-ready');
+  assert.equal(hidden.getWheelCount(), 0);
+
+  const closed = createNativeWheelHistoryPage({ backend: 'chrome-cdp', initialBrowserWindowState: 'normal', initialPageClosed: true });
+  const closedResult = await createController(closed.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(closedResult.history.complete, false);
+  assert.equal(closedResult.history.reason, 'history-native-window-not-ready');
+  assert.equal(closed.getWheelCount(), 0);
+
+  const runtimeHidden = createNativeWheelHistoryPage({
+    backend: 'chrome-cdp',
+    initialBrowserWindowState: 'normal',
+    initialDocumentHasFocus: false,
+    nativeDiagnosticsPlan: ({ count }) => count >= 2 ? { documentVisibilityState: 'hidden', documentHidden: true } : null
+  });
+  const runtimeResult = await createController(runtimeHidden.page).readConversationTurns({ historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(runtimeResult.history.complete, false);
+  assert.equal(runtimeResult.history.reason, 'history-native-window-not-ready');
+  assert.equal(runtimeHidden.getWheelCount(), 0);
 });
 
 test('chatgpt-controller: complete history defaults use the existing maximum budget', () => {

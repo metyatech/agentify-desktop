@@ -669,7 +669,7 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
   const windows = windowCount > 5
     ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: 7 }, (_, offset) => index * 5 + offset))
@@ -765,6 +765,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
       const traversalRead = js.includes('const traversalRead = true;');
       if (!traversalRead) readCount += 1;
+      if (Number.isInteger(changeUrlOnReadAt) && readCount === changeUrlOnReadAt) url = 'https://chatgpt.com/c/changed';
       const state = snapshot();
       const layoutOverride = !traversalRead && Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
         ? layoutSnapshots[readCount - 1]
@@ -2455,7 +2456,7 @@ test('chatgpt-controller: complete history proves an already-tail start without 
 test('chatgpt-controller: tail history is bounded and does not require start proof', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 30 });
-  assert.deepEqual(result.turns.map((turn) => turn.index), Array.from({ length: 25 }, (_, index) => index));
+  assert.deepEqual(result.turns.map((turn) => turn.index), Array.from({ length: 5 }, (_, index) => index));
   assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
   assert.equal(result.history.mode, 'tail');
   assert.equal(result.history.complete, false);
@@ -2465,13 +2466,40 @@ test('chatgpt-controller: tail history is bounded and does not require start pro
   assert.equal(result.history.diagnostics.tailProven, true);
   assert.equal(result.history.diagnostics.tailEntry.directAttempted, true);
   assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
+  assert.equal(result.history.diagnostics.tailEntry.alreadyAtBottom, true);
+  assert.equal(result.history.diagnostics.tailScopeStopReason, 'tail-window');
   assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
   assert.equal(result.history.scrollRestored, true);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
-test('chatgpt-controller: tail history treats iteration budget as a bounded scope stop', async () => {
-  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19 });
+test('chatgpt-controller: tail history at bottom performs no scroll mutation', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(harness.events.includes('conversation-scroll-restore'), false);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: tail history establishes bottom without upward traversal and restores the original position', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.diagnostics.tailEntry.alreadyAtBottom, false);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(harness.events.includes('conversation-scroll-restore'), true);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: tail history does not traverse upward for a long conversation', async () => {
+  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 10 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
   assert.equal(result.history.reason, null);
   assert.equal(result.history.scopeComplete, true);
@@ -2480,8 +2508,10 @@ test('chatgpt-controller: tail history treats iteration budget as a bounded scop
   assert.equal(result.history.startReached, false);
   assert.equal(result.history.tailProven, true);
   assert.equal(result.history.snapshotStable, true);
-  assert.equal(result.history.diagnostics.tailScopeStopReason, 'iteration-limit');
-  assert.equal(result.history.diagnostics.iterationLimitReached, true);
+  assert.equal(result.history.diagnostics.tailScopeStopReason, 'tail-window');
+  assert.equal(result.history.diagnostics.iterationLimitReached, false);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
   assert.ok(result.turns.length < 100);
   assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
 });
@@ -2496,18 +2526,20 @@ test('chatgpt-controller: tail history treats a valid upward no-progress boundar
   assert.equal(result.history.startReached, false);
   assert.equal(result.history.tailProven, true);
   assert.equal(result.history.snapshotStable, true);
-  assert.equal(result.history.diagnostics.tailScopeStopReason, 'no-progress');
+  assert.equal(result.history.diagnostics.tailScopeStopReason, 'tail-window');
   assert.equal(result.history.diagnostics.iterationLimitReached, false);
   assert.equal(result.turns.length, 7);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
   assert.ok(result.turns.every((turn, index, turns) => index === 0 || turn.index > turns[index - 1].index));
 });
 
 test('chatgpt-controller: tail history keeps conversation changes fail-closed', async () => {
-  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19, changeUrlOnWheel: true });
+  const harness = createNativeWheelHistoryPage({ windowCount: 20, initialWindow: 19, changeUrlOnReadAt: 4 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
   assert.equal(result.history.reason, 'conversation-changed');
   assert.equal(result.history.scopeComplete, false);
-  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.tailProven, false);
 });
 
 test('chatgpt-controller: tail history keeps an unproven tail fail-closed', async () => {

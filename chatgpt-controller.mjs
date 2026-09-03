@@ -3604,7 +3604,9 @@ export class ChatGPTController {
         mode: null,
         directAttempted: false,
         directVerified: false,
-        fallbackUsed: false
+        fallbackUsed: false,
+        alreadyAtBottom: false,
+        scrollMutationSkipped: false
       },
       directTop: {
         candidateDetected: false,
@@ -4021,8 +4023,12 @@ export class ChatGPTController {
       const entry = diagnostics.tailEntry;
       entry.directAttempted = true;
       entry.mode = 'direct-bottom';
-      let command = null;
-      try { command = await this.#eval(buildRestoreConversationScrollScript(0, 'tail')); } catch { command = null; }
+      entry.alreadyAtBottom = current?.scroller?.atBottom === true && current?.loading === false;
+      entry.scrollMutationSkipped = entry.alreadyAtBottom;
+      let command = entry.alreadyAtBottom ? { ok: true, skipped: true } : null;
+      if (!entry.alreadyAtBottom) {
+        try { command = await this.#eval(buildRestoreConversationScrollScript(0, 'tail')); } catch { command = null; }
+      }
       if (command?.ok !== true) {
         entry.fallbackUsed = true;
         entry.mode = 'native-wheel-fallback';
@@ -4145,18 +4151,27 @@ export class ChatGPTController {
             restoreDiagnostics.lastFailureReason = 'scroller-missing';
             continue;
           }
-          const result = await this.#eval(buildRestoreConversationScrollScript(targetDistance)).catch(() => null);
-          if (result?.ok !== true) {
-            restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
-            continue;
-          }
-          await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
-          let restored = null;
-          try {
-            restored = await readWindow();
-          } catch {
-            restoreDiagnostics.lastFailureReason = 'read-failed';
-            continue;
+          const currentDistance = currentScrollHeight - currentClientHeight - Number(currentState.scroller?.scrollTop);
+          const alreadyAtTarget = tailOnly
+            && targetMode === 'bottom'
+            && currentState.scroller.atBottom === true
+            && currentState.loading === false
+            && Number.isFinite(currentDistance)
+            && Math.abs(currentDistance - targetDistance) <= 2;
+          let restored = currentState;
+          if (!alreadyAtTarget) {
+            const result = await this.#eval(buildRestoreConversationScrollScript(targetDistance)).catch(() => null);
+            if (result?.ok !== true) {
+              restoreDiagnostics.lastFailureReason = result?.reason === 'scroll-container-ambiguous' ? 'scroller-ambiguous' : 'restore-command-failed';
+              continue;
+            }
+            await sleep(CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS);
+            try {
+              restored = await readWindow();
+            } catch {
+              restoreDiagnostics.lastFailureReason = 'read-failed';
+              continue;
+            }
           }
           if (!restored || restored.limitExceeded) {
             restoreDiagnostics.lastFailureReason = restored?.limitExceeded ? 'limit-exceeded' : 'read-failed';
@@ -4387,55 +4402,9 @@ export class ChatGPTController {
       }
 
       if (!reason && tailOnly && diagnostics.tailProven) {
-        const observedIdentityCount = () => new Set(snapshots.flatMap((snapshot) => (Array.isArray(snapshot) ? snapshot : []), []).map((turn) => {
-          const text = normalizeConversationText(turn?.text);
-          return turn?.messageId
-            ? `message:${turn.messageId}`
-            : turn?.turnId
-              ? `turn:${turn.turnId}`
-              : `fingerprint:${turn?.role || ''}\u0000${text}`;
-        })).size;
-        let noProgressCount = 0;
-        while (!reason && !current?.scroller?.atTop && observedIdentityCount() < limits.maxTurns) {
-          if (historyElapsedMs() > historyTimeoutMs) {
-            diagnostics.tailScopeStopReason = 'timeout';
-            break;
-          }
-          if (iterations >= historyMaxIterations) {
-            diagnostics.iterationLimitReached = true;
-            diagnostics.tailScopeStopReason = 'iteration-limit';
-            break;
-          }
-          const before = current;
-          const result = await nativeWheel(-1, before);
-          if (!result.ok) {
-            if (result.reason === 'timeout') {
-              diagnostics.iterationLimitReached = iterations >= historyMaxIterations;
-              diagnostics.tailScopeStopReason = diagnostics.iterationLimitReached ? 'iteration-limit' : 'timeout';
-              break;
-            }
-            reason = result.reason;
-            break;
-          }
-          if (result.windowChanged || result.physicalChanged || result.range.min < conversationTurnRange(before?.turns).min) noProgressCount = 0;
-          else noProgressCount += 1;
-          if (noProgressCount >= 3) {
-            diagnostics.tailScopeStopReason = 'no-progress';
-            break;
-          }
-        }
-        if (!reason && !diagnostics.tailScopeStopReason) {
-          diagnostics.tailScopeStopReason = current?.scroller?.atTop
-            ? 'at-top'
-            : observedIdentityCount() >= limits.maxTurns
-              ? 'max-turns'
-              : historyElapsedMs() > historyTimeoutMs
-                ? 'timeout'
-                : iterations >= historyMaxIterations
-                  ? 'iteration-limit'
-                  : null;
-          if (diagnostics.tailScopeStopReason === 'iteration-limit') diagnostics.iterationLimitReached = true;
-        }
+        // A proven tail read is already a valid bounded scope. Do not walk older
+        // virtualized windows here; complete mode owns historical traversal.
+        diagnostics.tailScopeStopReason = 'tail-window';
         snapshotStable = diagnostics.tailProven && !reason;
       }
 

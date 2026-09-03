@@ -6,6 +6,7 @@ import { atomicWriteFile } from './state.mjs';
 
 export const DRAFT_OWNERSHIP_SCHEMA_VERSION = 1;
 export const DRAFT_OWNERSHIP_TTL_MS = 24 * 60 * 60 * 1000;
+export const POST_SEND_TOMBSTONE_GRACE_MS = 5_000;
 
 const OWNERSHIP_PHASES = new Set([
   'prepared',
@@ -14,6 +15,7 @@ const OWNERSHIP_PHASES = new Set([
   'dispatch-started',
   'send-confirmed',
   'post-send-settling',
+  'post-send-tombstone',
   'cleanup-required',
   'cleared'
 ]);
@@ -96,15 +98,24 @@ export function canSettlePostSendDraft({ lease, current, tabId, conversationDige
   if (!lease || lease.schemaVersion !== DRAFT_OWNERSHIP_SCHEMA_VERSION || lease.sendConfirmed !== true) return { safe: false, reason: 'post_send_lease_missing' };
   if (!tabId || (!allowRuntimeTabRebind && lease.tabId !== tabId) || !conversationDigest || lease.conversationDigest !== conversationDigest) return { safe: false, reason: 'post_send_identity_mismatch' };
   if (activeOperationId && lease.operationId === activeOperationId) return { safe: false, reason: 'post_send_operation_reused' };
-  if (!lease.operationId || !['send-confirmed', 'post-send-settling', 'cleanup-required'].includes(lease.phase)) return { safe: false, reason: 'post_send_phase_invalid' };
+  if (!lease.operationId || !['send-confirmed', 'post-send-settling', 'post-send-tombstone', 'cleanup-required'].includes(lease.phase)) return { safe: false, reason: 'post_send_phase_invalid' };
   const updatedAt = Date.parse(lease.updatedAt || '');
   if (!Number.isFinite(updatedAt) || now - updatedAt > DRAFT_OWNERSHIP_TTL_MS) return { safe: false, reason: 'post_send_lease_expired' };
+  if (lease.phase === 'post-send-tombstone' && (!lease.postSendTombstone || Date.parse(lease.postSendTombstone.expiresAt || '') <= now)) return { safe: false, reason: 'post_send_tombstone_expired' };
   if (!current) return { safe: false, reason: 'post_send_input_ownership_unknown' };
   const baseline = normalizedBaseline(lease.userTurnBaseline);
   const observed = normalizedBaseline(current.userTurnBaseline);
-  const sentTurnMatches = observed.count === baseline.count + 1 &&
-    observed.lastTextDigest === lease.promptDigest &&
-    (!baseline.lastId || !observed.lastId || baseline.lastId !== observed.lastId);
+  const sentProof = lease.sentUserTurnProof && typeof lease.sentUserTurnProof === 'object'
+    ? normalizedBaseline(lease.sentUserTurnProof)
+    : null;
+  const sentTurnMatches = sentProof
+    ? observed.count === sentProof.count &&
+      (!sentProof.lastId || observed.lastId === sentProof.lastId) &&
+      (!sentProof.lastTextDigest || observed.lastTextDigest === sentProof.lastTextDigest) &&
+      (!baseline.lastId || !observed.lastId || baseline.lastId !== observed.lastId)
+    : observed.count === baseline.count + 1 &&
+      observed.lastTextDigest === lease.promptDigest &&
+      (!baseline.lastId || !observed.lastId || baseline.lastId !== observed.lastId);
   if (!sentTurnMatches) return { safe: false, reason: 'post_send_turn_proof_missing' };
   const promptOwned = current.promptLength === 0 || (lease.ownedPrompt === true && current.promptDigest === lease.promptDigest && current.promptLength === lease.promptLength);
   if (!promptOwned) return { safe: false, reason: 'post_send_foreign_prompt' };
@@ -157,6 +168,20 @@ export function sameBaseline(left, right) {
   const a = normalizedBaseline(left);
   const b = normalizedBaseline(right);
   return a.count === b.count && a.lastId === b.lastId && a.lastTextDigest === b.lastTextDigest;
+}
+
+export function createPostSendTombstone({ operationId, tabId, conversationDigest, sentUserTurnProof, expectedAttachments = [], clearedAt = new Date().toISOString(), graceMs = POST_SEND_TOMBSTONE_GRACE_MS } = {}) {
+  const cleared = new Date(clearedAt);
+  const expires = new Date(cleared.getTime() + Math.max(1_000, Math.min(30_000, Number(graceMs) || POST_SEND_TOMBSTONE_GRACE_MS)));
+  return {
+    operationId: String(operationId || ''),
+    tabId: String(tabId || ''),
+    conversationDigest: String(conversationDigest || ''),
+    sentUserTurnProof: normalizedBaseline(sentUserTurnProof),
+    expectedAttachments: (Array.isArray(expectedAttachments) ? expectedAttachments : []).map(normalizedAttachment),
+    clearedAt: cleared.toISOString(),
+    expiresAt: expires.toISOString()
+  };
 }
 
 export async function sha256File(filePath) {
@@ -212,7 +237,7 @@ export class DraftOwnershipStore {
         const candidatePath = path.join(this.stateDir, name);
         try {
           const candidate = JSON.parse(await fs.readFile(candidatePath, 'utf8'));
-          if (candidate && typeof candidate === 'object' && candidate.sendConfirmed === true && ['send-confirmed', 'post-send-settling', 'cleanup-required'].includes(candidate.phase)) candidates.push({ candidate, candidatePath });
+          if (candidate && typeof candidate === 'object' && candidate.sendConfirmed === true && ['send-confirmed', 'post-send-settling', 'post-send-tombstone', 'cleanup-required'].includes(candidate.phase)) candidates.push({ candidate, candidatePath });
         } catch {}
       }
       if (candidates.length !== 1) return null;
@@ -239,7 +264,7 @@ export class DraftOwnershipStore {
   }
 }
 
-export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest = '', promptLength = 0, ownedPrompt = false, ownedPromptDigest = promptDigest, ownedPromptLength = promptLength, phase = 'prepared', sendConfirmed = false, postSendDiagnostic = null, updatedAt = new Date().toISOString() }) {
+export function createDraftLease({ operationId, tabId, conversationDigest, userTurnBaseline, expectedAttachments = [], promptDigest = '', promptLength = 0, ownedPrompt = false, ownedPromptDigest = promptDigest, ownedPromptLength = promptLength, phase = 'prepared', sendConfirmed = false, sentUserTurnProof = null, postSendTombstone = null, postSendDiagnostic = null, updatedAt = new Date().toISOString() }) {
   const promptIsOwned = ownedPrompt === true && phase !== 'prepared' && phase !== 'attachments-owned';
   return {
     schemaVersion: DRAFT_OWNERSHIP_SCHEMA_VERSION,
@@ -247,12 +272,16 @@ export function createDraftLease({ operationId, tabId, conversationDigest, userT
     tabId: String(tabId || ''),
     conversationDigest: String(conversationDigest || ''),
     userTurnBaseline: normalizedBaseline(userTurnBaseline),
+    sentUserTurnProof: sentUserTurnProof && typeof sentUserTurnProof === 'object' ? normalizedBaseline(sentUserTurnProof) : null,
     expectedAttachments: (Array.isArray(expectedAttachments) ? expectedAttachments : []).map(normalizedAttachment),
     ownedPrompt: promptIsOwned,
     promptDigest: promptIsOwned ? String(ownedPromptDigest || '') : '',
     promptLength: promptIsOwned ? Math.max(0, Number(ownedPromptLength) || 0) : 0,
     phase: OWNERSHIP_PHASES.has(phase) ? phase : 'prepared',
     sendConfirmed: sendConfirmed === true,
+    postSendTombstone: postSendTombstone && typeof postSendTombstone === 'object'
+      ? createPostSendTombstone(postSendTombstone)
+      : null,
     postSendDiagnostic: postSendDiagnostic && typeof postSendDiagnostic === 'object'
       ? { status: String(postSendDiagnostic.status || '').slice(0, 32), reason: String(postSendDiagnostic.reason || '').slice(0, 80) }
       : null,

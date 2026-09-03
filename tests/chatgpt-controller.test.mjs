@@ -6218,6 +6218,156 @@ test('chatgpt-controller: post-send settling clears only exact owned current-dra
   assert.equal(events.includes('card-remove'), true);
 });
 
+test('chatgpt-controller: reproduces the post-send clean lease clear before owned attachment resurrection', async () => {
+  await withTempAttachments(['task-contract.json', 'verification.json', 'execution-log.json', 'execution-summary.txt'], async (attachments) => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-post-send-resurrection-'));
+    try {
+      const events = [];
+      const prompt = 'attachment query whose draft resurrects after settlement';
+      const names = attachments.map((filePath) => path.basename(filePath));
+      const expected = await describeAttachmentFiles(attachments);
+      const cleanDraft = {
+        ...chatgptUploadInputState({}),
+        promptLength: 0,
+        promptDigest: textDigest(''),
+        selectedFiles: [],
+        inputValuePresent: false,
+        composerInputCount: 1,
+        pageUploadInputCount: 1,
+        pageInputCount: 1
+      };
+      const resurrectedDraft = {
+        ...chatgptUploadInputState({ selectedFileNames: names, cardDisplayNames: names, inputValue: 'C:\\fakepath\\task-contract.json' }),
+        promptLength: 0,
+        promptDigest: textDigest(''),
+        inputValuePresent: true,
+        selectedFiles: expected,
+        pageInputCount: 1
+      };
+      let draftReadCount = 0;
+      let cleanupTriggered = false;
+      let baselineReadCount = 0;
+      const baseline = { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') };
+      const sentBaseline = { count: 1, lastId: 'sent-user', lastTextDigest: userTurnDigestForTest(prompt) };
+      const { page } = createAttachmentCleanupPage({
+        events,
+        attachmentDraftState: () => {
+          if (cleanupTriggered) return cleanDraft;
+          draftReadCount += 1;
+          return draftReadCount <= 2 ? cleanDraft : resurrectedDraft;
+        },
+        attachmentState: () => attachmentCardSnapshot(names.map((fileName) => ({
+          fileName,
+          found: true,
+          pending: false,
+          failed: false
+        }))),
+        cleanupResult: { ok: true },
+        userTurnBaseline: () => {
+          baselineReadCount += 1;
+          return baselineReadCount === 1 ? baseline : sentBaseline;
+        },
+        onBasicEvaluate: async (js) => js.includes('missing_prompt_textarea')
+          ? { ok: true, rect: { x: 10, y: 10, w: 400, h: 40 }, userTurnBaseline: baseline }
+          : undefined,
+        onEvaluateExtra: async (js) => {
+          if (js.includes('const agentifyAttachmentCleanup')) {
+            cleanupTriggered = true;
+            return { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 1 };
+          }
+          if (isClickSendEvaluation(js)) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+          if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({
+            userCount: 1,
+            lastUserId: 'sent-user',
+            lastUserText: prompt,
+            activePromptText: prompt
+          });
+          return undefined;
+        }
+      });
+      const controller = createController(page, { stateDir, tabId: 'post-send-resurrection-tab' });
+
+      const result = await controller.query({ prompt, attachments, timeoutMs: 5_000 });
+      assert.equal(result.text, 'cleanup-answer');
+      assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'post-send-resurrection-tab' }).read(), null);
+      assert.equal(cleanupTriggered, true);
+
+      const dispatchesBeforePlainSend = events.filter((event) => event === 'normal-send-click').length;
+      await controller.send({ text: 'plain text after owned resurrection cleanup', timeoutMs: 5_000 });
+      assert.equal(events.filter((event) => event === 'normal-send-click').length, dispatchesBeforePlainSend + 1);
+      assert.equal(draftReadCount, 3);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('chatgpt-controller: keeps a clean post-send attachment tombstone until stable clean is proven', async () => {
+  await withTempAttachments(['task-contract.json', 'verification.json', 'execution-log.json', 'execution-summary.txt'], async (attachments) => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-post-send-stable-clean-'));
+    try {
+      const events = [];
+      const prompt = 'attachment query with stable post-send cleanup';
+      const names = attachments.map((filePath) => path.basename(filePath));
+      const expected = await describeAttachmentFiles(attachments);
+      const cleanDraft = {
+        ...chatgptUploadInputState({}),
+        promptLength: 0,
+        promptDigest: textDigest(''),
+        selectedFiles: [],
+        inputValuePresent: false,
+        composerInputCount: 1,
+        pageUploadInputCount: 1,
+        pageInputCount: 1
+      };
+      let draftReadCount = 0;
+      let baselineReadCount = 0;
+      const baseline = { count: 0, lastId: '', lastTextDigest: userTurnDigestForTest('') };
+      const sentBaseline = { count: 1, lastId: 'sent-user', lastTextDigest: userTurnDigestForTest(prompt) };
+      const { page } = createAttachmentCleanupPage({
+        events,
+        attachmentDraftState: () => {
+          draftReadCount += 1;
+          return cleanDraft;
+        },
+        attachmentState: attachmentCardSnapshot(names.map((fileName) => ({
+          fileName,
+          found: true,
+          pending: false,
+          failed: false
+        }))),
+        userTurnBaseline: () => {
+          baselineReadCount += 1;
+          return baselineReadCount === 1 ? baseline : sentBaseline;
+        },
+        onBasicEvaluate: async (js) => js.includes('missing_prompt_textarea')
+          ? { ok: true, rect: { x: 10, y: 10, w: 400, h: 40 }, userTurnBaseline: baseline }
+          : undefined,
+        onEvaluateExtra: async (js) => {
+          if (isClickSendEvaluation(js)) return normalChatGPTSendResult(sendBaseline({ activePromptText: prompt }));
+          if (js.includes('const chatgptUserTurns')) return chatgptSendSignal({
+            userCount: 1,
+            lastUserId: 'sent-user',
+            lastUserText: prompt,
+            activePromptText: prompt
+          });
+          return undefined;
+        }
+      });
+      const controller = createController(page, { stateDir, tabId: 'post-send-stable-clean-tab' });
+
+      const result = await controller.query({ prompt, attachments, timeoutMs: 5_000 });
+      assert.equal(result.text, 'cleanup-answer');
+      assert.ok(draftReadCount >= 3);
+      assert.equal(events.includes('cleanup-draft'), false);
+      assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'post-send-stable-clean-tab' }).read(), null);
+      assert.equal(expected.length, 4);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
 test('chatgpt-controller: production-like nine-file and seven-card residual cleanup is safe', async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-production-like-'));
   const evidenceNames = ['task-contract.json', 'repository-state.json', 'repository-diff.txt', 'changed-files.json', 'binary-files.json', 'commits.txt', 'verification.json', 'execution-log.json', 'execution-summary.txt'];
@@ -6294,20 +6444,30 @@ test('chatgpt-controller: production-like cleanup failure survives restart and r
     assert.equal(stored.ownedPrompt, false);
     const events = [];
     let preflightCount = 0;
+    const cleanDraftState = {
+      isChatGPT: true,
+      hasAttachmentState: false,
+      promptLength: 0,
+      promptDigest: textDigest(''),
+      selectedFiles: [],
+      cardDisplayNames: [],
+      inputValuePresent: false,
+      composerInputCount: 1,
+      pageInputCount: 1
+    };
     const secondPage = createAttachmentCleanupPage({
       events,
-      attachmentDraftState: () => preflightCount++ === 0 ? staleState : { isChatGPT: true, hasAttachmentState: false },
+      attachmentDraftState: () => preflightCount++ === 0 ? staleState : cleanDraftState,
       cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
       attachmentState: () => attachmentCardSnapshot(evidenceNames.map((fileName) => ({ fileName, found: true, pending: false, failed: false }))),
       onBasicEvaluate: async (js) => js.includes('const node = nodes[0] || null') ? '' : undefined,
       onSetFileInputFiles: async () => {}
     }).page;
     await createController(secondPage, { stateDir, tabId: 'restart-production-tab' }).query({ prompt: 'second production attempt', attachments: files, timeoutMs: 5_000 });
-    assert.equal(preflightCount, 3);
+    assert.equal(preflightCount, 5);
     assert.equal(events.filter((event) => event === 'files-set:9').length, 1);
     const postSendLease = await new DraftOwnershipStore({ stateDir, tabId: 'restart-production-tab' }).read();
-    assert.equal(postSendLease.phase, 'cleanup-required');
-    assert.equal(postSendLease.postSendDiagnostic.reason, 'post_send_turn_proof_missing');
+    assert.equal(postSendLease, null);
   } finally {
     await fs.rm(stateDir, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });

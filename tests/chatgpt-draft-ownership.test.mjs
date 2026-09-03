@@ -8,6 +8,7 @@ import {
   canRecoverDraftLease,
   canSettlePostSendDraft,
   createDraftLease,
+  createPostSendTombstone,
   DraftOwnershipStore,
   hasOnlyOwnedAttachmentCards,
   sameAttachmentIdentitySet,
@@ -237,6 +238,50 @@ test('post-send settling requires the newly sent turn and accepts clean or exact
   assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: [{ ...expected[0], sha256: 'b'.repeat(64) }], cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
   assert.equal(canSettlePostSendDraft({ lease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['foreign.txt'] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
   assert.equal(canSettlePostSendDraft({ lease, current: { ...base, userTurnBaseline: { ...base.userTurnBaseline, lastTextDigest: textDigest('other') } }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1') }).safe, false);
+});
+
+test('post-send tombstone preserves exact ownership across a clean-to-resurrection window', () => {
+  const expected = [{ transportName: 'evidence.txt', logicalName: 'evidence.txt', size: 3, sha256: 'a'.repeat(64) }];
+  const sentUserTurnProof = { count: 3, lastId: 'sent', lastTextDigest: textDigest('rendered attachment turn') };
+  const tombstone = createPostSendTombstone({
+    operationId: 'send-operation',
+    tabId: 'tab-1',
+    conversationDigest: textDigest('conversation-1'),
+    sentUserTurnProof,
+    expectedAttachments: expected,
+    clearedAt: '2026-09-03T00:00:00.000Z',
+    graceMs: 5_000
+  });
+  const postSendLease = createDraftLease({
+    operationId: 'send-operation',
+    tabId: 'tab-1',
+    conversationDigest: textDigest('conversation-1'),
+    userTurnBaseline: { count: 2, lastId: 'old', lastTextDigest: textDigest('old') },
+    sentUserTurnProof,
+    expectedAttachments: expected,
+    ownedPrompt: true,
+    ownedPromptDigest: textDigest('typed prompt'),
+    ownedPromptLength: 12,
+    phase: 'post-send-tombstone',
+    sendConfirmed: true,
+    postSendTombstone: tombstone,
+    updatedAt: '2026-09-03T00:00:00.000Z'
+  });
+  const base = {
+    composerInputCount: 1,
+    pageInputCount: 1,
+    promptLength: 0,
+    promptDigest: textDigest(''),
+    inputValuePresent: false,
+    userTurnBaseline: sentUserTurnProof
+  };
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: [], cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:01.000Z') }).clean, true);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['evidence.txt'], inputValuePresent: true }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:02.000Z') }).cleanupAllowed, true);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: [{ ...expected[0], sha256: 'b'.repeat(64) }], cardDisplayNames: ['evidence.txt'], inputValuePresent: true }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:02.000Z') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['foreign.txt'], inputValuePresent: true }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:02.000Z') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['evidence.txt'], inputValuePresent: true, userTurnBaseline: { ...sentUserTurnProof, count: 4 } }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:02.000Z') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: expected, cardDisplayNames: ['evidence.txt'], inputValuePresent: true }, tabId: 'other-tab', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:02.000Z') }).safe, false);
+  assert.equal(canSettlePostSendDraft({ lease: postSendLease, current: { ...base, selectedFiles: [], cardDisplayNames: [] }, tabId: 'tab-1', conversationDigest: textDigest('conversation-1'), now: Date.parse('2026-09-03T00:00:06.000Z') }).safe, false);
 });
 
 test('post-send lease survives a runtime tab-id change when the logical conversation is proven', async () => {

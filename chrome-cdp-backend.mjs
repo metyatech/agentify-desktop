@@ -245,6 +245,17 @@ export function buildChromeLaunchArgs({ debugPort, userDataDir, profileName = nu
   return args;
 }
 
+export function selectBootstrapTarget(targetInfos) {
+  const candidates = (Array.isArray(targetInfos) ? targetInfos : [])
+    .filter((info) => info?.type === 'page' && String(info.url || '').trim() === 'about:blank' && String(info.targetId || '').trim());
+  if (candidates.length !== 1) return null;
+  return {
+    targetId: String(candidates[0].targetId).trim(),
+    type: 'page',
+    url: 'about:blank'
+  };
+}
+
 export function chromeSpawnOptions() {
   return { stdio: 'ignore' };
 }
@@ -913,6 +924,8 @@ export class ChromeCdpBrowserBackend {
     this.client = null;
     this.started = false;
     this.tabClosers = new Map();
+    this.bootstrapTarget = null;
+    this.bootstrapTargetCloseAttempted = false;
     this.chromeUserDataDir =
       this.profileMode === 'existing' ? defaultChromeUserDataDir() : path.join(this.stateDir, 'chrome-user-data');
     this.boundTargetDestroyed = null;
@@ -948,6 +961,8 @@ export class ChromeCdpBrowserBackend {
     }
 
     try {
+      this.bootstrapTarget = null;
+      this.bootstrapTargetCloseAttempted = false;
       const executable = await findChromeExecutable(this.executablePath);
       const args = buildChromeLaunchArgs({
         debugPort: this.debugPort,
@@ -986,6 +1001,7 @@ export class ChromeCdpBrowserBackend {
       if (!wsUrl) throw new Error('chrome_cdp_missing_ws_url');
       this.client = new ChromeCdpConnection(wsUrl);
       await this.client.connect();
+      if (this.profileMode === 'isolated') this.bootstrapTarget = await this.#captureBootstrapTarget();
       this.boundTargetDestroyed = this.client.on('Target.targetDestroyed', ({ targetId }) => {
         const closer = this.tabClosers.get(String(targetId || ''));
         if (!closer) return;
@@ -1007,6 +1023,8 @@ export class ChromeCdpBrowserBackend {
       } catch {}
       this.client = null;
       this.started = false;
+      this.bootstrapTarget = null;
+      this.bootstrapTargetCloseAttempted = false;
       if (this.chromeProcess && !this.chromeProcess.killed) {
         try {
           this.chromeProcess.kill('SIGTERM');
@@ -1030,6 +1048,42 @@ export class ChromeCdpBrowserBackend {
   }
 
   setQuitting() {}
+
+  async #captureBootstrapTarget() {
+    try {
+      const targets = await this.client.send('Target.getTargets');
+      return selectBootstrapTarget(targets?.targetInfos);
+    } catch {
+      return null;
+    }
+  }
+
+  async #closeBootstrapTargetAfterManagedSession(managedTargetId) {
+    if (this.bootstrapTargetCloseAttempted || !this.bootstrapTarget) return;
+    const bootstrap = this.bootstrapTarget;
+    if (bootstrap.targetId === managedTargetId) return;
+
+    let targets;
+    try {
+      targets = await this.client.send('Target.getTargets');
+    } catch {
+      return;
+    }
+    const infos = Array.isArray(targets?.targetInfos) ? targets.targetInfos : [];
+    const managedTargets = infos.filter((info) => String(info?.targetId || '').trim() === managedTargetId);
+    const blankCandidates = infos.filter(
+      (info) => info?.type === 'page' && String(info.url || '').trim() === 'about:blank' && String(info.targetId || '').trim()
+    );
+    const currentBootstrap = infos.filter(
+      (info) => info?.type === 'page' && String(info.url || '').trim() === 'about:blank' && String(info.targetId || '').trim() === bootstrap.targetId
+    );
+    if (managedTargets.length !== 1 || blankCandidates.length !== 1 || currentBootstrap.length !== 1) return;
+
+    this.bootstrapTargetCloseAttempted = true;
+    try {
+      await this.client.send('Target.closeTarget', { targetId: bootstrap.targetId });
+    } catch {}
+  }
 
   async createSession({ url, show = false, onClosed, onUrlChanged } = {}) {
     await this.start();
@@ -1057,6 +1111,7 @@ export class ChromeCdpBrowserBackend {
       await page.initialize({ userAgent: this.userAgent });
       if (show) await page.bringToFront().catch(() => {});
       else await page.minimize().catch(() => {});
+      await this.#closeBootstrapTargetAfterManagedSession(targetId);
 
       const removeListeners = [];
       const on = typeof this.client.on === 'function' ? this.client.on.bind(this.client) : null;

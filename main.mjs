@@ -298,19 +298,27 @@ async function main() {
     }
   });
 
-  // Default tab for legacy callers (no tabId).
+  // Default tab for legacy callers (no tabId). It is intentionally lazy so
+  // startup only restores explicitly persisted tabs.
   const defaultVendor =
     vendors.find((v) => v.id === 'chatgpt') ||
     vendors[0] || { id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/', status: 'supported' };
-  const defaultTabId = await tabs.createTab({
-    key: 'default',
-    name: 'default',
-    url: defaultVendor.url,
-    show: !startMinimized,
-    protectedTab: true,
-    vendorId: defaultVendor.id,
-    vendorName: defaultVendor.name
-  });
+  let defaultTabId = null;
+  const ensureDefaultTab = async () => {
+    if (defaultTabId) {
+      const existing = tabs.listTabs().find((tab) => tab.id === defaultTabId && tab.key === 'default');
+      if (existing) return defaultTabId;
+      defaultTabId = null;
+    }
+    defaultTabId = await tabs.ensureDefaultTab({
+      name: 'default',
+      url: defaultVendor.url,
+      show: !startMinimized,
+      vendorId: defaultVendor.id,
+      vendorName: defaultVendor.name
+    });
+    return defaultTabId;
+  };
   await tabs.restorePersistentTabs();
 
   const autopilotProposal = createAutopilotProposalService({
@@ -337,9 +345,9 @@ async function main() {
     }
   });
 
-  focusDefaultTab = () => {
+  focusDefaultTab = async () => {
     try {
-      const win = tabs.getWindowById(defaultTabId);
+      const win = tabs.getWindowById(await ensureDefaultTab());
       if (win.isMinimized?.()) win.restore?.();
       win.show?.();
       win.focus?.();
@@ -516,7 +524,7 @@ async function main() {
     return { ok: true };
   });
   ipcMain.handle('agentify:stopQuery', async (_evt, args) => {
-    const tabId = String(args?.tabId || '').trim() || defaultTabId;
+    const tabId = String(args?.tabId || '').trim() || await ensureDefaultTab();
     return await server?.stopActiveQuery?.({ tabId });
   });
 
@@ -682,19 +690,21 @@ async function main() {
         port,
         token,
         tabs,
-        defaultTabId,
+        defaultTabId: () => defaultTabId,
+        ensureDefaultTab,
         vendors,
         serverId,
         stateDir,
         getSettings: async () => settings,
         onShow: async ({ tabId }) => {
-          const win = tabs.getWindowById(tabId || defaultTabId);
+          const win = tabs.getWindowById(tabId || await ensureDefaultTab());
           if (win.isMinimized?.()) win.restore?.();
           win.show?.();
           win.focus?.();
         },
         onHide: async ({ tabId }) => {
-          const win = tabs.getWindowById(tabId || defaultTabId);
+          if (!tabId) return;
+          const win = tabs.getWindowById(tabId);
           win.minimize?.();
         },
         onShutdown: async () => {
@@ -739,12 +749,13 @@ async function main() {
           emitTabsChanged();
         },
         getStatus: async ({ tabId }) => {
-          const controller = tabId ? tabs.getControllerById(tabId) : tabs.getControllerById(defaultTabId);
+          const resolvedTabId = tabId || await ensureDefaultTab();
+          const controller = tabs.getControllerById(resolvedTabId);
           const url = await controller.getUrl().catch(() => '');
           const challenge = await controller.detectChallenge().catch(() => null);
           return {
             ok: true,
-            tabId: tabId || defaultTabId,
+            tabId: resolvedTabId,
             url,
             blocked: !!challenge?.blocked,
             promptVisible: !!challenge?.promptVisible,

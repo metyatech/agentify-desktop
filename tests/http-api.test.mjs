@@ -115,6 +115,70 @@ test('http-api: status returns getStatus output', async (t) => {
   assert.equal(data.url, 'https://chatgpt.com/');
 });
 
+test('http-api: legacy default is created on demand while explicit keyed operations do not create it', async (t) => {
+  let defaultTabId = null;
+  let ensureDefaultCalls = 0;
+  const rows = [];
+  const tabs = {
+    listTabs: () => [...rows],
+    ensureTab: async ({ key }) => {
+      const id = `tab-${key}`;
+      rows.push({ id, key, vendorId: 'chatgpt', url: 'https://chatgpt.com/' });
+      return id;
+    },
+    createTab: async () => 'unexpected',
+    closeTab: async () => true,
+    getControllerById: (id) => ({
+      getUrl: async () => 'https://chatgpt.com/',
+      detectChallenge: async () => null,
+      query: async () => ({ ok: true }),
+      send: async () => ({ ok: true }),
+      id
+    })
+  };
+  const ensureDefaultTab = async () => {
+    ensureDefaultCalls += 1;
+    if (!defaultTabId) {
+      defaultTabId = 'default-1';
+      rows.push({ id: defaultTabId, key: 'default', vendorId: 'chatgpt', url: 'https://chatgpt.com/' });
+    }
+    return defaultTabId;
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: () => defaultTabId,
+    ensureDefaultTab,
+    vendors: [{ id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/' }],
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0 }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/' })
+  });
+  t.after(() => server.close());
+
+  const initial = await req({ port: server.address().port, token: 'secret', method: 'GET', pth: '/tabs' });
+  assert.equal(initial.res.status, 200);
+  assert.equal(initial.data.defaultTabId, null);
+  assert.equal(ensureDefaultCalls, 0);
+
+  const status = await req({ port: server.address().port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.res.status, 200);
+  assert.equal(status.data.tabId, 'default-1');
+  assert.equal(ensureDefaultCalls, 1);
+
+  const explicit = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/show',
+    body: { key: 'autopilot-production', vendorId: 'chatgpt' }
+  });
+  assert.equal(explicit.res.status, 200);
+  assert.equal(ensureDefaultCalls, 1);
+});
+
 test('http-api: native input diagnostics are read-only, serialized, and bounded', async (t) => {
   let exclusive = false;
   const controller = {

@@ -66,3 +66,41 @@ test('tab-manager: createTab closes session if controller creation fails', async
   assert.equal(closeCalls, 1);
   assert.deepEqual(manager.listTabs(), []);
 });
+
+test('tab-manager: default tab is lazy, isolated from persistent tabs, and concurrent legacy resolution creates once', async () => {
+  let sessionCount = 0;
+  const browserBackend = {
+    async createSession() {
+      sessionCount += 1;
+      return {
+        page: {},
+        presenter: {},
+        isClosed: () => false,
+        close: async () => {}
+      };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+
+  const productionId = await manager.createTab({
+    key: 'autopilot-production',
+    url: 'https://chatgpt.com/',
+    vendorId: 'chatgpt',
+    vendorName: 'ChatGPT'
+  });
+  assert.equal(sessionCount, 1);
+  assert.equal(manager.listTabs().some((tab) => tab.key === 'default'), false);
+
+  const defaultIds = await Promise.all([
+    manager.ensureDefaultTab(),
+    manager.ensureDefaultTab(),
+    manager.ensureDefaultTab()
+  ]);
+  assert.equal(new Set(defaultIds).size, 1);
+  assert.equal(sessionCount, 2);
+  assert.notEqual(defaultIds[0], productionId);
+  const rows = manager.listTabs();
+  assert.equal(rows.filter((tab) => tab.key === 'default').length, 1);
+  assert.equal(rows.find((tab) => tab.key === 'default')?.protectedTab, true);
+  assert.equal(rows.find((tab) => tab.key === 'autopilot-production')?.protectedTab, false);
+});

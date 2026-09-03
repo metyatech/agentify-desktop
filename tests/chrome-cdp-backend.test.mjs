@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ChromeCdpBrowserBackend, ChromeCdpConnection, buildChromeLaunchArgs, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
+import { ChromeCdpBrowserBackend, ChromeCdpConnection, buildChromeLaunchArgs, chromeSpawnOptions, selectBootstrapTarget } from '../chrome-cdp-backend.mjs';
 
 class MockWebSocket {
   constructor() {
@@ -116,6 +116,18 @@ test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () =
   const opts = chromeSpawnOptions();
   assert.equal(opts.stdio, 'ignore');
   assert.equal(Object.hasOwn(opts, 'shell'), false);
+});
+
+test('chrome-cdp-backend: captures only one page about:blank as the bootstrap target', () => {
+  assert.deepEqual(
+    selectBootstrapTarget([
+      { targetId: 'bootstrap', type: 'page', url: 'about:blank' },
+      { targetId: 'extension', type: 'service_worker', url: 'about:blank' }
+    ]),
+    { targetId: 'bootstrap', type: 'page', url: 'about:blank' }
+  );
+  assert.equal(selectBootstrapTarget([{ targetId: 'one', type: 'page', url: 'about:blank' }, { targetId: 'two', type: 'page', url: 'about:blank' }]), null);
+  assert.equal(selectBootstrapTarget([{ targetId: 'foreign', type: 'page', url: 'https://chatgpt.com/' }]), null);
 });
 
 test('chrome-cdp-backend: connect rejects if websocket closes before open', async () => {
@@ -266,6 +278,86 @@ test('chrome-cdp-backend: createSession closes target if initialization fails', 
   );
 
   assert.equal(calls.some((item) => item.method === 'Target.closeTarget' && item.params?.targetId === 'target-1'), true);
+});
+
+test('chrome-cdp-backend: closes its bootstrap target only after managed initialization succeeds', async () => {
+  const calls = [];
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  backend.bootstrapTarget = { targetId: 'bootstrap-1', type: 'page', url: 'about:blank' };
+  backend.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}) => {
+      calls.push({ method, params });
+      if (method === 'Target.createTarget') return { targetId: 'managed-1' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'session-1' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (method === 'Target.getTargets') {
+        return {
+          targetInfos: [
+            { targetId: 'bootstrap-1', type: 'page', url: 'about:blank' },
+            { targetId: 'managed-1', type: 'page', url: 'https://chatgpt.com/' }
+          ]
+        };
+      }
+      return {};
+    }
+  };
+
+  const session = await backend.createSession({ url: 'https://chatgpt.com/' });
+  assert.equal(calls.filter((item) => item.method === 'Target.closeTarget' && item.params.targetId === 'bootstrap-1').length, 1);
+  assert.equal(calls.some((item) => item.method === 'Target.closeTarget' && item.params.targetId === 'managed-1'), false);
+  await session.close();
+});
+
+test('chrome-cdp-backend: does not close bootstrap before managed initialization or when target identity is ambiguous', async () => {
+  const failedCalls = [];
+  const failed = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  failed.started = true;
+  failed.bootstrapTarget = { targetId: 'bootstrap-1', type: 'page', url: 'about:blank' };
+  failed.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}) => {
+      failedCalls.push({ method, params });
+      if (method === 'Target.createTarget') return { targetId: 'managed-1' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'session-1' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (method === 'Page.enable') throw new Error('page_enable_failed');
+      return {};
+    }
+  };
+  await assert.rejects(async () => await failed.createSession({ url: 'https://chatgpt.com/' }), /page_enable_failed/);
+  assert.equal(failedCalls.some((item) => item.method === 'Target.closeTarget' && item.params.targetId === 'bootstrap-1'), false);
+
+  const ambiguousCalls = [];
+  const ambiguous = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  ambiguous.started = true;
+  ambiguous.bootstrapTarget = { targetId: 'bootstrap-1', type: 'page', url: 'about:blank' };
+  ambiguous.client = {
+    connected: true,
+    ws: {},
+    send: async (method, params = {}) => {
+      ambiguousCalls.push({ method, params });
+      if (method === 'Target.createTarget') return { targetId: 'managed-1' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'session-1' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (method === 'Target.getTargets') {
+        return {
+          targetInfos: [
+            { targetId: 'bootstrap-1', type: 'page', url: 'about:blank' },
+            { targetId: 'other-blank', type: 'page', url: 'about:blank' },
+            { targetId: 'managed-1', type: 'page', url: 'https://chatgpt.com/' }
+          ]
+        };
+      }
+      return {};
+    }
+  };
+  const session = await ambiguous.createSession({ url: 'https://chatgpt.com/' });
+  assert.equal(ambiguousCalls.some((item) => item.method === 'Target.closeTarget' && item.params.targetId === 'bootstrap-1'), false);
+  await session.close();
 });
 
 test('chrome-cdp-backend: session close is best-effort when closeTarget fails', async () => {

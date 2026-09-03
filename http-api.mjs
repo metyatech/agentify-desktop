@@ -713,6 +713,7 @@ function listedTabMatchesVendor(tab, vendor) {
 }
 
 async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = false, createIfMissing = true, vendors = [] }) {
+  const currentDefaultTabId = typeof defaultTabId === 'function' ? defaultTabId() : defaultTabId;
   const tabId = (body?.tabId ? String(body.tabId).trim() : '') || getTabIdFromUrl(url) || null;
   const key = (body?.key ? String(body.key).trim() : '') || null;
   const name = (body?.name ? String(body.name).trim() : '') || null;
@@ -739,8 +740,8 @@ async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = f
   }
   if (explicitVendor) {
     const rows = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
-    const defaultTab = rows.find((item) => String(item?.id || '') === String(defaultTabId || '')) || null;
-    if (listedTabMatchesVendor(defaultTab, explicitVendor)) return defaultTabId;
+    const defaultTab = rows.find((item) => String(item?.id || '') === String(currentDefaultTabId || '')) || null;
+    if (listedTabMatchesVendor(defaultTab, explicitVendor)) return currentDefaultTabId;
     if (!createIfMissing) throw new Error('tab_not_found');
     return await tabs.ensureTab({
       key: `vendor:${explicitVendor.id}`,
@@ -751,7 +752,8 @@ async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = f
       vendorName: explicitVendor.name
     });
   }
-  return defaultTabId;
+  if (typeof defaultTabId === 'function' && createIfMissing) return await defaultTabId({ ensure: true });
+  return currentDefaultTabId;
 }
 
 function getTabMeta(tabs, tabId) {
@@ -960,6 +962,7 @@ export function startHttpApi({
   token,
   tabs,
   defaultTabId,
+  ensureDefaultTab: ensureDefaultTabFn = null,
   vendors = [],
   serverId,
   stateDir,
@@ -983,6 +986,12 @@ export function startHttpApi({
   prepareQueryContextFn = prepareQueryContext
 }) {
   const tokenRef = typeof token === 'string' ? { current: token } : token;
+  const currentDefaultTabId = () => (typeof defaultTabId === 'function' ? defaultTabId() : defaultTabId);
+  const ensureDefaultTabId = async () => {
+    if (typeof ensureDefaultTabFn === 'function') return await ensureDefaultTabFn();
+    if (typeof defaultTabId === 'function') return await defaultTabId({ ensure: true });
+    return defaultTabId;
+  };
 
   // Governor state (per-desktop instance).
   const inflight = { queries: 0 };
@@ -1251,7 +1260,7 @@ export function startHttpApi({
     if (vendorId) return `vendor:${vendorId}`;
     const model = body?.model ? String(body.model).trim() : '';
     if (model) return `vendor:${model}`;
-    return `tab:${defaultTabId}`;
+    return `tab:${currentDefaultTabId() || 'default'}`;
   };
 
   const assertTabNotBusy = (tabId) => {
@@ -1388,7 +1397,7 @@ export function startHttpApi({
         const hasScopedTab = !!(statusBody.tabId || statusBody.key || statusBody.vendorId || statusBody.model);
         const tabId = hasScopedTab
           ? await resolveTab({ tabs, defaultTabId, body: statusBody, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors })
-          : defaultTabId;
+          : await ensureDefaultTabId();
         const st = await getStatus({ tabId });
         return sendJson(res, 200, {
           ...st,
@@ -1437,13 +1446,20 @@ export function startHttpApi({
       }
       if (url.pathname === '/hide' && req.method === 'POST') {
         const body = await parseBody(req);
-        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        const hasSelector = !!(
+          (body?.tabId ? String(body.tabId).trim() : '') ||
+          (body?.key ? String(body.key).trim() : '') ||
+          (body?.vendorId ? String(body.vendorId).trim() : '') ||
+          (body?.model ? String(body.model).trim() : '') ||
+          getTabIdFromUrl(url)
+        );
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: !hasSelector, vendors });
         await onHide?.({ tabId });
         return sendJson(res, 200, { ok: true });
       }
 
       if (url.pathname === '/tabs' && req.method === 'GET') {
-        return sendJson(res, 200, { ok: true, tabs: tabs.listTabs(), defaultTabId });
+        return sendJson(res, 200, { ok: true, tabs: tabs.listTabs(), defaultTabId: currentDefaultTabId() });
       }
       if (url.pathname === '/native-input/diagnostics' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 32_768 });
@@ -1562,7 +1578,7 @@ export function startHttpApi({
         const body = await parseBody(req);
         const tabId = (body.tabId ? String(body.tabId).trim() : '') || null;
         if (!tabId) return sendJson(res, 400, { error: 'missing_tabId' });
-        if (tabId === defaultTabId) throw new Error('default_tab_protected');
+        if (tabId === currentDefaultTabId()) throw new Error('default_tab_protected');
         await tabs.closeTab(tabId);
         return sendJson(res, 200, { ok: true });
       }
@@ -1573,7 +1589,7 @@ export function startHttpApi({
         const scope = String(body.scope || 'app');
         if (scope !== 'app') return sendJson(res, 400, { error: 'invalid_scope' });
         sendJson(res, 200, { ok: true });
-        await onHide?.({ tabId: defaultTabId }).catch(() => {});
+        await onHide?.({ tabId: currentDefaultTabId() }).catch(() => {});
         await onShutdown?.().catch(() => {});
         return;
       }
@@ -1838,7 +1854,7 @@ export function startHttpApi({
           requestedTabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
           operation = operationForStop({ body, tabId: requestedTabId });
         }
-        if (!requestedTabId && !operation) requestedTabId = defaultTabId;
+        if (!requestedTabId && !operation) requestedTabId = await ensureDefaultTabId();
         return sendJson(res, 200, await stopOperation({ operation, requestedTabId }));
       }
 

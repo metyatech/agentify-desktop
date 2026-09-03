@@ -57,7 +57,11 @@ export class TabManager {
 
   async createTab({ key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
     return await this.mutex.run(async () => {
-      return await this.#createTabUnlocked({ key, name, url, show, protectedTab, vendorId, vendorName }, { persist: true });
+      const isDefault = String(key || '').trim() === 'default';
+      return await this.#createTabUnlocked(
+        { key, name, url, show, protectedTab: protectedTab || isDefault, vendorId, vendorName },
+        { persist: !isDefault }
+      );
     });
   }
 
@@ -214,6 +218,9 @@ export class TabManager {
 
   async ensureTab({ key, name, url, vendorId, vendorName, show } = {}) {
     if (!key) throw new Error('missing_key');
+    if (String(key).trim() === 'default') {
+      return await this.ensureDefaultTab({ name: name || 'default', url, vendorId, vendorName, show: !!show });
+    }
     const existing = this.keyToId.get(key);
     if (existing) {
       const tab = this.tabs.get(existing);
@@ -225,6 +232,24 @@ export class TabManager {
       return existing;
     }
     return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
+  }
+
+  async ensureDefaultTab({ name = 'default', url = 'https://chatgpt.com/', vendorId = 'chatgpt', vendorName = 'ChatGPT', show = false } = {}) {
+    return await this.mutex.run(async () => {
+      const existingId = this.keyToId.get('default');
+      if (existingId) {
+        const existing = this.tabs.get(existingId);
+        if (existing) {
+          if (!tabMatchesVendor(existing, { vendorId, url })) throw new Error('key_vendor_mismatch');
+          return existingId;
+        }
+        this.keyToId.delete('default');
+      }
+      return await this.#createTabUnlocked(
+        { key: 'default', name, url, show, protectedTab: true, vendorId, vendorName },
+        { persist: false }
+      );
+    });
   }
 
   listTabs() {

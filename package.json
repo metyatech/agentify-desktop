@@ -17,6 +17,7 @@
     "TRADEMARKS.md",
     "artifact-store.mjs",
     "autopilot-proposal.mjs",
+    "autopilot-proposal-ticket.mjs",
     "autopilot-status.mjs",
     "autopilot-watch-status.mjs",
     "browser-backend.mjs",

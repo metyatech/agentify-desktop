@@ -21,6 +21,7 @@ import { TabRegistry } from './tab-registry.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
+import { createAutopilotProposalTicketStore } from './autopilot-proposal-ticket.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
@@ -161,6 +162,7 @@ async function main() {
   const token = await ensureToken(stateDir);
   const autopilotStatus = await createAutopilotStatusStore({ stateDir });
   const autopilotWatchStatus = await createAutopilotWatchStatusStore({ stateDir });
+  const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
@@ -323,6 +325,7 @@ async function main() {
 
   const autopilotProposal = createAutopilotProposalService({
     tabs,
+    proposalTicketStore: autopilotProposalTicket,
     getRuntimeState: () => server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
     requestQuery: async (body) => {
       if (!server?.address?.()) throw new Error('agentify_query_unavailable');
@@ -405,7 +408,8 @@ async function main() {
       runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
       autopilot: autopilotProposal.availability(),
       autopilotStatus: autopilotStatus.get(),
-      autopilotWatchStatus: autopilotWatchStatus.get()
+      autopilotWatchStatus: autopilotWatchStatus.get(),
+      autopilotProposalTicket: await autopilotProposalTicket.get()
     };
   });
 
@@ -739,6 +743,12 @@ async function main() {
         getAutopilotWatchStatus: async () => autopilotWatchStatus.get(),
         onAutopilotWatchStatus: async ({ snapshot }) => {
           const stored = await autopilotWatchStatus.update(snapshot);
+          emitTabsChanged();
+          return stored;
+        },
+        getAutopilotProposalTicket: async () => await autopilotProposalTicket.get(),
+        onAutopilotProposalTicket: async ({ proposalId, state }) => {
+          const stored = await autopilotProposalTicket.update({ proposalId, state });
           emitTabsChanged();
           return stored;
         },

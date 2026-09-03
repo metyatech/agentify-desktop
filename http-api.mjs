@@ -10,6 +10,7 @@ import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
 import { validateAutopilotStatus } from './autopilot-status.mjs';
 import { validateAutopilotWatchStatus } from './autopilot-watch-status.mjs';
+import { AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES, validateAutopilotProposalTicket } from './autopilot-proposal-ticket.mjs';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -980,6 +981,8 @@ export function startHttpApi({
   onAutopilotStatus,
   getAutopilotWatchStatus,
   onAutopilotWatchStatus,
+  getAutopilotProposalTicket,
+  onAutopilotProposalTicket,
   onAutopilotStatusClear,
   getSettings,
   onRuntimeChanged,
@@ -1436,6 +1439,26 @@ export function startHttpApi({
         const body = await parseBody(req, { maxBytes: 16 * 1024 });
         const snapshot = await onAutopilotWatchStatus({ snapshot: validateAutopilotWatchStatus(body) });
         return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
+      }
+
+      if (url.pathname === '/autopilot/proposal-ticket' && req.method === 'GET') {
+        if (typeof getAutopilotProposalTicket !== 'function') return sendJson(res, 200, { ok: true, ticket: null });
+        const requestedTabKey = String(url.searchParams.get('tabKey') || '').trim();
+        const ticket = await getAutopilotProposalTicket();
+        if (ticket === null) return sendJson(res, 200, { ok: true, ticket: null });
+        const validated = validateAutopilotProposalTicket(ticket);
+        if (requestedTabKey && requestedTabKey !== validated.tabKey) return sendJson(res, 200, { ok: true, ticket: null });
+        return sendJson(res, 200, { ok: true, ticket: validated }, { maxBytes: AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES });
+      }
+
+      if (url.pathname === '/autopilot/proposal-ticket' && req.method === 'POST') {
+        if (typeof onAutopilotProposalTicket !== 'function') return sendJson(res, 503, { error: 'autopilot_proposal_ticket_unavailable' });
+        const body = await parseBody(req, { maxBytes: 16 * 1024 });
+        const proposalId = String(body?.proposalId || '').trim();
+        const state = String(body?.state || '').trim();
+        if (!proposalId || !state) return sendJson(res, 400, { error: 'autopilot_proposal_ticket_update_invalid' });
+        const ticket = await onAutopilotProposalTicket({ proposalId, state });
+        return sendJson(res, 200, { ok: true, ticket: validateAutopilotProposalTicket(ticket) }, { maxBytes: AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES });
       }
 
       if (url.pathname === '/show' && req.method === 'POST') {

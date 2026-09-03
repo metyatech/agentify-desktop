@@ -279,20 +279,23 @@ The action generates the version-1 proposal envelope locally, then sends the
 versioned `ai-autopilot-proposal-generation-v3` instruction through the existing
 authenticated `POST /query` path. Agentify validates the response markers, JSON,
 metadata, and current v3 contract locally; malformed responses are discarded and
-retried up to three times with the same envelope metadata. The instruction asks
-ChatGPT to clarify only user decisions; verification commands, timeouts, review
-rounds, and other execution-plan details are owned by Autopilot and must not be
-requested from the user. Host/local tasks may use a null repository with push
-disabled, and their verification plan may be empty. It does not create a tab,
-start Codex, create a worktree, write a task, commit, push, or send approval. Only
-a locally validated response is treated as received and remains in ChatGPT for
-the user to inspect; a non-empty marker-free response is treated as a clarification
-instead of being retried or treated as a proposal. The Control Center asks the user
-to answer ChatGPT and press `この内容を実行` again. The existing watcher still
-requires the later exact approval turn (`開始して XXXXXXXX`). Proposal responses
-must be emitted as exactly one unlabeled fenced code block containing the marker
-pair and standalone JSON; clarification responses remain natural language. The
-rendered DOM text obtained by Agentify removes the fence but preserves literal
+retried up to three times with the same envelope metadata. After a valid response,
+Agentify performs a bounded tail read to uniquely anchor the exact assistant turn
+and atomically persists a proposal ticket in its state directory. The ticket is
+the durable handoff consumed by ai-autopilot after restart; no ticket is written
+for clarification, invalid, missing, or ambiguous proposal responses. The
+instruction asks ChatGPT to clarify only user decisions; verification commands,
+timeouts, review rounds, and other execution-plan details are owned by Autopilot
+and must not be requested from the user. Host/local tasks may use a null repository
+with push disabled, and their verification plan may be empty. It does not create a
+tab, start Codex, create a worktree, write a task, commit, push, or send approval.
+An unresolved ticket prevents another proposal from being stacked. The existing
+watcher uses the authenticated proposal-ticket API as the primary source, checks
+the current tab/conversation and exact approval turn with a bounded tail read, and
+keeps the older conversation-discovery path for legacy proposals. Proposal
+responses must be emitted as exactly one unlabeled fenced code block containing the
+marker pair and standalone JSON; clarification responses remain natural language.
+The rendered DOM text obtained by Agentify removes the fence but preserves literal
 backslashes, quotes, and JSON newline escapes inside the code block.
 
 The fallback prompt boundary is [`autopilot-proposal.mjs`](autopilot-proposal.mjs)

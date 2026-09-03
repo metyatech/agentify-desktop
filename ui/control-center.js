@@ -119,7 +119,8 @@ function defaultState() {
     runtime: { inflightQueries: 0, activeQueries: [], lastOutcomes: [] },
     autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false },
     autopilotStatus: null,
-    autopilotWatchStatus: null
+    autopilotWatchStatus: null,
+    autopilotProposalTicket: null
   };
 }
 
@@ -160,7 +161,7 @@ function renderAutopilotState() {
   const hint = el('autopilotProposalHint');
   const state = lastState.autopilot || {};
   const blockedByRuntime = Number(state.inflightQueries || 0) > 0 || Number(state.activeQueries || 0) > 0;
-  const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
+  const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, proposalTicket: lastState.autopilotProposalTicket, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
   let label = '準備可能';
   let className = '';
   let detail = 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。';
@@ -426,6 +427,11 @@ async function refresh({ initial = false } = {}) {
     const watchFoldersData =
       (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial, timeoutMs: startupTimeoutMs })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
+    const ticketProposal = lastState.autopilotProposalTicket?.proposal;
+    if (!autopilotProposal && ticketProposal && ['pending', 'acknowledged'].includes(lastState.autopilotProposalTicket?.state)) {
+      autopilotProposal = { proposalId: ticketProposal.proposalId, taskId: ticketProposal.contract?.id, approvalCode: ticketProposal.approvalCode };
+      autopilotStatusKey = 'generated';
+    }
     const watchedProposal = lastState.autopilotWatchStatus?.proposal;
     if (!autopilotProposal && watchedProposal && ['observed', 'approved', 'launch-prepared', 'launch-started', 'running'].includes(watchedProposal.state)) {
       autopilotProposal = { proposalId: watchedProposal.proposalId, taskId: watchedProposal.taskId, approvalCode: watchedProposal.approvalCode };

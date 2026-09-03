@@ -1,6 +1,13 @@
 const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running']);
 
-export function autopilotProposalViewModel({ proposal = null, watchStatus = null, taskStatus = null } = {}) {
+export function autopilotProposalViewModel({ proposal = null, proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
+  if (!proposal && proposalTicket?.proposal && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
+    proposal = {
+      proposalId: proposalTicket.proposalId,
+      taskId: proposalTicket.proposal.contract?.id || null,
+      approvalCode: proposalTicket.proposal.approvalCode || null,
+    };
+  }
   if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
   const runningTask = taskStatus?.status === 'running' && taskStatus?.taskId === proposal.taskId;

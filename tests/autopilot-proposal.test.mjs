@@ -15,6 +15,7 @@ import {
   classifyProposalResponse,
   createAutopilotProposalService,
   createProposalMetadata,
+  findValidatedProposalAssistantAnchor,
   parseValidateProposalResponse
 } from '../autopilot-proposal.mjs';
 
@@ -57,6 +58,13 @@ function fencedProposalText(metadata = FIXED_METADATA, options = {}) {
 
 function makeTabs({ rows = [{ id: 'tab-1', key: 'autopilot-production', vendorId: 'chatgpt' }], url = 'https://chatgpt.com/' } = {}) {
   const controllers = new Map(rows.map((row) => [row.id, { getUrl: async () => url }]));
+  for (const controller of controllers.values()) {
+    controller.readConversationTurns = async () => ({
+      url,
+      turns: [{ id: 'assistant-proposal-anchor', messageId: 'provider-message-proposal', identityProvenance: 'provider-message-id', role: 'assistant', index: 0, text: validProposalText() }],
+      history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true }
+    });
+  }
   return {
     listTabs: () => rows,
     getControllerById: (id) => {
@@ -81,7 +89,9 @@ function makeService(options = {}) {
     requestQuery,
     now: () => new Date('2026-08-10T00:00:00.000Z'),
     randomUUID: () => '123e4567-e89b-42d3-a456-426614174000',
-    randomBytes: () => Buffer.from([0xab, 0x12, 0xcd, 0x34])
+    randomBytes: () => Buffer.from([0xab, 0x12, 0xcd, 0x34]),
+    proposalTicketStore: options.proposalTicketStore,
+    proposalAnchorRead: options.proposalAnchorRead
   });
   return { service, calls, setRelease: (fn) => { release = fn; } };
 }
@@ -149,6 +159,17 @@ test('request error clears inflight state so the button is reusable', async () =
   await assert.rejects(service.request(), /query_error/u);
   await service.request();
   assert.equal(calls, 2);
+});
+
+test('proposal ticket anchoring requires provider durable identity provenance', () => {
+  const proposalTextValue = validProposalText();
+  const genericOnly = [{ id: 'synthetic-anchor', role: 'assistant', index: 0, text: proposalTextValue }];
+  const parsedProposal = JSON.parse(proposalTextValue.split(`${PROPOSAL_BEGIN}\n`)[1].split(`\n${PROPOSAL_END}`)[0]);
+  const anchorOptions = { proposal: parsedProposal, metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) };
+  assert.throws(() => findValidatedProposalAssistantAnchor({ turns: genericOnly, ...anchorOptions }), /anchor_missing/u);
+  const provider = [{ id: 'synthetic-anchor', messageId: 'provider-anchor', identityProvenance: 'provider-message-id', role: 'assistant', index: 0, text: proposalTextValue }];
+  const anchor = findValidatedProposalAssistantAnchor({ turns: provider, ...anchorOptions });
+  assert.deepEqual({ assistantTurnId: anchor.assistantTurnId, assistantTurnIdentityProvenance: anchor.assistantTurnIdentityProvenance }, { assistantTurnId: 'provider-anchor', assistantTurnIdentityProvenance: 'provider-message-id' });
 });
 
 test('malformed Windows path is rejected and a valid retry keeps the original metadata', async () => {
@@ -561,4 +582,57 @@ test('control center keeps proposal errors visible and suppresses duplicate requ
   assert.match(js, /autopilotErrorMessage = e\?\.message \|\| String\(e\);/u);
   assert.match(js, /statusText\(`Autopilot proposal failed:/u);
   assert.match(js, /autopilotRequestInFlight = false;/u);
+});
+
+test('valid proposal is persisted only after one exact assistant turn anchor is proven', async () => {
+  const saved = [];
+  const { service } = makeService({
+    proposalTicketStore: {
+      get: async () => null,
+      create: async (value) => { saved.push(value); return value; }
+    }
+  });
+  const result = await service.request();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].proposalId, result.proposal.proposalId);
+  assert.equal(saved[0].assistantTurnId, 'provider-message-proposal');
+  assert.equal(saved[0].assistantTurnIdentityProvenance, 'provider-message-id');
+  assert.equal(saved[0].conversationUrl, 'https://chatgpt.com/');
+  assert.equal(saved[0].contractHash.length, 64);
+});
+
+test('clarification, invalid response, missing anchor, and duplicate anchor never create a ticket', async () => {
+  const scenarios = [
+    {
+      name: 'clarification',
+      response: { result: { text: 'Which branch should I use?' } },
+      expected: /clarification_response_received/u
+    },
+    {
+      name: 'invalid',
+      response: { result: { text: `${PROPOSAL_BEGIN}\n{}\n${PROPOSAL_END}` } },
+      expected: /autopilot_proposal_generation_failed/u
+    },
+  ];
+  for (const scenario of scenarios) {
+    const saved = [];
+    const { service } = makeService({
+      requestQuery: async () => scenario.response,
+      proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+    });
+    if (scenario.name === 'clarification') {
+      const result = await service.request();
+      assert.equal(result.ok, false);
+    } else await assert.rejects(service.request(), scenario.expected);
+    assert.equal(saved.length, 0, scenario.name);
+  }
+  for (const turns of [[], [{ id: 'a1', role: 'assistant', index: 0, text: validProposalText() }, { id: 'a2', role: 'assistant', index: 1, text: validProposalText() }]]) {
+    const saved = [];
+    const { service } = makeService({
+      proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } },
+      proposalAnchorRead: async () => ({ url: 'https://chatgpt.com/', turns, history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } })
+    });
+    await assert.rejects(service.request(), /autopilot_proposal_anchor_(missing|ambiguous)/u);
+    assert.equal(saved.length, 0);
+  }
 });

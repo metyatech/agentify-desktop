@@ -393,13 +393,15 @@ export function mergeConversationSnapshots(snapshots = []) {
   const turns = orderedKeys.map((key, index) => {
     const record = records.get(key);
     const identityIndex = Number.isInteger(record.positionHint) ? record.positionHint : index;
+    const identityProvenance = record.messageId ? 'provider-message-id' : record.turnId ? 'provider-turn-id' : null;
     return {
       id: record.messageId || record.turnId || fallbackConversationTurnId({ role: record.role, index: identityIndex, text: record.text }),
       role: record.role,
       text: record.text,
       index,
       messageId: record.messageId || null,
-      turnId: record.turnId || null
+      turnId: record.turnId || null,
+      ...(identityProvenance ? { identityProvenance } : {})
     };
   });
   return { turns, ambiguous, continuous, observedTurnCount: records.size, mergeDiagnostics: { ambiguous, continuous, reasonCounts } };
@@ -4664,11 +4666,19 @@ export class ChatGPTController {
           const index = Number.isInteger(turn?.index) ? turn.index : -1;
           if (!role || !text || index < 0) return null;
           const messageId = typeof turn.messageId === 'string' ? turn.messageId.trim() : '';
+          const turnId = typeof turn.turnId === 'string' ? turn.turnId.trim() : '';
+          const identityProvenance = typeof turn.identityProvenance === 'string' ? turn.identityProvenance.trim() : '';
+          const providerIdentity = identityProvenance === 'provider-message-id' && messageId
+            ? { messageId, identityProvenance }
+            : identityProvenance === 'provider-turn-id' && turnId
+              ? { turnId, identityProvenance }
+              : {};
           return {
             id: messageId || fallbackConversationTurnId({ role, index, text }),
             role,
             text,
-            index
+            index,
+            ...providerIdentity
           };
         }).filter(Boolean).slice(-limits.maxTurns)
         : [];

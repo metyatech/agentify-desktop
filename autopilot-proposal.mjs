@@ -1,5 +1,10 @@
 import crypto from 'node:crypto';
 
+import {
+  AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES,
+  proposalContractHash,
+} from './autopilot-proposal-ticket.mjs';
+
 const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
@@ -278,6 +283,41 @@ function responseTextFromQuery(response) {
   return typeof response?.result?.text === 'string' ? response.result.text : null;
 }
 
+function proposalAnchorError(reason) {
+  const error = new Error(`autopilot_proposal_anchor_${reason}`);
+  error.code = 'autopilot_proposal_anchor_invalid';
+  error.reason = reason;
+  return error;
+}
+
+function canonicalizeProposal(value) {
+  if (Array.isArray(value)) return value.map(canonicalizeProposal);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalizeProposal(value[key])]));
+  return value;
+}
+
+export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date() } = {}) {
+  const matches = [];
+  for (const turn of Array.isArray(turns) ? turns : []) {
+    if (turn?.role !== 'assistant' || typeof turn.text !== 'string') continue;
+    const classification = classifyProposalResponse(turn.text, { metadata, now });
+    if (classification.kind !== PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) continue;
+    if (JSON.stringify(canonicalizeProposal(classification.proposal)) !== JSON.stringify(canonicalizeProposal(proposal))) continue;
+    const provenance = String(turn.identityProvenance || '').trim();
+    const id = provenance === 'provider-message-id'
+      ? String(turn.messageId || '').trim()
+      : provenance === 'provider-turn-id'
+        ? String(turn.turnId || '').trim()
+        : '';
+    matches.push({ turn, assistantTurnId: id, assistantTurnIdentityProvenance: provenance });
+  }
+  if (matches.length !== 1) throw proposalAnchorError(matches.length ? 'ambiguous' : 'missing');
+  if (!matches[0].assistantTurnId || !AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES.includes(matches[0].assistantTurnIdentityProvenance)) {
+    throw proposalAnchorError('missing');
+  }
+  return matches[0];
+}
+
 export const AUTOPILOT_WORKFLOWS = Object.freeze([
   Object.freeze({ key: 'autopilot-production', vendorId: 'chatgpt' })
 ]);
@@ -376,13 +416,19 @@ export function createAutopilotProposalService({
   now = () => new Date(),
   randomUUID = crypto.randomUUID,
   randomBytes = crypto.randomBytes,
-  targetKey = 'autopilot-production'
+  targetKey = 'autopilot-production',
+  proposalTicketStore = null,
+  proposalAnchorRead = null
 } = {}) {
   if (!tabs || typeof tabs.listTabs !== 'function' || typeof tabs.getControllerById !== 'function') throw new TypeError('tabs service is required');
   if (typeof requestQuery !== 'function') throw new TypeError('requestQuery is required');
   const workflow = getAutopilotWorkflow(targetKey);
   if (!workflow) throw new Error('autopilot_workflow_not_configured');
   let requestInFlight = null;
+  const ticketStore = proposalTicketStore || {
+    get: async () => null,
+    create: async (ticket) => ticket,
+  };
 
   const availability = () => {
     const matches = (tabs.listTabs() || []).filter((tab) => tab?.key === workflow.key);
@@ -410,14 +456,22 @@ export function createAutopilotProposalService({
     if (!controller || typeof controller.getUrl !== 'function') throw new Error('autopilot_production_tab_unusable');
     const url = await controller.getUrl();
     if (typeof url !== 'string' || !url.trim()) throw new Error('autopilot_production_tab_unusable');
-    return { state, tab };
+    return { state, tab, url };
   };
 
   const request = async () => {
     if (requestInFlight) throw new Error('autopilot_proposal_request_inflight');
     const promise = (async () => {
-      const { state, tab } = await assertReady();
+      const { state, tab, url: initialUrl } = await assertReady();
       const proposalNow = now();
+      const existingTicket = await ticketStore.get();
+      const ticketUnresolved = existingTicket && (
+        (existingTicket.state === 'pending' && Date.parse(existingTicket.expiresAt) > proposalNow.getTime())
+        || existingTicket.state === 'acknowledged'
+      );
+      if (ticketUnresolved) {
+        throw new Error('autopilot_proposal_ticket_unresolved');
+      }
       const metadata = createProposalMetadata({ now: proposalNow, tabKey: workflow.key, randomUUID, randomBytes });
       const attempts = [];
       for (let attempt = 1; attempt <= PROPOSAL_MAX_ATTEMPTS; attempt += 1) {
@@ -451,7 +505,44 @@ export function createAutopilotProposalService({
           };
         }
         if (classification.kind === PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) {
-          return { ok: true, status: 'proposal_response_received', tabId: state.tabId, metadata, prompt, response, proposal: classification.proposal, attempts: attempt };
+          const controller = tabs.getControllerById(tab.id);
+          const anchorRead = proposalAnchorRead || (async () => {
+            if (typeof controller?.readConversationTurns !== 'function') throw proposalAnchorError('reader_unavailable');
+            return await controller.readConversationTurns({
+              maxTurns: 100,
+              maxCharsPerTurn: 100_000,
+              maxTotalChars: 1_000_000,
+              historyMode: 'tail'
+            });
+          });
+          const anchorConversation = await anchorRead({ tab, controller, proposal: classification.proposal, metadata });
+          if (String(anchorConversation?.url || '').trim() !== String(initialUrl || '').trim()) throw proposalAnchorError('conversation_changed');
+          if (anchorConversation?.history?.mode !== 'tail' || anchorConversation.history.scopeComplete !== true || anchorConversation.history.tailProven !== true || anchorConversation.history.scrollRestored !== true) {
+            throw proposalAnchorError('tail_unproven');
+          }
+          const anchor = findValidatedProposalAssistantAnchor({
+            turns: anchorConversation.turns,
+            proposal: classification.proposal,
+            metadata,
+            now: proposalNow
+          });
+          const ticket = await ticketStore.create({
+            schemaVersion: 1,
+            proposalId: classification.proposal.proposalId,
+            tabKey: workflow.key,
+            tabId: tab.id,
+            vendorId: workflow.vendorId,
+            conversationUrl: anchorConversation.url,
+            assistantTurnId: anchor.assistantTurnId,
+            assistantTurnIdentityProvenance: anchor.assistantTurnIdentityProvenance,
+            proposal: classification.proposal,
+            contractHash: proposalContractHash(classification.proposal.contract),
+            createdAt: classification.proposal.createdAt,
+            expiresAt: classification.proposal.expiresAt,
+            state: 'pending',
+            updatedAt: classification.proposal.createdAt,
+          });
+          return { ok: true, status: 'proposal_response_received', tabId: state.tabId, metadata, prompt, response, proposal: classification.proposal, ticket, attempts: attempt };
         }
         attempts.push({ attempt, reason: classification.reason, ...(classification.diagnostic ? { diagnostic: classification.diagnostic } : {}) });
         if (attempt === PROPOSAL_MAX_ATTEMPTS) {

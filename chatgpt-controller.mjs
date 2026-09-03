@@ -3804,7 +3804,12 @@ export class ChatGPTController {
           && native?.documentVisibilityState === 'visible'
           && native?.documentHidden === false;
         if (initialNative?.browserWindowState === 'minimized') {
-          if (typeof this.page?.temporarilyUnminimizeForProbe !== 'function') {
+          if (tailOnly) {
+            // Tail proof is CDP/session scoped and must never change the OS window.
+            // A minimized page may still expose a usable DOM; the layout/scroller
+            // proof below remains the authority for whether the tail is readable.
+            if (initialNative?.pageClosed !== false) reason = 'history-native-window-not-ready';
+          } else if (typeof this.page?.temporarilyUnminimizeForProbe !== 'function') {
             reason = 'history-native-window-not-ready';
           } else {
             windowNormalizationApplied = true;
@@ -4290,7 +4295,7 @@ export class ChatGPTController {
       return false;
     };
     const restoreWindow = async () => {
-      if (!windowNormalizationApplied) {
+      if (tailOnly || !windowNormalizationApplied) {
         diagnostics.windowLifecycle.restoreVerified = true;
         return true;
       }

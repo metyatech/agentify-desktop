@@ -2485,6 +2485,63 @@ test('chatgpt-controller: tail history at bottom performs no scroll mutation', a
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
+test('chatgpt-controller: minimized tail history does not normalize or restore the window', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4, backend: 'chrome-cdp' });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  const lifecycle = result.history.diagnostics.windowLifecycle;
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(lifecycle.normalizationApplied, false);
+  assert.equal(lifecycle.restoreVerified, true);
+  assert.equal(harness.events.some((event) => event === 'window-state:normal'), false);
+  assert.equal(harness.events.some((event) => event === 'window-state:minimized'), false);
+});
+
+test('chatgpt-controller: minimized tail history can position through CDP without changing window state', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, backend: 'chrome-cdp' });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.scopeComplete, true);
+  assert.equal(result.history.diagnostics.tailEntry.alreadyAtBottom, false);
+  assert.equal(result.history.diagnostics.wheelUpAttempts, 0);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(harness.events.includes('conversation-scroll-restore'), true);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+  assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+});
+
+test('chatgpt-controller: minimized tail history fails closed when DOM proof is impossible', async () => {
+  const harness = createNativeWheelHistoryPage({
+    backend: 'chrome-cdp',
+    layoutSnapshots: [
+      { scroller: { candidateCount: 0 } }
+    ]
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });
+  assert.equal(result.history.tailProven, false);
+  assert.equal(result.history.scopeComplete, false);
+  assert.equal(result.history.reason, 'scroll-container-not-found');
+  assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+});
+
+test('chatgpt-controller: repeated minimized idle tail polls never mutate window state or use native wheels', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4, backend: 'chrome-cdp' });
+  const controller = createController(harness.page);
+  const results = [];
+  for (let poll = 0; poll < 5; poll += 1) {
+    results.push(await controller.readConversationTurns({ maxTurns: 100, maxCharsPerTurn: 1000, maxTotalChars: 100000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 }));
+  }
+  assert.equal(results.every((result) => result.history.mode === 'tail'), true);
+  assert.equal(results.every((result) => result.history.tailProven && result.history.scopeComplete), true);
+  assert.equal(results.every((result) => result.history.diagnostics.wheelUpAttempts === 0 && result.history.diagnostics.wheelDownAttempts === 0), true);
+  assert.equal(results.every((result) => result.history.diagnostics.windowLifecycle.normalizationApplied === false), true);
+  assert.equal(harness.getWheelCount(), 0);
+  assert.equal(harness.events.some((event) => event.startsWith('window-state:')), false);
+});
+
 test('chatgpt-controller: tail history establishes bottom without upward traversal and restores the original position', async () => {
   const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'tail', historyTimeoutMs: 5000, historyMaxIterations: 16 });

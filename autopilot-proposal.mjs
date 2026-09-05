@@ -177,62 +177,49 @@ function repositoryRelativePathKey(value) {
   return value.normalize('NFC').toLowerCase();
 }
 
-function pathContexts(text, relativePath) {
-  const lowerText = text.toLocaleLowerCase();
-  const lowerPath = relativePath.toLocaleLowerCase();
-  const contexts = [];
-  let offset = lowerText.indexOf(lowerPath);
-  while (offset >= 0) {
-    const sentenceStart = Math.max(
-      text.lastIndexOf('\n', offset),
-      text.lastIndexOf('。', offset),
-      text.lastIndexOf('.', offset),
-      text.lastIndexOf('!', offset),
-      text.lastIndexOf('！', offset),
-      text.lastIndexOf('?', offset),
-      text.lastIndexOf('？', offset),
-      text.lastIndexOf(',', offset),
-      text.lastIndexOf('，', offset),
-      text.lastIndexOf(';', offset),
-      text.lastIndexOf('；', offset),
-      text.lastIndexOf('、', offset),
-    ) + 1;
-    const sentenceEndCandidates = ['\n', '。', '.', '!', '！', '?', '？', ',', '，', ';', '；', '、']
-      .map((delimiter) => text.indexOf(delimiter, offset + relativePath.length))
-      .filter((index) => index >= 0);
-    const sentenceEnd = sentenceEndCandidates.length > 0 ? Math.min(...sentenceEndCandidates) : text.length;
-    contexts.push(text.slice(sentenceStart, sentenceEnd + 1));
-    offset = lowerText.indexOf(lowerPath, offset + lowerPath.length);
-  }
-  return contexts;
+function pathClause(text, start, end) {
+  const delimiters = ['\n', '。', '.', '!', '！', '?', '？', ',', '，', ';', '；', '、'];
+  const startCandidates = delimiters.map((delimiter) => text.lastIndexOf(delimiter, start - 1));
+  const endCandidates = delimiters
+    .map((delimiter) => text.indexOf(delimiter, end))
+    .filter((index) => index >= 0);
+  const clauseStart = Math.max(-1, ...startCandidates) + 1;
+  const clauseEnd = endCandidates.length > 0 ? Math.min(...endCandidates) + 1 : text.length;
+  return text.slice(clauseStart, clauseEnd);
 }
 
-function isExplicitlyExcludedPath(text, relativePath) {
-  return pathContexts(text, relativePath).some((context) => EXCLUSION_PATTERN.test(context));
+function isExplicitlyExcludedOccurrence(text, occurrence) {
+  return EXCLUSION_PATTERN.test(pathClause(text, occurrence.start, occurrence.end));
 }
 
-function isExplicitlyRequiredPath(text, relativePath) {
-  return pathContexts(text, relativePath).some((context) => ADOPTION_INTENT_PATTERN.test(context));
+function isExplicitlyRequiredOccurrence(text, occurrence) {
+  const context = pathClause(text, occurrence.start, occurrence.end);
+  return ADOPTION_INTENT_PATTERN.test(context)
+    && (EXPLICIT_SCOPE_PATTERN.test(context) || /(?:target|対象|採用|正式反映|手動変更|既に(?:ある|入っている))/iu.test(context));
 }
 
-function isLikelyRepositoryFilePath(value) {
-  if (typeof value !== 'string' || value.startsWith('http/') || value.startsWith('https/') || value.includes('://')) return false;
+function isPotentialAmbiguousRepositoryPath(value) {
   const segments = value.split('/');
   if (segments.length < 2 || segments.some((segment) => !segment)) return false;
-  const leaf = segments.at(-1);
-  return /\.[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(leaf)
-    || ['LICENSE', 'Makefile', 'Dockerfile', '.gitignore', '.gitattributes'].includes(leaf);
+  const firstSegment = segments[0].toLocaleLowerCase();
+  const knownRepositoryDirectories = new Set(['content', 'config', 'source', 'src', 'test', 'tests', 'scripts', 'docs', 'public', 'assets']);
+  const branchLikeDirectories = new Set(['feature', 'features', 'bugfix', 'hotfix', 'release', 'chore', 'fix', 'refs', 'heads']);
+  if (branchLikeDirectories.has(firstSegment)) return false;
+  if (knownRepositoryDirectories.has(firstSegment) || segments.length >= 3) return true;
+  return ['LICENSE', 'Makefile', 'Dockerfile', '.gitignore', '.gitattributes'].includes(segments.at(-1));
 }
 
-function extractRepositoryPaths(text) {
-  const paths = [];
+function extractRepositoryPathOccurrences(text) {
+  const occurrences = [];
   REPOSITORY_PATH_PATTERN.lastIndex = 0;
   for (const match of text.matchAll(REPOSITORY_PATH_PATTERN)) {
     const value = match[1];
-    if (!isLikelyRepositoryFilePath(value)) continue;
-    if (!paths.includes(value)) paths.push(value);
+    const start = match.index + match[0].indexOf(value);
+    const end = start + value.length;
+    if (text.slice(Math.max(0, start - 3), start).includes('://')) continue;
+    occurrences.push({ value, start, end });
   }
-  return paths;
+  return occurrences;
 }
 
 function userAuthoredTurn(turn) {
@@ -248,31 +235,34 @@ function userAuthoredTurn(turn) {
 export function deriveUserIntentGuard(turns) {
   const decisions = new Map();
   let adoptionIntent = false;
-  let explicitScope = false;
-  let ambiguousMention = false;
-  for (const [turnIndex, turn] of (Array.isArray(turns) ? turns : []).entries()) {
+  let occurrenceOrder = 0;
+  for (const turn of (Array.isArray(turns) ? turns : [])) {
     if (!userAuthoredTurn(turn)) continue;
     const text = normalizeProposalText(turn.text);
     if (!text) continue;
     adoptionIntent ||= ADOPTION_INTENT_PATTERN.test(text);
-    explicitScope ||= EXPLICIT_SCOPE_PATTERN.test(text);
-    for (const relativePath of extractRepositoryPaths(text)) {
-      const excluded = isExplicitlyExcludedPath(text, relativePath);
-      const required = !excluded && isExplicitlyRequiredPath(text, relativePath);
+    for (const occurrence of extractRepositoryPathOccurrences(text)) {
+      const relativePath = occurrence.value;
+      const order = occurrenceOrder++;
+      const excluded = isExplicitlyExcludedOccurrence(text, occurrence);
+      const required = !excluded && isExplicitlyRequiredOccurrence(text, occurrence);
       if (excluded) {
-        explicitScope = true;
-        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'excluded', turnIndex });
+        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'excluded', order });
       } else if (required) {
-        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'required', turnIndex });
-      } else if (adoptionIntent) {
-        ambiguousMention = true;
+        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'required', order });
+      } else if (adoptionIntent && isPotentialAmbiguousRepositoryPath(relativePath)) {
+        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'ambiguous', order });
       }
     }
   }
   const finalDecisions = [...decisions.values()];
   const requiredPaths = finalDecisions.filter((decision) => decision.disposition === 'required').map((decision) => decision.path);
   const excludedPaths = finalDecisions.filter((decision) => decision.disposition === 'excluded').map((decision) => decision.path);
-  const ambiguous = adoptionIntent && (ambiguousMention || !requiredPaths.length || !explicitScope);
+  const ambiguous = adoptionIntent && (
+    finalDecisions.some((decision) => decision.disposition === 'ambiguous')
+    || finalDecisions.length === 0
+    || !requiredPaths.length
+  );
   const adoptionRequired = adoptionIntent && !ambiguous && requiredPaths.length > 0;
   return Object.freeze({
     adoptionRequired,

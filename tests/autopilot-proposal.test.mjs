@@ -173,6 +173,44 @@ test('latest user disposition wins for the same canonical path', () => {
   assert.equal(excludedLater.adoptionRequired, false);
 });
 
+test('later user decisions resolve earlier ambiguous path mentions', () => {
+  const guard = deriveUserIntentGuard([
+    { role: 'user', text: `既存変更を正式反映したい。${ADOPTION_TARGET} と ${ADOPTION_EXCLUDED} を確認している。` },
+    { role: 'user', text: `${ADOPTION_TARGET} だけ正式反映する。${ADOPTION_EXCLUDED} は含めない。` }
+  ]);
+  assert.deepEqual(guard.requiredPaths, [ADOPTION_TARGET]);
+  assert.deepEqual(guard.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(guard.ambiguous, false);
+  assert.equal(guard.adoptionRequired, true);
+});
+
+test('same-turn latest occurrence decision wins for a path', () => {
+  const requiredLater = deriveUserIntentGuard([{ role: 'user', text: `${ADOPTION_EXCLUDED} は含めない。いや、${ADOPTION_EXCLUDED} にある手動変更だけ正式反映する。` }]);
+  assert.deepEqual(requiredLater.requiredPaths, [ADOPTION_EXCLUDED]);
+  assert.deepEqual(requiredLater.excludedPaths, []);
+
+  const excludedLater = deriveUserIntentGuard([{ role: 'user', text: `${ADOPTION_EXCLUDED} にある手動変更だけ正式反映する。いや、${ADOPTION_EXCLUDED} は含めない。` }]);
+  assert.deepEqual(excludedLater.requiredPaths, []);
+  assert.deepEqual(excludedLater.excludedPaths, [ADOPTION_EXCLUDED]);
+});
+
+test('dotted repository and branch-like tokens never become adoption paths', () => {
+  const guard = deriveUserIntentGuard([{ role: 'user', text: `owner/repo.tools と feature/foo.txt を参照しつつ、すでに手動で行った ${ADOPTION_TARGET} だけ正式反映する。${ADOPTION_EXCLUDED} は含めない。` }]);
+  assert.deepEqual(guard.requiredPaths, [ADOPTION_TARGET]);
+  assert.deepEqual(guard.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(guard.ambiguous, false);
+  assert.equal(guard.requiredPaths.includes('owner/repo.tools'), false);
+  assert.equal(guard.requiredPaths.includes('feature/foo.txt'), false);
+});
+
+test('explicit extensionless repository file can be adopted', () => {
+  const path = 'Content/README';
+  const guard = deriveUserIntentGuard([{ role: 'user', text: `既にある手動変更の ${path} だけ正式反映する。` }]);
+  assert.deepEqual(guard.requiredPaths, [path]);
+  assert.equal(guard.ambiguous, false);
+  assert.equal(guard.adoptionRequired, true);
+});
+
 test('later assistant or proposal-generation user text cannot override the latest user decision', () => {
   const guard = deriveUserIntentGuard([
     { role: 'user', text: `やっぱり ${ADOPTION_TARGET} だけ正式反映する。${ADOPTION_EXCLUDED} は含めない。` },

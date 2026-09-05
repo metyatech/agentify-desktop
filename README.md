@@ -276,12 +276,16 @@ The Control Center has one production-only action, `この内容を実行`, for 
 existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
 usable ChatGPT tab exists and that Agentify has no active or in-flight query.
 The action generates the version-1 proposal envelope locally, then sends the
-versioned `ai-autopilot-proposal-generation-v4` instruction through the existing
+versioned `ai-autopilot-proposal-generation-v5` instruction through the existing
 authenticated `POST /query` path. Agentify validates the response markers, JSON,
-metadata, and current v4 contract locally; malformed responses are discarded and
+metadata, and current v5 contract locally; malformed responses are discarded and
 retried up to three times with the same envelope metadata. After a valid response,
-Agentify performs a bounded tail read to uniquely anchor the exact assistant turn
-and atomically persists a proposal ticket in its state directory. The ticket is
+Agentify first takes a bounded, proven tail snapshot of user-authored turns and
+derives an internal adoption guard before querying ChatGPT. Generated proposal
+turns and assistant text are not authority for that guard. The same immutable guard
+is embedded as a system-owned instruction on every retry and validates the response
+before Agentify performs a second bounded tail read to uniquely anchor the exact
+assistant turn and atomically persist a proposal ticket in its state directory. The ticket is
 the durable handoff consumed by ai-autopilot after restart; no ticket is written
 for clarification, invalid, missing, or ambiguous proposal responses. The
 instruction asks ChatGPT to clarify only user decisions; verification commands,

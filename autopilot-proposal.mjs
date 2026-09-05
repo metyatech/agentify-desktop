@@ -10,7 +10,7 @@ const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
 // The installed desktop cannot depend on the private controller repository, so
 // the fallback template is intentionally duplicated and covered by contract tests.
-export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v4';
+export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v5';
 export const TASK_CONTRACT_SCHEMA_VERSION = 1;
 export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
 
@@ -218,7 +218,38 @@ function extractRepositoryPaths(text) {
   return paths;
 }
 
-function validateAdoptExistingChanges(repository, contractText) {
+function userAuthoredTurn(turn) {
+  const text = normalizeProposalText(turn?.text);
+  const systemGeneratedProposalTurn = /^System-owned proposal generation instruction:\s*ai-autopilot-proposal-generation-v\d+/imu.test(text);
+  return turn?.role === 'user'
+    && turn?.userAuthored !== false
+    && turn?.isUserAuthored !== false
+    && !['system', 'proposal-generation', 'agentify'].includes(String(turn?.source || '').trim().toLowerCase())
+    && !systemGeneratedProposalTurn;
+}
+
+export function deriveUserIntentGuard(turns) {
+  const userText = (Array.isArray(turns) ? turns : [])
+    .filter(userAuthoredTurn)
+    .map((turn) => normalizeProposalText(turn.text))
+    .filter(Boolean)
+    .join('\n');
+  const mentionedPaths = extractRepositoryPaths(userText);
+  const excludedPaths = mentionedPaths.filter((relativePath) => isExplicitlyExcludedPath(userText, relativePath));
+  const requiredPaths = mentionedPaths.filter((relativePath) => !excludedPaths.includes(relativePath));
+  const adoptionIntent = ADOPTION_INTENT_PATTERN.test(userText);
+  const explicitScope = EXPLICIT_SCOPE_PATTERN.test(userText);
+  const adoptionRequired = adoptionIntent && requiredPaths.length > 0 && explicitScope;
+  const ambiguous = adoptionIntent && (!requiredPaths.length || !explicitScope);
+  return Object.freeze({
+    adoptionRequired,
+    requiredPaths: Object.freeze(requiredPaths),
+    excludedPaths: Object.freeze(excludedPaths),
+    ambiguous,
+  });
+}
+
+function validateAdoptExistingChanges(repository, intentGuard) {
   const adoption = repository?.adoptExistingChanges;
   if (adoption !== undefined) {
     if (!isRecord(adoption) || !hasExactKeys(adoption, ['paths']) || !Array.isArray(adoption.paths) || adoption.paths.length === 0) {
@@ -233,20 +264,19 @@ function validateAdoptExistingChanges(repository, contractText) {
       const key = repositoryRelativePathKey(relativePath);
       if (seen.has(key)) throw proposalValidationError('adoption_path_duplicate');
       seen.add(key);
-      if (!contractText.toLocaleLowerCase().includes(relativePath.toLocaleLowerCase())) throw proposalValidationError('adoption_path_not_stated');
-      if (isExplicitlyExcludedPath(contractText, relativePath)) throw proposalValidationError('adoption_path_excluded');
+    }
+    if (!intentGuard) throw proposalValidationError('intent_guard_missing');
+    if (!intentGuard.adoptionRequired) throw proposalValidationError('adoption_not_authorized');
+    const actual = adoption.paths.map(repositoryRelativePathKey).sort();
+    const expected = intentGuard.requiredPaths.map(repositoryRelativePathKey).sort();
+    if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
+      throw proposalValidationError('adoption_paths_mismatch');
+    }
+    if (adoption.paths.some((relativePath) => intentGuard.excludedPaths.some((excludedPath) => repositoryRelativePathKey(excludedPath) === repositoryRelativePathKey(relativePath)))) {
+      throw proposalValidationError('adoption_path_excluded');
     }
   }
-
-  const mentionedPaths = extractRepositoryPaths(contractText)
-    .filter((relativePath) => relativePath.toLocaleLowerCase() !== String(repository?.slug || '').toLocaleLowerCase());
-  const adoptionRequired = ADOPTION_INTENT_PATTERN.test(contractText) && mentionedPaths.length > 0 && EXPLICIT_SCOPE_PATTERN.test(contractText);
-  if (!adoptionRequired) return;
-  const expectedPaths = mentionedPaths.filter((relativePath) => !isExplicitlyExcludedPath(contractText, relativePath));
-  if (!adoption) throw proposalValidationError('adoption_required');
-  const actual = adoption.paths.map(repositoryRelativePathKey).sort();
-  const expected = expectedPaths.map(repositoryRelativePathKey).sort();
-  if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) throw proposalValidationError('adoption_paths_mismatch');
+  if (intentGuard?.adoptionRequired && !adoption) throw proposalValidationError('adoption_required');
 }
 
 function findSensitiveEvidence(text) {
@@ -259,12 +289,13 @@ function findSensitiveEvidence(text) {
   return findings;
 }
 
-function validateContract(contract, metadata, { expectedTaskId = null } = {}) {
+function validateContract(contract, metadata, { expectedTaskId = null, intentGuard = null } = {}) {
   if (!isRecord(contract) || !hasExactKeys(contract, CONTRACT_KEYS)) throw proposalValidationError('contract_schema_invalid');
   if (contract.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('contract_schema_version_invalid');
   validateTaskId(contract.id);
   if (expectedTaskId !== null && contract.id !== expectedTaskId) throw proposalValidationError('contract_id_mismatch');
   if (!nonEmptyString(contract.title)) throw proposalValidationError('contract_title_invalid');
+  if (intentGuard?.ambiguous) throw proposalValidationError('intent_guard_ambiguous');
 
   if (contract.repository === null) {
     if (contract.delivery?.push !== false) throw proposalValidationError('host_task_push_must_be_false');
@@ -280,8 +311,10 @@ function validateContract(contract, metadata, { expectedTaskId = null } = {}) {
     if (!nonEmptyString(contract.repository.targetBranch) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/u.test(contract.repository.targetBranch) || contract.repository.targetBranch.includes('..') || contract.repository.targetBranch.includes('//') || contract.repository.targetBranch.includes('@{') || contract.repository.targetBranch.endsWith('/') || contract.repository.targetBranch.endsWith('.')) {
       throw proposalValidationError('repository_value_invalid');
     }
-    validateAdoptExistingChanges(contract.repository, [contract.title, contract.implementation?.prompt, ...(Array.isArray(contract.constraints) ? contract.constraints : [])].filter(Boolean).join('\n'));
+    validateAdoptExistingChanges(contract.repository, intentGuard);
   }
+  if (contract.repository === null && intentGuard?.adoptionRequired) throw proposalValidationError('adoption_required');
+  if (contract.repository && !Object.hasOwn(contract.repository, 'adoptExistingChanges') && intentGuard?.adoptionRequired) throw proposalValidationError('adoption_required');
 
   if (!isRecord(contract.agentify) || !hasExactKeys(contract.agentify, ['tabKey']) || contract.agentify.tabKey !== metadata.tabKey) {
     throw proposalValidationError('agentify_tab_key_invalid');
@@ -317,7 +350,7 @@ function parseUtcTimestamp(value, label) {
   return timestamp;
 }
 
-function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = null } = {}) {
+function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = null, intentGuard = null } = {}) {
   if (!isRecord(proposal) || !hasExactKeys(proposal, ENVELOPE_KEYS)) throw proposalValidationError('envelope_schema_invalid');
   if (proposal.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('proposal_schema_version_invalid');
   if (typeof proposal.proposalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(proposal.proposalId)) throw proposalValidationError('proposal_id_invalid');
@@ -330,11 +363,11 @@ function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = nu
   for (const key of ['schemaVersion', 'proposalId', 'createdAt', 'expiresAt', 'tabKey', 'approvalCode']) {
     if (proposal[key] !== metadata[key]) throw proposalValidationError(`metadata_mismatch_${key}`);
   }
-  validateContract(proposal.contract, metadata, { expectedTaskId });
+  validateContract(proposal.contract, metadata, { expectedTaskId, intentGuard });
   if (proposal.contract.agentify.tabKey !== proposal.tabKey) throw proposalValidationError('contract_tab_key_mismatch');
 }
 
-export function classifyProposalResponse(responseText, { metadata, now = new Date(), expectedTaskId = null } = {}) {
+export function classifyProposalResponse(responseText, { metadata, now = new Date(), expectedTaskId = null, intentGuard = null } = {}) {
   const text = normalizeProposalText(responseText);
   if (Buffer.byteLength(text, 'utf8') > PROPOSAL_MAX_BYTES) return invalidProposal('response_too_large');
   if (!text.trim()) return invalidProposal(typeof responseText === 'string' ? 'response_empty' : 'response_text_missing');
@@ -356,7 +389,7 @@ export function classifyProposalResponse(responseText, { metadata, now = new Dat
     return invalidProposal('proposal_json_invalid', jsonParseDiagnostic(error, jsonText));
   }
   try {
-    validateProposalEnvelope(proposal, metadata, now, { expectedTaskId });
+    validateProposalEnvelope(proposal, metadata, now, { expectedTaskId, intentGuard });
   } catch (error) {
     return invalidProposal(error.reason || 'proposal_schema_invalid');
   }
@@ -386,11 +419,11 @@ function canonicalizeProposal(value) {
   return value;
 }
 
-export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date(), expectedTaskId = null } = {}) {
+export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date(), expectedTaskId = null, intentGuard = null } = {}) {
   const matches = [];
   for (const turn of Array.isArray(turns) ? turns : []) {
     if (turn?.role !== 'assistant' || typeof turn.text !== 'string') continue;
-    const classification = classifyProposalResponse(turn.text, { metadata, now, expectedTaskId });
+    const classification = classifyProposalResponse(turn.text, { metadata, now, expectedTaskId, intentGuard });
     if (classification.kind !== PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) continue;
     if (JSON.stringify(canonicalizeProposal(classification.proposal)) !== JSON.stringify(canonicalizeProposal(proposal))) continue;
     const provenance = String(turn.identityProvenance || '').trim();
@@ -441,7 +474,7 @@ export function createProposalMetadata({
   };
 }
 
-export function buildProposalGenerationPrompt({ metadata, retryAttempt = 0, retryDiagnostic = null } = {}) {
+export function buildProposalGenerationPrompt({ metadata, intentGuard = null, retryAttempt = 0, retryDiagnostic = null } = {}) {
   if (!metadata || typeof metadata !== 'object') throw new TypeError('metadata is required');
   const exactMetadata = JSON.stringify(metadata, null, 2);
   return [
@@ -449,6 +482,7 @@ export function buildProposalGenerationPrompt({ metadata, retryAttempt = 0, retr
     '',
     'Use user-authored conversation turns as the source of implementation intent and user decisions.',
     'System-generated proposal-generation turns, proposal envelopes, and responses that ask for technical details are compiler artifacts, not authoritative user requirements. Do not promote them into the implementation request.',
+    'The local compiler-derived user intent guard below is authoritative for existing-change adoption. Do not infer, weaken, or broaden it from generated contract text.',
     "Do not rely on the user's memory of the Autopilot protocol; the protocol and schema below are authoritative for this turn.",
     '',
     'Separate user decisions from execution-plan details. User decisions are the implementation intent, repository/branch when the task is repository-scoped, and delivery.push when push permission is not clear. A repository is optional: host/local tasks may use repository:null, and repository:null requires delivery.push:false.',
@@ -471,13 +505,16 @@ export function buildProposalGenerationPrompt({ metadata, retryAttempt = 0, retr
     '',
     'The JSON object must contain exactly these envelope fields plus contract: schemaVersion, proposalId, createdAt, expiresAt, tabKey, approvalCode, contract.',
     'The envelope values above must be preserved byte-for-byte as JSON string/number values. In particular, tabKey must also be copied to contract.agentify.tabKey.',
+    'Compiler-derived intent guard (internal authority; do not copy it into the proposal envelope):',
+    JSON.stringify(intentGuard || { adoptionRequired: false, requiredPaths: [], excludedPaths: [] }, null, 2),
     'Serialize the output JSON exactly as JSON.stringify would. Every string, including Windows paths, quotation marks, backslashes, and newlines, must use valid JSON escaping.',
     '',
     'The contract must conform exactly to the current ai-autopilot task-contract validator:',
     '- Top-level fields are exactly: schemaVersion, id, title, repository, agentify, implementation, verification, review, delivery, constraints. No unknown fields.',
     `- schemaVersion is 1. id is system-owned and must be exactly "task-${metadata.proposalId}"; never invent a semantic slug or ask the user to choose a task id. title and implementation.prompt are non-empty strings.`,
-    '- repository is either null for host/local tasks or an object with slug and targetBranch; a repository object uses owner/name form and targetBranch is the requested existing branch. If the user explicitly wants already-existing/manual changes formally adopted, names exact repository-relative path(s), and explicitly excludes other existing changes, repository.adoptExistingChanges:{paths:[...]} is REQUIRED. Emit the exact intended paths only; excluded files must be absent. If the exact path or required field cannot be determined, emit a clarification instead of a proposal. Normal implementation tasks must omit this field. Never put a local checkout path in the contract.',
-    `- Before emitting a proposal, self-check: contract.id === "task-${metadata.proposalId}"; existing/manual adoption required? If yes, adoptExistingChanges is present, paths are exact, and excluded paths are absent.`,
+    `- repository is either null for host/local tasks or an object with slug and targetBranch; a repository object uses owner/name form and targetBranch is the requested existing branch. The compiler guard is authoritative: if adoptionRequired is true, repository.adoptExistingChanges is REQUIRED and present with paths equal to requiredPaths exactly, and excludedPaths must be absent. If adoptionRequired is false, omit adoptExistingChanges. If the guard is ambiguous, emit a clarification instead of a proposal. Never put a local checkout path in the contract.`,
+    `- Before emitting a proposal, self-check: contract.id === "task-${metadata.proposalId}"; apply the compiler-derived intent guard exactly; do not infer adoption from contract prose.`,
+    '- When existing/manual adoption is required, adoptExistingChanges:{paths:[...]} is mandatory and must contain only the exact repository-relative files stated by the user; paths use / and cannot be absolute, contain .., globs, duplicates, or be empty. Otherwise this field must be absent. Normal implementation tasks must omit adoptExistingChanges. Never put a local checkout path in the contract.',
     '- agentify.tabKey is required and must equal the envelope tabKey.',
     '- implementation.prompt is required; implementation has no patch-attempt setting.',
     '- verification is an array, possibly empty, of objects with verification[].name, verification[].command, verification[].args, and verification[].timeoutMs; args is an array of strings and timeoutMs is a positive integer.',
@@ -509,7 +546,8 @@ export function createAutopilotProposalService({
   randomBytes = crypto.randomBytes,
   targetKey = 'autopilot-production',
   proposalTicketStore = null,
-  proposalAnchorRead = null
+  proposalAnchorRead = null,
+  proposalIntentRead = null
 } = {}) {
   if (!tabs || typeof tabs.listTabs !== 'function' || typeof tabs.getControllerById !== 'function') throw new TypeError('tabs service is required');
   if (typeof requestQuery !== 'function') throw new TypeError('requestQuery is required');
@@ -563,12 +601,44 @@ export function createAutopilotProposalService({
       if (ticketUnresolved) {
         throw new Error('autopilot_proposal_ticket_unresolved');
       }
+      const controller = tabs.getControllerById(tab.id);
+      const readProvenTail = proposalIntentRead || (async () => {
+        if (typeof controller?.readConversationTurns !== 'function') throw proposalAnchorError('reader_unavailable');
+        return await controller.readConversationTurns({
+          maxTurns: 100,
+          maxCharsPerTurn: 100_000,
+          maxTotalChars: 1_000_000,
+          historyMode: 'tail'
+        });
+      });
+      const intentSnapshot = await readProvenTail({ tab, controller, url: initialUrl });
+      if (String(intentSnapshot?.url || '').trim() !== String(initialUrl || '').trim()) throw new Error('autopilot_proposal_intent_conversation_changed');
+      if (intentSnapshot?.history?.mode !== 'tail' || intentSnapshot.history.scopeComplete !== true || intentSnapshot.history.tailProven !== true || intentSnapshot.history.scrollRestored !== true) {
+        throw new Error('autopilot_proposal_intent_tail_unproven');
+      }
+      const intentGuard = deriveUserIntentGuard(intentSnapshot.turns);
+      if (intentGuard.ambiguous) {
+        return {
+          ok: false,
+          status: 'clarification_response_received',
+          tabId: state.tabId,
+          metadata: null,
+          prompt: null,
+          response: null,
+          clarification: {
+            kind: PROPOSAL_RESPONSE_KINDS.CLARIFICATION,
+            reason: 'intent_guard_ambiguous'
+          },
+          attempts: 0
+        };
+      }
       const metadata = createProposalMetadata({ now: proposalNow, tabKey: workflow.key, randomUUID, randomBytes });
       const attempts = [];
       for (let attempt = 1; attempt <= PROPOSAL_MAX_ATTEMPTS; attempt += 1) {
         const previousAttempt = attempts.at(-1);
         const prompt = buildProposalGenerationPrompt({
           metadata,
+          intentGuard,
           retryAttempt: attempt > 1 ? attempt : 0,
           retryDiagnostic: previousAttempt?.diagnostic || null
         });
@@ -583,7 +653,7 @@ export function createAutopilotProposalService({
           timeoutMs: 10 * 60 * 1000
         });
         const expectedTaskId = expectedTaskIdForProposal(metadata.proposalId);
-        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow, expectedTaskId });
+        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow, expectedTaskId, intentGuard });
         if (classification.kind === PROPOSAL_RESPONSE_KINDS.CLARIFICATION) {
           return {
             ok: false,
@@ -597,7 +667,6 @@ export function createAutopilotProposalService({
           };
         }
         if (classification.kind === PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) {
-          const controller = tabs.getControllerById(tab.id);
           const anchorRead = proposalAnchorRead || (async () => {
             if (typeof controller?.readConversationTurns !== 'function') throw proposalAnchorError('reader_unavailable');
             return await controller.readConversationTurns({
@@ -617,7 +686,8 @@ export function createAutopilotProposalService({
             proposal: classification.proposal,
             metadata,
             now: proposalNow,
-            expectedTaskId
+            expectedTaskId,
+            intentGuard
           });
           const ticket = await ticketStore.create({
             schemaVersion: 1,

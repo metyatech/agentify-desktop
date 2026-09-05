@@ -15,6 +15,7 @@ import {
   classifyProposalResponse,
   createAutopilotProposalService,
   createProposalMetadata,
+  deriveUserIntentGuard,
   expectedTaskIdForProposal,
   findValidatedProposalAssistantAnchor,
   parseValidateProposalResponse
@@ -92,7 +93,8 @@ function makeService(options = {}) {
     randomUUID: () => '123e4567-e89b-42d3-a456-426614174000',
     randomBytes: () => Buffer.from([0xab, 0x12, 0xcd, 0x34]),
     proposalTicketStore: options.proposalTicketStore,
-    proposalAnchorRead: options.proposalAnchorRead
+    proposalAnchorRead: options.proposalAnchorRead,
+    proposalIntentRead: options.proposalIntentRead
   });
   return { service, calls, setRelease: (fn) => { release = fn; } };
 }
@@ -129,6 +131,70 @@ const ADOPTION_TARGET = 'Content/__ExternalActors__/Maps/L_RuntimeUnicodeTextSam
 const ADOPTION_EXCLUDED = 'Config/DefaultEngine.ini';
 const ADOPTION_PROMPT = `すでに手動で行ってある変更を正式に反映したい。対象は ${ADOPTION_TARGET} に既に入っている手動変更だけ。${ADOPTION_EXCLUDED} は含めない。`;
 
+test('user-authored intent guard derives exact adoption and exclusion paths from a proven snapshot', () => {
+  const guard = deriveUserIntentGuard([
+    { role: 'assistant', text: ADOPTION_PROMPT },
+    { role: 'user', source: 'proposal-generation', text: `adopt ${ADOPTION_TARGET}` },
+    { role: 'user', text: ADOPTION_PROMPT }
+  ]);
+  assert.deepEqual({ adoptionRequired: guard.adoptionRequired, requiredPaths: guard.requiredPaths, excludedPaths: guard.excludedPaths }, {
+    adoptionRequired: true,
+    requiredPaths: [ADOPTION_TARGET],
+    excludedPaths: [ADOPTION_EXCLUDED]
+  });
+});
+
+test('normal user intent produces no adoption guard and generated text cannot authorize adoption', () => {
+  const guard = deriveUserIntentGuard([{ role: 'user', text: '通常の新規実装をお願いします。' }]);
+  assert.deepEqual({ adoptionRequired: guard.adoptionRequired, requiredPaths: guard.requiredPaths, excludedPaths: guard.excludedPaths }, {
+    adoptionRequired: false,
+    requiredPaths: [],
+    excludedPaths: []
+  });
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } };
+  const response = validProposalText(FIXED_METADATA, { contract: { repository } });
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), intentGuard: guard }), /adoption_not_authorized/u);
+});
+
+test('assistant and system-generated turns never authorize adoption', () => {
+  assert.deepEqual(deriveUserIntentGuard([{ role: 'assistant', text: ADOPTION_PROMPT }]).adoptionRequired, false);
+  assert.deepEqual(deriveUserIntentGuard([{ role: 'user', source: 'proposal-generation', text: ADOPTION_PROMPT }]).adoptionRequired, false);
+  assert.deepEqual(deriveUserIntentGuard([{ role: 'user', text: `System-owned proposal generation instruction: ai-autopilot-proposal-generation-v5\n${ADOPTION_PROMPT}` }]).adoptionRequired, false);
+});
+
+test('proven user intent snapshot is read before query and remains immutable across retries', async () => {
+  const events = [];
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } };
+  const valid = validProposalText(FIXED_METADATA, { contract: { repository, implementation: { prompt: 'Implement the generated plan.' } } });
+  let queryCount = 0;
+  const { service } = makeService({
+    proposalIntentRead: async () => {
+      events.push('intent-snapshot');
+      return { url: 'https://chatgpt.com/', turns: [{ role: 'user', text: ADOPTION_PROMPT }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } };
+    },
+    requestQuery: async (body) => {
+      events.push(`query-${++queryCount}`);
+      assert.match(body.prompt, /"adoptionRequired": true/u);
+      assert.match(body.prompt, new RegExp(ADOPTION_TARGET.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+      return { result: { text: queryCount === 1 ? `${PROPOSAL_BEGIN}\n{}\n${PROPOSAL_END}` : valid } };
+    },
+    proposalAnchorRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'assistant', messageId: 'provider-message-proposal', identityProvenance: 'provider-message-id', index: 0, text: valid }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } })
+  });
+  const result = await service.request();
+  assert.equal(result.status, 'proposal_response_received');
+  assert.deepEqual(events, ['intent-snapshot', 'query-1', 'query-2']);
+});
+
+test('unproven intent snapshot fails closed before proposal query', async () => {
+  let calls = 0;
+  const { service } = makeService({
+    proposalIntentRead: async () => ({ url: 'https://chatgpt.com/', turns: [], history: { mode: 'tail', scopeComplete: true, tailProven: false, scrollRestored: true } }),
+    requestQuery: async () => { calls += 1; return { result: { text: validProposalText() } }; }
+  });
+  await assert.rejects(service.request(), /autopilot_proposal_intent_tail_unproven/u);
+  assert.equal(calls, 0);
+});
+
 test('explicit existing-change intent requires the exact adoption path and excludes unrelated files', async () => {
   const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } };
   const response = validProposalText(FIXED_METADATA, { contract: { title: 'Adopt the approved existing change', repository, implementation: { prompt: ADOPTION_PROMPT } } });
@@ -136,6 +202,7 @@ test('explicit existing-change intent requires the exact adoption path and exclu
   const { service } = makeService({
     requestQuery: async () => ({ result: { text: response } }),
     tabs: makeTabs({ anchorText: response }),
+    proposalIntentRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'user', text: ADOPTION_PROMPT }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } }),
     proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
   });
   const result = await service.request();
@@ -144,20 +211,32 @@ test('explicit existing-change intent requires the exact adoption path and exclu
 });
 
 test('explicit existing-change intent without adoption field is rejected before ticket creation', async () => {
-  const response = validProposalText(FIXED_METADATA, { contract: { repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master' }, implementation: { prompt: ADOPTION_PROMPT } } });
+  const response = validProposalText(FIXED_METADATA, { contract: { repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master' }, implementation: { prompt: 'Implement the requested display change.' } } });
   const saved = [];
   const { service } = makeService({
     requestQuery: async () => ({ result: { text: response } }),
+    proposalIntentRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'user', text: ADOPTION_PROMPT }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } }),
     proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
   });
   await assert.rejects(service.request(), /autopilot_proposal_generation_failed:adoption_required/u);
   assert.equal(saved.length, 0);
 });
 
+test('correct adoption field remains valid even when generated contract prose omits manual-adoption details', () => {
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } };
+  const response = validProposalText(FIXED_METADATA, { contract: { repository, implementation: { prompt: 'Implement the requested display change.' } } });
+  const parsed = parseValidateProposalResponse(response, {
+    metadata: FIXED_METADATA,
+    now: new Date(FIXED_METADATA.createdAt),
+    intentGuard: { adoptionRequired: true, requiredPaths: [ADOPTION_TARGET], excludedPaths: [ADOPTION_EXCLUDED] }
+  });
+  assert.deepEqual(parsed.contract.repository.adoptExistingChanges.paths, [ADOPTION_TARGET]);
+});
+
 test('explicitly excluded adoption path is rejected', () => {
   const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET, ADOPTION_EXCLUDED] } };
   const response = validProposalText(FIXED_METADATA, { contract: { repository, implementation: { prompt: ADOPTION_PROMPT } } });
-  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), expectedTaskId: expectedTaskIdForProposal(FIXED_METADATA.proposalId) }), /adoption_path_excluded/u);
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), expectedTaskId: expectedTaskIdForProposal(FIXED_METADATA.proposalId), intentGuard: { adoptionRequired: true, requiredPaths: [ADOPTION_TARGET], excludedPaths: [ADOPTION_EXCLUDED] } }), /adoption_paths?_(excluded|mismatch)/u);
 });
 
 test('normal implementation tasks omit adoption field', () => {
@@ -523,7 +602,7 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   });
   const prompt = buildProposalGenerationPrompt({ metadata });
   assert.match(prompt, new RegExp(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'u'));
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v4');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v5');
   assert.match(prompt, new RegExp(PROPOSAL_PROTOCOL_VERSION, 'u'));
   assert.match(prompt, new RegExp(`Task contract schemaVersion: ${TASK_CONTRACT_SCHEMA_VERSION}`, 'u'));
   assert.match(prompt, /repository\/branch when the task is repository-scoped/u);
@@ -570,8 +649,10 @@ test('proposal prompt owns technical verification planning and ignores generated
       approvalCode: 'AB12CD34'
     }
   });
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v4');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v5');
   assert.match(prompt, /System-generated proposal-generation turns.*not authoritative user requirements/u);
+  assert.match(prompt, /compiler-derived user intent guard.*authoritative/iu);
+  assert.match(prompt, /required.*adoptExistingChanges.*present/iu);
   assert.match(prompt, /If a required user decision is missing or ambiguous/u);
   assert.match(prompt, /Verification is an execution plan, not a user-facing requirement/u);
   assert.match(prompt, /If concrete verification commands are explicitly present.*respect them/u);

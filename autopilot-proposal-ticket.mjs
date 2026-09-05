@@ -7,7 +7,7 @@ import { atomicWriteFile, defaultStateDir, ensureStateDir } from './state.mjs';
 export const AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION = 1;
 export const AUTOPILOT_PROPOSAL_TICKET_FILE = 'autopilot-proposal-ticket.json';
 export const AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES = 512 * 1024;
-export const AUTOPILOT_PROPOSAL_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'consumed']);
+export const AUTOPILOT_PROPOSAL_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'consumed', 'abandoned']);
 
 const TICKET_KEYS = Object.freeze([
   'schemaVersion', 'proposalId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
@@ -136,7 +136,7 @@ export async function createAutopilotProposalTicketStore({ stateDir = defaultSta
     async update({ proposalId: requestedProposalId, state } = {}) {
       if (!current || current.proposalId !== requestedProposalId) throw new Error('autopilot_proposal_ticket_not_found');
       if (!AUTOPILOT_PROPOSAL_TICKET_STATES.includes(state)) throw new Error('autopilot_proposal_ticket_state_invalid');
-      const allowed = current.state === 'pending' ? ['pending', 'acknowledged'] : current.state === 'acknowledged' ? ['acknowledged', 'consumed'] : ['consumed'];
+      const allowed = current.state === 'pending' ? ['pending', 'acknowledged', 'abandoned'] : current.state === 'acknowledged' ? ['acknowledged', 'consumed'] : current.state === 'consumed' ? ['consumed'] : ['abandoned'];
       if (!allowed.includes(state)) throw new Error('autopilot_proposal_ticket_transition_invalid');
       const next = validateAutopilotProposalTicket({ ...current, state, updatedAt: now().toISOString() }, { now: now(), allowExpired: true });
       await atomicWriteFile(autopilotProposalTicketPath(stateDir), `${JSON.stringify(next, null, 2)}\n`);

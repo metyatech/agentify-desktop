@@ -10,7 +10,7 @@ const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
 // The installed desktop cannot depend on the private controller repository, so
 // the fallback template is intentionally duplicated and covered by contract tests.
-export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v3';
+export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v4';
 export const TASK_CONTRACT_SCHEMA_VERSION = 1;
 export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
 
@@ -67,6 +67,11 @@ const REDACTION_PATTERNS = [
   { kind: 'credential-assignment', pattern: /\btoken\s*[:=]\s*['"]?[^\s,'";]{12,}/giu },
   { kind: 'signed-url', pattern: /[?&](?:access_token|token|signature|sig|x-amz-credential)=[^&\s]{12,}/giu }
 ];
+
+const REPOSITORY_PATH_PATTERN = /(?:^|[^A-Za-z0-9_])((?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+)(?![A-Za-z0-9_])/gu;
+const ADOPTION_INTENT_PATTERN = /already[- ]existing|existing manual|manual change|adopt(?:ed|ing)?|既に手動|手動変更|既存変更|正式反映|そのまま使用/iu;
+const EXCLUSION_PATTERN = /exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めず|除外|対象外|変更しない|触らない/iu;
+const EXPLICIT_SCOPE_PATTERN = /only|just|exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めず|除外|対象外|変更しない|触らない|だけ|のみ/iu;
 
 function isRecord(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -161,6 +166,89 @@ function validateTaskId(value) {
   assertValidGitRef(`autopilot/${value}`);
 }
 
+export function expectedTaskIdForProposal(proposalId) {
+  if (typeof proposalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(proposalId)) {
+    throw proposalValidationError('proposal_id_invalid');
+  }
+  return `task-${proposalId}`;
+}
+
+function repositoryRelativePathKey(value) {
+  return value.normalize('NFC').toLowerCase();
+}
+
+function isExplicitlyExcludedPath(text, relativePath) {
+  const lowerText = text.toLocaleLowerCase();
+  const lowerPath = relativePath.toLocaleLowerCase();
+  let offset = lowerText.indexOf(lowerPath);
+  while (offset >= 0) {
+    const sentenceStart = Math.max(
+      text.lastIndexOf('\n', offset),
+      text.lastIndexOf('。', offset),
+      text.lastIndexOf('.', offset),
+      text.lastIndexOf('!', offset),
+      text.lastIndexOf('！', offset),
+      text.lastIndexOf('?', offset),
+      text.lastIndexOf('？', offset),
+      text.lastIndexOf(',', offset),
+      text.lastIndexOf('，', offset),
+      text.lastIndexOf(';', offset),
+      text.lastIndexOf('；', offset),
+      text.lastIndexOf('、', offset),
+    ) + 1;
+    const sentenceEndCandidates = ['\n', '。', '.', '!', '！', '?', '？', ',', '，', ';', '；', '、']
+      .map((delimiter) => text.indexOf(delimiter, offset + relativePath.length))
+      .filter((index) => index >= 0);
+    const sentenceEnd = sentenceEndCandidates.length > 0 ? Math.min(...sentenceEndCandidates) : text.length;
+    const context = text.slice(sentenceStart, sentenceEnd + 1);
+    if (EXCLUSION_PATTERN.test(context)) return true;
+    offset = lowerText.indexOf(lowerPath, offset + lowerPath.length);
+  }
+  return false;
+}
+
+function extractRepositoryPaths(text) {
+  const paths = [];
+  REPOSITORY_PATH_PATTERN.lastIndex = 0;
+  for (const match of text.matchAll(REPOSITORY_PATH_PATTERN)) {
+    const value = match[1];
+    if (!value || value.startsWith('http/') || value.startsWith('https/')) continue;
+    if (!paths.includes(value)) paths.push(value);
+  }
+  return paths;
+}
+
+function validateAdoptExistingChanges(repository, contractText) {
+  const adoption = repository?.adoptExistingChanges;
+  if (adoption !== undefined) {
+    if (!isRecord(adoption) || !hasExactKeys(adoption, ['paths']) || !Array.isArray(adoption.paths) || adoption.paths.length === 0) {
+      throw proposalValidationError('adoption_paths_invalid');
+    }
+    const seen = new Set();
+    for (const relativePath of adoption.paths) {
+      const segments = typeof relativePath === 'string' ? relativePath.split('/') : [];
+      if (typeof relativePath !== 'string' || !relativePath || relativePath.includes('\\') || relativePath.startsWith('/') || /^[A-Za-z]:/u.test(relativePath) || /[<>:"|?*\0-\x1f\x7f]/u.test(relativePath) || /[*?\[\]{}]/u.test(relativePath) || segments.some((segment) => !segment || segment === '.' || segment === '..' || /[. ]$/u.test(segment) || isWindowsReservedDeviceName(segment))) {
+        throw proposalValidationError('adoption_path_invalid');
+      }
+      const key = repositoryRelativePathKey(relativePath);
+      if (seen.has(key)) throw proposalValidationError('adoption_path_duplicate');
+      seen.add(key);
+      if (!contractText.toLocaleLowerCase().includes(relativePath.toLocaleLowerCase())) throw proposalValidationError('adoption_path_not_stated');
+      if (isExplicitlyExcludedPath(contractText, relativePath)) throw proposalValidationError('adoption_path_excluded');
+    }
+  }
+
+  const mentionedPaths = extractRepositoryPaths(contractText)
+    .filter((relativePath) => relativePath.toLocaleLowerCase() !== String(repository?.slug || '').toLocaleLowerCase());
+  const adoptionRequired = ADOPTION_INTENT_PATTERN.test(contractText) && mentionedPaths.length > 0 && EXPLICIT_SCOPE_PATTERN.test(contractText);
+  if (!adoptionRequired) return;
+  const expectedPaths = mentionedPaths.filter((relativePath) => !isExplicitlyExcludedPath(contractText, relativePath));
+  if (!adoption) throw proposalValidationError('adoption_required');
+  const actual = adoption.paths.map(repositoryRelativePathKey).sort();
+  const expected = expectedPaths.map(repositoryRelativePathKey).sort();
+  if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) throw proposalValidationError('adoption_paths_mismatch');
+}
+
 function findSensitiveEvidence(text) {
   const findings = [];
   const scanText = text.replace(/(?:\bAuthorization\s*:\s*(?:Bearer\s+)?|\b(?:CODEX_API_KEY|OPENAI_API_KEY)\s*[:=]\s*|\b(?:password|secret|token)\s*[:=\s]*|[?&](?:access_token|token|signature|sig|x-amz-credential)=)\[REDACTED\]/giu, '');
@@ -171,16 +259,17 @@ function findSensitiveEvidence(text) {
   return findings;
 }
 
-function validateContract(contract, metadata) {
+function validateContract(contract, metadata, { expectedTaskId = null } = {}) {
   if (!isRecord(contract) || !hasExactKeys(contract, CONTRACT_KEYS)) throw proposalValidationError('contract_schema_invalid');
   if (contract.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('contract_schema_version_invalid');
   validateTaskId(contract.id);
+  if (expectedTaskId !== null && contract.id !== expectedTaskId) throw proposalValidationError('contract_id_mismatch');
   if (!nonEmptyString(contract.title)) throw proposalValidationError('contract_title_invalid');
 
   if (contract.repository === null) {
     if (contract.delivery?.push !== false) throw proposalValidationError('host_task_push_must_be_false');
   } else {
-    if (!isRecord(contract.repository) || !hasExactKeys(contract.repository, ['slug', 'targetBranch'])) {
+    if (!isRecord(contract.repository) || Object.keys(contract.repository).some((key) => !['slug', 'targetBranch', 'adoptExistingChanges'].includes(key)) || !['slug', 'targetBranch'].every((key) => Object.hasOwn(contract.repository, key))) {
       throw proposalValidationError('repository_schema_invalid');
     }
     if (!/^[^/\\\s]+\/[^/\\\s]+$/u.test(contract.repository.slug)) {
@@ -191,6 +280,7 @@ function validateContract(contract, metadata) {
     if (!nonEmptyString(contract.repository.targetBranch) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/u.test(contract.repository.targetBranch) || contract.repository.targetBranch.includes('..') || contract.repository.targetBranch.includes('//') || contract.repository.targetBranch.includes('@{') || contract.repository.targetBranch.endsWith('/') || contract.repository.targetBranch.endsWith('.')) {
       throw proposalValidationError('repository_value_invalid');
     }
+    validateAdoptExistingChanges(contract.repository, [contract.title, contract.implementation?.prompt, ...(Array.isArray(contract.constraints) ? contract.constraints : [])].filter(Boolean).join('\n'));
   }
 
   if (!isRecord(contract.agentify) || !hasExactKeys(contract.agentify, ['tabKey']) || contract.agentify.tabKey !== metadata.tabKey) {
@@ -227,7 +317,7 @@ function parseUtcTimestamp(value, label) {
   return timestamp;
 }
 
-function validateProposalEnvelope(proposal, metadata, now) {
+function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = null } = {}) {
   if (!isRecord(proposal) || !hasExactKeys(proposal, ENVELOPE_KEYS)) throw proposalValidationError('envelope_schema_invalid');
   if (proposal.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('proposal_schema_version_invalid');
   if (typeof proposal.proposalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(proposal.proposalId)) throw proposalValidationError('proposal_id_invalid');
@@ -240,11 +330,11 @@ function validateProposalEnvelope(proposal, metadata, now) {
   for (const key of ['schemaVersion', 'proposalId', 'createdAt', 'expiresAt', 'tabKey', 'approvalCode']) {
     if (proposal[key] !== metadata[key]) throw proposalValidationError(`metadata_mismatch_${key}`);
   }
-  validateContract(proposal.contract, metadata);
+  validateContract(proposal.contract, metadata, { expectedTaskId });
   if (proposal.contract.agentify.tabKey !== proposal.tabKey) throw proposalValidationError('contract_tab_key_mismatch');
 }
 
-export function classifyProposalResponse(responseText, { metadata, now = new Date() } = {}) {
+export function classifyProposalResponse(responseText, { metadata, now = new Date(), expectedTaskId = null } = {}) {
   const text = normalizeProposalText(responseText);
   if (Buffer.byteLength(text, 'utf8') > PROPOSAL_MAX_BYTES) return invalidProposal('response_too_large');
   if (!text.trim()) return invalidProposal(typeof responseText === 'string' ? 'response_empty' : 'response_text_missing');
@@ -266,7 +356,7 @@ export function classifyProposalResponse(responseText, { metadata, now = new Dat
     return invalidProposal('proposal_json_invalid', jsonParseDiagnostic(error, jsonText));
   }
   try {
-    validateProposalEnvelope(proposal, metadata, now);
+    validateProposalEnvelope(proposal, metadata, now, { expectedTaskId });
   } catch (error) {
     return invalidProposal(error.reason || 'proposal_schema_invalid');
   }
@@ -296,11 +386,11 @@ function canonicalizeProposal(value) {
   return value;
 }
 
-export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date() } = {}) {
+export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date(), expectedTaskId = null } = {}) {
   const matches = [];
   for (const turn of Array.isArray(turns) ? turns : []) {
     if (turn?.role !== 'assistant' || typeof turn.text !== 'string') continue;
-    const classification = classifyProposalResponse(turn.text, { metadata, now });
+    const classification = classifyProposalResponse(turn.text, { metadata, now, expectedTaskId });
     if (classification.kind !== PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) continue;
     if (JSON.stringify(canonicalizeProposal(classification.proposal)) !== JSON.stringify(canonicalizeProposal(proposal))) continue;
     const provenance = String(turn.identityProvenance || '').trim();
@@ -385,8 +475,9 @@ export function buildProposalGenerationPrompt({ metadata, retryAttempt = 0, retr
     '',
     'The contract must conform exactly to the current ai-autopilot task-contract validator:',
     '- Top-level fields are exactly: schemaVersion, id, title, repository, agentify, implementation, verification, review, delivery, constraints. No unknown fields.',
-    '- schemaVersion is 1. id is a short Windows-safe task id; title and implementation.prompt are non-empty strings.',
-    '- repository is either null for host/local tasks or an object with slug and targetBranch; a repository object uses owner/name form and targetBranch is the requested existing branch.',
+    `- schemaVersion is 1. id is system-owned and must be exactly "task-${metadata.proposalId}"; never invent a semantic slug or ask the user to choose a task id. title and implementation.prompt are non-empty strings.`,
+    '- repository is either null for host/local tasks or an object with slug and targetBranch; a repository object uses owner/name form and targetBranch is the requested existing branch. If the user explicitly wants already-existing/manual changes formally adopted, names exact repository-relative path(s), and explicitly excludes other existing changes, repository.adoptExistingChanges:{paths:[...]} is REQUIRED. Emit the exact intended paths only; excluded files must be absent. If the exact path or required field cannot be determined, emit a clarification instead of a proposal. Normal implementation tasks must omit this field. Never put a local checkout path in the contract.',
+    `- Before emitting a proposal, self-check: contract.id === "task-${metadata.proposalId}"; existing/manual adoption required? If yes, adoptExistingChanges is present, paths are exact, and excluded paths are absent.`,
     '- agentify.tabKey is required and must equal the envelope tabKey.',
     '- implementation.prompt is required; implementation has no patch-attempt setting.',
     '- verification is an array, possibly empty, of objects with verification[].name, verification[].command, verification[].args, and verification[].timeoutMs; args is an array of strings and timeoutMs is a positive integer.',
@@ -491,7 +582,8 @@ export function createAutopilotProposalService({
           prompt,
           timeoutMs: 10 * 60 * 1000
         });
-        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow });
+        const expectedTaskId = expectedTaskIdForProposal(metadata.proposalId);
+        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow, expectedTaskId });
         if (classification.kind === PROPOSAL_RESPONSE_KINDS.CLARIFICATION) {
           return {
             ok: false,
@@ -524,7 +616,8 @@ export function createAutopilotProposalService({
             turns: anchorConversation.turns,
             proposal: classification.proposal,
             metadata,
-            now: proposalNow
+            now: proposalNow,
+            expectedTaskId
           });
           const ticket = await ticketStore.create({
             schemaVersion: 1,

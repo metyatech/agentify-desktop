@@ -276,9 +276,9 @@ The Control Center has one production-only action, `この内容を実行`, for 
 existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
 usable ChatGPT tab exists and that Agentify has no active or in-flight query.
 The action generates the version-1 proposal envelope locally, then sends the
-versioned `ai-autopilot-proposal-generation-v3` instruction through the existing
+versioned `ai-autopilot-proposal-generation-v4` instruction through the existing
 authenticated `POST /query` path. Agentify validates the response markers, JSON,
-metadata, and current v3 contract locally; malformed responses are discarded and
+metadata, and current v4 contract locally; malformed responses are discarded and
 retried up to three times with the same envelope metadata. After a valid response,
 Agentify performs a bounded tail read to uniquely anchor the exact assistant turn
 and atomically persists a proposal ticket in its state directory. The ticket is
@@ -286,13 +286,21 @@ the durable handoff consumed by ai-autopilot after restart; no ticket is written
 for clarification, invalid, missing, or ambiguous proposal responses. The
 instruction asks ChatGPT to clarify only user decisions; verification commands,
 timeouts, review rounds, and other execution-plan details are owned by Autopilot
-and must not be requested from the user. Host/local tasks may use a null repository
+and must not be requested from the user. New system-generated proposals receive
+the task id `task-<proposalId>`; legacy historical proposal ids remain readable.
+When user intent explicitly adopts already-existing manual changes with exact
+paths and explicit exclusions, `repository.adoptExistingChanges.paths` is
+required and contains only those paths; normal implementation tasks omit the
+field. Host/local tasks may use a null repository
 with push disabled, and their verification plan may be empty. It does not create a
 tab, start Codex, create a worktree, write a task, commit, push, or send approval.
 An unresolved ticket prevents another proposal from being stacked. The existing
 watcher uses the authenticated proposal-ticket API as the primary source, checks
 the current tab/conversation and exact approval turn with a bounded tail read, and
-keeps the older conversation-discovery path for legacy proposals. Proposal
+keeps the older conversation-discovery path for legacy proposals. A pending
+ticket with no durable execution evidence may be safely abandoned by the
+controller operator; abandoned tickets are replaceable and are never polled
+for conversation or execution work. Proposal
 responses must be emitted as exactly one unlabeled fenced code block containing the
 marker pair and standalone JSON; clarification responses remain natural language.
 The rendered DOM text obtained by Agentify removes the fence but preserves literal

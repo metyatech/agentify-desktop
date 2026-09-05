@@ -15,6 +15,7 @@ import {
   classifyProposalResponse,
   createAutopilotProposalService,
   createProposalMetadata,
+  expectedTaskIdForProposal,
   findValidatedProposalAssistantAnchor,
   parseValidateProposalResponse
 } from '../autopilot-proposal.mjs';
@@ -33,7 +34,7 @@ const FIXED_METADATA = Object.freeze({
 function validContract(overrides = {}) {
   return {
     schemaVersion: 1,
-    id: 'proposal-validation-test',
+    id: expectedTaskIdForProposal(FIXED_METADATA.proposalId),
     title: 'Proposal validation test',
     repository: null,
     agentify: { tabKey: FIXED_METADATA.tabKey },
@@ -56,12 +57,12 @@ function fencedProposalText(metadata = FIXED_METADATA, options = {}) {
   return `\`\`\`\n${validProposalText(metadata, options)}\n\`\`\``;
 }
 
-function makeTabs({ rows = [{ id: 'tab-1', key: 'autopilot-production', vendorId: 'chatgpt' }], url = 'https://chatgpt.com/' } = {}) {
+function makeTabs({ rows = [{ id: 'tab-1', key: 'autopilot-production', vendorId: 'chatgpt' }], url = 'https://chatgpt.com/', anchorText = validProposalText() } = {}) {
   const controllers = new Map(rows.map((row) => [row.id, { getUrl: async () => url }]));
   for (const controller of controllers.values()) {
     controller.readConversationTurns = async () => ({
       url,
-      turns: [{ id: 'assistant-proposal-anchor', messageId: 'provider-message-proposal', identityProvenance: 'provider-message-id', role: 'assistant', index: 0, text: validProposalText() }],
+      turns: [{ id: 'assistant-proposal-anchor', messageId: 'provider-message-proposal', identityProvenance: 'provider-message-id', role: 'assistant', index: 0, text: anchorText }],
       history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true }
     });
   }
@@ -107,6 +108,63 @@ test('control center workflow is production-only and metadata is local', async (
   assert.match(result.metadata.approvalCode, /^[A-F0-9]{8}$/u);
   assert.equal(result.metadata.tabKey, 'autopilot-production');
   assert.equal(result.status, 'proposal_response_received');
+});
+
+test('system-generated task id is proposal-unique and wrong ids never create a ticket', async () => {
+  const proposalIds = [
+    '123e4567-e89b-42d3-a456-426614174000',
+    '423e4567-e89b-42d3-a456-426614174000'
+  ];
+  assert.notEqual(expectedTaskIdForProposal(proposalIds[0]), expectedTaskIdForProposal(proposalIds[1]));
+  const saved = [];
+  const { service } = makeService({
+    requestQuery: async () => ({ result: { text: validProposalText(FIXED_METADATA, { contract: { id: 'runtime-unicode-text-sample-display-cleanup' } }) } }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:contract_id_mismatch/u);
+  assert.equal(saved.length, 0);
+});
+
+const ADOPTION_TARGET = 'Content/__ExternalActors__/Maps/L_RuntimeUnicodeTextSample/2/AS/5HXB2MIDVDRPKO4S6W2BDY.uasset';
+const ADOPTION_EXCLUDED = 'Config/DefaultEngine.ini';
+const ADOPTION_PROMPT = `すでに手動で行ってある変更を正式に反映したい。対象は ${ADOPTION_TARGET} に既に入っている手動変更だけ。${ADOPTION_EXCLUDED} は含めない。`;
+
+test('explicit existing-change intent requires the exact adoption path and excludes unrelated files', async () => {
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } };
+  const response = validProposalText(FIXED_METADATA, { contract: { title: 'Adopt the approved existing change', repository, implementation: { prompt: ADOPTION_PROMPT } } });
+  const saved = [];
+  const { service } = makeService({
+    requestQuery: async () => ({ result: { text: response } }),
+    tabs: makeTabs({ anchorText: response }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  const result = await service.request();
+  assert.deepEqual(result.proposal.contract.repository.adoptExistingChanges.paths, [ADOPTION_TARGET]);
+  assert.deepEqual(saved[0].proposal.contract.repository.adoptExistingChanges.paths, [ADOPTION_TARGET]);
+});
+
+test('explicit existing-change intent without adoption field is rejected before ticket creation', async () => {
+  const response = validProposalText(FIXED_METADATA, { contract: { repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master' }, implementation: { prompt: ADOPTION_PROMPT } } });
+  const saved = [];
+  const { service } = makeService({
+    requestQuery: async () => ({ result: { text: response } }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:adoption_required/u);
+  assert.equal(saved.length, 0);
+});
+
+test('explicitly excluded adoption path is rejected', () => {
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET, ADOPTION_EXCLUDED] } };
+  const response = validProposalText(FIXED_METADATA, { contract: { repository, implementation: { prompt: ADOPTION_PROMPT } } });
+  assert.throws(() => parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), expectedTaskId: expectedTaskIdForProposal(FIXED_METADATA.proposalId) }), /adoption_path_excluded/u);
+});
+
+test('normal implementation tasks omit adoption field', () => {
+  const repository = { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master' };
+  const response = validProposalText(FIXED_METADATA, { contract: { repository, implementation: { prompt: 'Implement a new display feature.' } } });
+  const parsed = parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), expectedTaskId: expectedTaskIdForProposal(FIXED_METADATA.proposalId) });
+  assert.equal(Object.hasOwn(parsed.contract.repository, 'adoptExistingChanges'), false);
 });
 
 for (const [name, tabs, runtime] of [
@@ -429,6 +487,12 @@ for (const id of ['CON', 'foo..bar', 'foo.lock', 'proposal-validation-test.']) {
   });
 }
 
+test('standalone historical proposal parsing remains compatible with semantic task ids', () => {
+  const response = validProposalText(FIXED_METADATA, { contract: { id: 'runtime-unicode-text-sample-display-cleanup' } });
+  const parsed = parseValidateProposalResponse(response, { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  assert.equal(parsed.contract.id, 'runtime-unicode-text-sample-display-cleanup');
+});
+
 for (const id of [`task-${'a'.repeat(60)}`, `task-${'a'.repeat(75)}`]) {
   test(`controller task id accepts safe id of length ${id.length}`, () => {
     const response = validProposalText(FIXED_METADATA, { contract: { id } });
@@ -459,7 +523,7 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   });
   const prompt = buildProposalGenerationPrompt({ metadata });
   assert.match(prompt, new RegExp(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'u'));
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v3');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v4');
   assert.match(prompt, new RegExp(PROPOSAL_PROTOCOL_VERSION, 'u'));
   assert.match(prompt, new RegExp(`Task contract schemaVersion: ${TASK_CONTRACT_SCHEMA_VERSION}`, 'u'));
   assert.match(prompt, /repository\/branch when the task is repository-scoped/u);
@@ -506,7 +570,7 @@ test('proposal prompt owns technical verification planning and ignores generated
       approvalCode: 'AB12CD34'
     }
   });
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v3');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v4');
   assert.match(prompt, /System-generated proposal-generation turns.*not authoritative user requirements/u);
   assert.match(prompt, /If a required user decision is missing or ambiguous/u);
   assert.match(prompt, /Verification is an execution plan, not a user-facing requirement/u);

@@ -100,6 +100,19 @@ test('unresolved ticket blocks a second proposal and lifecycle acknowledgement i
   await fs.rm(stateDir, { recursive: true, force: false });
 });
 
+test('pending tickets may be abandoned once and abandoned tickets are replaceable', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-abandon-'));
+  const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  await store.create(ticket());
+  assert.equal((await store.update({ proposalId: proposal.proposalId, state: 'abandoned' })).state, 'abandoned');
+  for (const state of ['acknowledged', 'consumed', 'pending']) {
+    await assert.rejects(() => store.update({ proposalId: proposal.proposalId, state }), /transition_invalid/u);
+  }
+  const replacement = await store.create(replacementTicket());
+  assert.equal(replacement.proposalId, replacementProposal.proposalId);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
 test('ticket lifecycle replaces only expired pending tickets and never expired acknowledged tickets', async () => {
   let currentNow = new Date('2026-08-10T01:00:00.000Z');
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-lifecycle-'));

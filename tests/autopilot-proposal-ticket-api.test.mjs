@@ -52,3 +52,28 @@ test('proposal ticket API is authenticated, bounded, and exposes lifecycle updat
   assert.equal(update.status, 200);
   assert.equal((await update.json()).ticket.state, 'acknowledged');
 });
+
+test('proposal ticket API accepts only the pending-to-abandoned lifecycle step', async (t) => {
+  let current = { ...ticket };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    stateDir: 'D:/state',
+    tabs: { listTabs: () => [], getControllerById: () => ({}) },
+    defaultTabId: null,
+    getAutopilotProposalTicket: async () => current,
+    onAutopilotProposalTicket: async ({ proposalId, state }) => {
+      assert.equal(proposalId, ticket.proposalId);
+      current = { ...current, state, updatedAt: '2026-08-10T01:00:00.000Z' };
+      return current;
+    }
+  });
+  t.after(() => server.close());
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/autopilot/proposal-ticket`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer secret', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ proposalId: ticket.proposalId, state: 'abandoned' })
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).ticket.state, 'abandoned');
+});

@@ -177,9 +177,10 @@ function repositoryRelativePathKey(value) {
   return value.normalize('NFC').toLowerCase();
 }
 
-function isExplicitlyExcludedPath(text, relativePath) {
+function pathContexts(text, relativePath) {
   const lowerText = text.toLocaleLowerCase();
   const lowerPath = relativePath.toLocaleLowerCase();
+  const contexts = [];
   let offset = lowerText.indexOf(lowerPath);
   while (offset >= 0) {
     const sentenceStart = Math.max(
@@ -200,11 +201,27 @@ function isExplicitlyExcludedPath(text, relativePath) {
       .map((delimiter) => text.indexOf(delimiter, offset + relativePath.length))
       .filter((index) => index >= 0);
     const sentenceEnd = sentenceEndCandidates.length > 0 ? Math.min(...sentenceEndCandidates) : text.length;
-    const context = text.slice(sentenceStart, sentenceEnd + 1);
-    if (EXCLUSION_PATTERN.test(context)) return true;
+    contexts.push(text.slice(sentenceStart, sentenceEnd + 1));
     offset = lowerText.indexOf(lowerPath, offset + lowerPath.length);
   }
-  return false;
+  return contexts;
+}
+
+function isExplicitlyExcludedPath(text, relativePath) {
+  return pathContexts(text, relativePath).some((context) => EXCLUSION_PATTERN.test(context));
+}
+
+function isExplicitlyRequiredPath(text, relativePath) {
+  return pathContexts(text, relativePath).some((context) => ADOPTION_INTENT_PATTERN.test(context));
+}
+
+function isLikelyRepositoryFilePath(value) {
+  if (typeof value !== 'string' || value.startsWith('http/') || value.startsWith('https/') || value.includes('://')) return false;
+  const segments = value.split('/');
+  if (segments.length < 2 || segments.some((segment) => !segment)) return false;
+  const leaf = segments.at(-1);
+  return /\.[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(leaf)
+    || ['LICENSE', 'Makefile', 'Dockerfile', '.gitignore', '.gitattributes'].includes(leaf);
 }
 
 function extractRepositoryPaths(text) {
@@ -212,7 +229,7 @@ function extractRepositoryPaths(text) {
   REPOSITORY_PATH_PATTERN.lastIndex = 0;
   for (const match of text.matchAll(REPOSITORY_PATH_PATTERN)) {
     const value = match[1];
-    if (!value || value.startsWith('http/') || value.startsWith('https/')) continue;
+    if (!isLikelyRepositoryFilePath(value)) continue;
     if (!paths.includes(value)) paths.push(value);
   }
   return paths;
@@ -229,18 +246,34 @@ function userAuthoredTurn(turn) {
 }
 
 export function deriveUserIntentGuard(turns) {
-  const userText = (Array.isArray(turns) ? turns : [])
-    .filter(userAuthoredTurn)
-    .map((turn) => normalizeProposalText(turn.text))
-    .filter(Boolean)
-    .join('\n');
-  const mentionedPaths = extractRepositoryPaths(userText);
-  const excludedPaths = mentionedPaths.filter((relativePath) => isExplicitlyExcludedPath(userText, relativePath));
-  const requiredPaths = mentionedPaths.filter((relativePath) => !excludedPaths.includes(relativePath));
-  const adoptionIntent = ADOPTION_INTENT_PATTERN.test(userText);
-  const explicitScope = EXPLICIT_SCOPE_PATTERN.test(userText);
-  const adoptionRequired = adoptionIntent && requiredPaths.length > 0 && explicitScope;
-  const ambiguous = adoptionIntent && (!requiredPaths.length || !explicitScope);
+  const decisions = new Map();
+  let adoptionIntent = false;
+  let explicitScope = false;
+  let ambiguousMention = false;
+  for (const [turnIndex, turn] of (Array.isArray(turns) ? turns : []).entries()) {
+    if (!userAuthoredTurn(turn)) continue;
+    const text = normalizeProposalText(turn.text);
+    if (!text) continue;
+    adoptionIntent ||= ADOPTION_INTENT_PATTERN.test(text);
+    explicitScope ||= EXPLICIT_SCOPE_PATTERN.test(text);
+    for (const relativePath of extractRepositoryPaths(text)) {
+      const excluded = isExplicitlyExcludedPath(text, relativePath);
+      const required = !excluded && isExplicitlyRequiredPath(text, relativePath);
+      if (excluded) {
+        explicitScope = true;
+        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'excluded', turnIndex });
+      } else if (required) {
+        decisions.set(repositoryRelativePathKey(relativePath), { path: relativePath, disposition: 'required', turnIndex });
+      } else if (adoptionIntent) {
+        ambiguousMention = true;
+      }
+    }
+  }
+  const finalDecisions = [...decisions.values()];
+  const requiredPaths = finalDecisions.filter((decision) => decision.disposition === 'required').map((decision) => decision.path);
+  const excludedPaths = finalDecisions.filter((decision) => decision.disposition === 'excluded').map((decision) => decision.path);
+  const ambiguous = adoptionIntent && (ambiguousMention || !requiredPaths.length || !explicitScope);
+  const adoptionRequired = adoptionIntent && !ambiguous && requiredPaths.length > 0;
   return Object.freeze({
     adoptionRequired,
     requiredPaths: Object.freeze(requiredPaths),

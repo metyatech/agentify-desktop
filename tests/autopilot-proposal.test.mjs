@@ -144,6 +144,46 @@ test('user-authored intent guard derives exact adoption and exclusion paths from
   });
 });
 
+test('guard keeps repository slugs and branch-like tokens out of adoption paths', () => {
+  const text = `metyatech/RuntimeUnicodeTextSample で feature/foo の変更を確認し、すでに手動で行った ${ADOPTION_TARGET} だけ正式反映する。${ADOPTION_EXCLUDED} は含めない。`;
+  const guard = deriveUserIntentGuard([{ role: 'user', text }]);
+  assert.deepEqual(guard.requiredPaths, [ADOPTION_TARGET]);
+  assert.deepEqual(guard.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(guard.requiredPaths.includes('metyatech/RuntimeUnicodeTextSample'), false);
+  assert.equal(guard.requiredPaths.includes('feature/foo'), false);
+  assert.equal(guard.adoptionRequired, true);
+});
+
+test('latest user disposition wins for the same canonical path', () => {
+  const requiredLater = deriveUserIntentGuard([
+    { role: 'user', text: `${ADOPTION_EXCLUDED} は含めない。` },
+    { role: 'user', text: `やっぱり ${ADOPTION_EXCLUDED} に既にある手動変更だけ正式反映する。` }
+  ]);
+  assert.deepEqual(requiredLater.requiredPaths, [ADOPTION_EXCLUDED]);
+  assert.deepEqual(requiredLater.excludedPaths, []);
+  assert.equal(requiredLater.adoptionRequired, true);
+
+  const excludedLater = deriveUserIntentGuard([
+    { role: 'user', text: `${ADOPTION_EXCLUDED} を正式反映する。` },
+    { role: 'user', text: `やっぱり ${ADOPTION_EXCLUDED} は含めない。` }
+  ]);
+  assert.deepEqual(excludedLater.requiredPaths, []);
+  assert.deepEqual(excludedLater.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(excludedLater.ambiguous, true);
+  assert.equal(excludedLater.adoptionRequired, false);
+});
+
+test('later assistant or proposal-generation user text cannot override the latest user decision', () => {
+  const guard = deriveUserIntentGuard([
+    { role: 'user', text: `やっぱり ${ADOPTION_TARGET} だけ正式反映する。${ADOPTION_EXCLUDED} は含めない。` },
+    { role: 'assistant', text: `${ADOPTION_TARGET} は含めません。` },
+    { role: 'user', text: `System-owned proposal generation instruction: ai-autopilot-proposal-generation-v5\n${ADOPTION_EXCLUDED} を正式反映する。` }
+  ]);
+  assert.deepEqual(guard.requiredPaths, [ADOPTION_TARGET]);
+  assert.deepEqual(guard.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(guard.adoptionRequired, true);
+});
+
 test('normal user intent produces no adoption guard and generated text cannot authorize adoption', () => {
   const guard = deriveUserIntentGuard([{ role: 'user', text: '通常の新規実装をお願いします。' }]);
   assert.deepEqual({ adoptionRequired: guard.adoptionRequired, requiredPaths: guard.requiredPaths, excludedPaths: guard.excludedPaths }, {

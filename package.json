@@ -16,6 +16,7 @@
     "SECURITY.md",
     "TRADEMARKS.md",
     "artifact-store.mjs",
+    "autopilot-approval.mjs",
     "autopilot-proposal.mjs",
     "autopilot-proposal-ticket.mjs",
     "autopilot-status.mjs",

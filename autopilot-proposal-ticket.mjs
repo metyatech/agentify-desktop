@@ -4,19 +4,24 @@ import path from 'node:path';
 
 import { atomicWriteFile, defaultStateDir, ensureStateDir } from './state.mjs';
 
-export const AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION = 1;
+export const AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION = 2;
+export const AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION = 1;
 export const AUTOPILOT_PROPOSAL_TICKET_FILE = 'autopilot-proposal-ticket.json';
+export const AUTOPILOT_PROPOSAL_TICKETS_DIR = 'autopilot-tickets';
 export const AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES = 512 * 1024;
 export const AUTOPILOT_PROPOSAL_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'consumed', 'abandoned']);
-
-const TICKET_KEYS = Object.freeze([
-  'schemaVersion', 'proposalId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
-  'assistantTurnId', 'assistantTurnIdentityProvenance', 'proposal', 'contractHash', 'createdAt', 'expiresAt', 'state', 'updatedAt'
-]);
-
 export const AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES = Object.freeze([
   'provider-message-id',
   'provider-turn-id',
+]);
+
+const LEGACY_KEYS = Object.freeze([
+  'schemaVersion', 'proposalId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
+  'assistantTurnId', 'assistantTurnIdentityProvenance', 'proposal', 'contractHash', 'createdAt', 'expiresAt', 'state', 'updatedAt'
+]);
+const V2_KEYS = Object.freeze([
+  'schemaVersion', 'proposalId', 'taskId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
+  'assistantTurnId', 'assistantTurnIdentityProvenance', 'approvalCode', 'contract', 'contractHash', 'createdAt', 'expiresAt', 'proposal'
 ]);
 
 function isRecord(value) {
@@ -53,38 +58,79 @@ function proposalId(value) {
   return text;
 }
 
-function validateProposal(proposal) {
-  if (!isRecord(proposal)) throw new Error('autopilot_proposal_ticket_proposal_invalid');
-  if (proposalId(proposal.proposalId) !== proposal.proposalId) throw new Error('autopilot_proposal_ticket_proposal_invalid');
-  if (!isRecord(proposal.contract)) throw new Error('autopilot_proposal_ticket_proposal_invalid');
-  const serialized = JSON.stringify(proposal);
-  if (Buffer.byteLength(serialized, 'utf8') > AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES) throw new Error('autopilot_proposal_ticket_too_large');
-  return proposal;
+function validateContract(contract) {
+  if (!isRecord(contract)) throw new Error('autopilot_proposal_ticket_contract_invalid');
+  if (Buffer.byteLength(JSON.stringify(contract), 'utf8') > AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES) throw new Error('autopilot_proposal_ticket_too_large');
+  return contract;
 }
 
-export function validateAutopilotProposalTicket(value, { now = null, allowExpired = true } = {}) {
-  if (!isRecord(value) || Object.keys(value).some((key) => !TICKET_KEYS.includes(key)) || Object.keys(value).length !== TICKET_KEYS.length) {
-    throw new Error('autopilot_proposal_ticket_schema_invalid');
-  }
-  if (value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_schema_version_invalid');
-  const id = proposalId(value.proposalId);
-  const tabKey = safeText(value.tabKey, 'tabKey', 128);
-  const tabId = safeText(value.tabId, 'tabId', 256);
-  const vendorId = safeText(value.vendorId, 'vendorId', 64);
-  if (vendorId !== 'chatgpt') throw new Error('autopilot_proposal_ticket_vendor_invalid');
+function validateConversationIdentity(value) {
   const conversationUrl = safeText(value.conversationUrl, 'conversationUrl', 2_000);
   let parsedUrl;
   try { parsedUrl = new URL(conversationUrl); } catch { throw new Error('autopilot_proposal_ticket_url_invalid'); }
   if (parsedUrl.protocol !== 'https:' || (parsedUrl.hostname !== 'chatgpt.com' && !parsedUrl.hostname.endsWith('.chatgpt.com'))) throw new Error('autopilot_proposal_ticket_url_invalid');
+  const provenance = safeText(value.assistantTurnIdentityProvenance, 'assistantTurnIdentityProvenance', 64);
+  if (!AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES.includes(provenance)) throw new Error('autopilot_proposal_ticket_assistantTurnIdentityProvenance_invalid');
+  return { conversationUrl, provenance };
+}
+
+export function validateAutopilotProposalTicket(value, { now = null, allowExpired = true, state = undefined } = {}) {
+  if (!isRecord(value)) throw new Error('autopilot_proposal_ticket_schema_invalid');
+  if (value.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) return validateLegacyTicket(value, { now, allowExpired });
+  const requiredV2Keys = new Set(V2_KEYS);
+  requiredV2Keys.delete('proposal');
+  const v2WithLifecycleKeys = new Set([...V2_KEYS, 'state', 'updatedAt']);
+  if (value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION || Object.keys(value).some((key) => !v2WithLifecycleKeys.has(key)) || Object.keys(value).some((key) => requiredV2Keys.has(key) === false && !['state', 'updatedAt', 'proposal'].includes(key))) throw new Error('autopilot_proposal_ticket_schema_invalid');
+  const id = proposalId(value.proposalId);
+  const taskId = safeText(value.taskId, 'taskId', 128);
+  const tabKey = safeText(value.tabKey, 'tabKey', 128);
+  const tabId = safeText(value.tabId, 'tabId', 256);
+  const vendorId = safeText(value.vendorId, 'vendorId', 64);
+  if (vendorId !== 'chatgpt') throw new Error('autopilot_proposal_ticket_vendor_invalid');
+  const identity = validateConversationIdentity(value);
   const assistantTurnId = safeText(value.assistantTurnId, 'assistantTurnId', 512);
-  const assistantTurnIdentityProvenance = safeText(value.assistantTurnIdentityProvenance, 'assistantTurnIdentityProvenance', 64);
-  if (!AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES.includes(assistantTurnIdentityProvenance)) {
-    throw new Error('autopilot_proposal_ticket_assistantTurnIdentityProvenance_invalid');
-  }
-  const proposal = validateProposal(value.proposal);
-  if (proposal.proposalId !== id) throw new Error('autopilot_proposal_ticket_proposal_mismatch');
-  const contractHash = safeText(value.contractHash, 'contractHash', 64).toLowerCase();
-  if (!/^[0-9a-f]{64}$/u.test(contractHash) || proposalContractHash(proposal.contract) !== contractHash) throw new Error('autopilot_proposal_ticket_contract_hash_invalid');
+  const approvalCode = safeText(value.approvalCode, 'approvalCode', 8).toUpperCase();
+  if (!/^[A-F0-9]{8}$/u.test(approvalCode)) throw new Error('autopilot_proposal_ticket_approvalCode_invalid');
+  const contract = validateContract(value.contract);
+  if (contract.id !== taskId) throw new Error('autopilot_proposal_ticket_task_mismatch');
+  if (value.proposal !== undefined && (!isRecord(value.proposal) || value.proposal.proposalId !== id || value.proposal.approvalCode !== approvalCode || !isRecord(value.proposal.contract) || proposalContractHash(value.proposal.contract) !== proposalContractHash(contract))) throw new Error('autopilot_proposal_ticket_proposal_mismatch');
+  const hash = safeText(value.contractHash, 'contractHash', 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(hash) || proposalContractHash(contract) !== hash) throw new Error('autopilot_proposal_ticket_contract_hash_invalid');
+  const createdAt = canonicalTimestamp(value.createdAt, 'createdAt');
+  const expiresAt = canonicalTimestamp(value.expiresAt, 'expiresAt');
+  if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw new Error('autopilot_proposal_ticket_time_invalid');
+  if (now !== null && !allowExpired && Date.parse(expiresAt) <= (now instanceof Date ? now.getTime() : Date.parse(now))) throw new Error('autopilot_proposal_ticket_expired');
+  const lifecycleState = state === undefined ? (value.state === undefined ? undefined : validateTicketState(value.state)) : validateTicketState(state);
+  const updatedAt = value.updatedAt === undefined ? undefined : canonicalTimestamp(value.updatedAt, 'updatedAt');
+  return {
+    schemaVersion: AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION,
+    proposalId: id,
+    taskId,
+    tabKey,
+    tabId,
+    vendorId,
+    conversationUrl: identity.conversationUrl,
+    assistantTurnId,
+    assistantTurnIdentityProvenance: identity.provenance,
+    approvalCode,
+    contract,
+    contractHash: hash,
+    createdAt,
+    expiresAt,
+    ...(lifecycleState === undefined ? {} : { state: lifecycleState }),
+    ...(updatedAt === undefined ? {} : { updatedAt }),
+  };
+}
+
+function validateLegacyTicket(value, { now, allowExpired }) {
+  if (Object.keys(value).some((key) => !LEGACY_KEYS.includes(key)) || Object.keys(value).length !== LEGACY_KEYS.length) throw new Error('autopilot_proposal_ticket_schema_invalid');
+  if (value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_schema_version_invalid');
+  const id = proposalId(value.proposalId);
+  const identity = validateConversationIdentity(value);
+  if (!isRecord(value.proposal) || value.proposal.proposalId !== id || !isRecord(value.proposal.contract)) throw new Error('autopilot_proposal_ticket_proposal_invalid');
+  if (Buffer.byteLength(JSON.stringify(value.proposal), 'utf8') > AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES) throw new Error('autopilot_proposal_ticket_too_large');
+  const hash = safeText(value.contractHash, 'contractHash', 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(hash) || proposalContractHash(value.proposal.contract) !== hash) throw new Error('autopilot_proposal_ticket_contract_hash_invalid');
   const createdAt = canonicalTimestamp(value.createdAt, 'createdAt');
   const expiresAt = canonicalTimestamp(value.expiresAt, 'expiresAt');
   const updatedAt = canonicalTimestamp(value.updatedAt, 'updatedAt');
@@ -92,67 +138,94 @@ export function validateAutopilotProposalTicket(value, { now = null, allowExpire
   if (!AUTOPILOT_PROPOSAL_TICKET_STATES.includes(value.state)) throw new Error('autopilot_proposal_ticket_state_invalid');
   if (now !== null && !allowExpired && Date.parse(expiresAt) <= (now instanceof Date ? now.getTime() : Date.parse(now))) throw new Error('autopilot_proposal_ticket_expired');
   return {
-    schemaVersion: AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION,
-    proposalId: id,
-    tabKey,
-    tabId,
-    vendorId,
-    conversationUrl,
-    assistantTurnId,
-    assistantTurnIdentityProvenance,
-    proposal,
-    contractHash,
+    ...value,
+    tabKey: safeText(value.tabKey, 'tabKey', 128),
+    tabId: safeText(value.tabId, 'tabId', 256),
+    vendorId: 'chatgpt',
+    conversationUrl: identity.conversationUrl,
+    assistantTurnId: safeText(value.assistantTurnId, 'assistantTurnId', 512),
+    assistantTurnIdentityProvenance: identity.provenance,
+    contractHash: hash,
     createdAt,
     expiresAt,
-    state: value.state,
     updatedAt,
   };
 }
 
-export function autopilotProposalTicketPath(stateDir = defaultStateDir()) {
-  return path.join(stateDir, AUTOPILOT_PROPOSAL_TICKET_FILE);
+function validateTicketState(value) {
+  if (!AUTOPILOT_PROPOSAL_TICKET_STATES.includes(value)) throw new Error('autopilot_proposal_ticket_state_invalid');
+  return value;
 }
+
+export function autopilotProposalTicketPath(stateDir = defaultStateDir()) { return path.join(stateDir, AUTOPILOT_PROPOSAL_TICKET_FILE); }
+export function autopilotProposalTicketsRoot(stateDir = defaultStateDir()) { return path.join(stateDir, AUTOPILOT_PROPOSAL_TICKETS_DIR); }
+export function autopilotProposalTicketDir(proposalIdValue, stateDir = defaultStateDir()) { return path.join(autopilotProposalTicketsRoot(stateDir), proposalIdValue); }
+export function autopilotProposalTicketJsonPath(proposalIdValue, stateDir = defaultStateDir()) { return path.join(autopilotProposalTicketDir(proposalIdValue, stateDir), 'ticket.json'); }
+export function autopilotProposalTicketStatePath(proposalIdValue, stateDir = defaultStateDir()) { return path.join(autopilotProposalTicketDir(proposalIdValue, stateDir), 'state.json'); }
 
 export async function createAutopilotProposalTicketStore({ stateDir = defaultStateDir(), now = () => new Date() } = {}) {
   await ensureStateDir(stateDir);
-  let current = await readPersistedTicket(stateDir);
-  const get = async () => current ? structuredClone(current) : null;
+  await fs.mkdir(autopilotProposalTicketsRoot(stateDir), { recursive: true });
+  const readAll = async () => await listTickets(stateDir);
+  const get = async (requestedProposalId = null) => {
+    const tickets = await readAll();
+    if (requestedProposalId) return tickets.find((ticket) => ticket.proposalId === requestedProposalId) || null;
+    const unresolved = tickets.filter((ticket) => isUnresolved(ticket, now()));
+    return unresolved.at(-1) || tickets.at(-1) || null;
+  };
   return {
     get,
+    list: readAll,
+    async listUnresolved() { return (await readAll()).filter((ticket) => ticket.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION && isUnresolved(ticket, now())); },
     async create(ticket) {
+      if (ticket?.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_legacy_read_only');
       const currentNow = now();
       const next = validateAutopilotProposalTicket(ticket, { now: currentNow, allowExpired: false });
-      const unresolved = current && (
-        (current.state === 'pending' && Date.parse(current.expiresAt) > currentNow.getTime())
-        || current.state === 'acknowledged'
-      );
-      if (unresolved && current.proposalId !== next.proposalId) {
-        throw new Error('autopilot_proposal_ticket_unresolved');
-      }
-      await atomicWriteFile(autopilotProposalTicketPath(stateDir), `${JSON.stringify(next, null, 2)}\n`);
-      current = next;
-      return await get();
+      if ((await readAll()).some((item) => isUnresolved(item, currentNow))) throw new Error('autopilot_proposal_ticket_unresolved');
+      const dir = autopilotProposalTicketDir(next.proposalId, stateDir);
+      try { await fs.mkdir(dir, { recursive: false }); } catch (error) { if (error.code === 'EEXIST') throw new Error('autopilot_proposal_ticket_exists'); throw error; }
+      await atomicWriteFile(autopilotProposalTicketJsonPath(next.proposalId, stateDir), `${JSON.stringify(next, null, 2)}\n`);
+      await atomicWriteFile(autopilotProposalTicketStatePath(next.proposalId, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: next.proposalId, state: 'pending', updatedAt: next.createdAt }, null, 2)}\n`);
+      return { ...next, state: 'pending', updatedAt: next.createdAt };
     },
     async update({ proposalId: requestedProposalId, state } = {}) {
-      if (!current || current.proposalId !== requestedProposalId) throw new Error('autopilot_proposal_ticket_not_found');
-      if (!AUTOPILOT_PROPOSAL_TICKET_STATES.includes(state)) throw new Error('autopilot_proposal_ticket_state_invalid');
+      const id = proposalId(requestedProposalId);
+      const current = await get(id);
+      if (!current) throw new Error('autopilot_proposal_ticket_not_found');
+      if (current.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_legacy_read_only');
+      const nextState = validateTicketState(state);
       const allowed = current.state === 'pending' ? ['pending', 'acknowledged', 'abandoned'] : current.state === 'acknowledged' ? ['acknowledged', 'consumed'] : current.state === 'consumed' ? ['consumed'] : ['abandoned'];
-      if (!allowed.includes(state)) throw new Error('autopilot_proposal_ticket_transition_invalid');
-      const next = validateAutopilotProposalTicket({ ...current, state, updatedAt: now().toISOString() }, { now: now(), allowExpired: true });
-      await atomicWriteFile(autopilotProposalTicketPath(stateDir), `${JSON.stringify(next, null, 2)}\n`);
-      current = next;
-      return await get();
+      if (!allowed.includes(nextState)) throw new Error('autopilot_proposal_ticket_transition_invalid');
+      const updatedAt = now().toISOString();
+      await atomicWriteFile(autopilotProposalTicketStatePath(id, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: id, state: nextState, updatedAt }, null, 2)}\n`);
+      return { ...current, state: nextState, updatedAt };
     },
   };
 }
 
-async function readPersistedTicket(stateDir) {
+async function listTickets(stateDir) {
+  const result = [];
   try {
-    const raw = await fs.readFile(autopilotProposalTicketPath(stateDir), 'utf8');
-    if (Buffer.byteLength(raw, 'utf8') > AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES) throw new Error('autopilot_proposal_ticket_too_large');
-    return validateAutopilotProposalTicket(JSON.parse(raw));
+    const entries = await fs.readdir(autopilotProposalTicketsRoot(stateDir), { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const id = entry.name;
+      const ticket = validateAutopilotProposalTicket(JSON.parse(await fs.readFile(autopilotProposalTicketJsonPath(id, stateDir), 'utf8')));
+      const lifecycle = JSON.parse(await fs.readFile(autopilotProposalTicketStatePath(id, stateDir), 'utf8'));
+      if (lifecycle.schemaVersion !== 2 || lifecycle.proposalId !== ticket.proposalId) throw new Error('autopilot_proposal_ticket_state_invalid');
+      result.push({ ...ticket, state: validateTicketState(lifecycle.state), updatedAt: canonicalTimestamp(lifecycle.updatedAt, 'updatedAt') });
+    }
   } catch (error) {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
+    if (error.code !== 'ENOENT') throw error;
   }
+  try {
+    result.push(validateLegacyTicket(JSON.parse(await fs.readFile(autopilotProposalTicketPath(stateDir), 'utf8')), { now: null, allowExpired: true }));
+  } catch (error) {
+    if (error.code !== 'ENOENT' && !String(error?.message || '').includes('ENOENT')) throw error;
+  }
+  return result.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+}
+
+function isUnresolved(ticket, currentNow) {
+  return ticket?.state === 'acknowledged' || (ticket?.state === 'pending' && Date.parse(ticket.expiresAt) > currentNow.getTime());
 }

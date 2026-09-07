@@ -1,16 +1,28 @@
-const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running']);
+const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running', 'reviewing', 'fixing', 'delivery']);
 
 export function autopilotProposalViewModel({ proposal = null, proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
-  if (!proposal && proposalTicket?.proposal && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
+  if (!proposal && proposalTicket && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
     proposal = {
       proposalId: proposalTicket.proposalId,
-      taskId: proposalTicket.proposal.contract?.id || null,
-      approvalCode: proposalTicket.proposal.approvalCode || null,
+      taskId: proposalTicket.taskId || proposalTicket.proposal?.contract?.id || null,
+      approvalCode: proposalTicket.approvalCode || proposalTicket.proposal?.approvalCode || null,
     };
   }
   if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
   const runningTask = taskStatus?.status === 'running' && taskStatus?.taskId === proposal.taskId;
+  const matchingTask = taskStatus?.taskId === proposal.taskId;
+  if (matchingTask && taskStatus.status === 'completed') return { key: 'completed', label: '完了', detail: 'このtaskはreviewとdeliveryを完了しました。', disableRequest: false, command: null };
+  if (matchingTask && taskStatus.status === 'blocked') {
+    const code = taskStatus.lastError?.code || taskStatus.errorCode || 'TASK_BLOCKED';
+    return { key: 'error', label: 'エラー停止', detail: `taskが停止しました。${code}。`, disableRequest: false, command: null, errorCode: code };
+  }
+  if (matchingTask && ['reviewing', 'fixing', 'delivery'].includes(taskStatus.phase)) {
+    const phase = taskStatus.phase;
+    if (phase === 'reviewing') return { key: 'reviewing', label: 'ChatGPTレビュー中', detail: 'ChatGPTのreview結果を待っています。', disableRequest: true, command: null };
+    if (phase === 'fixing') return { key: 'fixing', label: `修正中 ${taskStatus.reviewRound || 0}/${taskStatus.reviewMaxRounds || '?'}`, detail: 'review結果に基づくCodex修正を実行しています。', disableRequest: true, command: null };
+    return { key: 'delivery', label: 'Delivery中', detail: 'PASS済み結果をdeliveryしています。', disableRequest: true, command: null };
+  }
   if (runningTask) return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
   if (watchStatus?.status === 'error') {
     const code = watchStatus.lastError?.code || 'WATCH_ERROR';

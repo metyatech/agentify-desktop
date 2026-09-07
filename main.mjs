@@ -22,6 +22,7 @@ import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSetti
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
 import { createAutopilotProposalTicketStore } from './autopilot-proposal-ticket.mjs';
+import { resolveAutopilotProposalApproval } from './autopilot-approval.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
 import { logPath as orchestratorLogPath } from './orchestrator/logging.mjs';
@@ -746,7 +747,13 @@ async function main() {
           emitTabsChanged();
           return stored;
         },
-        getAutopilotProposalTicket: async () => await autopilotProposalTicket.get(),
+        getAutopilotProposalTicket: async ({ proposalId = null } = {}) => await autopilotProposalTicket.get(proposalId),
+        getAutopilotProposalTickets: async () => (await autopilotProposalTicket.list()).filter((ticket) => ticket.schemaVersion === 2),
+        resolveAutopilotProposalApproval: async ({ proposalId }) => await resolveAutopilotProposalApproval({
+          ticketStore: autopilotProposalTicket,
+          tabs,
+          proposalId,
+        }),
         onAutopilotProposalTicket: async ({ proposalId, state }) => {
           const stored = await autopilotProposalTicket.update({ proposalId, state });
           emitTabsChanged();

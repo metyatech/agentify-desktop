@@ -648,12 +648,17 @@ export function createAutopilotProposalService({
     const promise = (async () => {
       const { state, tab, url: initialUrl } = await assertReady();
       const proposalNow = now();
-      const existingTicket = await ticketStore.get();
-      const ticketUnresolved = existingTicket && (
-        (existingTicket.state === 'pending' && Date.parse(existingTicket.expiresAt) > proposalNow.getTime())
-        || existingTicket.state === 'acknowledged'
-      );
-      if (ticketUnresolved) {
+      let unresolvedTickets;
+      if (typeof ticketStore.listUnresolved === 'function') {
+        unresolvedTickets = await ticketStore.listUnresolved();
+      } else {
+        const existingTicket = typeof ticketStore.get === 'function' ? await ticketStore.get() : null;
+        unresolvedTickets = existingTicket && (
+          (existingTicket.state === 'pending' && Date.parse(existingTicket.expiresAt) > proposalNow.getTime())
+          || existingTicket.state === 'acknowledged'
+        ) ? [existingTicket] : [];
+      }
+      if (unresolvedTickets.length > 0) {
         throw new Error('autopilot_proposal_ticket_unresolved');
       }
       const controller = tabs.getControllerById(tab.id);
@@ -745,22 +750,26 @@ export function createAutopilotProposalService({
             intentGuard,
             requireImplementationTimeout: true
           });
-          const ticket = await ticketStore.create({
-            schemaVersion: 1,
+          const storedTicket = await ticketStore.create({
+            schemaVersion: 2,
             proposalId: classification.proposal.proposalId,
+            taskId: classification.proposal.contract.id,
             tabKey: workflow.key,
             tabId: tab.id,
             vendorId: workflow.vendorId,
             conversationUrl: anchorConversation.url,
             assistantTurnId: anchor.assistantTurnId,
             assistantTurnIdentityProvenance: anchor.assistantTurnIdentityProvenance,
+            approvalCode: classification.proposal.approvalCode,
+            contract: classification.proposal.contract,
             proposal: classification.proposal,
             contractHash: proposalContractHash(classification.proposal.contract),
             createdAt: classification.proposal.createdAt,
             expiresAt: classification.proposal.expiresAt,
-            state: 'pending',
-            updatedAt: classification.proposal.createdAt,
           });
+          const ticket = storedTicket && storedTicket.schemaVersion === 2
+            ? { ...storedTicket, proposal: classification.proposal }
+            : storedTicket;
           return { ok: true, status: 'proposal_response_received', tabId: state.tabId, metadata, prompt, response, proposal: classification.proposal, ticket, attempts: attempt };
         }
         attempts.push({ attempt, reason: classification.reason, ...(classification.diagnostic ? { diagnostic: classification.diagnostic } : {}) });

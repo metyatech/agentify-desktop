@@ -6,7 +6,10 @@ import test from 'node:test';
 
 import {
   AUTOPILOT_PROPOSAL_TICKET_FILE,
+  AUTOPILOT_PROPOSAL_TICKETS_DIR,
   autopilotProposalTicketPath,
+  autopilotProposalTicketJsonPath,
+  autopilotProposalTicketStatePath,
   createAutopilotProposalTicketStore,
   proposalContractHash,
   validateAutopilotProposalTicket,
@@ -35,8 +38,9 @@ const proposal = {
 
 function ticket(overrides = {}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     proposalId: proposal.proposalId,
+    taskId: proposal.contract.id,
     tabKey: 'autopilot-production',
     tabId: 'tab-1',
     vendorId: 'chatgpt',
@@ -44,11 +48,11 @@ function ticket(overrides = {}) {
     assistantTurnId: 'assistant-1',
     assistantTurnIdentityProvenance: 'provider-message-id',
     proposal,
+    approvalCode: proposal.approvalCode,
+    contract: proposal.contract,
     contractHash: proposalContractHash(proposal.contract),
     createdAt: proposal.createdAt,
     expiresAt: proposal.expiresAt,
-    state: 'pending',
-    updatedAt: proposal.createdAt,
     ...overrides,
   };
 }
@@ -63,8 +67,11 @@ const replacementProposal = {
 function replacementTicket(overrides = {}) {
   return ticket({
     proposalId: replacementProposal.proposalId,
+    taskId: replacementProposal.contract.id,
     assistantTurnId: 'assistant-2',
     proposal: replacementProposal,
+    approvalCode: replacementProposal.approvalCode,
+    contract: replacementProposal.contract,
     contractHash: proposalContractHash(replacementProposal.contract),
     createdAt: replacementProposal.createdAt,
     expiresAt: replacementProposal.expiresAt,
@@ -76,16 +83,27 @@ test('proposal ticket persists the exact validated proposal atomically and survi
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-'));
   const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
   const saved = await store.create(ticket());
-  assert.deepEqual(saved, ticket());
-  assert.equal((await store.get()).proposal.contract.implementation.prompt, proposal.contract.implementation.prompt);
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.proposalId, proposal.proposalId);
+  assert.equal(saved.taskId, proposal.contract.id);
+  assert.equal(saved.contract.implementation.prompt, proposal.contract.implementation.prompt);
+  assert.equal(saved.state, 'pending');
+  assert.equal(saved.updatedAt, proposal.createdAt);
+  assert.equal(saved.proposal, undefined);
+  assert.equal((await store.get()).contract.implementation.prompt, proposal.contract.implementation.prompt);
   assert.equal(path.basename(autopilotProposalTicketPath(stateDir)), AUTOPILOT_PROPOSAL_TICKET_FILE);
+  assert.equal(path.basename(path.dirname(autopilotProposalTicketJsonPath(proposal.proposalId, stateDir))), proposal.proposalId);
+  assert.equal(path.basename(path.dirname(autopilotProposalTicketStatePath(proposal.proposalId, stateDir))), proposal.proposalId);
   const restored = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
   assert.deepEqual(await restored.get(), saved);
+  await restored.update({ proposalId: proposal.proposalId, state: 'acknowledged' });
+  await restored.update({ proposalId: proposal.proposalId, state: 'consumed' });
+  await assert.rejects(() => restored.create(ticket()), /exists/u);
   await fs.rm(stateDir, { recursive: true, force: false });
 });
 
 test('clarification or invalid proposal cannot be represented as a ticket', () => {
-  assert.throws(() => validateAutopilotProposalTicket(ticket({ proposal: null })), /proposal_invalid/u);
+  assert.throws(() => validateAutopilotProposalTicket(ticket({ contract: null, proposal: null })), /contract_invalid/u);
   assert.throws(() => validateAutopilotProposalTicket(ticket({ contractHash: '0'.repeat(64) })), /contract_hash_invalid/u);
 });
 
@@ -97,6 +115,31 @@ test('unresolved ticket blocks a second proposal and lifecycle acknowledgement i
   assert.equal((await store.update({ proposalId: proposal.proposalId, state: 'acknowledged' })).state, 'acknowledged');
   assert.equal((await store.update({ proposalId: proposal.proposalId, state: 'consumed' })).state, 'consumed');
   await assert.rejects(() => store.update({ proposalId: proposal.proposalId, state: 'pending' }), /transition_invalid/u);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
+test('legacy single ticket file remains readable but is not writable by the V2 store', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-legacy-'));
+  const legacy = {
+    schemaVersion: 1,
+    proposalId: proposal.proposalId,
+    tabKey: 'autopilot-production',
+    tabId: 'tab-1',
+    vendorId: 'chatgpt',
+    conversationUrl: 'https://chatgpt.com/c/ticket',
+    assistantTurnId: 'assistant-1',
+    assistantTurnIdentityProvenance: 'provider-message-id',
+    proposal,
+    contractHash: proposalContractHash(proposal.contract),
+    createdAt: proposal.createdAt,
+    expiresAt: proposal.expiresAt,
+    state: 'consumed',
+    updatedAt: proposal.createdAt,
+  };
+  await fs.writeFile(autopilotProposalTicketPath(stateDir), `${JSON.stringify(legacy)}\n`);
+  const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  assert.equal((await store.get()).proposalId, proposal.proposalId);
+  await assert.rejects(() => store.update({ proposalId: proposal.proposalId, state: 'acknowledged' }), /legacy_read_only/u);
   await fs.rm(stateDir, { recursive: true, force: false });
 });
 

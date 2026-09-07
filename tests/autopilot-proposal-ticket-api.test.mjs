@@ -77,3 +77,33 @@ test('proposal ticket API accepts only the pending-to-abandoned lifecycle step',
   assert.equal(response.status, 200);
   assert.equal((await response.json()).ticket.state, 'abandoned');
 });
+
+test('V2 ticket list and approval resolver endpoints are authenticated and proposal-scoped', async (t) => {
+  const v2 = {
+    ...ticket,
+    schemaVersion: 2,
+    taskId: ticket.proposal.contract.id,
+    approvalCode: ticket.proposal.approvalCode,
+    contract: ticket.proposal.contract,
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    stateDir: 'D:/state',
+    tabs: { listTabs: () => [], getControllerById: () => ({}) },
+    defaultTabId: null,
+    getAutopilotProposalTickets: async () => [v2],
+    resolveAutopilotProposalApproval: async ({ proposalId }) => {
+      assert.equal(proposalId, v2.proposalId);
+      return { status: 'pending', reason: 'approval_missing', ticket: v2, approvalTurnId: null };
+    },
+  });
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const list = await fetch(`${base}/autopilot/proposal-tickets`, { headers: { Authorization: 'Bearer secret' } });
+  assert.equal(list.status, 200);
+  assert.deepEqual((await list.json()).tickets[0].taskId, v2.taskId);
+  const approval = await fetch(`${base}/autopilot/proposal-ticket/approval?proposalId=${v2.proposalId}`, { headers: { Authorization: 'Bearer secret' } });
+  assert.equal(approval.status, 200);
+  assert.equal((await approval.json()).status, 'pending');
+});

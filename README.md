@@ -302,12 +302,15 @@ required and contains only those paths; normal implementation tasks omit the
 field. Host/local tasks may use a null repository
 with push disabled, and their verification plan may be empty. It does not create a
 tab, start Codex, create a worktree, write a task, commit, push, or send approval.
-An unresolved ticket prevents another proposal from being stacked. The existing
-watcher uses the authenticated proposal-ticket API as the primary source, checks
-the current tab/conversation and exact approval turn with a bounded tail read, and
-keeps the older conversation-discovery path for legacy proposals. A pending
-ticket with no durable execution evidence may be safely abandoned by the
-controller operator; abandoned tickets are replaceable and are never polled
+The validated ticket is the execution authority. New tickets are stored under
+`%USERPROFILE%\\.agentify-desktop\\autopilot-tickets\\<proposalId>\\` as an
+immutable `ticket.json` plus lifecycle-only `state.json`; the old single-ticket
+file remains read-only historical compatibility. An unresolved ticket prevents
+another proposal from being stacked. The watcher never reconstructs a proposal
+from conversation history: it asks the authenticated Agentify approval resolver
+to verify only the stored assistant anchor and exact user approval command. A
+pending ticket with no durable execution evidence may be safely abandoned by
+the controller operator; abandoned tickets are replaceable and are never polled
 for conversation or execution work. Proposal
 responses must be emitted as exactly one unlabeled fenced code block containing the
 marker pair and standalone JSON; clarification responses remain natural language.

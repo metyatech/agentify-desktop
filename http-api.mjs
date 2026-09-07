@@ -278,6 +278,8 @@ export function mapErrorToHttp(error) {
   if (msg === 'timeout_waiting_for_response') return { code: 408, body: { error: 'timeout_waiting_for_response', data: error?.data || null } };
   if (msg === 'artifacts_folder_open_failed') return { code: 500, body: { error: 'artifacts_folder_open_failed', data: error?.data || null } };
   if (msg === 'artifact_save_failed') return { code: 500, body: { error: 'artifact_save_failed', data: error?.data || null } };
+  if (/^autopilot_approval_[a-z0-9_]+$/u.test(msg)) return { code: 409, body: { error: msg } };
+  if (/^autopilot_proposal_ticket_[a-z0-9_]+$/u.test(msg)) return { code: 409, body: { error: msg } };
   return null;
 }
 
@@ -982,6 +984,8 @@ export function startHttpApi({
   getAutopilotWatchStatus,
   onAutopilotWatchStatus,
   getAutopilotProposalTicket,
+  getAutopilotProposalTickets,
+  resolveAutopilotProposalApproval,
   onAutopilotProposalTicket,
   onAutopilotStatusClear,
   getSettings,
@@ -1441,10 +1445,25 @@ export function startHttpApi({
         return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
       }
 
+      if (url.pathname === '/autopilot/proposal-tickets' && req.method === 'GET') {
+        if (typeof getAutopilotProposalTickets !== 'function') return sendJson(res, 200, { ok: true, tickets: [] });
+        const tickets = await getAutopilotProposalTickets();
+        return sendJson(res, 200, { ok: true, tickets: tickets.map((ticket) => validateAutopilotProposalTicket(ticket)) }, { maxBytes: AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES });
+      }
+
+      if (url.pathname === '/autopilot/proposal-ticket/approval' && req.method === 'GET') {
+        if (typeof resolveAutopilotProposalApproval !== 'function') return sendJson(res, 503, { error: 'autopilot_proposal_approval_unavailable' });
+        const proposalId = String(url.searchParams.get('proposalId') || '').trim();
+        if (!proposalId) return sendJson(res, 400, { error: 'autopilot_proposal_approval_invalid' });
+        const result = await resolveAutopilotProposalApproval({ proposalId });
+        return sendJson(res, 200, { ok: true, ...result }, { maxBytes: AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES });
+      }
+
       if (url.pathname === '/autopilot/proposal-ticket' && req.method === 'GET') {
         if (typeof getAutopilotProposalTicket !== 'function') return sendJson(res, 200, { ok: true, ticket: null });
         const requestedTabKey = String(url.searchParams.get('tabKey') || '').trim();
-        const ticket = await getAutopilotProposalTicket();
+        const requestedProposalId = String(url.searchParams.get('proposalId') || '').trim() || null;
+        const ticket = await getAutopilotProposalTicket({ proposalId: requestedProposalId });
         if (ticket === null) return sendJson(res, 200, { ok: true, ticket: null });
         const validated = validateAutopilotProposalTicket(ticket);
         if (requestedTabKey && requestedTabKey !== validated.tabKey) return sendJson(res, 200, { ok: true, ticket: null });

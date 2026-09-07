@@ -43,9 +43,8 @@ test('matching running task overrides stale and error watcher mirrors', () => {
       watchStatus,
       taskStatus: { taskId: 'task-1', status: 'running', phase: 'reviewing' },
     });
-    assert.deepEqual({ key: view.key, label: view.label, command: view.command, disableRequest: view.disableRequest }, {
-      key: 'running', label: '実行中', command: null, disableRequest: true,
-    });
+    assert.equal(view.key, 'reviewing');
+    assert.equal(view.disableRequest, true);
   }
 });
 
@@ -59,7 +58,7 @@ test('unrelated or terminal task status does not override watcher state', () => 
       watchStatus: watch('observed', { stale: true, ageMs: 16000 }),
       taskStatus,
     });
-    assert.equal(view.key, 'stale');
+    assert.equal(view.key, taskStatus.status === 'completed' ? 'completed' : 'stale');
     assert.equal(view.command, null);
   }
 });
@@ -74,4 +73,12 @@ test('approval and launch lifecycle disable duplicate proposal requests', () => 
   for (const state of ['approved', 'launch-prepared', 'launch-started', 'running']) {
     assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch(state) }).disableRequest, true);
   }
+});
+
+test('task view distinguishes review, fix, delivery, completion, and blocked states', () => {
+  assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'running', phase: 'reviewing' }, watchStatus: watch('running') }).key, 'reviewing');
+  assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'running', phase: 'fixing', reviewRound: 2, reviewMaxRounds: 10 }, watchStatus: watch('running') }).label, '修正中 2/10');
+  assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'running', phase: 'delivery' }, watchStatus: watch('running') }).key, 'delivery');
+  assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'completed' }, watchStatus: watch('completed') }).key, 'completed');
+  assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'blocked', errorCode: 'REVIEW_TIMEOUT' }, watchStatus: watch('blocked') }).errorCode, 'REVIEW_TIMEOUT');
 });

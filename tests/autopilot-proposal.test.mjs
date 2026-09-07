@@ -34,25 +34,28 @@ const FIXED_METADATA = Object.freeze({
 });
 
 function validContract(overrides = {}) {
-  return {
+  const base = {
     schemaVersion: 1,
     id: expectedTaskIdForProposal(FIXED_METADATA.proposalId),
     title: 'Proposal validation test',
     repository: null,
     agentify: { tabKey: FIXED_METADATA.tabKey },
     implementation: {
-      prompt: 'Implement the requested change. Path D:\\ghws\\RuntimeUnicodeTextSample, quoted "text", and a newline\nare intentional.'
+      prompt: 'Implement the requested change. Path D:\\ghws\\RuntimeUnicodeTextSample, quoted "text", and a newline\nare intentional.',
+      timeoutMs: DEFAULT_IMPLEMENTATION_TIMEOUT_MS
     },
     verification: [],
     review: { maxRounds: 10, timeoutMs: 300000 },
     delivery: { push: false },
-    constraints: [],
-    ...overrides
+    constraints: []
   };
+  return { ...base, ...overrides, implementation: { ...base.implementation, ...(overrides.implementation || {}) } };
 }
 
-function validProposalText(metadata = FIXED_METADATA, { contract = {}, envelope = {} } = {}) {
-  return `${PROPOSAL_BEGIN}\n${JSON.stringify({ ...metadata, ...envelope, contract: validContract(contract) }, null, 2)}\n${PROPOSAL_END}`;
+function validProposalText(metadata = FIXED_METADATA, { contract = {}, envelope = {}, legacyImplementation = false } = {}) {
+  const parsedContract = validContract(contract);
+  if (legacyImplementation) delete parsedContract.implementation.timeoutMs;
+  return `${PROPOSAL_BEGIN}\n${JSON.stringify({ ...metadata, ...envelope, contract: parsedContract }, null, 2)}\n${PROPOSAL_END}`;
 }
 
 function fencedProposalText(metadata = FIXED_METADATA, options = {}) {
@@ -118,13 +121,53 @@ test('implementation timeout is accepted and preserved while remaining optional 
     contract: { implementation: { prompt: 'Implement the requested change.', timeoutMs: DEFAULT_IMPLEMENTATION_TIMEOUT_MS } }
   }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
   assert.equal(proposal.contract.implementation.timeoutMs, DEFAULT_IMPLEMENTATION_TIMEOUT_MS);
-  const legacy = parseValidateProposalResponse(validProposalText(), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
+  const legacy = parseValidateProposalResponse(validProposalText(FIXED_METADATA, { legacyImplementation: true }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
   assert.equal(Object.hasOwn(legacy.contract.implementation, 'timeoutMs'), false);
   for (const timeoutMs of [0, -1, 1.5, '1200000']) {
     assert.throws(() => parseValidateProposalResponse(validProposalText(FIXED_METADATA, {
       contract: { implementation: { prompt: 'Implement the requested change.', timeoutMs } }
     }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) }), /implementation_schema_invalid/u);
   }
+});
+
+test('current proposal service rejects a missing implementation timeout before ticket creation', async () => {
+  const saved = [];
+  const { service } = makeService({
+    requestQuery: async () => ({ result: { text: validProposalText(FIXED_METADATA, { legacyImplementation: true }) } }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:implementation_timeout_required/u);
+  assert.equal(saved.length, 0);
+});
+
+test('current proposal retry requires the timeout and preserves metadata and intent guard', async () => {
+  const saved = [];
+  const calls = [];
+  const { service } = makeService({
+    requestQuery: async (body) => {
+      calls.push(body);
+      return { result: { text: calls.length === 1 ? validProposalText(FIXED_METADATA, { legacyImplementation: true }) : validProposalText() } };
+    },
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  const result = await service.request();
+  assert.equal(result.attempts, 2);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].proposal.contract.implementation.timeoutMs, DEFAULT_IMPLEMENTATION_TIMEOUT_MS);
+  assert.deepEqual(calls.map((call) => JSON.parse(call.prompt.match(/\{\n  "schemaVersion"[\s\S]*?\n\}/u)[0]).proposalId), [FIXED_METADATA.proposalId, FIXED_METADATA.proposalId]);
+});
+
+test('current proposal anchor validation rejects a missing implementation timeout', () => {
+  const proposalText = validProposalText(FIXED_METADATA, { legacyImplementation: true });
+  const proposal = JSON.parse(proposalText.split(`${PROPOSAL_BEGIN}\n`)[1].split(`\n${PROPOSAL_END}`)[0]);
+  const turns = [{ messageId: 'provider-anchor', identityProvenance: 'provider-message-id', role: 'assistant', index: 0, text: proposalText }];
+  assert.throws(() => findValidatedProposalAssistantAnchor({
+    turns,
+    proposal,
+    metadata: FIXED_METADATA,
+    now: new Date(FIXED_METADATA.createdAt),
+    requireImplementationTimeout: true
+  }), /anchor_missing/u);
 });
 
 test('system-generated task id is proposal-unique and wrong ids never create a ticket', async () => {

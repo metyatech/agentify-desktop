@@ -313,7 +313,7 @@ function findSensitiveEvidence(text) {
   return findings;
 }
 
-function validateContract(contract, metadata, { expectedTaskId = null, intentGuard = null } = {}) {
+function validateContract(contract, metadata, { expectedTaskId = null, intentGuard = null, requireImplementationTimeout = false } = {}) {
   if (!isRecord(contract) || !hasExactKeys(contract, CONTRACT_KEYS)) throw proposalValidationError('contract_schema_invalid');
   if (contract.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('contract_schema_version_invalid');
   validateTaskId(contract.id);
@@ -346,6 +346,9 @@ function validateContract(contract, metadata, { expectedTaskId = null, intentGua
   if (!isRecord(contract.implementation) || Object.keys(contract.implementation).some((key) => !['prompt', 'timeoutMs'].includes(key)) || !Object.hasOwn(contract.implementation, 'prompt') || !nonEmptyString(contract.implementation.prompt) || (Object.hasOwn(contract.implementation, 'timeoutMs') && !positiveInteger(contract.implementation.timeoutMs))) {
     throw proposalValidationError('implementation_schema_invalid');
   }
+  if (requireImplementationTimeout && !Object.hasOwn(contract.implementation, 'timeoutMs')) {
+    throw proposalValidationError('implementation_timeout_required');
+  }
   if (!Array.isArray(contract.verification) || contract.verification.some((item) => (
     !isRecord(item) ||
     !hasExactKeys(item, ['name', 'command', 'args', 'timeoutMs']) ||
@@ -374,7 +377,7 @@ function parseUtcTimestamp(value, label) {
   return timestamp;
 }
 
-function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = null, intentGuard = null } = {}) {
+function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = null, intentGuard = null, requireImplementationTimeout = false } = {}) {
   if (!isRecord(proposal) || !hasExactKeys(proposal, ENVELOPE_KEYS)) throw proposalValidationError('envelope_schema_invalid');
   if (proposal.schemaVersion !== TASK_CONTRACT_SCHEMA_VERSION) throw proposalValidationError('proposal_schema_version_invalid');
   if (typeof proposal.proposalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(proposal.proposalId)) throw proposalValidationError('proposal_id_invalid');
@@ -387,11 +390,11 @@ function validateProposalEnvelope(proposal, metadata, now, { expectedTaskId = nu
   for (const key of ['schemaVersion', 'proposalId', 'createdAt', 'expiresAt', 'tabKey', 'approvalCode']) {
     if (proposal[key] !== metadata[key]) throw proposalValidationError(`metadata_mismatch_${key}`);
   }
-  validateContract(proposal.contract, metadata, { expectedTaskId, intentGuard });
+  validateContract(proposal.contract, metadata, { expectedTaskId, intentGuard, requireImplementationTimeout });
   if (proposal.contract.agentify.tabKey !== proposal.tabKey) throw proposalValidationError('contract_tab_key_mismatch');
 }
 
-export function classifyProposalResponse(responseText, { metadata, now = new Date(), expectedTaskId = null, intentGuard = null } = {}) {
+export function classifyProposalResponse(responseText, { metadata, now = new Date(), expectedTaskId = null, intentGuard = null, requireImplementationTimeout = false } = {}) {
   const text = normalizeProposalText(responseText);
   if (Buffer.byteLength(text, 'utf8') > PROPOSAL_MAX_BYTES) return invalidProposal('response_too_large');
   if (!text.trim()) return invalidProposal(typeof responseText === 'string' ? 'response_empty' : 'response_text_missing');
@@ -413,7 +416,7 @@ export function classifyProposalResponse(responseText, { metadata, now = new Dat
     return invalidProposal('proposal_json_invalid', jsonParseDiagnostic(error, jsonText));
   }
   try {
-    validateProposalEnvelope(proposal, metadata, now, { expectedTaskId, intentGuard });
+    validateProposalEnvelope(proposal, metadata, now, { expectedTaskId, intentGuard, requireImplementationTimeout });
   } catch (error) {
     return invalidProposal(error.reason || 'proposal_schema_invalid');
   }
@@ -443,11 +446,11 @@ function canonicalizeProposal(value) {
   return value;
 }
 
-export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date(), expectedTaskId = null, intentGuard = null } = {}) {
+export function findValidatedProposalAssistantAnchor({ turns, proposal, metadata, now = new Date(), expectedTaskId = null, intentGuard = null, requireImplementationTimeout = false } = {}) {
   const matches = [];
   for (const turn of Array.isArray(turns) ? turns : []) {
     if (turn?.role !== 'assistant' || typeof turn.text !== 'string') continue;
-    const classification = classifyProposalResponse(turn.text, { metadata, now, expectedTaskId, intentGuard });
+    const classification = classifyProposalResponse(turn.text, { metadata, now, expectedTaskId, intentGuard, requireImplementationTimeout });
     if (classification.kind !== PROPOSAL_RESPONSE_KINDS.VALID_PROPOSAL) continue;
     if (JSON.stringify(canonicalizeProposal(classification.proposal)) !== JSON.stringify(canonicalizeProposal(proposal))) continue;
     const provenance = String(turn.identityProvenance || '').trim();
@@ -677,7 +680,7 @@ export function createAutopilotProposalService({
           timeoutMs: 10 * 60 * 1000
         });
         const expectedTaskId = expectedTaskIdForProposal(metadata.proposalId);
-        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow, expectedTaskId, intentGuard });
+        const classification = classifyProposalResponse(responseTextFromQuery(response), { metadata, now: proposalNow, expectedTaskId, intentGuard, requireImplementationTimeout: true });
         if (classification.kind === PROPOSAL_RESPONSE_KINDS.CLARIFICATION) {
           return {
             ok: false,
@@ -711,7 +714,8 @@ export function createAutopilotProposalService({
             metadata,
             now: proposalNow,
             expectedTaskId,
-            intentGuard
+            intentGuard,
+            requireImplementationTimeout: true
           });
           const ticket = await ticketStore.create({
             schemaVersion: 1,

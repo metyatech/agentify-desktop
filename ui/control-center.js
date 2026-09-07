@@ -164,7 +164,7 @@ function renderAutopilotState() {
   const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, proposalTicket: lastState.autopilotProposalTicket, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
   let label = '準備可能';
   let className = '';
-  let detail = 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。';
+  let detail = 'クリックするとChatGPTへproposal生成を依頼します。生成後は承認コードで開始できます。';
   if (autopilotRequestInFlight) {
     label = 'ChatGPTへ依頼中';
     className = 'isWaiting';

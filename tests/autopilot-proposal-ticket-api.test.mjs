@@ -92,7 +92,10 @@ test('V2 ticket list and approval resolver endpoints are authenticated and propo
     stateDir: 'D:/state',
     tabs: { listTabs: () => [], getControllerById: () => ({}) },
     defaultTabId: null,
-    getAutopilotProposalTickets: async () => [v2],
+    getAutopilotProposalTickets: async ({ tabKey }) => {
+      assert.equal(tabKey, v2.tabKey);
+      return [v2];
+    },
     resolveAutopilotProposalApproval: async ({ proposalId }) => {
       assert.equal(proposalId, v2.proposalId);
       return { status: 'pending', reason: 'approval_missing', ticket: v2, approvalTurnId: null };
@@ -100,7 +103,9 @@ test('V2 ticket list and approval resolver endpoints are authenticated and propo
   });
   t.after(() => server.close());
   const base = `http://127.0.0.1:${server.address().port}`;
-  const list = await fetch(`${base}/autopilot/proposal-tickets`, { headers: { Authorization: 'Bearer secret' } });
+  const missingTab = await fetch(`${base}/autopilot/proposal-tickets`, { headers: { Authorization: 'Bearer secret' } });
+  assert.equal(missingTab.status, 400);
+  const list = await fetch(`${base}/autopilot/proposal-tickets?tabKey=${encodeURIComponent(v2.tabKey)}`, { headers: { Authorization: 'Bearer secret' } });
   assert.equal(list.status, 200);
   assert.deepEqual((await list.json()).tickets[0].taskId, v2.taskId);
   const approval = await fetch(`${base}/autopilot/proposal-ticket/approval?proposalId=${v2.proposalId}`, { headers: { Authorization: 'Bearer secret' } });

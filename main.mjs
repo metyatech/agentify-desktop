@@ -747,8 +747,10 @@ async function main() {
           emitTabsChanged();
           return stored;
         },
-        getAutopilotProposalTicket: async ({ proposalId = null } = {}) => await autopilotProposalTicket.get(proposalId),
-        getAutopilotProposalTickets: async () => (await autopilotProposalTicket.list()).filter((ticket) => ticket.schemaVersion === 2),
+        getAutopilotProposalTicket: async ({ proposalId = null } = {}) => proposalId
+          ? await autopilotProposalTicket.get(proposalId)
+          : (await autopilotProposalTicket.listUnresolved()).at(-1) || null,
+        getAutopilotProposalTickets: async ({ tabKey } = {}) => (await autopilotProposalTicket.listUnresolved()).filter((ticket) => !tabKey || ticket.tabKey === tabKey),
         resolveAutopilotProposalApproval: async ({ proposalId }) => await resolveAutopilotProposalApproval({
           ticketStore: autopilotProposalTicket,
           tabs,

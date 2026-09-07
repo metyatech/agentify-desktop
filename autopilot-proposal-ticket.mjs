@@ -163,10 +163,11 @@ export function autopilotProposalTicketDir(proposalIdValue, stateDir = defaultSt
 export function autopilotProposalTicketJsonPath(proposalIdValue, stateDir = defaultStateDir()) { return path.join(autopilotProposalTicketDir(proposalIdValue, stateDir), 'ticket.json'); }
 export function autopilotProposalTicketStatePath(proposalIdValue, stateDir = defaultStateDir()) { return path.join(autopilotProposalTicketDir(proposalIdValue, stateDir), 'state.json'); }
 
-export async function createAutopilotProposalTicketStore({ stateDir = defaultStateDir(), now = () => new Date() } = {}) {
+export async function createAutopilotProposalTicketStore({ stateDir = defaultStateDir(), now = () => new Date(), onCreatePhase = null } = {}) {
   await ensureStateDir(stateDir);
   await fs.mkdir(autopilotProposalTicketsRoot(stateDir), { recursive: true });
   const readAll = async () => await listTickets(stateDir);
+  const readV2 = async () => await listTickets(stateDir, { includeLegacy: false });
   const get = async (requestedProposalId = null) => {
     const tickets = await readAll();
     if (requestedProposalId) return tickets.find((ticket) => ticket.proposalId === requestedProposalId) || null;
@@ -176,16 +177,48 @@ export async function createAutopilotProposalTicketStore({ stateDir = defaultSta
   return {
     get,
     list: readAll,
-    async listUnresolved() { return (await readAll()).filter((ticket) => ticket.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION && isUnresolved(ticket, now())); },
+    async listUnresolved() { return (await readV2()).filter((ticket) => isUnresolved(ticket, now())); },
     async create(ticket) {
       if (ticket?.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_legacy_read_only');
       const currentNow = now();
       const next = validateAutopilotProposalTicket(ticket, { now: currentNow, allowExpired: false });
-      if ((await readAll()).some((item) => isUnresolved(item, currentNow))) throw new Error('autopilot_proposal_ticket_unresolved');
-      const dir = autopilotProposalTicketDir(next.proposalId, stateDir);
-      try { await fs.mkdir(dir, { recursive: false }); } catch (error) { if (error.code === 'EEXIST') throw new Error('autopilot_proposal_ticket_exists'); throw error; }
-      await atomicWriteFile(autopilotProposalTicketJsonPath(next.proposalId, stateDir), `${JSON.stringify(next, null, 2)}\n`);
-      await atomicWriteFile(autopilotProposalTicketStatePath(next.proposalId, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: next.proposalId, state: 'pending', updatedAt: next.createdAt }, null, 2)}\n`);
+      if ((await readV2()).some((item) => isUnresolved(item, currentNow))) throw new Error('autopilot_proposal_ticket_unresolved');
+      const root = autopilotProposalTicketsRoot(stateDir);
+      const finalDir = autopilotProposalTicketDir(next.proposalId, stateDir);
+      const stagingDir = path.join(root, `.${next.proposalId}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+      try {
+        try {
+          await fs.lstat(finalDir);
+          throw new Error('autopilot_proposal_ticket_exists');
+        } catch (error) {
+          if (error?.message === 'autopilot_proposal_ticket_exists') throw error;
+          if (error?.code !== 'ENOENT') throw error;
+        }
+        await fs.mkdir(stagingDir, { recursive: false });
+        await atomicWriteFile(path.join(stagingDir, 'ticket.json'), `${JSON.stringify(next, null, 2)}\n`);
+        await onCreatePhase?.({ phase: 'ticket-written', proposalId: next.proposalId, stagingDir });
+        await atomicWriteFile(path.join(stagingDir, 'state.json'), `${JSON.stringify({ schemaVersion: 2, proposalId: next.proposalId, state: 'pending', updatedAt: next.createdAt }, null, 2)}\n`);
+        await onCreatePhase?.({ phase: 'state-written', proposalId: next.proposalId, stagingDir });
+        await onCreatePhase?.({ phase: 'before-rename', proposalId: next.proposalId, stagingDir, finalDir });
+        await fs.rename(stagingDir, finalDir);
+        try {
+          const rootHandle = await fs.open(root, 'r');
+          try { await rootHandle.sync(); } finally { await rootHandle.close(); }
+        } catch {}
+      } catch (error) {
+        try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
+        if (error.code === 'EEXIST' || error.code === 'ENOTEMPTY') throw new Error('autopilot_proposal_ticket_exists');
+        if (error.code === 'EPERM') {
+          try {
+            await fs.lstat(finalDir);
+            throw new Error('autopilot_proposal_ticket_exists');
+          } catch (destinationError) {
+            if (destinationError?.message === 'autopilot_proposal_ticket_exists') throw destinationError;
+            if (destinationError?.code !== 'ENOENT') throw error;
+          }
+        }
+        throw error;
+      }
       return { ...next, state: 'pending', updatedAt: next.createdAt };
     },
     async update({ proposalId: requestedProposalId, state } = {}) {
@@ -203,13 +236,14 @@ export async function createAutopilotProposalTicketStore({ stateDir = defaultSta
   };
 }
 
-async function listTickets(stateDir) {
+async function listTickets(stateDir, { includeLegacy = true } = {}) {
   const result = [];
   try {
     const entries = await fs.readdir(autopilotProposalTicketsRoot(stateDir), { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const id = entry.name;
+      if (id.startsWith('.')) continue;
       const ticket = validateAutopilotProposalTicket(JSON.parse(await fs.readFile(autopilotProposalTicketJsonPath(id, stateDir), 'utf8')));
       const lifecycle = JSON.parse(await fs.readFile(autopilotProposalTicketStatePath(id, stateDir), 'utf8'));
       if (lifecycle.schemaVersion !== 2 || lifecycle.proposalId !== ticket.proposalId) throw new Error('autopilot_proposal_ticket_state_invalid');
@@ -218,10 +252,12 @@ async function listTickets(stateDir) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  try {
-    result.push(validateLegacyTicket(JSON.parse(await fs.readFile(autopilotProposalTicketPath(stateDir), 'utf8')), { now: null, allowExpired: true }));
-  } catch (error) {
-    if (error.code !== 'ENOENT' && !String(error?.message || '').includes('ENOENT')) throw error;
+  if (includeLegacy) {
+    try {
+      result.push(validateLegacyTicket(JSON.parse(await fs.readFile(autopilotProposalTicketPath(stateDir), 'utf8')), { now: null, allowExpired: true }));
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !String(error?.message || '').includes('ENOENT')) throw error;
+    }
   }
   return result.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
 }

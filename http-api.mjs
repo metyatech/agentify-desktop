@@ -1446,8 +1446,11 @@ export function startHttpApi({
       }
 
       if (url.pathname === '/autopilot/proposal-tickets' && req.method === 'GET') {
+        const tabKey = String(url.searchParams.get('tabKey') || '').trim();
+        if (!tabKey) return sendJson(res, 400, { error: 'autopilot_proposal_ticket_tab_invalid' });
         if (typeof getAutopilotProposalTickets !== 'function') return sendJson(res, 200, { ok: true, tickets: [] });
-        const tickets = await getAutopilotProposalTickets();
+        const tickets = await getAutopilotProposalTickets({ tabKey });
+        if (!Array.isArray(tickets) || tickets.some((ticket) => ticket?.tabKey !== tabKey)) throw new Error('autopilot_proposal_ticket_tab_invalid');
         return sendJson(res, 200, { ok: true, tickets: tickets.map((ticket) => validateAutopilotProposalTicket(ticket)) }, { maxBytes: AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES });
       }
 

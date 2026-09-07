@@ -45,9 +45,11 @@ export async function resolveAutopilotProposalApproval({
   const anchorPosition = turns.findIndex((turn) => isStoredAssistantAnchor(turn, validated));
   if (anchorPosition < 0) throw approvalError('anchor_missing');
   const approvals = turns.filter((turn, position) => position > anchorPosition && isUserAuthoredTurn(turn) && normalizeApproval(turn.text) === `開始して ${validated.approvalCode}` && isAfter(turns[anchorPosition], turn));
-  if (approvals.length > 1) throw approvalError('approval_ambiguous');
   if (approvals.length === 0) return { status: AUTOPILOT_APPROVAL_RESULTS.PENDING, reason: 'approval_missing', ticket: validated, approvalTurnId: null };
-  return { status: AUTOPILOT_APPROVAL_RESULTS.APPROVED, ticket: validated, approvalTurnId: approvalTurnId(approvals[0]), conversation: { tabId: validated.tabId, vendorId: validated.vendorId, url: validated.conversationUrl } };
+  // Repeated identical approval commands are an idempotent user action. The
+  // first valid turn is the canonical identity so polling/restart is stable.
+  const approval = approvals[0];
+  return { status: AUTOPILOT_APPROVAL_RESULTS.APPROVED, ticket: validated, approvalTurnId: approvalTurnId(approval), conversation: { tabId: validated.tabId, vendorId: validated.vendorId, url: validated.conversationUrl } };
 }
 
 function resolveLegacyTicket({ ticket, tabs }) {
@@ -60,7 +62,9 @@ function isStoredAssistantAnchor(turn, ticket) {
 }
 
 function isUserAuthoredTurn(turn) {
-  return turn?.role === 'user' && !IGNORED_TURN_SOURCES.has(String(turn.source || '').trim().toLowerCase()) && turn.author !== 'assistant' && turn.author !== 'system';
+  if (turn?.role !== 'user' || IGNORED_TURN_SOURCES.has(String(turn.source || '').trim().toLowerCase()) || turn.author === 'assistant' || turn.author === 'system') return false;
+  if (turn?.userAuthored === false || turn?.isUserAuthored === false) return false;
+  return true;
 }
 
 function normalizeApproval(value) {

@@ -305,8 +305,10 @@ tab, start Codex, create a worktree, write a task, commit, push, or send approva
 The validated ticket is the execution authority. New tickets are stored under
 `%USERPROFILE%\\.agentify-desktop\\autopilot-tickets\\<proposalId>\\` as an
 immutable `ticket.json` plus lifecycle-only `state.json`; the old single-ticket
-file remains read-only historical compatibility. An unresolved ticket prevents
-another proposal from being stacked. The watcher never reconstructs a proposal
+file remains read-only historical compatibility and never blocks a V2 ticket.
+The watcher-facing endpoint returns only server-filtered pending or acknowledged
+V2 tickets for the requested tab; consumed and abandoned history is not returned.
+An unresolved V2 ticket prevents another proposal from being stacked. The watcher never reconstructs a proposal
 from conversation history: it asks the authenticated Agentify approval resolver
 to verify only the stored assistant anchor and exact user approval command. A
 pending ticket with no durable execution evidence may be safely abandoned by

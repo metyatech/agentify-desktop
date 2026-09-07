@@ -16,7 +16,11 @@ test('proposal stays in watcher confirmation until matching observed status arri
 });
 
 test('watcher errors and stale heartbeat never become approval', () => {
-  assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { status: 'error', lastError: { code: 'TURNS_FAILED' } }) }).key, 'error');
+  const error = autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { status: 'error', lastError: { code: 'TURNS_FAILED' } }) });
+  assert.equal(error.key, 'error');
+  assert.equal(error.label, 'エラー停止');
+  assert.equal(error.disableRequest, true);
+  assert.match(error.detail, /再承認・再送せず/u);
   const stale = autopilotProposalViewModel({ proposal, watchStatus: watch('observed', { stale: true, ageMs: 16000 }) });
   assert.equal(stale.key, 'stale');
   assert.equal(stale.command, null);
@@ -73,6 +77,11 @@ test('approval and launch lifecycle disable duplicate proposal requests', () => 
   for (const state of ['approved', 'launch-prepared', 'launch-started', 'running']) {
     assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch(state) }).disableRequest, true);
   }
+});
+
+test('lifecycle labels distinguish preparation from Codex execution', () => {
+  assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch('approved') }).label, '承認済み — 実行準備中');
+  assert.equal(autopilotProposalViewModel({ proposal, watchStatus: watch('launch-started') }).label, 'Codex実行中');
 });
 
 test('task view distinguishes review, fix, delivery, completion, and blocked states', () => {

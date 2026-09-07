@@ -8,7 +8,7 @@ export function autopilotProposalViewModel({ proposal = null, proposalTicket = n
       approvalCode: proposalTicket.approvalCode || proposalTicket.proposal?.approvalCode || null,
     };
   }
-  if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。返答後に内容を目視確認してください。', disableRequest: false, command: null };
+  if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。生成後は承認コードで開始できます。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
   const runningTask = taskStatus?.status === 'running' && taskStatus?.taskId === proposal.taskId;
   const matchingTask = taskStatus?.taskId === proposal.taskId;
@@ -23,10 +23,10 @@ export function autopilotProposalViewModel({ proposal = null, proposalTicket = n
     if (phase === 'fixing') return { key: 'fixing', label: `修正中 ${taskStatus.reviewRound || 0}/${taskStatus.reviewMaxRounds || '?'}`, detail: 'review結果に基づくCodex修正を実行しています。', disableRequest: true, command: null };
     return { key: 'delivery', label: 'Delivery中', detail: 'PASS済み結果をdeliveryしています。', disableRequest: true, command: null };
   }
-  if (runningTask) return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
+  if (runningTask) return { key: 'running', label: 'Codex実行中', detail: 'Codexの実行状態を表示しています。', disableRequest: true, command: null };
   if (watchStatus?.status === 'error') {
     const code = watchStatus.lastError?.code || 'WATCH_ERROR';
-    return { key: 'error', label: 'watcherエラー', detail: `watcherが確認できません。${code}。しばらく待ってから再試行できます。`, disableRequest: false, command: null, errorCode: code };
+    return { key: 'error', label: 'エラー停止', detail: `${code}。再承認・再送せず、エラーを確認してください。`, disableRequest: true, command: null, errorCode: code };
   }
   if (watchStatus?.stale && Number.isFinite(watchStatus.ageMs)) {
     return { key: 'stale', label: 'Watcher offline / stale', detail: 'watcherのheartbeatが更新されていません。watcherが再開するまで承認は待機してください。', disableRequest: true, command: null };
@@ -42,14 +42,13 @@ export function autopilotProposalViewModel({ proposal = null, proposalTicket = n
     return {
       key: 'approval-waiting',
       label: '承認待ち',
-      detail: 'watcher確認済みです。ChatGPT上のproposal内容を確認し、問題なければ次の承認文を送信してください。',
+      detail: '承認コードを確認し、問題なければ次の開始文を送信してください。',
       disableRequest: true,
       command: `開始して ${proposal.approvalCode}`,
     };
   }
-  if (state === 'approved') return { key: 'approved', label: '承認済み・開始準備中', detail: '承認をwatcherが検出しました。task起動の準備中です。', disableRequest: true, command: null };
-  if (state === 'launch-prepared' || state === 'launch-started') return { key: 'launching', label: 'task起動中', detail: 'task controllerの起動を準備しています。', disableRequest: true, command: null };
-  return { key: 'running', label: '実行中', detail: 'task progressを表示しています。', disableRequest: true, command: null };
+  if (state === 'approved' || state === 'launch-prepared') return { key: 'approved', label: '承認済み — 実行準備中', detail: '承認済みです。controllerの起動を準備しています。', disableRequest: true, command: null };
+  if (state === 'launch-started' || state === 'running') return { key: 'running', label: 'Codex実行中', detail: 'Codexの実行状態を表示しています。', disableRequest: true, command: null };
 }
 
 export function isActiveAutopilotProposal(proposal, watchStatus, taskStatus = null) {

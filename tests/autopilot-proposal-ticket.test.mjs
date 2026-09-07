@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   AUTOPILOT_PROPOSAL_TICKET_FILE,
   AUTOPILOT_PROPOSAL_TICKETS_DIR,
+  autopilotProposalTicketDir,
   autopilotProposalTicketPath,
   autopilotProposalTicketJsonPath,
   autopilotProposalTicketStatePath,
@@ -140,6 +141,68 @@ test('legacy single ticket file remains readable but is not writable by the V2 s
   const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
   assert.equal((await store.get()).proposalId, proposal.proposalId);
   await assert.rejects(() => store.update({ proposalId: proposal.proposalId, state: 'acknowledged' }), /legacy_read_only/u);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
+test('legacy pending and acknowledged tickets never block new V2 creation or change legacy bytes', async () => {
+  for (const state of ['pending', 'acknowledged']) {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `agentify-ticket-legacy-${state}-`));
+    const legacy = {
+      schemaVersion: 1,
+      proposalId: proposal.proposalId,
+      tabKey: 'autopilot-production',
+      tabId: 'tab-1',
+      vendorId: 'chatgpt',
+      conversationUrl: 'https://chatgpt.com/c/ticket',
+      assistantTurnId: 'assistant-1',
+      assistantTurnIdentityProvenance: 'provider-message-id',
+      proposal,
+      contractHash: proposalContractHash(proposal.contract),
+      createdAt: proposal.createdAt,
+      expiresAt: proposal.expiresAt,
+      state,
+      updatedAt: proposal.createdAt,
+    };
+    const legacyPath = autopilotProposalTicketPath(stateDir);
+    await fs.writeFile(legacyPath, `${JSON.stringify(legacy, null, 2)}\n`);
+    const before = await fs.readFile(legacyPath);
+    const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+    const saved = await store.create(replacementTicket());
+    assert.equal(saved.schemaVersion, 2);
+    assert.deepEqual(await fs.readFile(legacyPath), before);
+    await fs.rm(stateDir, { recursive: true, force: false });
+  }
+});
+
+test('V2 ticket creation exposes no final directory after staged write failure', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-atomic-'));
+  const store = await createAutopilotProposalTicketStore({
+    stateDir,
+    now: () => new Date('2026-08-10T01:00:00.000Z'),
+    onCreatePhase: async ({ phase }) => {
+      if (phase === 'ticket-written') throw new Error('injected_ticket_write_failure');
+    },
+  });
+  await assert.rejects(() => store.create(ticket()), /injected_ticket_write_failure/u);
+  await assert.rejects(() => fs.access(autopilotProposalTicketDir(proposal.proposalId, stateDir)), /ENOENT/u);
+  assert.deepEqual(await store.listUnresolved(), []);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
+test('V2 ticket creation hides staged state until atomic directory rename', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-rename-'));
+  const store = await createAutopilotProposalTicketStore({
+    stateDir,
+    now: () => new Date('2026-08-10T01:00:00.000Z'),
+    onCreatePhase: async ({ phase, finalDir }) => {
+      if (phase === 'before-rename') {
+        await assert.rejects(() => fs.access(finalDir), /ENOENT/u);
+        throw new Error('injected_rename_failure');
+      }
+    },
+  });
+  await assert.rejects(() => store.create(ticket()), /injected_rename_failure/u);
+  assert.deepEqual(await store.listUnresolved(), []);
   await fs.rm(stateDir, { recursive: true, force: false });
 });
 

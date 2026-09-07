@@ -2,7 +2,11 @@
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
-import { autopilotProposalViewModel, deriveAutopilotProposalAuthority } from './autopilot-proposal-view.mjs';
+import {
+  autopilotProposalViewModel,
+  deriveAutopilotProposalAuthority,
+  isAutopilotProposalRequestDisabled,
+} from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
 import {
   callControlCenterApi,
@@ -193,9 +197,12 @@ function renderAutopilotState() {
   status.textContent = label;
   status.className = `autopilotStatus ${className}`.trim();
   hint.textContent = detail;
-  const durableExecutionActive = lastState.autopilotStatus?.status === 'running'
-    || ['approved', 'launch-prepared', 'launch-started', 'running', 'reviewing', 'fixing', 'delivery'].includes(lastState.autopilotWatchStatus?.proposal?.state);
-  button.disabled = autopilotRequestInFlight || !state.ready || !!lastState.autopilotProposalTicketError || proposalView.disableRequest || durableExecutionActive;
+  button.disabled = isAutopilotProposalRequestDisabled({
+    proposalView,
+    runtimeReady: state.ready,
+    requestInFlight: autopilotRequestInFlight,
+    ticketError: lastState.autopilotProposalTicketError,
+  });
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
   const approval = el('autopilotApproval');
   const approvalCommand = el('autopilotApprovalCommand');

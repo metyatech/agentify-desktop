@@ -33,6 +33,10 @@ export function deriveAutopilotProposalAuthority({ proposalTicket = null, watchS
   return null;
 }
 
+export function isAutopilotProposalRequestDisabled({ proposalView = null, runtimeReady = false, requestInFlight = false, ticketError = null } = {}) {
+  return requestInFlight || !runtimeReady || !!ticketError || !!proposalView?.disableRequest;
+}
+
 export function autopilotProposalViewModel({ proposal = null, proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
   if (!proposal && proposalTicket && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
     proposal = {

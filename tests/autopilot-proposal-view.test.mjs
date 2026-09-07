@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { autopilotProposalViewModel, deriveAutopilotProposalAuthority } from '../ui/autopilot-proposal-view.mjs';
+import {
+  autopilotProposalViewModel,
+  deriveAutopilotProposalAuthority,
+  isAutopilotProposalRequestDisabled,
+} from '../ui/autopilot-proposal-view.mjs';
 
 const proposal = { proposalId: '123e4567-e89b-42d3-a456-426614174000', taskId: 'task-1', approvalCode: '4216E4AE' };
 const watch = (state, overrides = {}) => ({ status: 'healthy', stale: false, ageMs: 1000, lastError: null, proposal: { ...proposal, state }, ...overrides });
@@ -132,4 +136,33 @@ test('renderer authority derives only unresolved V2 tickets and active durable e
     proposalTicket: null,
     taskStatus: { taskId: 'task-1', status: 'running' },
   }), { proposalId: null, taskId: 'task-1', approvalCode: null });
+});
+
+test('button authority ignores stale watcher state and disables only for current authority or runtime safety', () => {
+  const staleView = autopilotProposalViewModel({
+    proposal: null,
+    watchStatus: watch('running', { stale: true }),
+    taskStatus: { taskId: 'task-1', status: 'completed' },
+  });
+  assert.equal(staleView.key, 'ready');
+  assert.equal(isAutopilotProposalRequestDisabled({ proposalView: staleView, runtimeReady: true }), false);
+
+  const activeWatchView = autopilotProposalViewModel({
+    proposal: deriveAutopilotProposalAuthority({ watchStatus: watch('running') }),
+    watchStatus: watch('running'),
+  });
+  assert.equal(activeWatchView.key, 'running');
+  assert.equal(isAutopilotProposalRequestDisabled({ proposalView: activeWatchView, runtimeReady: true }), true);
+
+  const runningTaskView = autopilotProposalViewModel({
+    proposal: deriveAutopilotProposalAuthority({ taskStatus: { taskId: 'task-1', status: 'running' } }),
+    taskStatus: { taskId: 'task-1', status: 'running' },
+  });
+  assert.equal(isAutopilotProposalRequestDisabled({ proposalView: runningTaskView, runtimeReady: true }), true);
+
+  const pendingView = autopilotProposalViewModel({
+    proposalTicket: { schemaVersion: 2, state: 'pending', proposalId: 'p1', taskId: 'task-1', approvalCode: '4216E4AE' },
+  });
+  assert.equal(isAutopilotProposalRequestDisabled({ proposalView: pendingView, runtimeReady: true }), true);
+  assert.equal(isAutopilotProposalRequestDisabled({ proposalView: staleView, runtimeReady: true, ticketError: { code: 'CONFLICT' } }), true);
 });

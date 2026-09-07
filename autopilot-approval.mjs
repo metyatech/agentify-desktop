@@ -3,7 +3,7 @@ import { validateAutopilotProposalTicket } from './autopilot-proposal-ticket.mjs
 const MAX_TURNS = 200;
 const MAX_CHARS_PER_TURN = 200_000;
 const MAX_TOTAL_CHARS = 2_000_000;
-const IGNORED_TURN_SOURCES = new Set(['assistant', 'system', 'proposal-generation', 'autopilot']);
+const IGNORED_TURN_SOURCES = new Set(['assistant', 'system', 'proposal-generation', 'autopilot', 'agentify']);
 
 export const AUTOPILOT_APPROVAL_RESULTS = Object.freeze({
   PENDING: 'pending',

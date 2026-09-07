@@ -174,6 +174,54 @@ test('legacy pending and acknowledged tickets never block new V2 creation or cha
   }
 });
 
+test('V2 unresolved scans ignore malformed terminal and expired historical ticket files', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-isolation-'));
+  const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  await store.create(ticket());
+  const current = await store.get(proposal.proposalId);
+  await store.update({ proposalId: proposal.proposalId, state: 'acknowledged' });
+  await store.update({ proposalId: proposal.proposalId, state: 'consumed' });
+
+  const historicalId = '623e4567-e89b-42d3-a456-426614174000';
+  const historical = replacementTicket({ proposalId: historicalId, proposal: { ...replacementProposal, proposalId: historicalId } });
+  const historicalDir = autopilotProposalTicketDir(historicalId, stateDir);
+  await fs.mkdir(historicalDir, { recursive: true });
+  await fs.writeFile(autopilotProposalTicketJsonPath(historicalId, stateDir), '{broken\n');
+  await fs.writeFile(autopilotProposalTicketStatePath(historicalId, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: historicalId, state: 'consumed', updatedAt: historical.createdAt, expiresAt: historical.expiresAt })}\n`);
+
+  const expiredId = '723e4567-e89b-42d3-a456-426614174000';
+  const expired = replacementTicket({ proposalId: expiredId, proposal: { ...replacementProposal, proposalId: expiredId }, expiresAt: '2026-08-09T23:59:59.999Z' });
+  const expiredDir = autopilotProposalTicketDir(expiredId, stateDir);
+  await fs.mkdir(expiredDir, { recursive: true });
+  await fs.writeFile(autopilotProposalTicketJsonPath(expiredId, stateDir), '{broken\n');
+  await fs.writeFile(autopilotProposalTicketStatePath(expiredId, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: expiredId, state: 'pending', updatedAt: expired.createdAt, expiresAt: expired.expiresAt })}\n`);
+
+  await fs.writeFile(autopilotProposalTicketPath(stateDir), '{legacy broken\n');
+  const replacement = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  assert.deepEqual(await replacement.listUnresolved(), []);
+  assert.equal((await replacement.get(proposal.proposalId)).proposalId, current.proposalId);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
+test('active V2 ticket corruption fails closed without being masked by historical corruption', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-active-corrupt-'));
+  const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  await store.create(ticket());
+  await fs.writeFile(autopilotProposalTicketJsonPath(proposal.proposalId, stateDir), '{broken\n');
+  await assert.rejects(() => store.listUnresolved(), /JSON|Unexpected/u);
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
+test('explicit V2 get and update ignore malformed legacy ticket bytes', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-explicit-v2-'));
+  const store = await createAutopilotProposalTicketStore({ stateDir, now: () => new Date('2026-08-10T01:00:00.000Z') });
+  await store.create(ticket());
+  await fs.writeFile(autopilotProposalTicketPath(stateDir), '{legacy broken\n');
+  assert.equal((await store.get(proposal.proposalId)).proposalId, proposal.proposalId);
+  assert.equal((await store.update({ proposalId: proposal.proposalId, state: 'acknowledged' })).state, 'acknowledged');
+  await fs.rm(stateDir, { recursive: true, force: false });
+});
+
 test('V2 ticket creation exposes no final directory after staged write failure', async () => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-ticket-atomic-'));
   const store = await createAutopilotProposalTicketStore({

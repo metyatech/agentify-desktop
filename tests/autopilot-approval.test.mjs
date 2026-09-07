@@ -99,6 +99,11 @@ test('assistant and proposal-generation approval-like text is ignored', async ()
   assert.equal(result.result.status, 'pending');
 });
 
+test('agentify-sourced approval-like user turns are not approval authority', async () => {
+  const result = await resolve([anchor(), user('agentify-approval', '開始して AB12CD34', 'agentify')]);
+  assert.equal(result.result.status, 'pending');
+});
+
 test('malformed proposal marker noise is never parsed by approval resolution', async () => {
   const result = await resolve([anchor(), user('noise', 'AUTOPILOT_PROPOSAL_BEGIN_V1{not json}AUTOPILOT_PROPOSAL_END_V1'), user('approval', '開始して AB12CD34')]);
   assert.equal(result.result.status, 'approved');

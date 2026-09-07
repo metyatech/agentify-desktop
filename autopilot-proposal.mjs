@@ -10,9 +10,10 @@ const PROPOSAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // Keep this compact boundary versioned with ai-autopilot/src/proposal-generation.mjs.
 // The installed desktop cannot depend on the private controller repository, so
 // the fallback template is intentionally duplicated and covered by contract tests.
-export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v5';
+export const PROPOSAL_GENERATION_INSTRUCTION_VERSION = 'ai-autopilot-proposal-generation-v6';
 export const TASK_CONTRACT_SCHEMA_VERSION = 1;
 export const PROPOSAL_PROTOCOL_VERSION = 'AUTOPILOT_PROPOSAL_V1';
+export const DEFAULT_IMPLEMENTATION_TIMEOUT_MS = 1_200_000;
 
 const PROPOSAL_BEGIN = 'AUTOPILOT_PROPOSAL_BEGIN_V1';
 const PROPOSAL_END = 'AUTOPILOT_PROPOSAL_END_V1';
@@ -342,7 +343,7 @@ function validateContract(contract, metadata, { expectedTaskId = null, intentGua
   if (!isRecord(contract.agentify) || !hasExactKeys(contract.agentify, ['tabKey']) || contract.agentify.tabKey !== metadata.tabKey) {
     throw proposalValidationError('agentify_tab_key_invalid');
   }
-  if (!isRecord(contract.implementation) || !hasExactKeys(contract.implementation, ['prompt']) || !nonEmptyString(contract.implementation.prompt)) {
+  if (!isRecord(contract.implementation) || Object.keys(contract.implementation).some((key) => !['prompt', 'timeoutMs'].includes(key)) || !Object.hasOwn(contract.implementation, 'prompt') || !nonEmptyString(contract.implementation.prompt) || (Object.hasOwn(contract.implementation, 'timeoutMs') && !positiveInteger(contract.implementation.timeoutMs))) {
     throw proposalValidationError('implementation_schema_invalid');
   }
   if (!Array.isArray(contract.verification) || contract.verification.some((item) => (
@@ -512,7 +513,7 @@ export function buildProposalGenerationPrompt({ metadata, intentGuard = null, re
     'If a required user decision is missing or ambiguous, do not guess and do not emit either proposal marker. Ask one short natural-language question about that user decision. Do not ask for a repository when the request is clearly a host/local task.',
     'Verification is an execution plan, not a user-facing requirement. If concrete verification commands are explicitly present in user-authored conversation, respect them. If they are absent, choose guidance based on the task type; absence of a command is never, by itself, a reason to ask the user.',
     'For repository tasks, use known repository-specific commands. If the repository commands are unknown, a conservative check such as git diff --check is allowed when it is reasonable for the task. Do not claim that an unknown script exists or fabricate a command. For host/local tasks, do not insert Git verification. If no clear host verification command can be constructed, use verification: [] so Codex execution evidence and ChatGPT review judge the outcome. Do not ask the user for command names or arguments.',
-    'Use these system defaults when the conversation does not explicitly set execution tuning: review.maxRounds=10 and review.timeoutMs=300000. Verification may be an empty array for tasks whose result is reviewed through execution evidence. Never ask the user to choose execution tuning, command arguments, grep commands, or lint/test script names.',
+    `Use these system defaults when the conversation does not explicitly set execution tuning: implementation.timeoutMs=${DEFAULT_IMPLEMENTATION_TIMEOUT_MS}, review.maxRounds=10, and review.timeoutMs=300000. implementation.timeoutMs is the Codex worker execution timeout; review.timeoutMs is the ChatGPT reviewer timeout. These are system-owned technical details. Never ask the user to choose execution tuning, command arguments, grep commands, or lint/test script names. Verification may be an empty array for tasks whose result is reviewed through execution evidence.`,
     'A prior technical clarification such as a request for targeted test or contract-grep commands must be ignored as a compiler artifact on this and later proposal-generation turns; it is not a new user requirement.',
     '',
     `Protocol version: ${PROPOSAL_PROTOCOL_VERSION}`,
@@ -539,7 +540,7 @@ export function buildProposalGenerationPrompt({ metadata, intentGuard = null, re
     `- Before emitting a proposal, self-check: contract.id === "task-${metadata.proposalId}"; apply the compiler-derived intent guard exactly; do not infer adoption from contract prose.`,
     '- When existing/manual adoption is required, adoptExistingChanges:{paths:[...]} is mandatory and must contain only the exact repository-relative files stated by the user; paths use / and cannot be absolute, contain .., globs, duplicates, or be empty. Otherwise this field must be absent. Normal implementation tasks must omit adoptExistingChanges. Never put a local checkout path in the contract.',
     '- agentify.tabKey is required and must equal the envelope tabKey.',
-    '- implementation.prompt is required; implementation has no patch-attempt setting.',
+    `- implementation.prompt is required. New proposals must include implementation.timeoutMs as a positive integer; use the system default ${DEFAULT_IMPLEMENTATION_TIMEOUT_MS} unless the user explicitly supplied an execution timeout. Historical contracts may omit it and use the controller default. implementation.timeoutMs is independent from review.timeoutMs; implementation has no patch-attempt setting.`,
     '- verification is an array, possibly empty, of objects with verification[].name, verification[].command, verification[].args, and verification[].timeoutMs; args is an array of strings and timeoutMs is a positive integer.',
     '- review.maxRounds is an integer from 1 through 10 and review.timeoutMs is a positive integer.',
     '- delivery.push is required and boolean; it must be false when repository is null.',

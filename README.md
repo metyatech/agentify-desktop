@@ -276,9 +276,9 @@ The Control Center has one production-only action, `この内容を実行`, for 
 existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
 usable ChatGPT tab exists and that Agentify has no active or in-flight query.
 The action generates the version-1 proposal envelope locally, then sends the
-versioned `ai-autopilot-proposal-generation-v5` instruction through the existing
+versioned `ai-autopilot-proposal-generation-v6` instruction through the existing
 authenticated `POST /query` path. Agentify validates the response markers, JSON,
-metadata, and current v5 contract locally; malformed responses are discarded and
+metadata, and current v6 contract locally; malformed responses are discarded and
 retried up to three times with the same envelope metadata. After a valid response,
 Agentify first takes a bounded, proven tail snapshot of user-authored turns and
 derives an internal adoption guard before querying ChatGPT. Generated proposal
@@ -292,6 +292,10 @@ instruction asks ChatGPT to clarify only user decisions; verification commands,
 timeouts, review rounds, and other execution-plan details are owned by Autopilot
 and must not be requested from the user. New system-generated proposals receive
 the task id `task-<proposalId>`; legacy historical proposal ids remain readable.
+New proposals include `implementation.timeoutMs` with the system default `1200000`
+milliseconds for Codex execution. `review.timeoutMs` remains the ChatGPT reviewer
+timeout; the two budgets are independent. Historical contracts may omit
+`implementation.timeoutMs` and use the controller default.
 When user intent explicitly adopts already-existing manual changes with exact
 paths and explicit exclusions, `repository.adoptExistingChanges.paths` is
 required and contains only those paths; normal implementation tasks omit the

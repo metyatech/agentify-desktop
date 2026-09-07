@@ -71,8 +71,8 @@ const REDACTION_PATTERNS = [
 
 const REPOSITORY_PATH_PATTERN = /(?:^|[^A-Za-z0-9_])((?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+)(?![A-Za-z0-9_])/gu;
 const ADOPTION_INTENT_PATTERN = /already[- ]existing|existing manual|manual change|adopt(?:ed|ing)?|既に手動|手動変更|既存変更|正式反映|そのまま使用/iu;
-const EXCLUSION_PATTERN = /exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めず|除外|対象外|変更しない|触らない/iu;
-const EXPLICIT_SCOPE_PATTERN = /only|just|exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めず|除外|対象外|変更しない|触らない|だけ|のみ/iu;
+const EXCLUSION_PATTERN = /exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めません|含めず|除外|対象外|変更しない|変更しません|触らない|触りません/iu;
+const EXPLICIT_SCOPE_PATTERN = /only|just|exclude|excluded|do not include|don't include|leave .* unchanged|含めない|含めません|含めず|除外|対象外|変更しない|変更しません|触らない|触りません|だけ|のみ/iu;
 
 function isRecord(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -178,7 +178,35 @@ function repositoryRelativePathKey(value) {
   return value.normalize('NFC').toLowerCase();
 }
 
+function pathOnlyLineContext(text, start, end) {
+  const lineStart = text.lastIndexOf('\n', start - 1) + 1;
+  const lineEndIndex = text.indexOf('\n', end);
+  const lineEnd = lineEndIndex >= 0 ? lineEndIndex : text.length;
+  const line = text.slice(lineStart, lineEnd);
+  const relativeStart = start - lineStart;
+  const relativeEnd = end - lineStart;
+  const wrapperOnly = (value) => /^[\s`'"“”‘’«»()[\]{}*+\-]*$/u.test(value);
+  const before = line.slice(0, relativeStart);
+  const after = line.slice(relativeEnd);
+  const lineOccurrences = extractRepositoryPathOccurrences(line);
+  const path = text.slice(start, end);
+  if (lineOccurrences.length !== 1 || lineOccurrences[0].value !== path || !wrapperOnly(before) || !wrapperOnly(after)) return null;
+
+  const previousLineStart = lineStart > 0 ? text.lastIndexOf('\n', lineStart - 2) + 1 : 0;
+  const previousLine = lineStart > 0 ? text.slice(previousLineStart, lineStart - 1) : '';
+  const nextLine = lineEndIndex >= 0
+    ? text.slice(lineEndIndex + 1, text.indexOf('\n', lineEndIndex + 1) >= 0 ? text.indexOf('\n', lineEndIndex + 1) : text.length)
+    : '';
+  if (!previousLine.trim() || !nextLine.trim()) return null;
+  return `${previousLine}\n${line}\n${nextLine}`;
+}
+
 function pathClause(text, start, end) {
+  const path = text.slice(start, end);
+  if (isPotentialAmbiguousRepositoryPath(path)) {
+    const lineContext = pathOnlyLineContext(text, start, end);
+    if (lineContext !== null) return lineContext;
+  }
   const delimiters = ['\n', '。', '.', '!', '！', '?', '？', ',', '，', ';', '；', '、'];
   const startCandidates = delimiters.map((delimiter) => text.lastIndexOf(delimiter, start - 1));
   const endCandidates = delimiters

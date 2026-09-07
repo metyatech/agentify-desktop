@@ -188,6 +188,23 @@ test('system-generated task id is proposal-unique and wrong ids never create a t
 const ADOPTION_TARGET = 'Content/__ExternalActors__/Maps/L_RuntimeUnicodeTextSample/2/AS/5HXB2MIDVDRPKO4S6W2BDY.uasset';
 const ADOPTION_EXCLUDED = 'Config/DefaultEngine.ini';
 const ADOPTION_PROMPT = `すでに手動で行ってある変更を正式に反映したい。対象は ${ADOPTION_TARGET} に既に入っている手動変更だけ。${ADOPTION_EXCLUDED} は含めない。`;
+const RUNTIME_UNICODE_USER_TEXT = [
+  'RuntimeUnicodeTextSample で、すでに手動で行ってある価格 `1,234` と `Version 0.1.0` の表示削除を、新しいAutopilot taskとして正式に反映したい。',
+  '',
+  '今回の実行では、過去のAutopilot task、過去のcommit、過去のreview結果、retained worktreeを再利用しないでください。',
+  '特に過去の commit `1fba115fbef4afded631443610fe99788f95805b` は historical evidence であり、今回の実装・deliveryには使用しません。',
+  '',
+  '対象は',
+  ADOPTION_TARGET,
+  'に現在すでに入っている手動変更だけです。',
+  '',
+  `${ADOPTION_EXCLUDED} の既存変更は今回には含めません。`,
+  'RuntimeUnicodeTextPlugin の submodule pin やその他のファイルも変更しません。',
+  '',
+  '新しいtaskで、対象の既存変更をadoptし、意図した変更だけcommitして検証・reviewしてください。',
+  '',
+  'reviewがPASSした場合は、その新しいtaskで作成したPASS済みcommitを origin/master へpushしてdeliveryしてよいです。'
+].join('\n');
 
 test('user-authored intent guard derives exact adoption and exclusion paths from a proven snapshot', () => {
   const guard = deriveUserIntentGuard([
@@ -200,6 +217,50 @@ test('user-authored intent guard derives exact adoption and exclusion paths from
     requiredPaths: [ADOPTION_TARGET],
     excludedPaths: [ADOPTION_EXCLUDED]
   });
+});
+
+test('the RuntimeUnicodeTextSample user fixture derives the exact guard', () => {
+  const guard = deriveUserIntentGuard([{ role: 'user', text: RUNTIME_UNICODE_USER_TEXT }]);
+  assert.deepEqual(guard, {
+    adoptionRequired: true,
+    requiredPaths: [ADOPTION_TARGET],
+    excludedPaths: [ADOPTION_EXCLUDED],
+    ambiguous: false
+  });
+});
+
+test('polite Japanese exclusions are recognized without broad negative matching', () => {
+  const guard = deriveUserIntentGuard([{ role: 'user', text: [
+    `既存変更を正式反映したい。${ADOPTION_TARGET} だけ正式反映する。`,
+    `${ADOPTION_EXCLUDED} は今回には含めません。`,
+    'Config/Runtime.ini は変更しません。',
+    'Config/Editor.ini には触りません。'
+  ].join('\n') }]);
+  assert.deepEqual(guard.excludedPaths, [ADOPTION_EXCLUDED, 'Config/Runtime.ini', 'Config/Editor.ini']);
+  assert.equal(guard.requiredPaths[0], ADOPTION_TARGET);
+  assert.equal(guard.ambiguous, false);
+});
+
+test('path-only lines use only the adjacent bounded context and do not cross blanks', () => {
+  const pathOnly = deriveUserIntentGuard([{ role: 'user', text: [
+    '対象は',
+    ADOPTION_TARGET,
+    'に現在すでに入っている手動変更だけです。',
+    `${ADOPTION_EXCLUDED} の既存変更は今回には含めません。`
+  ].join('\n') }]);
+  assert.deepEqual(pathOnly.requiredPaths, [ADOPTION_TARGET]);
+  assert.deepEqual(pathOnly.excludedPaths, [ADOPTION_EXCLUDED]);
+  assert.equal(pathOnly.ambiguous, false);
+
+  const blankBoundary = deriveUserIntentGuard([{ role: 'user', text: [
+    '既存変更を正式反映したい。',
+    '',
+    ADOPTION_TARGET,
+    '',
+    '別の手動変更だけ正式反映する。'
+  ].join('\n') }]);
+  assert.equal(blankBoundary.requiredPaths.includes(ADOPTION_TARGET), false);
+  assert.equal(blankBoundary.ambiguous, true);
 });
 
 test('guard keeps repository slugs and branch-like tokens out of adoption paths', () => {
@@ -280,6 +341,15 @@ test('later assistant or proposal-generation user text cannot override the lates
   assert.equal(guard.adoptionRequired, true);
 });
 
+test('user approval text cannot change the immutable adoption guard', () => {
+  const before = deriveUserIntentGuard([{ role: 'user', text: RUNTIME_UNICODE_USER_TEXT }]);
+  const after = deriveUserIntentGuard([
+    { role: 'user', text: RUNTIME_UNICODE_USER_TEXT },
+    { role: 'user', text: '開始して 5146DB51' }
+  ]);
+  assert.deepEqual(after, before);
+});
+
 test('normal user intent produces no adoption guard and generated text cannot authorize adoption', () => {
   const guard = deriveUserIntentGuard([{ role: 'user', text: '通常の新規実装をお願いします。' }]);
   assert.deepEqual({ adoptionRequired: guard.adoptionRequired, requiredPaths: guard.requiredPaths, excludedPaths: guard.excludedPaths }, {
@@ -344,6 +414,60 @@ test('explicit existing-change intent requires the exact adoption path and exclu
   const result = await service.request();
   assert.deepEqual(result.proposal.contract.repository.adoptExistingChanges.paths, [ADOPTION_TARGET]);
   assert.deepEqual(saved[0].proposal.contract.repository.adoptExistingChanges.paths, [ADOPTION_TARGET]);
+});
+
+test('wrong generated adoption path is rejected before ticket creation', async () => {
+  const wrongTarget = ADOPTION_TARGET.replace('__ExternalActors__', 'ExternalActors');
+  const response = validProposalText(FIXED_METADATA, {
+    contract: {
+      repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [wrongTarget] } }
+    }
+  });
+  const saved = [];
+  let calls = 0;
+  const { service } = makeService({
+    requestQuery: async () => { calls += 1; return { result: { text: response } }; },
+    proposalIntentRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'user', text: RUNTIME_UNICODE_USER_TEXT }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:adoption_paths_mismatch/u);
+  assert.equal(calls, 3);
+  assert.equal(saved.length, 0);
+});
+
+test('wrong adoption path retries with the same metadata and immutable guard', async () => {
+  const wrongTarget = ADOPTION_TARGET.replace('__ExternalActors__', 'ExternalActors');
+  const wrongResponse = validProposalText(FIXED_METADATA, {
+    contract: {
+      repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [wrongTarget] } }
+    }
+  });
+  const correctResponse = validProposalText(FIXED_METADATA, {
+    contract: {
+      repository: { slug: 'metyatech/RuntimeUnicodeTextSample', targetBranch: 'master', adoptExistingChanges: { paths: [ADOPTION_TARGET] } }
+    }
+  });
+  const prompts = [];
+  const saved = [];
+  let calls = 0;
+  const { service } = makeService({
+    requestQuery: async (body) => {
+      prompts.push(body.prompt);
+      calls += 1;
+      return { result: { text: calls === 1 ? wrongResponse : correctResponse } };
+    },
+    proposalIntentRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'user', text: RUNTIME_UNICODE_USER_TEXT }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } }),
+    proposalAnchorRead: async () => ({ url: 'https://chatgpt.com/', turns: [{ role: 'assistant', messageId: 'provider-message-proposal', identityProvenance: 'provider-message-id', index: 0, text: correctResponse }], history: { mode: 'tail', scopeComplete: true, tailProven: true, scrollRestored: true } }),
+    proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
+  });
+  const result = await service.request();
+  assert.equal(calls, 2);
+  assert.equal(result.metadata.proposalId, FIXED_METADATA.proposalId);
+  assert.equal(result.proposal.contract.repository.adoptExistingChanges.paths[0], ADOPTION_TARGET);
+  assert.equal(saved[0].proposal.contract.repository.adoptExistingChanges.paths[0], ADOPTION_TARGET);
+  assert.match(prompts[0], /"adoptionRequired": true/u);
+  assert.match(prompts[0], new RegExp(ADOPTION_TARGET.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+  assert.equal(prompts[1].includes(JSON.stringify({ adoptionRequired: true, requiredPaths: [ADOPTION_TARGET], excludedPaths: [ADOPTION_EXCLUDED], ambiguous: false }, null, 2)), true);
 });
 
 test('explicit existing-change intent without adoption field is rejected before ticket creation', async () => {

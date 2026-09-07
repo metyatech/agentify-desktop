@@ -2,7 +2,7 @@
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
-import { autopilotProposalViewModel } from './autopilot-proposal-view.mjs';
+import { autopilotProposalViewModel, deriveAutopilotProposalAuthority } from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
 import {
   callControlCenterApi,
@@ -120,7 +120,8 @@ function defaultState() {
     autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false },
     autopilotStatus: null,
     autopilotWatchStatus: null,
-    autopilotProposalTicket: null
+    autopilotProposalTicket: null,
+    autopilotProposalTicketError: null
   };
 }
 
@@ -173,6 +174,10 @@ function renderAutopilotState() {
     label = '確認事項あり';
     className = 'isClarification';
     detail = autopilotClarificationMessage || 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
+  } else if (lastState.autopilotProposalTicketError) {
+    label = 'エラー停止';
+    className = 'isError';
+    detail = `${lastState.autopilotProposalTicketError.code}。現在のproposalを確定できないため、再承認・再送せず状態を確認してください。`;
   } else if (autopilotProposal) {
     label = proposalView.label;
     className = proposalView.key === 'error' ? 'isError' : proposalView.key === 'approval-waiting' ? 'isApprovalWaiting' : proposalView.key === 'stale' ? 'isStale' : proposalView.key === 'approved' || proposalView.key === 'launching' ? 'isWaiting' : proposalView.key === 'completed' ? 'isCompleted' : '';
@@ -188,7 +193,9 @@ function renderAutopilotState() {
   status.textContent = label;
   status.className = `autopilotStatus ${className}`.trim();
   hint.textContent = detail;
-  button.disabled = autopilotRequestInFlight || !state.ready || proposalView.disableRequest;
+  const durableExecutionActive = lastState.autopilotStatus?.status === 'running'
+    || ['approved', 'launch-prepared', 'launch-started', 'running', 'reviewing', 'fixing', 'delivery'].includes(lastState.autopilotWatchStatus?.proposal?.state);
+  button.disabled = autopilotRequestInFlight || !state.ready || !!lastState.autopilotProposalTicketError || proposalView.disableRequest || durableExecutionActive;
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
   const approval = el('autopilotApproval');
   const approvalCommand = el('autopilotApprovalCommand');
@@ -427,15 +434,17 @@ async function refresh({ initial = false } = {}) {
     const watchFoldersData =
       (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial, timeoutMs: startupTimeoutMs })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
-    const ticketProposal = lastState.autopilotProposalTicket?.proposal;
-    if (!autopilotProposal && ticketProposal && ['pending', 'acknowledged'].includes(lastState.autopilotProposalTicket?.state)) {
-      autopilotProposal = { proposalId: ticketProposal.proposalId, taskId: ticketProposal.contract?.id, approvalCode: ticketProposal.approvalCode };
+    const authoritativeProposal = deriveAutopilotProposalAuthority({
+      proposalTicket: lastState.autopilotProposalTicket,
+      watchStatus: lastState.autopilotWatchStatus,
+      taskStatus: lastState.autopilotStatus,
+    });
+    if (authoritativeProposal) {
+      autopilotProposal = authoritativeProposal;
       autopilotStatusKey = 'generated';
-    }
-    const watchedProposal = lastState.autopilotWatchStatus?.proposal;
-    if (!autopilotProposal && watchedProposal && ['observed', 'approved', 'launch-prepared', 'launch-started', 'running'].includes(watchedProposal.state)) {
-      autopilotProposal = { proposalId: watchedProposal.proposalId, taskId: watchedProposal.taskId, approvalCode: watchedProposal.approvalCode };
-      autopilotStatusKey = 'generated';
+    } else {
+      autopilotProposal = null;
+      if (autopilotStatusKey === 'generated') autopilotStatusKey = 'ready';
     }
     renderAutopilotState();
 

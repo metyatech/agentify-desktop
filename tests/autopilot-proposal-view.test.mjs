@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { autopilotProposalViewModel } from '../ui/autopilot-proposal-view.mjs';
+import { autopilotProposalViewModel, deriveAutopilotProposalAuthority } from '../ui/autopilot-proposal-view.mjs';
 
 const proposal = { proposalId: '123e4567-e89b-42d3-a456-426614174000', taskId: 'task-1', approvalCode: '4216E4AE' };
 const watch = (state, overrides = {}) => ({ status: 'healthy', stale: false, ageMs: 1000, lastError: null, proposal: { ...proposal, state }, ...overrides });
@@ -90,4 +90,46 @@ test('task view distinguishes review, fix, delivery, completion, and blocked sta
   assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'running', phase: 'delivery' }, watchStatus: watch('running') }).key, 'delivery');
   assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'completed' }, watchStatus: watch('completed') }).key, 'completed');
   assert.equal(autopilotProposalViewModel({ proposal, taskStatus: { taskId: 'task-1', status: 'blocked', errorCode: 'REVIEW_TIMEOUT' }, watchStatus: watch('blocked') }).errorCode, 'REVIEW_TIMEOUT');
+});
+
+test('renderer authority ignores historical proposal-looking state without current V2 or active execution', () => {
+  assert.deepEqual(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('completed'),
+    taskStatus: { taskId: 'task-1', status: 'completed' },
+  }), null);
+  assert.equal(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('blocked'),
+    taskStatus: { taskId: 'task-1', status: 'blocked' },
+  }), null);
+  assert.equal(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('observed'),
+    taskStatus: null,
+  }), null);
+  assert.equal(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('running', { stale: true }),
+    taskStatus: null,
+  }), null);
+  assert.deepEqual(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('running'),
+    taskStatus: { taskId: 'different-task', status: 'running' },
+  }), { proposalId: null, taskId: 'different-task', approvalCode: null });
+});
+
+test('renderer authority derives only unresolved V2 tickets and active durable execution', () => {
+  assert.deepEqual(deriveAutopilotProposalAuthority({
+    proposalTicket: { schemaVersion: 2, state: 'pending', proposalId: 'p1', taskId: 'task-1', approvalCode: '4216E4AE' },
+  }), { proposalId: 'p1', taskId: 'task-1', approvalCode: '4216E4AE' });
+  assert.deepEqual(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    watchStatus: watch('running'),
+  }), proposal);
+  assert.deepEqual(deriveAutopilotProposalAuthority({
+    proposalTicket: null,
+    taskStatus: { taskId: 'task-1', status: 'running' },
+  }), { proposalId: null, taskId: 'task-1', approvalCode: null });
 });

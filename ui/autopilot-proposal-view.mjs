@@ -1,5 +1,38 @@
 const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running', 'reviewing', 'fixing', 'delivery']);
 
+export function deriveAutopilotProposalAuthority({ proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
+  if (proposalTicket?.schemaVersion === 2 && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
+    return {
+      proposalId: proposalTicket.proposalId,
+      taskId: proposalTicket.taskId,
+      approvalCode: proposalTicket.approvalCode,
+    };
+  }
+  const watchedProposal = watchStatus?.proposal;
+  const activeWatch = watchedProposal
+    && ACTIVE_WATCH_STATES.has(watchedProposal.state)
+    && watchedProposal.state !== 'observed'
+    && watchStatus?.status === 'healthy'
+    && watchStatus?.stale !== true
+    && (!taskStatus || (taskStatus.status === 'running' && taskStatus.taskId === watchedProposal.taskId));
+  if (activeWatch) {
+    return {
+      proposalId: watchedProposal.proposalId,
+      taskId: watchedProposal.taskId,
+      approvalCode: watchedProposal.approvalCode,
+    };
+  }
+  if (taskStatus?.status === 'running' && taskStatus.taskId) {
+    const matchingWatchProposal = watchedProposal?.taskId === taskStatus.taskId ? watchedProposal : null;
+    return {
+      proposalId: matchingWatchProposal?.proposalId || null,
+      taskId: taskStatus.taskId,
+      approvalCode: matchingWatchProposal?.approvalCode || null,
+    };
+  }
+  return null;
+}
+
 export function autopilotProposalViewModel({ proposal = null, proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
   if (!proposal && proposalTicket && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
     proposal = {

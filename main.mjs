@@ -22,6 +22,7 @@ import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSetti
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
 import { createAutopilotProposalTicketStore } from './autopilot-proposal-ticket.mjs';
+import { selectCurrentAutopilotProposalTicket } from './autopilot-current-proposal.mjs';
 import { resolveAutopilotProposalApproval } from './autopilot-approval.mjs';
 import { createWatchFolderManager } from './watch-folder.mjs';
 import { getWorkspace, setWorkspace } from './orchestrator/storage.mjs';
@@ -398,6 +399,20 @@ async function main() {
   } catch {}
 
   ipcMain.handle('agentify:getState', async () => {
+    let currentProposalTicket = { ticket: null, error: null };
+    try {
+      currentProposalTicket = selectCurrentAutopilotProposalTicket(
+        await autopilotProposalTicket.listUnresolved(),
+      );
+    } catch (error) {
+      currentProposalTicket = {
+        ticket: null,
+        error: {
+          code: 'AUTOPILOT_PROPOSAL_TICKET_UNAVAILABLE',
+          message: String(error?.message || error),
+        },
+      };
+    }
     return {
       ok: true,
       vendors,
@@ -410,7 +425,8 @@ async function main() {
       autopilot: autopilotProposal.availability(),
       autopilotStatus: autopilotStatus.get(),
       autopilotWatchStatus: autopilotWatchStatus.get(),
-      autopilotProposalTicket: await autopilotProposalTicket.get()
+      autopilotProposalTicket: currentProposalTicket.ticket,
+      autopilotProposalTicketError: currentProposalTicket.error,
     };
   });
 

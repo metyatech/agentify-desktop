@@ -1,6 +1,9 @@
 const ACTIVE_WATCH_STATES = new Set(['observed', 'approved', 'launch-prepared', 'launch-started', 'running', 'reviewing', 'fixing', 'delivery']);
 
 export function deriveAutopilotProposalAuthority({ proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
+  if (proposalTicket?.schemaVersion === 3 && ['authorized', 'consumed'].includes(proposalTicket.state)) {
+    return { proposalId: proposalTicket.proposalId, taskId: proposalTicket.taskId, approvalCode: null, execution: proposalTicket.execution, authorizationId: proposalTicket.authorization?.authorizationId || null };
+  }
   if (proposalTicket?.schemaVersion === 2 && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
     return {
       proposalId: proposalTicket.proposalId,
@@ -38,14 +41,16 @@ export function isAutopilotProposalRequestDisabled({ proposalView = null, runtim
 }
 
 export function autopilotProposalViewModel({ proposal = null, proposalTicket = null, watchStatus = null, taskStatus = null } = {}) {
-  if (!proposal && proposalTicket && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
+  if (!proposal && proposalTicket?.schemaVersion === 3 && ['authorized', 'consumed'].includes(proposalTicket.state)) {
+    proposal = { proposalId: proposalTicket.proposalId, taskId: proposalTicket.taskId, approvalCode: null, execution: proposalTicket.execution || null };
+  } else if (!proposal && proposalTicket && ['pending', 'acknowledged'].includes(proposalTicket.state)) {
     proposal = {
       proposalId: proposalTicket.proposalId,
       taskId: proposalTicket.taskId || proposalTicket.proposal?.contract?.id || null,
       approvalCode: proposalTicket.approvalCode || proposalTicket.proposal?.approvalCode || null,
     };
   }
-  if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリックするとChatGPTへproposal生成を依頼します。生成後は承認コードで開始できます。', disableRequest: false, command: null };
+  if (!proposal) return { key: 'ready', label: '準備可能', detail: 'クリック時点の内容と実行設定を固定して検証します。', disableRequest: false, command: null };
   const observed = watchStatus?.proposal?.proposalId === proposal.proposalId;
   const runningTask = taskStatus?.status === 'running' && taskStatus?.taskId === proposal.taskId;
   const matchingTask = taskStatus?.taskId === proposal.taskId;
@@ -61,6 +66,7 @@ export function autopilotProposalViewModel({ proposal = null, proposalTicket = n
     return { key: 'delivery', label: 'Delivery中', detail: 'PASS済み結果をdeliveryしています。', disableRequest: true, command: null };
   }
   if (runningTask) return { key: 'running', label: 'Codex実行中', detail: 'Codexの実行状態を表示しています。', disableRequest: true, command: null };
+  if (proposal.execution && ['authorized', 'consumed'].includes(proposalTicket?.state)) return { key: 'authorized', label: '承認済み — 実行待ち', detail: `Model: ${proposal.execution.model} / Reasoning: ${proposal.execution.reasoningEffort}`, disableRequest: true, command: null };
   if (watchStatus?.status === 'error') {
     const code = watchStatus.lastError?.code || 'WATCH_ERROR';
     return { key: 'error', label: 'エラー停止', detail: `${code}。再承認・再送せず、エラーを確認してください。`, disableRequest: true, command: null, errorCode: code };

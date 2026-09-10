@@ -21,6 +21,13 @@ export async function resolveAutopilotProposalApproval({
   if (!ticket || ticket.proposalId !== proposalId) throw approvalError('ticket_invalid');
   const validated = validateAutopilotProposalTicket(ticket, { now, allowExpired: true });
   if (validated.schemaVersion === 1) return resolveLegacyTicket({ ticket: validated, tabs, now });
+  if (validated.schemaVersion === 3) {
+    return {
+      status: validated.state === 'authorized' || validated.state === 'consumed' ? AUTOPILOT_APPROVAL_RESULTS.APPROVED : AUTOPILOT_APPROVAL_RESULTS.PENDING,
+      ticket: validated,
+      approvalTurnId: null,
+    };
+  }
   if (validated.state !== 'pending') return { status: validated.state === 'acknowledged' || validated.state === 'consumed' ? AUTOPILOT_APPROVAL_RESULTS.APPROVED : AUTOPILOT_APPROVAL_RESULTS.PENDING, ticket: validated, approvalTurnId: null };
   if (Date.parse(validated.expiresAt) <= now.getTime()) return { status: AUTOPILOT_APPROVAL_RESULTS.PENDING, reason: 'ticket_expired', ticket: validated, approvalTurnId: null };
 

@@ -24,11 +24,13 @@ function closeServerOnce(closeServer) {
 export async function cleanupRuntimeResources({
   closeServer,
   stopWatchFolders,
+  stopAutopilotWatcher,
   disposeBrowserBackend
 } = {}) {
   await Promise.allSettled([
     closeServerOnce(closeServer),
     Promise.resolve().then(() => stopWatchFolders?.()),
+    Promise.resolve().then(() => stopAutopilotWatcher?.()),
     Promise.resolve().then(() => disposeBrowserBackend?.())
   ]);
 }
@@ -36,6 +38,7 @@ export async function cleanupRuntimeResources({
 export function createGracefulShutdown({
   closeServer,
   stopWatchFolders,
+  stopAutopilotWatcher,
   disposeBrowserBackend,
   stopOrchestrators,
   prepareTabsForShutdown,
@@ -59,7 +62,7 @@ export function createGracefulShutdown({
       try {
         setTabsQuitting?.();
       } catch {}
-      await cleanupRuntimeResources({ closeServer, stopWatchFolders, disposeBrowserBackend });
+      await cleanupRuntimeResources({ closeServer, stopWatchFolders, stopAutopilotWatcher, disposeBrowserBackend });
     })();
     return cleanupPromise;
   }

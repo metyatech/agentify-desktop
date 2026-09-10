@@ -115,7 +115,7 @@
 
         <section class="card autopilotCard" aria-labelledby="autopilotTitle">
           <div id="autopilotTitle" class="cardTitle">Autopilot Production</div>
-          <div class="hint">現在のChatGPTで相談した内容から、実行内容を準備します。まだ変更は開始しません。</div>
+          <div class="hint">現在のChatGPTで相談した内容を検証し、このボタンのクリックを実行承認として開始します。</div>
           <div class="autopilotTarget">
             <span class="autopilotTargetLabel">対象</span>
             <span class="mono">autopilot-production</span>
@@ -124,12 +124,8 @@
             <button id="btnAutopilotProposal" class="btn primary autopilotAction" type="button">この内容を実行</button>
             <div id="autopilotProposalStatus" class="autopilotStatus" role="status" aria-live="polite">準備可能</div>
           </div>
-          <div id="autopilotProposalHint" class="hint autopilotHint">クリックするとChatGPTへproposal生成を依頼します。生成後は承認コードで開始できます。</div>
-          <div id="autopilotApproval" class="autopilotApproval isHidden" aria-live="polite">
-            <span class="autopilotApprovalLabel">承認文</span>
-            <code id="autopilotApprovalCommand" class="autopilotApprovalCommand"></code>
-            <button id="btnCopyAutopilotApproval" class="btn" type="button">コピー</button>
-          </div>
+          <div id="autopilotProposalHint" class="hint autopilotHint">クリック時点の対象・会話・実行設定を固定し、検証に成功したticketだけを実行します。</div>
+          <div class="autopilotWatcherRow"><span>Watcher:</span> <strong id="autopilotWatcherStatus">Offline</strong> <button id="btnRestartAutopilotWatcher" class="btn secondary isHidden" type="button">Watcherを再起動</button></div>
           <div id="autopilotTaskProgress" class="autopilotTaskProgress" aria-live="polite" aria-label="Autopilot task progress"></div>
         </section>
 
@@ -161,11 +157,21 @@
         </section>
 
         <section class="card">
-          <div class="cardTitle">Settings (governor)</div>
+          <div class="cardTitle">Settings (Codex & governor)</div>
           <div class="hint governorIntro">
             These defaults exist to reduce accidental high-rate automation. Automating web UIs may violate website terms; use responsibly.
           </div>
           <div class="grid governorGrid">
+            <label class="field">
+              <div class="label">Codex Model</div>
+              <select id="setCodexModel" aria-describedby="codexModelHelp"></select>
+              <div id="codexModelHelp" class="fieldHelp">取得したCodex model/listの順序で表示します。</div>
+            </label>
+            <label class="field">
+              <div class="label">Reasoning Effort</div>
+              <select id="setCodexReasoningEffort"></select>
+              <div class="fieldHelp">選択モデルが対応する値だけを表示します。</div>
+            </label>
             <label class="field">
               <div class="label">Max in-flight queries</div>
               <input id="setMaxInflight" class="governorInput" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-min="1" data-max="12" value="2" />

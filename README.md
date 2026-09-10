@@ -276,9 +276,9 @@ The Control Center has one production-only action, `この内容を実行`, for 
 existing keyed ChatGPT tab `autopilot-production`. It checks that exactly one
 usable ChatGPT tab exists and that Agentify has no active or in-flight query.
 The action generates the version-1 proposal envelope locally, then sends the
-versioned `ai-autopilot-proposal-generation-v6` instruction through the existing
+versioned `ai-autopilot-proposal-generation-v7` instruction through the existing
 authenticated `POST /query` path. Agentify validates the response markers, JSON,
-metadata, and current v6 contract locally; malformed responses are discarded and
+metadata, and current v7 contract locally; malformed responses are discarded and
 retried up to three times with the same envelope metadata. After a valid response,
 Agentify first takes a bounded, proven tail snapshot of user-authored turns and
 derives an internal adoption guard before querying ChatGPT. Generated proposal
@@ -292,10 +292,10 @@ instruction asks ChatGPT to clarify only user decisions; verification commands,
 timeouts, review rounds, and other execution-plan details are owned by Autopilot
 and must not be requested from the user. New system-generated proposals receive
 the task id `task-<proposalId>`; legacy historical proposal ids remain readable.
-New proposals include `implementation.timeoutMs` with the system default `1200000`
-milliseconds for Codex execution. `review.timeoutMs` remains the ChatGPT reviewer
-timeout; the two budgets are independent. Historical contracts may omit
-`implementation.timeoutMs` and use the controller default.
+New proposals use the Agentify execute click as authorization and do not apply a
+wall-clock timeout to the Codex implementation worker. An explicit historical
+`implementation.timeoutMs` remains compatible; `review.timeoutMs` remains the
+independent ChatGPT reviewer timeout.
 When user intent explicitly adopts already-existing manual changes with exact
 paths and explicit exclusions, `repository.adoptExistingChanges.paths` is
 required and contains only those paths; normal implementation tasks omit the
@@ -306,11 +306,14 @@ The validated ticket is the execution authority. New tickets are stored under
 `%USERPROFILE%\\.agentify-desktop\\autopilot-tickets\\<proposalId>\\` as an
 immutable `ticket.json` plus lifecycle-only `state.json`; the old single-ticket
 file remains read-only historical compatibility and never blocks a V2 ticket.
-The watcher-facing endpoint returns only server-filtered pending or acknowledged
-V2 tickets for the requested tab; consumed and abandoned history is not returned.
-An unresolved V2 ticket prevents another proposal from being stacked. The watcher never reconstructs a proposal
-from conversation history: it asks the authenticated Agentify approval resolver
-to verify only the stored assistant anchor and exact user approval command. A
+The watcher-facing endpoint returns server-filtered authorized V3 tickets for the
+requested tab. V1/V2 approval records remain readable historical compatibility;
+their approval text cannot authorize a new task.
+An unresolved ticket prevents another proposal from being stacked. For new V3
+tickets, the watcher consumes the already-authorized ticket directly and never
+scans conversation approval text. V1/V2 tickets remain read-only compatibility;
+their resolver verifies only the stored assistant anchor and exact historical
+approval command. A
 pending ticket with no durable execution evidence may be safely abandoned by
 the controller operator; abandoned tickets are replaceable and are never polled
 for conversation or execution work. Proposal
@@ -325,7 +328,7 @@ the explicit instruction and protocol versions. The installed desktop cannot
 depend on the private controller repository, so this small versioned template
 is intentionally duplicated rather than introducing a daemon or API redesign.
 
-After approval, the Autopilot Production card also shows the latest
+During execution, the Autopilot Production card also shows the latest
 ai-autopilot task progress snapshot: task id, phase, round, repository target,
 latest review verdict, verification counts, and blocked/completed details. The
 snapshot is a small versioned observation contract received through the
@@ -336,12 +339,11 @@ and a stale marker for old running snapshots.
 
 The card also receives the watcher's separate bounded heartbeat mirror through
 authenticated `POST /autopilot/watch-status` and reads it with `GET`. It shows
-watcher confirmation, the matching exact approval command, approval detection,
-launch preparation, controller start, and watcher errors. The mirror contains
-only tab/proposal identifiers, approval code, lifecycle state, timestamps, and a
-bounded error code/message; it never contains conversation text, contracts,
-tokens, URLs, paths, or Codex output. The approval command is copyable but is
-never sent by Agentify. Completed or blocked task snapshots are labeled as the
+watcher confirmation, authorization, launch preparation, controller start, and
+watcher errors. The mirror contains only tab/proposal/authorization identifiers,
+lifecycle state, timestamps, and a bounded error code/message; it never contains
+conversation text, contracts, tokens, URLs, paths, or Codex output. Completed or
+blocked task snapshots are labeled as the
 previous Autopilot execution and can be hidden with `表示を消す`; this removes
 only the Agentify display snapshot and never deletes task state, worktrees,
 branches, evidence, or the watcher ledger. The API rejects clearing a running

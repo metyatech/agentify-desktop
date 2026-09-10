@@ -126,6 +126,7 @@ function defaultState() {
     autopilotWatchStatus: null,
     autopilotProposalTicket: null,
     autopilotProposalTicketError: null
+    ,codexModels: [], codexModelError: null, codexDeepLinkAvailable: false
   };
 }
 
@@ -136,6 +137,8 @@ function defaultSettings() {
     chromeExecutablePath: null,
     chromeProfileMode: 'isolated',
     chromeProfileName: 'Default',
+    codexModel: null,
+    codexReasoningEffort: null,
     maxInflightQueries: 2,
     maxQueriesPerMinute: 12,
     minTabGapMs: 1200,
@@ -169,7 +172,7 @@ function renderAutopilotState() {
   const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, proposalTicket: lastState.autopilotProposalTicket, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
   let label = '準備可能';
   let className = '';
-  let detail = 'クリックするとChatGPTへproposal生成を依頼します。生成後は承認コードで開始できます。';
+  let detail = 'クリック時点の会話と実行設定を固定し、検証に成功したticketを開始します。';
   if (autopilotRequestInFlight) {
     label = 'ChatGPTへ依頼中';
     className = 'isWaiting';
@@ -197,6 +200,11 @@ function renderAutopilotState() {
   status.textContent = label;
   status.className = `autopilotStatus ${className}`.trim();
   hint.textContent = detail;
+  const watcher = lastState.autopilotWatcher || { status: 'offline' };
+  const watcherLabel = { running: 'Running', starting: 'Starting', offline: 'Offline', error: 'Error' }[watcher.status] || 'Error';
+  el('autopilotWatcherStatus').textContent = watcherLabel;
+  const restartWatcher = el('btnRestartAutopilotWatcher');
+  restartWatcher.classList.toggle('isHidden', !['offline', 'error'].includes(watcher.status));
   button.disabled = isAutopilotProposalRequestDisabled({
     proposalView,
     runtimeReady: state.ready,
@@ -204,10 +212,6 @@ function renderAutopilotState() {
     ticketError: lastState.autopilotProposalTicketError,
   });
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
-  const approval = el('autopilotApproval');
-  const approvalCommand = el('autopilotApprovalCommand');
-  approval.classList.toggle('isHidden', !proposalView.command);
-  approvalCommand.textContent = proposalView.command || '';
   renderAutopilotTaskProgress(lastState.autopilotStatus);
   autopilotStatusScheduler.schedule(lastState.autopilotStatus);
   autopilotWatchStatusScheduler.schedule(lastState.autopilotWatchStatus);
@@ -225,6 +229,17 @@ function renderAutopilotTaskProgress(snapshot) {
   headline.className = `autopilotProgressHeadline status-${view.kind}`;
   headline.textContent = view.statusLabel || view.label;
   root.appendChild(headline);
+  if (view.executionLabel) {
+    const execution = document.createElement('div'); execution.className = 'autopilotProgressMeta'; execution.textContent = view.executionLabel; root.appendChild(execution);
+  }
+  if (view.codexThreadId) {
+    const row = document.createElement('div'); row.className = 'autopilotProgressMeta'; row.textContent = `Thread: ${view.codexThreadId}`; root.appendChild(row);
+    if (lastState.codexDeepLinkAvailable) {
+      const open = document.createElement('button'); open.type = 'button'; open.className = 'btn secondary'; open.textContent = 'Codexで開く'; open.onclick = () => callApi('openCodexThread', { threadId: view.codexThreadId }, { required: true }).catch((error) => statusText(`Codexを開けませんでした: ${error.message}`, 'error')); root.appendChild(open);
+    } else {
+      const unavailable = document.createElement('span'); unavailable.className = 'hint'; unavailable.textContent = 'Codex deep linkは利用できません'; root.appendChild(unavailable);
+    }
+  }
   if (view.kind === 'empty') {
     const empty = document.createElement('div');
     empty.className = 'hint';
@@ -356,6 +371,7 @@ function applySettings(settings) {
   setValue('setBrowserBackend', s.browserBackend || defaultSettings().browserBackend);
   setValue('setChromeProfileMode', s.chromeProfileMode || defaultSettings().chromeProfileMode);
   setValue('setChromeProfileName', s.chromeProfileName || defaultSettings().chromeProfileName);
+  populateCodexModels(s.codexModel, s.codexReasoningEffort);
   setNum('setMaxInflight', s.maxInflightQueries, defaultSettings().maxInflightQueries);
   setNum('setQpm', s.maxQueriesPerMinute, defaultSettings().maxQueriesPerMinute);
   setNum('setTabGap', s.minTabGapMs, defaultSettings().minTabGapMs);
@@ -367,6 +383,31 @@ function applySettings(settings) {
   updateSaveEnabled();
   el('settingsHint').textContent = s.acknowledgedAt ? `Last acknowledged: ${s.acknowledgedAt}` : 'Using safe defaults until you acknowledge changes.';
   syncChromeProfileFields();
+}
+
+function populateCodexModels(selectedModel = null, selectedEffort = null) {
+  const modelSelect = el('setCodexModel');
+  const effortSelect = el('setCodexReasoningEffort');
+  if (!modelSelect || !effortSelect) return;
+  const models = (lastState.codexModels || []).filter((model) => model.available !== false && !model.hidden);
+  modelSelect.replaceChildren();
+  for (const model of models) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    option.textContent = model.displayName || model.id;
+    modelSelect.appendChild(option);
+  }
+  if (selectedModel && models.some((model) => model.id === selectedModel)) modelSelect.value = selectedModel;
+  const model = models.find((item) => item.id === modelSelect.value) || models[0];
+  effortSelect.replaceChildren();
+  for (const effort of model?.supportedReasoningEfforts || []) {
+    const option = document.createElement('option'); option.value = effort; option.textContent = effort; effortSelect.appendChild(option);
+  }
+  if (selectedEffort && model?.supportedReasoningEfforts?.includes(selectedEffort)) effortSelect.value = selectedEffort;
+  if (!effortSelect.value && model?.defaultReasoningEffort) effortSelect.value = model.defaultReasoningEffort;
+  if (!effortSelect.value && effortSelect.options.length) effortSelect.selectedIndex = 0;
+  modelSelect.disabled = models.length === 0;
+  effortSelect.disabled = !model;
 }
 
 function closeDialog(dialog) {
@@ -828,7 +869,9 @@ async function main() {
         autopilotProposal = result?.proposal ? {
           proposalId: result.proposal.proposalId,
           taskId: result.proposal.contract?.id || '',
-          approvalCode: result.proposal.approvalCode
+          approvalCode: result.proposal.approvalCode || null,
+          execution: result.ticket?.execution || null,
+          authorizationId: result.ticket?.authorization?.authorizationId || null
         } : null;
         autopilotStatusKey = autopilotProposal ? 'generated' : 'received';
       }
@@ -845,20 +888,23 @@ async function main() {
     }
   };
 
-  el('btnCopyAutopilotApproval').onclick = async () => {
-    const command = el('autopilotApprovalCommand').textContent;
-    if (!command) return;
-    try {
-      await navigator.clipboard.writeText(command);
-      statusText('承認文をクリップボードへコピーしました。ChatGPTへは送信していません。', 'muted');
-    } catch (e) {
-      statusText(`承認文をコピーできませんでした: ${e?.message || String(e)}`, 'error');
-    }
+  el('btnRestartAutopilotWatcher').onclick = async () => {
+    const button = el('btnRestartAutopilotWatcher'); button.disabled = true;
+    try { await callApi('restartAutopilotWatcher', undefined, { required: true }); statusText('Watcherを再起動しました。', 'muted'); await refresh(); }
+    catch (error) { statusText(`Watcherを再起動できませんでした: ${error?.message || error}`, 'error'); }
+    finally { button.disabled = false; }
   };
 
   el('setBrowserBackend').onchange = () => {
     syncChromeProfileFields();
   };
+
+  el('setCodexModel').onchange = () => {
+    const model = (lastState.codexModels || []).find((item) => item.id === el('setCodexModel').value);
+    populateCodexModels(model?.id || null, model?.defaultReasoningEffort || model?.supportedReasoningEfforts?.[0] || null);
+    markSettingsDirty();
+  };
+  el('setCodexReasoningEffort').onchange = markSettingsDirty;
 
   el('setAcknowledge').onchange = updateSaveEnabled;
   for (const id of ['setMaxInflight', 'setQpm', 'setTabGap', 'setGlobalGap']) {
@@ -911,6 +957,8 @@ async function main() {
           browserBackend: String(el('setBrowserBackend').value || 'electron').trim() || 'electron',
           chromeProfileMode: String(el('setChromeProfileMode').value || 'isolated').trim() || 'isolated',
           chromeProfileName: String(el('setChromeProfileName').value || 'Default').trim() || 'Default',
+          codexModel: String(el('setCodexModel').value || '').trim() || null,
+          codexReasoningEffort: String(el('setCodexReasoningEffort').value || '').trim() || null,
           maxInflightQueries: num('setMaxInflight', 2),
           maxQueriesPerMinute: num('setQpm', 12),
           minTabGapMs: num('setTabGap', 0),

@@ -5,11 +5,13 @@ import path from 'node:path';
 import { atomicWriteFile, defaultStateDir, ensureStateDir } from './state.mjs';
 
 export const AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION = 2;
+export const AUTOPILOT_PROPOSAL_TICKET_V2_SCHEMA_VERSION = 2;
+export const AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION = 3;
 export const AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION = 1;
 export const AUTOPILOT_PROPOSAL_TICKET_FILE = 'autopilot-proposal-ticket.json';
 export const AUTOPILOT_PROPOSAL_TICKETS_DIR = 'autopilot-tickets';
 export const AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES = 512 * 1024;
-export const AUTOPILOT_PROPOSAL_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'consumed', 'abandoned']);
+export const AUTOPILOT_PROPOSAL_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'authorized', 'consumed', 'abandoned']);
 export const AUTOPILOT_PROPOSAL_TICKET_IDENTITY_PROVENANCES = Object.freeze([
   'provider-message-id',
   'provider-turn-id',
@@ -22,6 +24,10 @@ const LEGACY_KEYS = Object.freeze([
 const V2_KEYS = Object.freeze([
   'schemaVersion', 'proposalId', 'taskId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
   'assistantTurnId', 'assistantTurnIdentityProvenance', 'approvalCode', 'contract', 'contractHash', 'createdAt', 'expiresAt', 'proposal'
+]);
+const V3_KEYS = Object.freeze([
+  'schemaVersion', 'proposalId', 'taskId', 'tabKey', 'tabId', 'vendorId', 'conversationUrl',
+  'assistantTurnId', 'assistantTurnIdentityProvenance', 'contract', 'contractHash', 'createdAt', 'expiresAt', 'authorization', 'execution'
 ]);
 
 function isRecord(value) {
@@ -77,10 +83,11 @@ function validateConversationIdentity(value) {
 export function validateAutopilotProposalTicket(value, { now = null, allowExpired = true, state = undefined } = {}) {
   if (!isRecord(value)) throw new Error('autopilot_proposal_ticket_schema_invalid');
   if (value.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) return validateLegacyTicket(value, { now, allowExpired });
+  if (value.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION) return validateAuthorizedTicket(value, { now, allowExpired, state });
   const requiredV2Keys = new Set(V2_KEYS);
   requiredV2Keys.delete('proposal');
   const v2WithLifecycleKeys = new Set([...V2_KEYS, 'state', 'updatedAt']);
-  if (value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION || Object.keys(value).some((key) => !v2WithLifecycleKeys.has(key)) || Object.keys(value).some((key) => requiredV2Keys.has(key) === false && !['state', 'updatedAt', 'proposal'].includes(key))) throw new Error('autopilot_proposal_ticket_schema_invalid');
+  if (value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_V2_SCHEMA_VERSION || Object.keys(value).some((key) => !v2WithLifecycleKeys.has(key)) || Object.keys(value).some((key) => requiredV2Keys.has(key) === false && !['state', 'updatedAt', 'proposal'].includes(key))) throw new Error('autopilot_proposal_ticket_schema_invalid');
   const id = proposalId(value.proposalId);
   const taskId = safeText(value.taskId, 'taskId', 128);
   const tabKey = safeText(value.tabKey, 'tabKey', 128);
@@ -120,6 +127,36 @@ export function validateAutopilotProposalTicket(value, { now = null, allowExpire
     ...(lifecycleState === undefined ? {} : { state: lifecycleState }),
     ...(updatedAt === undefined ? {} : { updatedAt }),
   };
+}
+
+function validateAuthorizedTicket(value, { now, allowExpired, state }) {
+  const lifecycleKeys = new Set([...V3_KEYS, 'state', 'updatedAt']);
+  if (Object.keys(value).some((key) => !lifecycleKeys.has(key))) throw new Error('autopilot_proposal_ticket_schema_invalid');
+  const id = proposalId(value.proposalId);
+  const taskId = safeText(value.taskId, 'taskId', 128);
+  const tabKey = safeText(value.tabKey, 'tabKey', 128);
+  const tabId = safeText(value.tabId, 'tabId', 256);
+  if (value.vendorId !== 'chatgpt') throw new Error('autopilot_proposal_ticket_vendor_invalid');
+  const identity = validateConversationIdentity(value);
+  const assistantTurnId = safeText(value.assistantTurnId, 'assistantTurnId', 512);
+  const contract = validateContract(value.contract);
+  if (contract.id !== taskId || contract.agentify?.tabKey !== tabKey) throw new Error('autopilot_proposal_ticket_task_mismatch');
+  const hash = safeText(value.contractHash, 'contractHash', 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(hash) || proposalContractHash(contract) !== hash) throw new Error('autopilot_proposal_ticket_contract_hash_invalid');
+  const createdAt = canonicalTimestamp(value.createdAt, 'createdAt');
+  const expiresAt = canonicalTimestamp(value.expiresAt, 'expiresAt');
+  if (Date.parse(expiresAt) <= Date.parse(createdAt)) throw new Error('autopilot_proposal_ticket_time_invalid');
+  if (now !== null && !allowExpired && Date.parse(expiresAt) <= (now instanceof Date ? now.getTime() : Date.parse(now))) throw new Error('autopilot_proposal_ticket_expired');
+  if (!isRecord(value.authorization) || Object.keys(value.authorization).some((key) => !['authorizationId', 'clickedAt', 'tabId', 'tabKey', 'conversationUrl', 'intentDigest'].includes(key))) throw new Error('autopilot_proposal_ticket_authorization_invalid');
+  const authorizationId = safeText(value.authorization.authorizationId, 'authorization.authorizationId', 64);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(authorizationId)) throw new Error('autopilot_proposal_ticket_authorization_invalid');
+  const clickedAt = canonicalTimestamp(value.authorization.clickedAt, 'authorization.clickedAt');
+  const intentDigest = safeText(value.authorization.intentDigest, 'authorization.intentDigest', 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(intentDigest) || value.authorization.tabId !== tabId || value.authorization.tabKey !== tabKey || value.authorization.conversationUrl !== identity.conversationUrl) throw new Error('autopilot_proposal_ticket_authorization_invalid');
+  if (!isRecord(value.execution) || Object.keys(value.execution).some((key) => !['model', 'reasoningEffort'].includes(key)) || !safeText(value.execution.model, 'execution.model', 128) || !safeText(value.execution.reasoningEffort, 'execution.reasoningEffort', 64)) throw new Error('autopilot_proposal_ticket_execution_invalid');
+  const lifecycleState = state === undefined ? (value.state === undefined ? undefined : validateTicketState(value.state)) : validateTicketState(state);
+  const updatedAt = value.updatedAt === undefined ? undefined : canonicalTimestamp(value.updatedAt, 'updatedAt');
+  return { schemaVersion: 3, proposalId: id, taskId, tabKey, tabId, vendorId: 'chatgpt', conversationUrl: identity.conversationUrl, assistantTurnId, assistantTurnIdentityProvenance: identity.provenance, contract, contractHash: hash, createdAt, expiresAt, authorization: { authorizationId, clickedAt, tabId, tabKey, conversationUrl: identity.conversationUrl, intentDigest }, execution: { model: String(value.execution.model).trim(), reasoningEffort: String(value.execution.reasoningEffort).trim() }, ...(lifecycleState === undefined ? {} : { state: lifecycleState }), ...(updatedAt === undefined ? {} : { updatedAt }) };
 }
 
 function validateLegacyTicket(value, { now, allowExpired }) {
@@ -189,6 +226,7 @@ export async function createAutopilotProposalTicketStore({ stateDir = defaultSta
     async listUnresolved() { return await listUnresolvedTickets(stateDir, now()); },
     async create(ticket) {
       if (ticket?.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_LEGACY_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_legacy_read_only');
+      if (ticket?.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION) return await createAuthorizedTicket(ticket, { stateDir, now, onCreatePhase });
       const currentNow = now();
       const next = validateAutopilotProposalTicket(ticket, { now: currentNow, allowExpired: false });
       if ((await listUnresolvedTickets(stateDir, currentNow)).length > 0) throw new Error('autopilot_proposal_ticket_unresolved');
@@ -234,15 +272,39 @@ export async function createAutopilotProposalTicketStore({ stateDir = defaultSta
       const id = proposalId(requestedProposalId);
       const current = await get(id);
       if (!current) throw new Error('autopilot_proposal_ticket_not_found');
-      if (current.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION) throw new Error('autopilot_proposal_ticket_legacy_read_only');
+      if (![AUTOPILOT_PROPOSAL_TICKET_V2_SCHEMA_VERSION, AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION].includes(current.schemaVersion)) throw new Error('autopilot_proposal_ticket_legacy_read_only');
       const nextState = validateTicketState(state);
-      const allowed = current.state === 'pending' ? ['pending', 'acknowledged', 'abandoned'] : current.state === 'acknowledged' ? ['acknowledged', 'consumed'] : current.state === 'consumed' ? ['consumed'] : ['abandoned'];
+      const allowed = current.schemaVersion === AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION
+        ? (current.state === 'authorized' ? ['authorized', 'consumed', 'abandoned'] : current.state === 'consumed' ? ['consumed'] : ['abandoned'])
+        : current.state === 'pending' ? ['pending', 'acknowledged', 'abandoned'] : current.state === 'acknowledged' ? ['acknowledged', 'consumed'] : current.state === 'consumed' ? ['consumed'] : ['abandoned'];
       if (!allowed.includes(nextState)) throw new Error('autopilot_proposal_ticket_transition_invalid');
       const updatedAt = now().toISOString();
-      await atomicWriteFile(autopilotProposalTicketStatePath(id, stateDir), `${JSON.stringify({ schemaVersion: 2, proposalId: id, state: nextState, updatedAt, ...(current.expiresAt ? { expiresAt: current.expiresAt } : {}) }, null, 2)}\n`);
+      await atomicWriteFile(autopilotProposalTicketStatePath(id, stateDir), `${JSON.stringify({ schemaVersion: current.schemaVersion, proposalId: id, state: nextState, updatedAt, ...(current.expiresAt ? { expiresAt: current.expiresAt } : {}) }, null, 2)}\n`);
       return { ...current, state: nextState, updatedAt };
     },
   };
+}
+
+async function createAuthorizedTicket(ticket, { stateDir, now, onCreatePhase }) {
+  const currentNow = now();
+  const next = validateAutopilotProposalTicket(ticket, { now: currentNow, allowExpired: false });
+  if ((await listUnresolvedTickets(stateDir, currentNow)).length > 0) throw new Error('autopilot_proposal_ticket_unresolved');
+  const root = autopilotProposalTicketsRoot(stateDir);
+  const finalDir = autopilotProposalTicketDir(next.proposalId, stateDir);
+  const stagingDir = path.join(root, `.${next.proposalId}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  try {
+    try { await fs.lstat(finalDir); throw new Error('autopilot_proposal_ticket_exists'); } catch (error) { if (error.message === 'autopilot_proposal_ticket_exists') throw error; if (error.code !== 'ENOENT') throw error; }
+    await fs.mkdir(stagingDir, { recursive: false });
+    await atomicWriteFile(path.join(stagingDir, 'ticket.json'), `${JSON.stringify(next, null, 2)}\n`);
+    await onCreatePhase?.({ phase: 'ticket-written', proposalId: next.proposalId, stagingDir });
+    await atomicWriteFile(path.join(stagingDir, 'state.json'), `${JSON.stringify({ schemaVersion: 3, proposalId: next.proposalId, state: 'authorized', updatedAt: next.createdAt, expiresAt: next.expiresAt }, null, 2)}\n`);
+    await onCreatePhase?.({ phase: 'state-written', proposalId: next.proposalId, stagingDir });
+    await fs.rename(stagingDir, finalDir);
+    return { ...next, state: 'authorized', updatedAt: next.createdAt };
+  } catch (error) {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function listTickets(stateDir, { includeLegacy = true } = {}) {
@@ -255,7 +317,7 @@ async function listTickets(stateDir, { includeLegacy = true } = {}) {
       if (id.startsWith('.')) continue;
       const ticket = validateAutopilotProposalTicket(JSON.parse(await fs.readFile(autopilotProposalTicketJsonPath(id, stateDir), 'utf8')));
       const lifecycle = JSON.parse(await fs.readFile(autopilotProposalTicketStatePath(id, stateDir), 'utf8'));
-      if (lifecycle.schemaVersion !== 2 || lifecycle.proposalId !== ticket.proposalId) throw new Error('autopilot_proposal_ticket_state_invalid');
+      if (lifecycle.schemaVersion !== ticket.schemaVersion || lifecycle.proposalId !== ticket.proposalId) throw new Error('autopilot_proposal_ticket_state_invalid');
       result.push({ ...ticket, state: validateTicketState(lifecycle.state), updatedAt: canonicalTimestamp(lifecycle.updatedAt, 'updatedAt') });
     }
   } catch (error) {
@@ -279,7 +341,7 @@ async function readV2Ticket(id, stateDir) {
 }
 
 function parseLifecycleState(value, expectedProposalId) {
-  if (!isRecord(value) || value.schemaVersion !== AUTOPILOT_PROPOSAL_TICKET_SCHEMA_VERSION || value.proposalId !== expectedProposalId) {
+  if (!isRecord(value) || ![AUTOPILOT_PROPOSAL_TICKET_V2_SCHEMA_VERSION, AUTOPILOT_PROPOSAL_TICKET_V3_SCHEMA_VERSION].includes(value.schemaVersion) || value.proposalId !== expectedProposalId) {
     throw new Error('autopilot_proposal_ticket_state_invalid');
   }
   const state = validateTicketState(value.state);
@@ -311,5 +373,5 @@ async function listUnresolvedTickets(stateDir, currentNow) {
 }
 
 function isUnresolved(ticket, currentNow) {
-  return ticket?.state === 'acknowledged' || (ticket?.state === 'pending' && Date.parse(ticket.expiresAt) > currentNow.getTime());
+  return ticket?.state === 'acknowledged' || ticket?.state === 'authorized' || (ticket?.state === 'pending' && Date.parse(ticket.expiresAt) > currentNow.getTime());
 }

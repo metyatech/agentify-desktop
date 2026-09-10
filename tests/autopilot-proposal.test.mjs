@@ -42,7 +42,7 @@ function validContract(overrides = {}) {
     agentify: { tabKey: FIXED_METADATA.tabKey },
     implementation: {
       prompt: 'Implement the requested change. Path D:\\ghws\\RuntimeUnicodeTextSample, quoted "text", and a newline\nare intentional.',
-      timeoutMs: DEFAULT_IMPLEMENTATION_TIMEOUT_MS
+      ...(DEFAULT_IMPLEMENTATION_TIMEOUT_MS === null ? {} : { timeoutMs: DEFAULT_IMPLEMENTATION_TIMEOUT_MS })
     },
     verification: [],
     review: { maxRounds: 10, timeoutMs: 300000 },
@@ -118,9 +118,9 @@ test('control center workflow is production-only and metadata is local', async (
 
 test('implementation timeout is accepted and preserved while remaining optional for legacy contracts', () => {
   const proposal = parseValidateProposalResponse(validProposalText(FIXED_METADATA, {
-    contract: { implementation: { prompt: 'Implement the requested change.', timeoutMs: DEFAULT_IMPLEMENTATION_TIMEOUT_MS } }
+      contract: { implementation: { prompt: 'Implement the requested change.', timeoutMs: 900000 } }
   }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
-  assert.equal(proposal.contract.implementation.timeoutMs, DEFAULT_IMPLEMENTATION_TIMEOUT_MS);
+  assert.equal(proposal.contract.implementation.timeoutMs, 900000);
   const legacy = parseValidateProposalResponse(validProposalText(FIXED_METADATA, { legacyImplementation: true }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt) });
   assert.equal(Object.hasOwn(legacy.contract.implementation, 'timeoutMs'), false);
   for (const timeoutMs of [0, -1, 1.5, '1200000']) {
@@ -130,30 +130,31 @@ test('implementation timeout is accepted and preserved while remaining optional 
   }
 });
 
-test('current proposal service rejects a missing implementation timeout before ticket creation', async () => {
+test('current proposal service accepts a missing implementation timeout without ticket failure', async () => {
   const saved = [];
   const { service } = makeService({
     requestQuery: async () => ({ result: { text: validProposalText(FIXED_METADATA, { legacyImplementation: true }) } }),
     proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
   });
-  await assert.rejects(service.request(), /autopilot_proposal_generation_failed:implementation_timeout_required/u);
-  assert.equal(saved.length, 0);
+  const result = await service.request();
+  assert.equal(result.status, 'proposal_response_received');
+  assert.equal(saved.length, 1);
 });
 
-test('current proposal retry requires the timeout and preserves metadata and intent guard', async () => {
+test('current proposal retry preserves metadata and intent guard without adding a timeout', async () => {
   const saved = [];
   const calls = [];
   const { service } = makeService({
     requestQuery: async (body) => {
       calls.push(body);
-      return { result: { text: calls.length === 1 ? validProposalText(FIXED_METADATA, { legacyImplementation: true }) : validProposalText() } };
+      return { result: { text: calls.length === 1 ? validProposalText(FIXED_METADATA, { contract: { id: 'wrong-task-id' } }) : validProposalText() } };
     },
     proposalTicketStore: { get: async () => null, create: async (value) => { saved.push(value); return value; } }
   });
   const result = await service.request();
   assert.equal(result.attempts, 2);
   assert.equal(saved.length, 1);
-  assert.equal(saved[0].proposal.contract.implementation.timeoutMs, DEFAULT_IMPLEMENTATION_TIMEOUT_MS);
+  assert.equal(Object.hasOwn(saved[0].proposal.contract.implementation, 'timeoutMs'), false);
   assert.deepEqual(calls.map((call) => JSON.parse(call.prompt.match(/\{\n  "schemaVersion"[\s\S]*?\n\}/u)[0]).proposalId), [FIXED_METADATA.proposalId, FIXED_METADATA.proposalId]);
 });
 
@@ -862,14 +863,14 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   });
   const prompt = buildProposalGenerationPrompt({ metadata });
   assert.match(prompt, new RegExp(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'u'));
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v6');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v7');
   assert.match(prompt, new RegExp(PROPOSAL_PROTOCOL_VERSION, 'u'));
   assert.match(prompt, new RegExp(`Task contract schemaVersion: ${TASK_CONTRACT_SCHEMA_VERSION}`, 'u'));
   assert.match(prompt, /repository\/branch when the task is repository-scoped/u);
   assert.match(prompt, /repository is either null for host\/local tasks/u);
   assert.doesNotMatch(prompt, /maxPatchAttempts/u);
-  assert.match(prompt, new RegExp(`implementation\\.timeoutMs=${DEFAULT_IMPLEMENTATION_TIMEOUT_MS}`, 'u'));
-  assert.match(prompt, /implementation\.timeoutMs is the Codex worker execution timeout/u);
+  assert.equal(DEFAULT_IMPLEMENTATION_TIMEOUT_MS, null);
+  assert.match(prompt, /no implementation wall-clock termination/u);
   assert.match(prompt, /review\.timeoutMs is the ChatGPT reviewer timeout/u);
   assert.match(prompt, /implementation\.prompt is required.*implementation\.timeoutMs/u);
   assert.match(prompt, /verification/u);
@@ -885,7 +886,7 @@ test('proposal prompt pins current schema, metadata, and clarification safety', 
   assert.match(prompt, /exactly one unlabeled fenced code block/u);
   assert.match(prompt, /opening line containing exactly ``` with no language label/u);
   assert.doesNotMatch(prompt, /Do not include a code fence/u);
-  assert.match(prompt, /開始して XXXXXXXX/u);
+  assert.match(prompt, /Agentify execute click is the sole authorization/u);
 });
 
 test('retry proposal prompt keeps the fenced transport requirement and contains no legacy fence prohibition', () => {
@@ -912,7 +913,7 @@ test('proposal prompt owns technical verification planning and ignores generated
       approvalCode: 'AB12CD34'
     }
   });
-  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v6');
+  assert.equal(PROPOSAL_GENERATION_INSTRUCTION_VERSION, 'ai-autopilot-proposal-generation-v7');
   assert.match(prompt, /System-generated proposal-generation turns.*not authoritative user requirements/u);
   assert.match(prompt, /compiler-derived user intent guard.*authoritative/iu);
   assert.match(prompt, /required.*adoptExistingChanges.*present/iu);
@@ -956,7 +957,7 @@ test('control center exposes the production action', async () => {
   const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
   assert.match(html, /この内容を実行/u);
   assert.match(html, /autopilot-production/u);
-  assert.match(html, /まだ変更は開始しません/u);
+  assert.match(html, /クリックを実行承認として開始します/u);
   assert.match(js, /clarification_response_received/u);
   assert.match(js, /確認事項あり/u);
   assert.match(js, /ChatGPTの質問に回答してから、再度「この内容を実行」してください/u);

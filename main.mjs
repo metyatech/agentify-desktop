@@ -31,6 +31,9 @@ import { shouldAllowPopup } from './popup-policy.mjs';
 import { cleanupRuntimeResources, createGracefulShutdown, registerShutdownSignals } from './shutdown.mjs';
 import { createControlCenterShowGate, hasStartMinimizedArg } from './launch-mode.mjs';
 import { createAutopilotProposalService } from './autopilot-proposal.mjs';
+import { defaultCodexSelection, listCodexModels, validateCodexSelection } from './codex-models.mjs';
+import { detectCodexDeepLink, isCodexThreadId } from './codex-deep-link.mjs';
+import { createAutopilotWatcherManager } from './autopilot-watcher-manager.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -165,9 +168,24 @@ async function main() {
   const autopilotStatus = await createAutopilotStatusStore({ stateDir });
   const autopilotWatchStatus = await createAutopilotWatchStatusStore({ stateDir });
   const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
+  const autopilotWatcher = createAutopilotWatcherManager({ root: process.env.AI_AUTOPILOT_ROOT || path.join(path.dirname(stateDir), 'AIAutopilot') });
+  await autopilotWatcher.start();
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
+  let codexModels = [];
+  let codexModelError = null;
+  const codexDeepLinkAvailable = await detectCodexDeepLink();
+  void listCodexModels().then(async (models) => {
+    codexModels = models;
+    codexModelError = null;
+    const defaultSelection = defaultCodexSelection(codexModels);
+    if (!settings.codexModel && defaultSelection) settings = await writeSettings({ ...settings, codexModel: defaultSelection.model, codexReasoningEffort: defaultSelection.reasoningEffort }, stateDir);
+    emitTabsChanged?.();
+  }).catch((error) => {
+    codexModelError = String(error?.message || error);
+    emitTabsChanged?.();
+  });
   const browserBackendKind = resolveBrowserBackend({ settings });
   const chromeExecutablePath = resolveChromeExecutablePath({ settings });
   const chromeDebugPort = resolveChromeDebugPort({ settings });
@@ -329,6 +347,8 @@ async function main() {
     tabs,
     proposalTicketStore: autopilotProposalTicket,
     getRuntimeState: () => server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] },
+    getExecutionSelection: () => ({ model: settings.codexModel || '', reasoningEffort: settings.codexReasoningEffort || '' }),
+    validateExecutionSelection: (selection) => validateCodexSelection(selection, codexModels),
     requestQuery: async (body) => {
       if (!server?.address?.()) throw new Error('agentify_query_unavailable');
       const port = server.address().port;
@@ -427,10 +447,21 @@ async function main() {
       autopilotWatchStatus: autopilotWatchStatus.get(),
       autopilotProposalTicket: currentProposalTicket.ticket,
       autopilotProposalTicketError: currentProposalTicket.error,
+      codexModels,
+      codexModelError,
+      codexDeepLinkAvailable,
+      autopilotWatcher: autopilotWatcher.getStatus(),
     };
   });
 
   ipcMain.handle('agentify:requestAutopilotProposal', async () => await autopilotProposal.request());
+  ipcMain.handle('agentify:openCodexThread', async (_evt, args) => {
+    const threadId = String(args?.threadId || '').trim();
+    if (!codexDeepLinkAvailable || !isCodexThreadId(threadId)) throw new Error('codex_thread_id_unavailable');
+    const result = await shell.openExternal(`codex://threads/${threadId}`);
+    return { ok: result === undefined };
+  });
+  ipcMain.handle('agentify:restartAutopilotWatcher', async () => ({ watcher: await autopilotWatcher.restart() }));
   ipcMain.handle('agentify:clearAutopilotStatus', async () => {
     const snapshot = autopilotStatus.get();
     if (snapshot && !['completed', 'blocked'].includes(snapshot.status)) throw new Error('autopilot_status_not_terminal');
@@ -446,7 +477,9 @@ async function main() {
 
   ipcMain.handle('agentify:setSettings', async (_evt, args) => {
     if (args?.reset) {
-      settings = await writeSettings(defaultSettings(), stateDir);
+      const selection = defaultCodexSelection(codexModels);
+      const reset = { ...defaultSettings(), codexModel: selection?.model || null, codexReasoningEffort: selection?.reasoningEffort || null };
+      settings = await writeSettings(reset, stateDir);
       return settings;
     }
     const next = { ...settings };
@@ -460,6 +493,9 @@ async function main() {
     if (has('chromeExecutablePath')) next.chromeExecutablePath = args.chromeExecutablePath;
     if (has('chromeProfileMode')) next.chromeProfileMode = args.chromeProfileMode;
     if (has('chromeProfileName')) next.chromeProfileName = args.chromeProfileName;
+    if (has('codexModel')) next.codexModel = args.codexModel;
+    if (has('codexReasoningEffort')) next.codexReasoningEffort = args.codexReasoningEffort;
+    if (next.codexModel || next.codexReasoningEffort) validateCodexSelection({ model: next.codexModel, reasoningEffort: next.codexReasoningEffort }, codexModels);
     if (has('showTabsByDefault')) next.showTabsByDefault = args.showTabsByDefault;
     if (has('allowAuthPopups')) next.allowAuthPopups = args.allowAuthPopups;
     if (args?.acknowledge) next.acknowledgedAt = new Date().toISOString();
@@ -830,6 +866,9 @@ async function main() {
     },
     stopWatchFolders: async () => {
       await watchFolders.stop();
+    },
+    stopAutopilotWatcher: async () => {
+      await autopilotWatcher.stop();
     },
     disposeBrowserBackend: async () => {
       await browserBackend.dispose?.();

@@ -1,5 +1,5 @@
 export const AUTOPILOT_PRODUCTION_TAB_KEY = 'autopilot-production';
-export const CURRENT_AUTOPILOT_TICKET_STATES = Object.freeze(['pending', 'acknowledged']);
+export const CURRENT_AUTOPILOT_TICKET_STATES = Object.freeze(['pending', 'acknowledged', 'authorized']);
 
 export function selectCurrentAutopilotProposalTicket(tickets, { tabKey = AUTOPILOT_PRODUCTION_TAB_KEY } = {}) {
   if (!Array.isArray(tickets)) {
@@ -9,7 +9,7 @@ export function selectCurrentAutopilotProposalTicket(tickets, { tabKey = AUTOPIL
     };
   }
   const candidates = tickets.filter((ticket) => (
-    ticket?.schemaVersion === 2
+    (ticket?.schemaVersion === 2 || ticket?.schemaVersion === 3)
     && ticket?.tabKey === tabKey
     && CURRENT_AUTOPILOT_TICKET_STATES.includes(ticket.state)
   ));

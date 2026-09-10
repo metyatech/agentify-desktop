@@ -32,6 +32,8 @@ export function autopilotStatusViewModel(snapshot, now = Date.now()) {
     phaseLabel: stale ? `Last phase: ${phase}` : phase,
     roundLabel: `Round ${snapshot.round} / ${snapshot.maxRounds}`,
     targetLabel: snapshot.repository ? `${snapshot.repository} → ${snapshot.targetBranch}` : 'Host / local task',
+    executionLabel: snapshot.codexModel ? `Model: ${snapshot.codexModel} • Reasoning: ${snapshot.reasoningEffort || '—'}` : null,
+    codexThreadId: snapshot.codexThreadId || null,
     verdictLabel: snapshot.latestVerdict ? `Latest review: ${snapshot.latestVerdict}` : null,
     verificationLabel: verification,
     errorCode: snapshot.error?.code || null,

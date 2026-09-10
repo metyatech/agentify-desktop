@@ -56,6 +56,8 @@ export function defaultSettings() {
     chromeExecutablePath: null,
     chromeProfileMode: 'isolated',
     chromeProfileName: 'Default',
+    codexModel: null,
+    codexReasoningEffort: null,
 
     // Governor defaults (intentionally conservative).
     maxInflightQueries: 2,
@@ -97,6 +99,8 @@ export function normalizeSettings(input) {
       : d.chromeProfileMode,
     chromeProfileName:
       typeof s.chromeProfileName === 'string' && s.chromeProfileName.trim() ? s.chromeProfileName.trim() : d.chromeProfileName,
+    codexModel: typeof s.codexModel === 'string' && s.codexModel.trim() ? s.codexModel.trim() : null,
+    codexReasoningEffort: typeof s.codexReasoningEffort === 'string' && s.codexReasoningEffort.trim() ? s.codexReasoningEffort.trim() : null,
     maxInflightQueries: clampInt(s.maxInflightQueries, { min: 1, max: 12, fallback: d.maxInflightQueries }),
     maxQueriesPerMinute: clampInt(s.maxQueriesPerMinute, { min: 1, max: 600, fallback: d.maxQueriesPerMinute }),
     minTabGapMs: clampMs(s.minTabGapMs, { min: 0, max: 60_000, fallback: d.minTabGapMs }),

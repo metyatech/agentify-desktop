@@ -9,7 +9,7 @@ export const AUTOPILOT_STATUS_STALE_AFTER_MS = 10 * 60 * 1000;
 
 const ALLOWED_KEYS = new Set([
   'schemaVersion', 'taskId', 'title', 'repository', 'targetBranch', 'status', 'phase',
-  'round', 'maxRounds', 'latestVerdict', 'verification', 'error', 'updatedAt'
+  'round', 'maxRounds', 'latestVerdict', 'verification', 'error', 'updatedAt', 'codexModel', 'reasoningEffort', 'codexThreadId'
 ]);
 const VERDICTS = new Set(['PASS', 'FIX_REQUIRED', 'USER_ACTION_REQUIRED']);
 const PHASES = new Set(['preparing', 'executing', 'verifying', 'reviewing', 'delivering', 'cleaning', 'completed', 'blocked']);
@@ -39,6 +39,8 @@ export function validateAutopilotStatus(value) {
   if (!Number.isInteger(value.round) || value.round < 1 || value.round > 10) throw invalidStatus('round is invalid');
   if (!Number.isInteger(value.maxRounds) || value.maxRounds < 1 || value.maxRounds > 10 || value.round > value.maxRounds) throw invalidStatus('maxRounds is invalid');
   if (value.latestVerdict !== null && !VERDICTS.has(value.latestVerdict)) throw invalidStatus('latestVerdict is invalid');
+  for (const key of ['codexModel', 'reasoningEffort']) if (value[key] !== null && value[key] !== undefined) safeText(value[key], key, 128);
+  if (value.codexThreadId !== null && value.codexThreadId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(String(value.codexThreadId))) throw invalidStatus('codexThreadId is invalid');
   if (!value.verification || typeof value.verification !== 'object' || Array.isArray(value.verification)) throw invalidStatus('verification is invalid');
   const verificationKeys = Object.keys(value.verification);
   if (verificationKeys.some((key) => !['completed', 'total', 'failed'].includes(key))) throw invalidStatus('verification contains unknown fields');
@@ -67,6 +69,9 @@ export function validateAutopilotStatus(value) {
     latestVerdict: value.latestVerdict,
     verification: { ...value.verification },
     error: value.error === null ? null : { code: value.error.code, message: value.error.message },
+    codexModel: value.codexModel ?? null,
+    reasoningEffort: value.reasoningEffort ?? null,
+    codexThreadId: value.codexThreadId ?? null,
     updatedAt: value.updatedAt,
   };
 }

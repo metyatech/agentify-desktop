@@ -66,6 +66,36 @@ function fmtOutcomeStatus(status) {
   return 'Last run';
 }
 
+function cdpTimeoutDiagnostics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const method = String(data.method || '').trim();
+  const phase = String(data.phase || data.queryPhase || '').trim();
+  return {
+    method: /^[A-Za-z][A-Za-z0-9_.]{0,79}$/u.test(method) ? method : null,
+    phase: /^[a-z][a-z0-9_-]{0,63}$/u.test(phase) ? phase : null
+  };
+}
+
+function formatOutcomeDetail(outcome) {
+  const detail = String(outcome?.detail || '').trim();
+  const diagnostics = cdpTimeoutDiagnostics(outcome?.diagnostics);
+  const suffix = [
+    diagnostics.method ? `CDP method: ${diagnostics.method}` : '',
+    diagnostics.phase ? `phase: ${diagnostics.phase}` : ''
+  ].filter(Boolean).join('; ');
+  return suffix ? `${detail}${detail ? ' ' : ''}(${suffix})` : detail;
+}
+
+function formatAutopilotError(error) {
+  const message = String(error?.message || error || '').trim();
+  const diagnostics = cdpTimeoutDiagnostics(error?.data?.diagnostics || error?.data?.body?.data || error?.data?.data);
+  const suffix = [
+    diagnostics.method ? `CDP method: ${diagnostics.method}` : '',
+    diagnostics.phase ? `phase: ${diagnostics.phase}` : ''
+  ].filter(Boolean).join('; ');
+  return suffix ? `${message}${message ? ' ' : ''}(${suffix})` : message;
+}
+
 function num(id, fallback) {
   const raw = String(el(id).value || '').trim();
   if (!raw) return fallback;
@@ -641,7 +671,7 @@ async function refresh({ initial = false } = {}) {
       } else if (outcome?.detail) {
         const last = document.createElement('div');
         last.className = 'sub';
-        last.textContent = `${outcome.label || fmtOutcomeStatus(outcome.status)}: ${outcome.detail}`;
+        last.textContent = `${outcome.label || fmtOutcomeStatus(outcome.status)}: ${formatOutcomeDetail(outcome)}`;
         meta.appendChild(last);
       }
 
@@ -922,7 +952,8 @@ async function main() {
       autopilotStatusKey = 'error';
       autopilotClarificationMessage = null;
       autopilotErrorMessage = e?.message || String(e);
-      statusText(`Autopilot proposal failed: ${e?.message || String(e)}`, 'error');
+      autopilotErrorMessage = formatAutopilotError(e) || autopilotErrorMessage;
+      statusText(`Autopilot proposal failed: ${autopilotErrorMessage}`, 'error');
     } finally {
       autopilotRequestInFlight = false;
       await refresh().catch(() => {});

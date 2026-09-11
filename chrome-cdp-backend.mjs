@@ -260,7 +260,26 @@ export function chromeSpawnOptions() {
   return { stdio: 'ignore' };
 }
 
-const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
+export const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 60_000;
+
+function attachTargetIdDiagnostic(error, targetId) {
+  if (!error || typeof error !== 'object') return error;
+  const normalizedTargetId = String(targetId || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(normalizedTargetId)) return error;
+  if (error.message === 'chrome_cdp_command_timeout') {
+    const method = String(error.data?.method || '').trim();
+    error.data = {
+      ...(/^[A-Za-z][A-Za-z0-9_.]{0,79}$/u.test(method) ? { method } : {}),
+      targetId: normalizedTargetId
+    };
+    return error;
+  }
+  error.data = {
+    ...(error.data && typeof error.data === 'object' ? error.data : {}),
+    targetId: normalizedTargetId
+  };
+  return error;
+}
 
 function isStaleSessionError(error) {
   const code = Number(error?.data?.code);
@@ -556,6 +575,7 @@ class ChromeCdpPageAdapter {
     try {
       return await this.client.send(method, params, staleSessionId);
     } catch (error) {
+      attachTargetIdDiagnostic(error, this.targetId);
       if (!isStaleSessionError(error) || recoveryAttempted) throw error;
       recoveryAttempted = true;
       try {
@@ -575,7 +595,11 @@ class ChromeCdpPageAdapter {
         closedError.data = { code: error?.data?.code ?? null, originalMessage: String(error?.message || 'cdp_error') };
         throw closedError;
       }
-      return await this.client.send(method, params, this.sessionId);
+      try {
+        return await this.client.send(method, params, this.sessionId);
+      } catch (error) {
+        throw attachTargetIdDiagnostic(error, this.targetId);
+      }
     }
   }
 

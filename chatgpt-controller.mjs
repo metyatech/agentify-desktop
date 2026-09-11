@@ -57,6 +57,11 @@ const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_X = 0;
 const SCROLL_VISIBILITY_MOUSE_WHEEL_DELTA_Y = -720;
 const MOUSE_WHEEL_VISIBILITY_PROBE_MAX_ATTEMPTS = 8;
 const MAX_NATIVE_INPUT_ERROR_MESSAGE_LENGTH = 256;
+const QUERY_DIAGNOSTIC_ID_MAX_LENGTH = 128;
+const QUERY_DIAGNOSTIC_METHOD_MAX_LENGTH = 80;
+const QUERY_DIAGNOSTIC_PHASE_MAX_LENGTH = 64;
+const QUERY_DIAGNOSTIC_DISPATCH_STATES = new Set(['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled', 'unknown']);
+const QUERY_DIAGNOSTIC_OWNERSHIP_PHASES = new Set(['prepared', 'attachments-owned', 'prompt-owned', 'dispatch-started', 'send-confirmed', 'cleanup-required', 'cleared']);
 const CONVERSATION_LAYOUT_SETTLE_TIMEOUT_MS = 2_000;
 const CONVERSATION_LAYOUT_SETTLE_POLL_MS = 200;
 const CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES = 3;
@@ -158,6 +163,54 @@ function messageDispatchStateForError(run) {
     ['dispatching', 'dispatched'].includes(run?.dispatchState)
   ) return 'unknown';
   return 'not-dispatched';
+}
+
+function boundedQueryDiagnosticId(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(text) ? text.slice(0, QUERY_DIAGNOSTIC_ID_MAX_LENGTH) : null;
+}
+
+function boundedQueryDiagnosticMethod(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z][A-Za-z0-9_.]{0,79}$/u.test(text) ? text.slice(0, QUERY_DIAGNOSTIC_METHOD_MAX_LENGTH) : null;
+}
+
+function boundedQueryDiagnosticPhase(value) {
+  const text = String(value || '').trim();
+  return /^[a-z][a-z0-9_-]{0,63}$/u.test(text) ? text.slice(0, QUERY_DIAGNOSTIC_PHASE_MAX_LENGTH) : null;
+}
+
+function queryRunDiagnostics(error, run, page) {
+  const errorData = error?.data && typeof error.data === 'object' ? error.data : {};
+  const nested = errorData.queryDiagnostics && typeof errorData.queryDiagnostics === 'object'
+    ? errorData.queryDiagnostics
+    : {};
+  const phase = boundedQueryDiagnosticPhase(errorData.phase) || boundedQueryDiagnosticPhase(run?.phase) || null;
+  const ownershipPhase = QUERY_DIAGNOSTIC_OWNERSHIP_PHASES.has(run?.ownershipPhase) ? run.ownershipPhase : null;
+  const dispatchState = QUERY_DIAGNOSTIC_DISPATCH_STATES.has(run?.dispatchState)
+    ? run.dispatchState
+    : QUERY_DIAGNOSTIC_DISPATCH_STATES.has(nested.dispatchState)
+      ? nested.dispatchState
+      : null;
+  const method = boundedQueryDiagnosticMethod(errorData.method) || boundedQueryDiagnosticMethod(nested.method);
+  const targetId = boundedQueryDiagnosticId(errorData.targetId) || boundedQueryDiagnosticId(nested.targetId) || boundedQueryDiagnosticId(page?.targetId);
+  const operationId = boundedQueryDiagnosticId(run?.operationId) || boundedQueryDiagnosticId(nested.operationId);
+  return {
+    errorCode: String(error?.message || '').trim() === 'chrome_cdp_command_timeout' ? 'chrome_cdp_command_timeout' : null,
+    ...(method ? { method } : {}),
+    ...(targetId ? { targetId } : {}),
+    ...(operationId ? { operationId } : {}),
+    phase,
+    queryPhase: phase,
+    ownershipPhase,
+    promptTyped: run?.promptTyped === true,
+    messageDispatchStarted: run?.messageDispatchStarted === true,
+    dispatchState,
+    dispatchStateUnknown: run?.dispatchStateUnknown === true,
+    sendAttemptCompleted: run?.sendAttemptCompleted === true,
+    sendConfirmed: run?.sendConfirmed === true,
+    messageDispatchState: messageDispatchStateForError(run)
+  };
 }
 
 function fallbackConversationTurnId({ role, index, text }) {
@@ -1731,7 +1784,9 @@ export class ChatGPTController {
   }
 
   async #persistDraftLease(run, phase = run?.ownershipPhase || 'prepared') {
-    if (!run || !this.draftOwnership.enabled) return;
+    if (!run) return;
+    if (QUERY_DIAGNOSTIC_OWNERSHIP_PHASES.has(phase)) run.ownershipPhase = phase;
+    if (!this.draftOwnership.enabled) return;
     const lease = createDraftLease({
       operationId: run.operationId,
       tabId: this.tabId,
@@ -2554,7 +2609,12 @@ export class ChatGPTController {
   }
 
   async #emitProgress(patch) {
-    if (!this.currentRun?.onProgress || !patch || typeof patch !== 'object') return;
+    if (!patch || typeof patch !== 'object') return;
+    if (this.currentRun && typeof patch.phase === 'string') {
+      const phase = boundedQueryDiagnosticPhase(patch.phase);
+      if (phase) this.currentRun.phase = phase;
+    }
+    if (!this.currentRun?.onProgress) return;
     try {
       await this.currentRun.onProgress({ ...patch });
     } catch {}
@@ -7661,6 +7721,7 @@ export class ChatGPTController {
       postSendSettled: false,
       ownershipPersisted: false,
       preflightConflict: false,
+      phase: 'prepared',
       signal
     };
     this.currentRun = run;
@@ -7720,6 +7781,14 @@ export class ChatGPTController {
       const postSendDraft = await this.#settlePostSend(run);
       return { ...response, meta: { ...(response.meta || {}), postSendDraft } };
     } catch (error) {
+      if (error?.message === 'chrome_cdp_command_timeout') {
+        const diagnostics = queryRunDiagnostics(error, run, this.page);
+        error.data = {
+          ...(error?.data && typeof error.data === 'object' ? error.data : {}),
+          ...diagnostics,
+          queryDiagnostics: diagnostics
+        };
+      }
       if (this.#canCleanupUnsentDraft(run) && (!attachments?.length || run.attachmentOwnershipEstablished)) {
         try {
           const cleanup = await this.cleanupUnsentDraft({
@@ -7803,6 +7872,7 @@ export class ChatGPTController {
         postSendSettled: false,
         ownershipPersisted: false,
         preflightConflict: false,
+        phase: 'prepared',
         signal
       };
       this.currentRun = run;
@@ -7853,6 +7923,14 @@ export class ChatGPTController {
           ...(error?.data && typeof error.data === 'object' ? error.data : {}),
           messageDispatchState: messageDispatchStateForError(run)
         };
+        if (error?.message === 'chrome_cdp_command_timeout') {
+          const diagnostics = queryRunDiagnostics(error, run, this.page);
+          error.data = {
+            ...error.data,
+            ...diagnostics,
+            queryDiagnostics: diagnostics
+          };
+        }
         if (this.#canCleanupUnsentDraft(run)) {
           try {
             const cleanup = await this.cleanupUnsentDraft({

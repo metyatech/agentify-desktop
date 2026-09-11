@@ -474,7 +474,24 @@ async function main() {
     };
   });
 
-  ipcMain.handle('agentify:requestAutopilotProposal', async () => await autopilotProposal.request());
+  ipcMain.handle('agentify:requestAutopilotProposal', async () => {
+    try {
+      return await autopilotProposal.request();
+    } catch (error) {
+      const body = error?.data?.body;
+      const diagnostics = body?.error === 'chrome_cdp_command_timeout' && body?.data && typeof body.data === 'object'
+        ? body.data
+        : null;
+      if (diagnostics) {
+        error.data = {
+          ...(error.data && typeof error.data === 'object' ? error.data : {}),
+          ...diagnostics,
+          diagnostics
+        };
+      }
+      throw error;
+    }
+  });
   ipcMain.handle('agentify:openCodexThread', async (_evt, args) => {
     const threadId = String(args?.threadId || '').trim();
     if (!codexDeepLinkAvailable || !isCodexThreadId(threadId)) throw new Error('codex_thread_id_unavailable');

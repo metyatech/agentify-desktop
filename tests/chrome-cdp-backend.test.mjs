@@ -112,6 +112,25 @@ test('chrome-cdp-backend: pending commands reject at the bounded command deadlin
   await conn.close();
 });
 
+test('chrome-cdp-backend: default command timeout is 60 seconds and remains bounded', async () => {
+  const conn = new ChromeCdpConnection('ws://example.test/devtools/browser/1', {
+    wsFactory: () => new MockWebSocket()
+  });
+
+  assert.equal(conn.commandTimeoutMs, 60_000);
+  await conn.close();
+});
+
+test('chrome-cdp-backend: explicit command timeout override remains effective', async () => {
+  const conn = new ChromeCdpConnection('ws://example.test/devtools/browser/1', {
+    wsFactory: () => new MockWebSocket(),
+    commandTimeoutMs: 20
+  });
+
+  assert.equal(conn.commandTimeoutMs, 20);
+  await conn.close();
+});
+
 test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () => {
   const opts = chromeSpawnOptions();
   assert.equal(opts.stdio, 'ignore');

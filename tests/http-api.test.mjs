@@ -1538,6 +1538,96 @@ test('http-api: attachment state conflict and clear errors keep explicit status 
   assert.equal(unknown.body.data.messageDispatchState, null);
 });
 
+test('http-api: CDP timeout serialization preserves bounded diagnostics only', () => {
+  const error = Object.assign(new Error('chrome_cdp_command_timeout'), {
+    data: {
+      method: 'Runtime.evaluate',
+      targetId: 'target-123',
+      operationId: 'operation-123',
+      phase: 'typing_prompt',
+      queryPhase: 'typing_prompt',
+      ownershipPhase: 'prompt-owned',
+      promptTyped: true,
+      messageDispatchStarted: false,
+      dispatchState: 'pending',
+      dispatchStateUnknown: false,
+      sendAttemptCompleted: false,
+      sendConfirmed: false,
+      prompt: 'do not persist this prompt',
+      params: { expression: 'secret', token: 'cookie' }
+    }
+  });
+
+  const mapped = mapErrorToHttp(error);
+  assert.equal(mapped.code, 504);
+  assert.equal(mapped.body.error, 'chrome_cdp_command_timeout');
+  assert.equal(mapped.body.data.method, 'Runtime.evaluate');
+  assert.equal(mapped.body.data.targetId, 'target-123');
+  assert.equal(mapped.body.data.operationId, 'operation-123');
+  assert.equal(mapped.body.data.phase, 'typing_prompt');
+  assert.equal(mapped.body.data.ownershipPhase, 'prompt-owned');
+  assert.equal(mapped.body.data.promptTyped, true);
+  assert.equal(mapped.body.data.messageDispatchStarted, false);
+  assert.equal(mapped.body.data.sendConfirmed, false);
+  assert.equal(JSON.stringify(mapped).includes('do not persist'), false);
+  assert.equal(JSON.stringify(mapped).includes('secret'), false);
+  assert.equal(JSON.stringify(mapped).includes('cookie'), false);
+});
+
+test('http-api: CDP timeout outcome keeps method and query phase on the real handler', async (t) => {
+  const diagnostic = {
+    method: 'Input.dispatchMouseEvent',
+    targetId: 'target-456',
+    operationId: 'operation-456',
+    phase: 'sending_prompt',
+    queryPhase: 'sending_prompt',
+    ownershipPhase: 'dispatch-started',
+    promptTyped: true,
+    messageDispatchStarted: false,
+    dispatchState: 'pending',
+    dispatchStateUnknown: false,
+    sendAttemptCompleted: false,
+    sendConfirmed: false,
+    prompt: 'never persist'
+  };
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => { throw Object.assign(new Error('chrome_cdp_command_timeout'), { data: diagnostic }); }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+
+  const timeout = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'timeout fixture' } });
+  assert.equal(timeout.res.status, 504);
+  assert.equal(timeout.data.error, 'chrome_cdp_command_timeout');
+  assert.equal(timeout.data.data.method, 'Input.dispatchMouseEvent');
+  assert.equal(timeout.data.data.phase, 'sending_prompt');
+  assert.equal(JSON.stringify(timeout.data).includes('never persist'), false);
+
+  const status = await req({ port: server.address().port, token: 'secret', method: 'GET', pth: '/status' });
+  assert.equal(status.data.runtime.lastOutcomes[0].label, 'CDP command timed out');
+  assert.equal(status.data.runtime.lastOutcomes[0].diagnostics.method, 'Input.dispatchMouseEvent');
+  assert.equal(status.data.runtime.lastOutcomes[0].diagnostics.ownershipPhase, 'dispatch-started');
+  assert.equal(status.data.runtime.lastOutcomes[0].diagnostics.promptTyped, true);
+  assert.equal(status.data.runtime.lastOutcomes[0].diagnostics.messageDispatchStarted, false);
+  assert.equal(status.data.runtime.lastOutcomes[0].diagnostics.sendConfirmed, false);
+});
+
 test('http-api: browser evaluation failures retain safe phase and diagnostics on the real handler', async (t) => {
   const marker = 'prompt-secret-marker';
   const controller = {

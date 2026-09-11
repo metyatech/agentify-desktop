@@ -197,6 +197,46 @@ function sanitizeBrowserEvaluationDiagnostics(value) {
   };
 }
 
+function sanitizeQueryDiagnostics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const nested = data.queryDiagnostics && typeof data.queryDiagnostics === 'object' ? data.queryDiagnostics : {};
+  const source = { ...nested, ...data };
+  const boundedId = (item) => {
+    const text = String(item || '').trim();
+    return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(text) ? text : null;
+  };
+  const boundedMethod = (item) => {
+    const text = String(item || '').trim();
+    return /^[A-Za-z][A-Za-z0-9_.]{0,79}$/u.test(text) ? text : null;
+  };
+  const boundedPhase = (item) => {
+    const text = String(item || '').trim();
+    return /^[a-z][a-z0-9_-]{0,63}$/u.test(text) ? text : null;
+  };
+  const dispatchStates = new Set(['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled', 'unknown']);
+  const ownershipPhases = new Set(['prepared', 'attachments-owned', 'prompt-owned', 'dispatch-started', 'send-confirmed', 'cleanup-required', 'cleared']);
+  const dispatchState = dispatchStates.has(source.dispatchState) ? source.dispatchState : null;
+  const ownershipPhase = ownershipPhases.has(source.ownershipPhase) ? source.ownershipPhase : null;
+  return {
+    errorCode: source.errorCode === 'chrome_cdp_command_timeout' ? source.errorCode : null,
+    method: boundedMethod(source.method),
+    targetId: boundedId(source.targetId),
+    operationId: boundedId(source.operationId),
+    phase: boundedPhase(source.phase),
+    queryPhase: boundedPhase(source.queryPhase),
+    ownershipPhase,
+    promptTyped: source.promptTyped === true,
+    messageDispatchStarted: source.messageDispatchStarted === true,
+    dispatchState,
+    dispatchStateUnknown: source.dispatchStateUnknown === true,
+    sendAttemptCompleted: source.sendAttemptCompleted === true,
+    sendConfirmed: source.sendConfirmed === true,
+    messageDispatchState: ['not-dispatched', 'unknown', 'confirmed'].includes(source.messageDispatchState)
+      ? source.messageDispatchState
+      : null
+  };
+}
+
 async function parseBody(req, { maxBytes = 2_000_000 } = {}) {
   const chunks = [];
   let total = 0;
@@ -264,6 +304,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'tab_not_found') return { code: 404, body: { error: 'tab_not_found' } };
   if (msg === 'tab_closed') return { code: 409, body: { error: 'tab_closed' } };
   if (msg === 'chrome_cdp_session_closed') return { code: 409, body: { error: 'chrome_cdp_session_closed', data: error?.data || null } };
+  if (msg === 'chrome_cdp_command_timeout') return { code: 504, body: { error: msg, data: sanitizeQueryDiagnostics(error?.data) } };
   if (msg === 'default_tab_protected') return { code: 409, body: { error: 'default_tab_protected' } };
   if (msg === 'max_tabs_reached') return { code: 409, body: { error: 'max_tabs_reached' } };
   if (msg === 'rate_limited') return { code: 429, body: { error: 'rate_limited', ...(error?.data || {}) } };
@@ -1094,6 +1135,8 @@ export function startHttpApi({
   const outcomeFromError = (error, op) => {
     const message = String(error?.message || 'error');
     const detail = error?.data || null;
+    const queryDiagnostics = sanitizeQueryDiagnostics(detail);
+    const hasQueryDiagnostics = Object.values(queryDiagnostics).some((value) => value !== null && value !== false);
     const base = {
       source: op?.source || 'http',
       kind: op?.kind || 'query',
@@ -1177,11 +1220,23 @@ export function startHttpApi({
         detail: 'Another run is already active on this tab.'
       };
     }
+    if (message === 'chrome_cdp_command_timeout') {
+      return {
+        ...base,
+        status: 'error',
+        label: 'CDP command timed out',
+        detail: message,
+        diagnostics: queryDiagnostics
+      };
+    }
     return {
       ...base,
       status: 'error',
       label: 'Run failed',
-      detail: message
+      detail: message,
+      ...(hasQueryDiagnostics
+        ? { diagnostics: queryDiagnostics }
+        : {})
     };
   };
 

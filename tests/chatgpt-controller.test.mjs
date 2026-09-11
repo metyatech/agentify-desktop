@@ -5973,6 +5973,140 @@ test('chatgpt-controller: browser evaluation errors preserve diagnostics before 
   assert.equal(events.some((item) => item.startsWith('text:') || item.startsWith('key:') || item.startsWith('files-set:') || item.includes('send')), false);
 });
 
+test('chatgpt-controller: pre-dispatch CDP timeout preserves prompt ownership diagnostics', async () => {
+  const cdpError = Object.assign(new Error('chrome_cdp_command_timeout'), {
+    data: { method: 'Runtime.evaluate', prompt: 'must not be persisted', params: { expression: 'secret' } }
+  });
+  const page = createPage({
+    events: [],
+    onBasicEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) throw cdpError;
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 };
+      return undefined;
+    },
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); }
+  });
+  page.targetId = 'target-pre-dispatch';
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'diagnostic prompt', operationId: 'operation-pre-dispatch' }),
+    (error) => {
+      assert.equal(error, cdpError);
+      assert.equal(error.data.method, 'Runtime.evaluate');
+      assert.equal(error.data.targetId, 'target-pre-dispatch');
+      assert.equal(error.data.operationId, 'operation-pre-dispatch');
+      assert.equal(error.data.promptTyped, true);
+      assert.equal(error.data.messageDispatchStarted, false);
+      assert.equal(error.data.sendConfirmed, false);
+      assert.equal(error.data.phase, 'typing_prompt');
+      assert.equal(error.data.queryPhase, 'typing_prompt');
+      assert.equal(error.data.ownershipPhase, 'prompt-owned');
+      assert.equal(error.data.messageDispatchState, 'not-dispatched');
+      return true;
+    }
+  );
+  assert.equal(cdpError.data.queryDiagnostics.method, 'Runtime.evaluate');
+  assert.equal(JSON.stringify(cdpError.data.queryDiagnostics).includes('must not be persisted'), false);
+  assert.equal(JSON.stringify(cdpError.data.queryDiagnostics).includes('secret'), false);
+});
+
+test('chatgpt-controller: dispatch-started CDP timeout is distinguished from pre-dispatch', async () => {
+  const cdpError = Object.assign(new Error('chrome_cdp_command_timeout'), {
+    data: { method: 'Input.dispatchMouseEvent' }
+  });
+  const page = createPage({
+    events: [],
+    onBasicEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return { isChatGPT: true, assistantCount: 0, lastAssistantId: '', lastAssistantText: '' };
+      if (js.includes('const sendBaseline')) return {
+        ok: true,
+        isChatGPT: true,
+        fallbackEnter: false,
+        rect: { x: 100, y: 100, w: 30, h: 30 },
+        requestSubmit: true,
+        host: 'chatgpt.com',
+        sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: '', activePromptText: 'diagnostic prompt', activePromptTextDigest: '', activePromptTextLength: 16 }
+      };
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 };
+      return undefined;
+    },
+    onMouseDown: async (x) => {
+      if (x >= 80) throw cdpError;
+    },
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); }
+  });
+  page.targetId = 'target-dispatch-started';
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'diagnostic prompt', operationId: 'operation-dispatch-started' }),
+    (error) => {
+      assert.equal(error, cdpError);
+      assert.equal(error.data.method, 'Input.dispatchMouseEvent');
+      assert.equal(error.data.promptTyped, true);
+      assert.equal(error.data.messageDispatchStarted, true);
+      assert.equal(error.data.sendConfirmed, false);
+      assert.equal(error.data.ownershipPhase, 'dispatch-started');
+      assert.equal(error.data.messageDispatchState, 'unknown');
+      assert.equal(error.data.dispatchState, 'dispatching');
+      return true;
+    }
+  );
+});
+
+test('chatgpt-controller: send-confirmed timeout is not classified as pre-dispatch', async () => {
+  const cdpError = Object.assign(new Error('chrome_cdp_command_timeout'), {
+    data: { method: 'Runtime.evaluate' }
+  });
+  let sendSignalReads = 0;
+  const page = createPage({
+    events: [],
+    onBasicEvaluate: async (js) => {
+      if (js.includes('const assistantBaseline')) return { isChatGPT: true, assistantCount: 0, lastAssistantId: '', lastAssistantText: '' };
+      if (js.includes('const sendBaseline')) return {
+        ok: true,
+        isChatGPT: true,
+        fallbackEnter: false,
+        rect: { x: 100, y: 100, w: 30, h: 30 },
+        requestSubmit: true,
+        host: 'chatgpt.com',
+        sendBaseline: { userCount: 0, lastUserId: '', lastUserTextDigest: '', activePromptText: 'diagnostic prompt', activePromptTextDigest: '', activePromptTextLength: 16 }
+      };
+      if (js.includes('const chatgptSendSel') && !js.includes('promptTextLength')) {
+        sendSignalReads += 1;
+        return {
+          isChatGPT: true,
+          userCount: 1,
+          lastUserId: 'new-user-turn',
+          lastUserTextDigest: 'different',
+          activePromptText: '',
+          activePromptTextDigest: '',
+          activePromptTextLength: 0,
+          normalStopVisible: true
+        };
+      }
+      if (js.includes('const chatgptSendSel') && js.includes('promptTextLength')) throw cdpError;
+      if (js.includes('agentifyAttachmentCleanup')) return { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 1 };
+      return undefined;
+    },
+    onEvaluate: async (js) => { throw new Error(`unexpected_eval:${js.slice(0, 80)}`); }
+  });
+  page.targetId = 'target-send-confirmed';
+
+  await assert.rejects(
+    createController(page).query({ prompt: 'diagnostic prompt', operationId: 'operation-send-confirmed' }),
+    (error) => {
+      assert.equal(error, cdpError);
+      assert.equal(sendSignalReads, 1);
+      assert.equal(error.data.promptTyped, true);
+      assert.equal(error.data.messageDispatchStarted, true);
+      assert.equal(error.data.sendConfirmed, true);
+      assert.equal(error.data.messageDispatchState, 'unknown');
+      assert.notEqual(error.data.ownershipPhase, 'cleanup-required');
+      return true;
+    }
+  );
+});
+
 test('chatgpt-controller: explicit prompt evaluation failure keeps its meaning and phase', async () => {
   const events = [];
   const page = createPage({

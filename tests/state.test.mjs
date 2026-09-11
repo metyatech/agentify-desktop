@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ensureToken, readToken, writeToken, defaultSettings, normalizeSettings, readSettings, writeSettings } from '../state.mjs';
+import { ensureToken, readToken, writeToken, defaultSettings, normalizeSettings, readSettings, writeSettings, readWatcherRegistration, removeWatcherRegistration, watcherRegistrationPath, writeWatcherRegistration } from '../state.mjs';
 
 async function tempDir() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
@@ -49,6 +49,17 @@ test('state: writeSettings persists allowAuthPopups', async () => {
   assert.equal(saved.allowAuthPopups, false);
   const re = await readSettings(dir);
   assert.equal(re.allowAuthPopups, false);
+});
+
+test('state: watcher registration is isolated, validated, atomic, and ownership-protected', async () => {
+  const dir = await tempDir();
+  const registration = { schemaVersion: 1, managementRoot: path.join(dir, 'custom-management-root'), controllerEntryPath: path.join(dir, 'controller.mjs'), installedAt: '2026-09-11T00:00:00.000Z' };
+  await writeWatcherRegistration(registration, dir);
+  assert.deepEqual(await readWatcherRegistration(dir), registration);
+  assert.notEqual(watcherRegistrationPath(dir), path.join(dir, 'settings.json'));
+  await assert.rejects(() => removeWatcherRegistration({ ...registration, managementRoot: path.join(dir, 'other-root') }, dir), /ownership_mismatch/u);
+  assert.equal(await removeWatcherRegistration(registration, dir), true);
+  assert.equal(await readWatcherRegistration(dir), null);
 });
 
 test('state: normalizeSettings clamps backend fields', () => {

@@ -141,6 +141,7 @@ function validateAuthorizedTicket(value, { now, allowExpired, state }) {
   const assistantTurnId = safeText(value.assistantTurnId, 'assistantTurnId', 512);
   const contract = validateContract(value.contract);
   if (contract.id !== taskId || contract.agentify?.tabKey !== tabKey) throw new Error('autopilot_proposal_ticket_task_mismatch');
+  if (isRecord(contract.implementation) && Object.hasOwn(contract.implementation, 'timeoutMs')) throw new Error('autopilot_proposal_ticket_implementation_timeout_forbidden');
   const hash = safeText(value.contractHash, 'contractHash', 64).toLowerCase();
   if (!/^[0-9a-f]{64}$/u.test(hash) || proposalContractHash(contract) !== hash) throw new Error('autopilot_proposal_ticket_contract_hash_invalid');
   const createdAt = canonicalTimestamp(value.createdAt, 'createdAt');

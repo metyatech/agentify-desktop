@@ -130,6 +130,17 @@ test('implementation timeout is accepted and preserved while remaining optional 
   }
 });
 
+test('new V3 proposal validation rejects implementation timeout while keeping legacy validation compatible', () => {
+  assert.throws(() => parseValidateProposalResponse(validProposalText(FIXED_METADATA, {
+    contract: { implementation: { prompt: 'Implement the requested change.', timeoutMs: 900000 } }
+  }), { metadata: FIXED_METADATA, now: new Date(FIXED_METADATA.createdAt), rejectImplementationTimeout: true }), /implementation_timeout_forbidden/u);
+  assert.doesNotThrow(() => parseValidateProposalResponse(validProposalText(FIXED_METADATA, { legacyImplementation: true }), {
+    metadata: FIXED_METADATA,
+    now: new Date(FIXED_METADATA.createdAt),
+    rejectImplementationTimeout: true
+  }));
+});
+
 test('current proposal service accepts a missing implementation timeout without ticket failure', async () => {
   const saved = [];
   const { service } = makeService({
@@ -969,6 +980,15 @@ test('control center refreshes backend watcher state at the stale boundary', asy
   const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
   assert.match(js, /onStale: \(\) => refresh\(\)\.catch\(\(\) => \{\}\)/u);
   assert.match(js, /taskStatus: lastState\.autopilotStatus/u);
+});
+
+test('control center fails closed while the dynamic Codex catalog is loading, unavailable, or stale', async () => {
+  const js = await fs.readFile(path.join(import.meta.dirname, '..', 'ui', 'control-center.js'), 'utf8');
+  assert.match(js, /codexModelCatalogStatus === 'loading'/u);
+  assert.match(js, /codexModelCatalogStatus === 'error'/u);
+  assert.match(js, /以前のmodelは現在利用不可/u);
+  assert.match(js, /supportedReasoningEfforts\?\.includes\(settingsEffort\)/u);
+  assert.match(js, /\|\| !selectionReady/u);
 });
 
 test('control center startup keeps renderer imports Node-free and fails visibly', async () => {

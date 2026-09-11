@@ -126,7 +126,7 @@ function defaultState() {
     autopilotWatchStatus: null,
     autopilotProposalTicket: null,
     autopilotProposalTicketError: null
-    ,codexModels: [], codexModelError: null, codexDeepLinkAvailable: false
+    ,codexModels: [], codexModelCatalogStatus: 'loading', codexModelError: null, codexDeepLinkAvailable: false
   };
 }
 
@@ -169,6 +169,7 @@ function renderAutopilotState() {
   const hint = el('autopilotProposalHint');
   const state = lastState.autopilot || {};
   const blockedByRuntime = Number(state.inflightQueries || 0) > 0 || Number(state.activeQueries || 0) > 0;
+  const selectionReady = isCodexSelectionReady();
   const proposalView = autopilotProposalViewModel({ proposal: autopilotProposal, proposalTicket: lastState.autopilotProposalTicket, watchStatus: lastState.autopilotWatchStatus, taskStatus: lastState.autopilotStatus });
   let label = '準備可能';
   let className = '';
@@ -181,6 +182,18 @@ function renderAutopilotState() {
     label = '確認事項あり';
     className = 'isClarification';
     detail = autopilotClarificationMessage || 'ChatGPTの質問に回答してから、再度「この内容を実行」してください。';
+  } else if (lastState.codexModelCatalogStatus === 'loading') {
+    label = 'Codex model確認中';
+    className = 'isWaiting';
+    detail = 'Codex model確認中です。確認が完了するまで実行できません。';
+  } else if (lastState.codexModelCatalogStatus === 'error') {
+    label = 'Codex model確認エラー';
+    className = 'isError';
+    detail = `Codex modelを確認できないため実行できません。${lastState.codexModelError || ''}`.trim();
+  } else if (!selectionReady) {
+    label = 'Codex設定待ち';
+    className = 'isError';
+    detail = '以前のmodelは現在利用不可です。現在利用可能なmodelとReasoning Effortを選択して保存してください。';
   } else if (lastState.autopilotProposalTicketError) {
     label = 'エラー停止';
     className = 'isError';
@@ -201,7 +214,7 @@ function renderAutopilotState() {
   status.className = `autopilotStatus ${className}`.trim();
   hint.textContent = detail;
   const watcher = lastState.autopilotWatcher || { status: 'offline' };
-  const watcherLabel = { running: 'Running', starting: 'Starting', offline: 'Offline', error: 'Error' }[watcher.status] || 'Error';
+  const watcherLabel = { running: 'Running', starting: 'Starting', offline: 'Offline', error: 'Error', 'not-configured': 'Not configured' }[watcher.status] || 'Error';
   el('autopilotWatcherStatus').textContent = watcherLabel;
   const restartWatcher = el('btnRestartAutopilotWatcher');
   restartWatcher.classList.toggle('isHidden', !['offline', 'error'].includes(watcher.status));
@@ -210,7 +223,7 @@ function renderAutopilotState() {
     runtimeReady: state.ready,
     requestInFlight: autopilotRequestInFlight,
     ticketError: lastState.autopilotProposalTicketError,
-  });
+  }) || !selectionReady;
   button.setAttribute('aria-busy', autopilotRequestInFlight ? 'true' : 'false');
   renderAutopilotTaskProgress(lastState.autopilotStatus);
   autopilotStatusScheduler.schedule(lastState.autopilotStatus);
@@ -320,6 +333,7 @@ function syncChromeProfileFields() {
 }
 
 let lastState = defaultState();
+let lastSettings = defaultSettings();
 let refreshInFlight = null;
 let lastRefreshAt = 0;
 let hasLiveUpdates = false;
@@ -391,23 +405,50 @@ function populateCodexModels(selectedModel = null, selectedEffort = null) {
   if (!modelSelect || !effortSelect) return;
   const models = (lastState.codexModels || []).filter((model) => model.available !== false && !model.hidden);
   modelSelect.replaceChildren();
+  const catalogStatus = lastState.codexModelCatalogStatus || 'loading';
+  const state = el('codexModelState');
+  if (catalogStatus === 'loading') {
+    const option = document.createElement('option'); option.textContent = 'Codex model確認中'; option.value = ''; option.disabled = true; option.selected = true; modelSelect.appendChild(option);
+    state.textContent = 'Codex model確認中';
+  } else if (catalogStatus === 'error') {
+    const option = document.createElement('option'); option.textContent = 'Codex modelを確認できません'; option.value = ''; option.disabled = true; option.selected = true; modelSelect.appendChild(option);
+    state.textContent = `Codex model確認エラー: ${lastState.codexModelError || 'catalog unavailable'}`;
+  }
+  const selectedAvailable = selectedModel && models.find((model) => model.id === selectedModel);
+  if (selectedModel && !selectedAvailable && catalogStatus === 'ready') {
+    const option = document.createElement('option'); option.textContent = `以前のmodelは現在利用不可: ${selectedModel}`; option.value = selectedModel; option.selected = true; modelSelect.appendChild(option);
+    state.textContent = '以前のmodelは現在利用不可です。現在利用可能なmodelを明示選択して保存してください。';
+  }
   for (const model of models) {
     const option = document.createElement('option');
     option.value = model.id;
     option.textContent = model.displayName || model.id;
     modelSelect.appendChild(option);
   }
-  if (selectedModel && models.some((model) => model.id === selectedModel)) modelSelect.value = selectedModel;
-  const model = models.find((item) => item.id === modelSelect.value) || models[0];
+  if (selectedAvailable) modelSelect.value = selectedModel;
+  const model = models.find((item) => item.id === modelSelect.value) || null;
   effortSelect.replaceChildren();
   for (const effort of model?.supportedReasoningEfforts || []) {
     const option = document.createElement('option'); option.value = effort; option.textContent = effort; effortSelect.appendChild(option);
   }
-  if (selectedEffort && model?.supportedReasoningEfforts?.includes(selectedEffort)) effortSelect.value = selectedEffort;
-  if (!effortSelect.value && model?.defaultReasoningEffort) effortSelect.value = model.defaultReasoningEffort;
+  const selectedEffortAvailable = selectedEffort && model?.supportedReasoningEfforts?.includes(selectedEffort);
+  if (selectedEffortAvailable) effortSelect.value = selectedEffort;
+  if (selectedEffort && model && !selectedEffortAvailable) {
+    const option = document.createElement('option'); option.value = selectedEffort; option.textContent = `以前のReasoning Effortは現在利用不可: ${selectedEffort}`; option.selected = true; option.disabled = true; effortSelect.insertBefore(option, effortSelect.firstChild);
+    state.textContent = '以前のReasoning Effortは現在利用不可です。現在のmodelで対応する値を明示選択して保存してください。';
+  } else if (!effortSelect.value && model?.defaultReasoningEffort) effortSelect.value = model.defaultReasoningEffort;
   if (!effortSelect.value && effortSelect.options.length) effortSelect.selectedIndex = 0;
-  modelSelect.disabled = models.length === 0;
-  effortSelect.disabled = !model;
+  modelSelect.disabled = catalogStatus !== 'ready';
+  effortSelect.disabled = !model || catalogStatus !== 'ready';
+  if (catalogStatus === 'ready' && !selectedModel) state.textContent = 'modelを選択して保存してください。';
+}
+
+function isCodexSelectionReady() {
+  if (lastState.codexModelCatalogStatus !== 'ready') return false;
+  const settingsModel = String(lastSettings?.codexModel || '').trim();
+  const settingsEffort = String(lastSettings?.codexReasoningEffort || '').trim();
+  const model = (lastState.codexModels || []).find((item) => item.id === settingsModel && item.available !== false && !item.hidden);
+  return !!model && model.supportedReasoningEfforts?.includes(settingsEffort);
 }
 
 function closeDialog(dialog) {
@@ -479,6 +520,7 @@ async function refresh({ initial = false } = {}) {
     const startupTimeoutMs = initial ? CONTROL_CENTER_STARTUP_IPC_TIMEOUT_MS : null;
     const state = (await callApi('getState', undefined, { fallback: lastState, required: initial, timeoutMs: startupTimeoutMs })) || lastState;
     const settings = (await callApi('getSettings', undefined, { fallback: defaultSettings(), required: initial, timeoutMs: startupTimeoutMs })) || defaultSettings();
+    lastSettings = { ...defaultSettings(), ...settings };
     const watchFoldersData =
       (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial, timeoutMs: startupTimeoutMs })) || { folders: [] };
     lastState = { ...defaultState(), ...state };

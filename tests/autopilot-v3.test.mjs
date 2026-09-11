@@ -27,6 +27,10 @@ test('V3 ticket is atomically already-authorized and approval resolution never r
   await fs.rm(stateDir, { recursive: true, force: true });
 });
 
+test('V3 ticket rejects an implementation timeout while preserving review timeout semantics', () => {
+  assert.throws(() => validateAutopilotProposalTicket({ ...makeTicket(), contract: { ...contract, implementation: { prompt: 'Do work.', timeoutMs: 1 } }, contractHash: proposalContractHash({ ...contract, implementation: { prompt: 'Do work.', timeoutMs: 1 } }) }), /implementation_timeout_forbidden/u);
+});
+
 test('model picker uses dynamic catalog metadata and selected effort', () => {
   const models = parseCodexModelListResponse({ data: [{ id: 'm1', displayName: 'M1', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }] }] });
   assert.deepEqual(validateCodexSelection({ model: 'm1', reasoningEffort: 'high' }, models), { model: 'm1', reasoningEffort: 'high' });

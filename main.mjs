@@ -18,7 +18,7 @@ import { ChatGPTController } from './chatgpt-controller.mjs';
 import { startHttpApi } from './http-api.mjs';
 import { TabManager } from './tab-manager.mjs';
 import { TabRegistry } from './tab-registry.mjs';
-import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
+import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState, readWatcherRegistration } from './state.mjs';
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
 import { createAutopilotProposalTicketStore } from './autopilot-proposal-ticket.mjs';
@@ -78,6 +78,20 @@ function createControlCenterDiagnosticLogger(stateDir) {
       .catch(() => {});
     console.warn(`[control-center:${safeCode}]`);
   };
+}
+
+export async function resolveAutopilotWatcherConfig(stateDir) {
+  const explicitRoot = String(process.env.AI_AUTOPILOT_ROOT || '').trim();
+  if (explicitRoot) return { root: path.resolve(explicitRoot), registration: null, error: null };
+  try {
+    const registration = await readWatcherRegistration(stateDir);
+    if (!registration) return { root: null, registration: null, error: null };
+    const stat = await fs.lstat(registration.controllerEntryPath);
+    if (!stat.isFile()) return { root: null, registration, error: 'Watcher registration controller entry is not a file.' };
+    return { root: registration.managementRoot, registration, error: null };
+  } catch (error) {
+    return { root: null, registration: null, error: 'Watcher registration is invalid or unreadable.' };
+  }
 }
 
 function buildChromeUserAgent() {
@@ -168,21 +182,25 @@ async function main() {
   const autopilotStatus = await createAutopilotStatusStore({ stateDir });
   const autopilotWatchStatus = await createAutopilotWatchStatusStore({ stateDir });
   const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
-  const autopilotWatcher = createAutopilotWatcherManager({ root: process.env.AI_AUTOPILOT_ROOT || path.join(path.dirname(stateDir), 'AIAutopilot') });
+  const watcherConfig = await resolveAutopilotWatcherConfig(stateDir);
+  const autopilotWatcher = createAutopilotWatcherManager({ root: watcherConfig.root, initialError: watcherConfig.error });
   await autopilotWatcher.start();
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
   let codexModels = [];
+  let codexModelCatalogStatus = 'loading';
   let codexModelError = null;
   const codexDeepLinkAvailable = await detectCodexDeepLink();
   void listCodexModels().then(async (models) => {
     codexModels = models;
+    codexModelCatalogStatus = 'ready';
     codexModelError = null;
     const defaultSelection = defaultCodexSelection(codexModels);
     if (!settings.codexModel && defaultSelection) settings = await writeSettings({ ...settings, codexModel: defaultSelection.model, codexReasoningEffort: defaultSelection.reasoningEffort }, stateDir);
     emitTabsChanged?.();
   }).catch((error) => {
+    codexModelCatalogStatus = 'error';
     codexModelError = String(error?.message || error);
     emitTabsChanged?.();
   });
@@ -448,6 +466,7 @@ async function main() {
       autopilotProposalTicket: currentProposalTicket.ticket,
       autopilotProposalTicketError: currentProposalTicket.error,
       codexModels,
+      codexModelCatalogStatus,
       codexModelError,
       codexDeepLinkAvailable,
       autopilotWatcher: autopilotWatcher.getStatus(),

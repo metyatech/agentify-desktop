@@ -24,6 +24,7 @@
     "autopilot-watch-status.mjs",
     "browser-backend.mjs",
     "codex-deep-link.mjs",
+    "codex-identity.mjs",
     "codex-models.mjs",
     "bundle-store.mjs",
     "chatgpt-controller.mjs",

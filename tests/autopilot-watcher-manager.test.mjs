@@ -35,3 +35,32 @@ test('dead owner stale lock is removed only without controller lock; live owner 
   const manager = createAutopilotWatcherManager({ root: 'D:/auto', readFile: async (file) => { if (file === live.paths.config) return config; return live.files[file]; }, lstat: async (file) => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; }, isPidAlive: () => true, env: {} });
   assert.equal((await manager.inspect()).status, 'running');
 });
+
+test('manager confirms the spawned watcher lock before reporting Running and never touches the controller lock', async () => {
+  const files = {};
+  const paths = watcherPaths('D:/custom-management-root');
+  files[paths.config] = config;
+  let spawnCount = 0;
+  const child = { exitCode: null, once() {}, kill() { this.exitCode = 0; } };
+  const manager = createAutopilotWatcherManager({
+    root: 'D:/custom-management-root',
+    readFile: async (file) => { if (!(file in files)) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return files[file]; },
+    lstat: async (file) => { if (file === paths.controllerLock) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return {}; },
+    unlink: async (file) => { delete files[file]; },
+    spawnImpl: () => { spawnCount += 1; files[paths.lock] = JSON.stringify({ pid: 1234 }); return child; },
+    isPidAlive: (pid) => pid === 1234,
+    sleep: async () => {},
+    startupTimeoutMs: 100,
+    env: {},
+  });
+  assert.equal((await manager.start()).status, 'running');
+  assert.equal((await manager.start()).status, 'running');
+  assert.equal(spawnCount, 1);
+  assert.equal(paths.controllerLock.endsWith('.controller-run.lock.json'), true);
+});
+
+test('manager reports Not configured without guessing a management root', async () => {
+  const manager = createAutopilotWatcherManager();
+  assert.equal((await manager.start()).status, 'not-configured');
+  assert.equal((await manager.inspect()).status, 'not-configured');
+});

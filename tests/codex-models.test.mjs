@@ -20,5 +20,6 @@ test('selection rejects unavailable model without fallback and deep link require
   assert.throws(() => validateCodexSelection({ model: 'one', reasoningEffort: 'high' }, models), /unsupported/u);
   assert.equal(isCodexThreadId('not-a-thread'), false);
   assert.equal(isCodexThreadId('123e4567-e89b-42d3-a456-426614174000'), true);
+  assert.equal(isCodexThreadId('01a08bd8-5737-7661-9fe4-2d216ac78d71'), true);
   assert.equal(await detectCodexDeepLink({ platform: 'linux' }), false);
 });

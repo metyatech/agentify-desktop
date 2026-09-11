@@ -39,6 +39,8 @@ test('autopilot status validation rejects unknown fields, malformed counts, and 
   assert.throws(() => validateAutopilotStatus({ ...snapshot(), verification: { completed: 3, total: 2, failed: 0 } }), /invalid_autopilot_status/u);
   assert.throws(() => validateAutopilotStatus({ ...snapshot(), repository: 'D:/secret' }), /invalid_autopilot_status/u);
   assert.throws(() => validateAutopilotStatus({ ...snapshot(), updatedAt: 'not-a-date' }), /invalid_autopilot_status/u);
+  assert.equal(validateAutopilotStatus({ ...snapshot(), codexThreadId: '01a08bd8-5737-7661-9fe4-2d216ac78d71' }).codexThreadId, '01a08bd8-5737-7661-9fe4-2d216ac78d71');
+  assert.throws(() => validateAutopilotStatus({ ...snapshot(), codexThreadId: 'not-a-thread' }), /invalid_autopilot_status/u);
 });
 
 test('autopilot status persists, reloads, and marks an old running snapshot stale', async () => {

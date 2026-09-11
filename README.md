@@ -349,6 +349,12 @@ only the Agentify display snapshot and never deletes task state, worktrees,
 branches, evidence, or the watcher ledger. The API rejects clearing a running
 snapshot.
 
+On Windows, Agentify manages the watcher from a controller-owned registration
+file, `autopilot-watcher-registration.json`, in the Agentify state directory.
+The registration is written atomically by `ai-autopilot watch install`; when no
+explicit `AI_AUTOPILOT_ROOT` or validated registration exists, the UI reports
+`Not configured` and does not infer a filesystem location.
+
 ## Structured Conversation Turns
 
 The authenticated loopback API exposes a read-only ChatGPT conversation boundary

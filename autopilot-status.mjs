@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 import { atomicWriteFile, defaultStateDir } from './state.mjs';
+import { isCodexThreadId } from './codex-identity.mjs';
 
 export const AUTOPILOT_STATUS_SCHEMA_VERSION = 1;
 export const AUTOPILOT_STATUS_FILE = 'autopilot-status.json';
@@ -40,7 +41,7 @@ export function validateAutopilotStatus(value) {
   if (!Number.isInteger(value.maxRounds) || value.maxRounds < 1 || value.maxRounds > 10 || value.round > value.maxRounds) throw invalidStatus('maxRounds is invalid');
   if (value.latestVerdict !== null && !VERDICTS.has(value.latestVerdict)) throw invalidStatus('latestVerdict is invalid');
   for (const key of ['codexModel', 'reasoningEffort']) if (value[key] !== null && value[key] !== undefined) safeText(value[key], key, 128);
-  if (value.codexThreadId !== null && value.codexThreadId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(String(value.codexThreadId))) throw invalidStatus('codexThreadId is invalid');
+  if (value.codexThreadId !== null && value.codexThreadId !== undefined && !isCodexThreadId(value.codexThreadId)) throw invalidStatus('codexThreadId is invalid');
   if (!value.verification || typeof value.verification !== 'object' || Array.isArray(value.verification)) throw invalidStatus('verification is invalid');
   const verificationKeys = Object.keys(value.verification);
   if (verificationKeys.some((key) => !['completed', 'total', 'failed'].includes(key))) throw invalidStatus('verification contains unknown fields');

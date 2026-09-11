@@ -49,6 +49,56 @@ export function settingsPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, 'settings.json');
 }
 
+export const WATCHER_REGISTRATION_SCHEMA_VERSION = 1;
+export const WATCHER_REGISTRATION_FILE = 'autopilot-watcher-registration.json';
+
+export function watcherRegistrationPath(stateDir = defaultStateDir()) {
+  return path.join(stateDir, WATCHER_REGISTRATION_FILE);
+}
+
+export function validateWatcherRegistration(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      value.schemaVersion !== WATCHER_REGISTRATION_SCHEMA_VERSION ||
+      typeof value.managementRoot !== 'string' || !path.isAbsolute(value.managementRoot) ||
+      typeof value.controllerEntryPath !== 'string' || !path.isAbsolute(value.controllerEntryPath) ||
+      typeof value.installedAt !== 'string' || !Number.isFinite(Date.parse(value.installedAt))) {
+    throw new Error('invalid_watcher_registration');
+  }
+  return {
+    schemaVersion: WATCHER_REGISTRATION_SCHEMA_VERSION,
+    managementRoot: path.resolve(value.managementRoot),
+    controllerEntryPath: path.resolve(value.controllerEntryPath),
+    installedAt: new Date(value.installedAt).toISOString(),
+  };
+}
+
+export async function readWatcherRegistration(stateDir = defaultStateDir()) {
+  try {
+    return validateWatcherRegistration(JSON.parse(await fs.readFile(watcherRegistrationPath(stateDir), 'utf8')));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+export async function writeWatcherRegistration(value, stateDir = defaultStateDir()) {
+  const registration = validateWatcherRegistration(value);
+  await ensureStateDir(stateDir);
+  await atomicWriteFile(watcherRegistrationPath(stateDir), `${JSON.stringify(registration, null, 2)}\n`, { mode: 0o600 });
+  return registration;
+}
+
+export async function removeWatcherRegistration(value, stateDir = defaultStateDir()) {
+  const current = await readWatcherRegistration(stateDir);
+  if (!current) return false;
+  const expected = validateWatcherRegistration(value);
+  if (current.managementRoot !== expected.managementRoot || current.controllerEntryPath !== expected.controllerEntryPath) {
+    throw new Error('watcher_registration_ownership_mismatch');
+  }
+  await fs.unlink(watcherRegistrationPath(stateDir));
+  return true;
+}
+
 export function defaultSettings() {
   return {
     browserBackend: 'chrome-cdp',

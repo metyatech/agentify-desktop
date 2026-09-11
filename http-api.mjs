@@ -197,7 +197,7 @@ function sanitizeBrowserEvaluationDiagnostics(value) {
   };
 }
 
-function sanitizeQueryDiagnostics(value) {
+export function sanitizeQueryDiagnostics(value) {
   const data = value && typeof value === 'object' ? value : {};
   const nested = data.queryDiagnostics && typeof data.queryDiagnostics === 'object' ? data.queryDiagnostics : {};
   const source = { ...nested, ...data };

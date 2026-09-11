@@ -31,6 +31,7 @@ import { shouldAllowPopup } from './popup-policy.mjs';
 import { cleanupRuntimeResources, createGracefulShutdown, registerShutdownSignals } from './shutdown.mjs';
 import { createControlCenterShowGate, hasStartMinimizedArg } from './launch-mode.mjs';
 import { createAutopilotProposalService } from './autopilot-proposal.mjs';
+import { createAutopilotProposalIpcFailure, createAutopilotProposalIpcSuccess } from './autopilot-proposal-ipc.mjs';
 import { defaultCodexSelection, listCodexModels, validateCodexSelection } from './codex-models.mjs';
 import { detectCodexDeepLink, isCodexThreadId } from './codex-deep-link.mjs';
 import { createAutopilotWatcherManager } from './autopilot-watcher-manager.mjs';
@@ -476,20 +477,9 @@ async function main() {
 
   ipcMain.handle('agentify:requestAutopilotProposal', async () => {
     try {
-      return await autopilotProposal.request();
+      return createAutopilotProposalIpcSuccess(await autopilotProposal.request());
     } catch (error) {
-      const body = error?.data?.body;
-      const diagnostics = body?.error === 'chrome_cdp_command_timeout' && body?.data && typeof body.data === 'object'
-        ? body.data
-        : null;
-      if (diagnostics) {
-        error.data = {
-          ...(error.data && typeof error.data === 'object' ? error.data : {}),
-          ...diagnostics,
-          diagnostics
-        };
-      }
-      throw error;
+      return createAutopilotProposalIpcFailure(error);
     }
   });
   ipcMain.handle('agentify:openCodexThread', async (_evt, args) => {

@@ -57,5 +57,5 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
     child.once?.('exit', (code) => { child = null; if (code !== 0) current = { status: 'error', detail: `Watcher exited (${code}).` }; else current = { status: 'offline', detail: 'Watcher stopped.' }; });
     return await waitForRunning();
   };
-  return { paths, inspect, start, async restart() { if (child && child.exitCode === null) { try { child.kill(); } catch {} child = null; } return await start(); }, getStatus: () => current, async stop() { if (child && child.exitCode === null) { try { child.kill(); } catch {} } child = null; } };
+  return { paths, inspect, getState: inspect, start, async restart() { if (child && child.exitCode === null) { try { child.kill(); } catch {} child = null; } return await start(); }, getStatus: () => current, async stop() { if (child && child.exitCode === null) { try { child.kill(); } catch {} } child = null; } };
 }

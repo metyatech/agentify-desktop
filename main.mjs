@@ -451,6 +451,7 @@ async function main() {
         },
       };
     }
+    const watcherStatus = await autopilotWatcher.getState();
     return {
       ok: true,
       vendors,
@@ -469,7 +470,7 @@ async function main() {
       codexModelCatalogStatus,
       codexModelError,
       codexDeepLinkAvailable,
-      autopilotWatcher: autopilotWatcher.getStatus(),
+      autopilotWatcher: watcherStatus,
     };
   });
 

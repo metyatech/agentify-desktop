@@ -59,6 +59,28 @@ test('manager confirms the spawned watcher lock before reporting Running and nev
   assert.equal(paths.controllerLock.endsWith('.controller-run.lock.json'), true);
 });
 
+test('getState refreshes an externally started watcher and does not leave a dead PID Running', async () => {
+  let alive = true;
+  const f = fixture({});
+  f.files[f.paths.config] = config;
+  f.files[f.paths.lock] = JSON.stringify({ pid: 4567 });
+  const manager = createAutopilotWatcherManager({
+    root: 'D:/auto',
+    readFile: async (file) => { if (!(file in f.files)) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return f.files[file]; },
+    lstat: async (file) => { if (file === f.paths.controllerLock) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return {}; },
+    unlink: async (file) => { f.calls.push(['unlink', file]); delete f.files[file]; },
+    spawnImpl: (...args) => { f.calls.push(['spawn', ...args]); return { exitCode: null, once() {}, kill() {} }; },
+    isPidAlive: () => alive,
+    env: {},
+  });
+  assert.equal((await manager.getState()).status, 'running');
+  alive = false;
+  assert.equal((await manager.getState()).status, 'offline');
+  assert.equal((await manager.getState()).status, 'offline');
+  assert.equal(f.calls.filter((call) => call[0] === 'spawn').length, 0);
+  assert.equal(f.calls.filter((call) => call[0] === 'unlink' && call[1] === f.paths.controllerLock).length, 0);
+});
+
 test('manager reports Not configured without guessing a management root', async () => {
   const manager = createAutopilotWatcherManager();
   assert.equal((await manager.start()).status, 'not-configured');

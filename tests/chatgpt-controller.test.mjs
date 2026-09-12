@@ -4465,7 +4465,8 @@ test('chatgpt-controller: includes ChatGPT composer diagnostics in response time
         newChatGPTAssistant: true,
         composerIdle: false,
         assistantTerminalSignal: false,
-        completionReason: 'terminal_signal_missing'
+        completionReason: 'terminal_signal_missing',
+        messageDispatchState: 'unknown'
       });
       return true;
     }
@@ -4704,6 +4705,133 @@ function chatgptUploadInputState({
     pageUploadInputCount: 1
   };
 }
+
+test('chatgpt-controller: reports preflight query conflicts as not-dispatched', async () => {
+  const events = [];
+  const staleState = {
+    isChatGPT: true,
+    hasAttachmentState: true,
+    promptLength: 0,
+    promptDigest: textDigest(''),
+    selectedFiles: [{ transportName: 'orphan.txt', logicalName: 'orphan.txt', size: 4, sha256: '0'.repeat(64) }],
+    selectedFileNames: ['orphan.txt'],
+    cardDisplayNames: [],
+    currentDraftCardCount: 0,
+    composerInputCount: 1,
+    pageInputCount: 1,
+    inputValuePresent: true
+  };
+  const { page } = createAttachmentCleanupPage({
+    events,
+    attachmentDraftState: staleState,
+    attachmentState: attachmentCardSnapshot([]),
+    cleanupResult: { ok: false, reason: 'orphan_recovery_not_attempted' }
+  });
+  await assert.rejects(
+    createController(page).query({ prompt: 'query conflict', attachments: [], timeoutMs: 5_000 }),
+    (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.messageDispatchState === 'not-dispatched'
+  );
+  assert.equal(events.includes('cleanup-draft'), false);
+});
+
+test('chatgpt-controller: clears only an exact orphan attachment residue before the same query', async () => {
+  await withTempAttachments(['orphan.txt'], async ([attachment]) => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-orphan-residue-'));
+    const events = [];
+    const expected = await describeAttachmentFiles([attachment]);
+    const residual = {
+      isChatGPT: true,
+      hasAttachmentState: true,
+      promptText: '',
+      promptLength: 0,
+      promptDigest: textDigest(''),
+      selectedFiles: expected,
+      selectedFileNames: expected.map((item) => item.transportName),
+      cardDisplayNames: [],
+      currentDraftCardCount: 0,
+      composerInputCount: 1,
+      pageInputCount: 1,
+      uploadInputIdentityMatch: true,
+      inputValuePresent: true
+    };
+    const clean = {
+      ...residual,
+      hasAttachmentState: false,
+      selectedFiles: [],
+      selectedFileNames: [],
+      inputValuePresent: false
+    };
+    let cleaned = false;
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: () => cleaned ? clean : residual,
+      attachmentState: () => attachmentCardSnapshot([{ fileName: 'orphan.txt', found: true, pending: false, failed: false }]),
+      cleanupResult: { ok: true, selectedFileNames: [], cardCount: 0, promptTextLength: 0, userTurnCount: 0 },
+      onEvaluateExtra: async (js) => {
+        if (js.includes('const agentifyAttachmentCleanup')) cleaned = true;
+        return undefined;
+      },
+      onBasicEvaluate: async (js) => js.includes('const node = nodes[0] || null') ? '' : undefined
+    });
+    try {
+      const result = await createController(page, { stateDir, tabId: 'orphan-residue-tab' }).query({
+        prompt: 'reuse exact requested files',
+        attachments: [attachment],
+        timeoutMs: 5_000
+      });
+      assert.equal(result.text, 'cleanup-answer');
+      assert.equal(cleaned, true);
+      assert.equal(events.filter((event) => event === 'cleanup-draft').length, 1);
+      assert.equal(events.filter((event) => event === 'files-set:1').length, 1);
+      assert.equal(events.some((event) => event === 'text:reuse exact requested files'), true);
+      assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'orphan-residue-tab' }).read(), null);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test('chatgpt-controller: refuses orphan cleanup for a same-name attachment with different bytes', async () => {
+  await withTempAttachments(['orphan-mismatch.txt'], async ([attachment]) => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-orphan-mismatch-'));
+    const events = [];
+    const expected = await describeAttachmentFiles([attachment]);
+    const staleState = {
+      isChatGPT: true,
+      hasAttachmentState: true,
+      promptLength: 0,
+      promptDigest: textDigest(''),
+      selectedFiles: [{ ...expected[0], sha256: 'f'.repeat(64) }],
+      selectedFileNames: [expected[0].transportName],
+      cardDisplayNames: [],
+      currentDraftCardCount: 0,
+      composerInputCount: 1,
+      pageInputCount: 1,
+      uploadInputIdentityMatch: true,
+      inputValuePresent: true
+    };
+    const { page } = createAttachmentCleanupPage({
+      events,
+      attachmentDraftState: staleState,
+      attachmentState: attachmentCardSnapshot([]),
+      cleanupResult: { ok: true }
+    });
+    try {
+      await assert.rejects(
+        createController(page, { stateDir, tabId: 'orphan-mismatch-tab' }).query({
+          prompt: 'must not clear mismatched bytes',
+          attachments: [attachment],
+          timeoutMs: 5_000
+        }),
+        (error) => error.message === 'chatgpt_file_input_state_conflict' && error.data?.messageDispatchState === 'not-dispatched'
+      );
+      assert.equal(events.includes('cleanup-draft'), false);
+      assert.equal(await new DraftOwnershipStore({ stateDir, tabId: 'orphan-mismatch-tab' }).read(), null);
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
 
 function createUploadInputStatePage({ events, initialState, fileStateForPoll = null, onSetFileInputFiles = null, requireAttachmentMenuWhenInputReady = false }) {
   let attachmentPolls = 0;

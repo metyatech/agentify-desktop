@@ -185,7 +185,6 @@ async function main() {
   const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
   const watcherConfig = await resolveAutopilotWatcherConfig(stateDir);
   const autopilotWatcher = createAutopilotWatcherManager({ root: watcherConfig.root, initialError: watcherConfig.error });
-  await autopilotWatcher.start();
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
@@ -878,6 +877,11 @@ async function main() {
   if (!server) throw new Error('http_api_start_failed');
 
   await writeState({ ok: true, port, pid: process.pid, serverId, startedAt: new Date().toISOString() }, stateDir);
+
+  // The watcher resolves persistent tabs through the live HTTP API. Start it
+  // only after the browser, restored tabs, server, and published state are
+  // all ready, so a fresh runtime tab id is visible before reconciliation.
+  await autopilotWatcher.start();
 
   const shutdown = createGracefulShutdown({
     closeServer: (done) => {

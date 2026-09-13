@@ -10,7 +10,10 @@ import {
   isAutopilotProposalRequestDisabled,
 } from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
-import { autopilotUserActionViewModel } from './autopilot-user-action-view.mjs';
+import {
+  autopilotTaskSurfaceViewModel,
+  autopilotUserActionViewModel,
+} from './autopilot-user-action-view.mjs';
 import {
   callControlCenterApi,
   safeControlCenterErrorCode,
@@ -281,6 +284,14 @@ function renderAutopilotTaskProgress(snapshot) {
   activityNewOutputPending = update.showNewOutput;
   activityVisibleCursor = activitySnapshot ? nextCursor : null;
   root.innerHTML = '';
+  const taskSurface = autopilotTaskSurfaceViewModel({
+    taskStatus: snapshot,
+    watchStatus: lastState.autopilotWatchStatus,
+  });
+  if (taskSurface.kind === 'user-action' && !taskSurface.matchingTaskStatus) {
+    renderCurrentUserActionTaskProgress(root, taskSurface);
+    return;
+  }
   const view = autopilotStatusViewModel(snapshot);
   const context = document.createElement('div');
   context.className = 'autopilotProgressContext';
@@ -377,8 +388,25 @@ function renderAutopilotTaskProgress(snapshot) {
   }
 }
 
-function appendUserActionResume(root, snapshot) {
-  const view = autopilotUserActionViewModel(snapshot, lastState.autopilotWatchStatus);
+function renderCurrentUserActionTaskProgress(root, surface) {
+  const context = document.createElement('div');
+  context.className = 'autopilotProgressContext';
+  context.textContent = '現在のAutopilot task';
+  root.appendChild(context);
+  const task = document.createElement('div');
+  task.className = 'autopilotProgressTask mono';
+  task.textContent = surface.taskId;
+  root.appendChild(task);
+  const phase = document.createElement('div');
+  phase.className = 'autopilotProgressLine';
+  const round = surface.sourceReviewRound == null ? '—' : `Round ${surface.sourceReviewRound}`;
+  phase.textContent = `Blocked / USER_ACTION_REQUIRED — ${round}`;
+  root.appendChild(phase);
+  appendUserActionResume(root, null, surface);
+}
+
+function appendUserActionResume(root, snapshot, resolvedView = null) {
+  const view = resolvedView || autopilotUserActionViewModel(snapshot, lastState.autopilotWatchStatus);
   if (!view.visible) return;
   const { taskId } = view;
   const section = document.createElement('section');

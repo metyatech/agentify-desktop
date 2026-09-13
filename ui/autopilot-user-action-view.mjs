@@ -1,19 +1,72 @@
 const STATES = new Set(['waiting-for-reply', 'reply-detected', 'authorized', 'resuming', 'stale']);
 
-export function autopilotUserActionViewModel(snapshot, watchStatus) {
-  if (!snapshot || snapshot.status !== 'blocked' || snapshot.latestVerdict !== 'USER_ACTION_REQUIRED') {
-    return { visible: false };
+export function resolveAutopilotTaskSurface({ taskStatus = null, watchStatus = null } = {}) {
+  const userAction = watchStatus?.userAction;
+  const taskId = typeof userAction?.taskId === 'string' ? userAction.taskId.trim() : '';
+  const isFreshUserAction = watchStatus?.status === 'healthy'
+    && watchStatus.stale !== true
+    && Boolean(taskId)
+    && STATES.has(userAction.state);
+
+  if (!isFreshUserAction) return { kind: 'task-status', taskStatus };
+
+  const sameTask = taskStatus?.taskId === taskId;
+  if (sameTask && (taskStatus.status !== 'blocked' || taskStatus.latestVerdict !== 'USER_ACTION_REQUIRED')) {
+    return {
+      kind: 'conflict',
+      taskId,
+      userAction,
+      taskStatus,
+      reason: 'USER_ACTION_TASK_STATUS_CONFLICT',
+      visible: false,
+      canCheck: false,
+      canResume: false,
+    };
   }
-  const taskId = String(snapshot.taskId || '');
-  const source = watchStatus?.userAction?.taskId === taskId ? watchStatus.userAction : null;
-  const state = STATES.has(source?.state) ? source.state : 'waiting-for-reply';
-  const userTurnCount = boundedCount(source?.userTurnCount);
-  const replyTurnCount = boundedCount(source?.replyTurnCount);
-  const canResume = source?.canResume === true && state === 'reply-detected';
+
+  return {
+    kind: 'user-action',
+    taskId,
+    userAction,
+    matchingTaskStatus: sameTask ? taskStatus : null,
+  };
+}
+
+export function autopilotTaskSurfaceViewModel({ taskStatus = null, watchStatus = null } = {}) {
+  const surface = resolveAutopilotTaskSurface({ taskStatus, watchStatus });
+  if (surface.kind !== 'user-action') return surface;
+  return {
+    ...surface,
+    ...userActionViewModel(surface.userAction),
+  };
+}
+
+export function autopilotUserActionViewModel(snapshot, watchStatus) {
+  const surface = resolveAutopilotTaskSurface({ taskStatus: snapshot, watchStatus });
+  if (surface.kind !== 'user-action') {
+    return {
+      visible: false,
+      taskId: surface.taskId || null,
+      conflict: surface.kind === 'conflict',
+      reason: surface.reason || null,
+      canCheck: false,
+      canResume: false,
+    };
+  }
+  return userActionViewModel(surface.userAction);
+}
+
+function userActionViewModel(source) {
+  const taskId = String(source.taskId);
+  const state = source.state;
+  const userTurnCount = boundedCount(source.userTurnCount);
+  const replyTurnCount = boundedCount(source.replyTurnCount);
+  const canResume = source.canResume === true && state === 'reply-detected';
   const canCheck = state === 'waiting-for-reply' || state === 'stale';
   return {
     visible: true,
     taskId,
+    sourceReviewRound: Number.isSafeInteger(source.sourceReviewRound) ? source.sourceReviewRound : null,
     state,
     userTurnCount,
     replyTurnCount,

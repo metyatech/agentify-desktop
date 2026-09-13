@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 
 const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u;
 const MAX_OUTPUT_BYTES = 64 * 1024;
-const RESULT_KEYS = new Set(['safeToResume', 'reason', 'taskId', 'sourceReviewRound', 'expectedExecutionRound', 'userTurnCount', 'replyTurnCount', 'reviewResponseIndex', 'answerLastIndex', 'conversationUrlHash', 'applied', 'attempt']);
+const RESULT_KEYS = new Set(['safeToResume', 'safeToSelect', 'reason', 'taskId', 'sourceReviewRound', 'expectedExecutionRound', 'userTurnCount', 'replyTurnCount', 'reviewResponseIndex', 'answerLastIndex', 'conversationUrlHash', 'applied', 'attempt']);
 
 export function buildAutopilotUserActionResumeSpawn({ invocation, taskId, env = process.env } = {}) {
   if (!TASK_ID_PATTERN.test(String(taskId || ''))) throw new Error('invalid_task_id');
@@ -26,7 +26,7 @@ export function buildAutopilotUserActionResumeSpawn({ invocation, taskId, env = 
 
 export function validateAutopilotUserActionResumeResult(value, expectedTaskId) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some((key) => !RESULT_KEYS.has(key)) || value.taskId !== expectedTaskId || typeof value.reason !== 'string' || value.reason.length < 1 || value.reason.length > 96 || /[\0\r\n]/u.test(value.reason)) throw new Error('invalid_user_action_resume_result');
-  if (typeof value.safeToResume !== 'boolean' || typeof value.applied !== 'boolean') throw new Error('invalid_user_action_resume_result');
+  if (typeof value.safeToResume !== 'boolean' || typeof value.safeToSelect !== 'boolean' || typeof value.applied !== 'boolean') throw new Error('invalid_user_action_resume_result');
   for (const field of ['sourceReviewRound', 'expectedExecutionRound', 'attempt', 'userTurnCount', 'replyTurnCount', 'reviewResponseIndex', 'answerLastIndex']) {
     if (value[field] !== null && value[field] !== undefined && (!Number.isSafeInteger(value[field]) || value[field] < 0)) throw new Error('invalid_user_action_resume_result');
   }

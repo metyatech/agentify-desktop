@@ -7896,7 +7896,7 @@ export class ChatGPTController {
     }
   }
 
-  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null, operationId = null, beforeDispatch = null } = {}) {
+  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null, operationId = null, beforeInput = null, beforeDispatch = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
@@ -7947,6 +7947,7 @@ export class ChatGPTController {
         this.#throwIfStopRequested();
         await this.ensureReady({ timeoutMs });
         this.#throwIfStopRequested();
+        await beforeInput?.();
         await this.#activateProviderStopToken(run, signal);
         this.#throwIfStopRequested();
         try {

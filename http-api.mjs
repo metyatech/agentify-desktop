@@ -1957,6 +1957,7 @@ export function startHttpApi({
             stopAfterSend,
             signal,
             operationId: op.id,
+            beforeInput: () => assertExpectedConversation(controller, expectedConversationUrlHash),
             beforeDispatch: () => assertExpectedConversation(controller, expectedConversationUrlHash),
             onProgress: (patch) => patchActiveQuery(tabId, patch)
           });

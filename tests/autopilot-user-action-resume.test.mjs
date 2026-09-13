@@ -32,15 +32,31 @@ test('resume spawn uses configured controller invocation, not management root', 
 
 test('resume subprocess validates task-bound result and rejects malformed or nonzero output', async () => {
   const calls = [];
-  const good = child({ stdout: JSON.stringify({ taskId: 'task-1', safeToResume: true, applied: true, reason: 'USER_ACTION_REPLY_READY', sourceReviewRound: 3, expectedExecutionRound: 4, attempt: 1, userTurnCount: 1, replyTurnCount: 1, reviewResponseIndex: 4, answerLastIndex: 5, conversationUrlHash: 'a'.repeat(64) }) });
+  const good = child({ stdout: JSON.stringify({ taskId: 'task-1', safeToResume: true, safeToSelect: true, applied: true, reason: 'USER_ACTION_REPLY_READY', sourceReviewRound: 3, expectedExecutionRound: 4, attempt: 1, userTurnCount: 1, replyTurnCount: 1, reviewResponseIndex: 4, answerLastIndex: 5, conversationUrlHash: 'a'.repeat(64) }) });
   const resultPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: (file, args, options) => { calls.push({ file, args, options }); return good; } });
   good.emitResult();
   const result = await resultPromise;
   assert.equal(result.applied, true);
+  assert.equal(result.safeToSelect, true);
   assert.equal(calls[0].file, invocation.nodeExecutable);
   await assert.rejects(() => Promise.resolve().then(() => validateAutopilotUserActionResumeResult({ taskId: 'task-1', safeToResume: true, applied: true, reason: 'ok', answer: 'secret' }, 'task-1')), /invalid_user_action_resume_result/u);
   const failed = child({ code: 2 });
   const failedPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => failed });
   failed.emitResult();
   await assert.rejects(failedPromise, (error) => error.code === 'USER_ACTION_RESUME_FAILED');
+});
+
+test('resume subprocess accepts an expected no-reply inspection result with exit 0', async () => {
+  const pending = child({ stdout: JSON.stringify({ taskId: 'task-1', safeToResume: false, safeToSelect: false, applied: false, reason: 'USER_ACTION_REPLY_NOT_FOUND', sourceReviewRound: 3, expectedExecutionRound: 4, userTurnCount: 0, replyTurnCount: 0, reviewResponseIndex: 4, answerLastIndex: null, conversationUrlHash: 'a'.repeat(64) }) });
+  const resultPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => pending });
+  pending.emitResult();
+  const result = await resultPromise;
+  assert.equal(result.reason, 'USER_ACTION_REPLY_NOT_FOUND');
+  assert.equal(result.applied, false);
+  assert.equal(result.safeToSelect, false);
+});
+
+test('resume result requires the exact safeToSelect boolean', () => {
+  assert.throws(() => validateAutopilotUserActionResumeResult({ taskId: 'task-1', safeToResume: true, applied: true, reason: 'ok' }, 'task-1'), /invalid_user_action_resume_result/u);
+  assert.doesNotThrow(() => validateAutopilotUserActionResumeResult({ taskId: 'task-1', safeToResume: false, safeToSelect: false, applied: false, reason: 'USER_ACTION_REPLY_NOT_FOUND' }, 'task-1'));
 });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 
 import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
 import { ChatGPTController } from '../chatgpt-controller.mjs';
@@ -872,6 +873,63 @@ test('http-api: task-bound query and send reject a changed conversation before c
   assert.equal(send.data.error, 'task_conversation_changed');
   assert.equal(send.data.data?.requestDispatched, false);
   assert.equal(queryCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test('http-api: task-bound send guards before input and again before dispatch', async (t) => {
+  const taskUrl = 'https://chatgpt.com/c/task-bound-send';
+  const unrelatedUrl = 'https://chatgpt.com/c/unrelated-send';
+  const expectedConversationUrlHash = crypto.createHash('sha256').update(taskUrl).digest('hex');
+  let currentUrl = unrelatedUrl;
+  let inputChecks = 0;
+  let typePromptCalls = 0;
+  let sendCalls = 0;
+  const controller = {
+    getUrl: async () => currentUrl,
+    send: async ({ beforeInput, beforeDispatch }) => {
+      await beforeInput?.();
+      inputChecks += 1;
+      typePromptCalls += 1;
+      currentUrl = unrelatedUrl;
+      await beforeDispatch?.();
+      sendCalls += 1;
+      return { ok: true };
+    },
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller,
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, url: currentUrl, tabs: tabs.listTabs() }),
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const wrongPage = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { key: 'autopilot-production', text: 'must not type', expectedConversationUrlHash } });
+  assert.equal(wrongPage.res.status, 409);
+  assert.equal(wrongPage.data.error, 'task_conversation_changed');
+  assert.equal(wrongPage.data.data?.requestDispatched, false);
+  assert.equal(inputChecks, 0);
+  assert.equal(typePromptCalls, 0);
+  assert.equal(sendCalls, 0);
+
+  currentUrl = taskUrl;
+  const changedDuringInput = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { key: 'autopilot-production', text: 'draft only', expectedConversationUrlHash } });
+  assert.equal(changedDuringInput.res.status, 409);
+  assert.equal(changedDuringInput.data.error, 'task_conversation_changed');
+  assert.equal(changedDuringInput.data.data?.requestDispatched, false);
+  assert.equal(inputChecks, 1);
+  assert.equal(typePromptCalls, 1);
   assert.equal(sendCalls, 0);
 });
 

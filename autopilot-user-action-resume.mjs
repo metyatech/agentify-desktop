@@ -47,6 +47,16 @@ export function runAutopilotUserActionResume({ invocation, taskId, env = process
       reject(error);
     });
     child.once?.('exit', (code) => {
+      let result = null;
+      try {
+        result = validateAutopilotUserActionResumeResult(JSON.parse(stdout), taskId);
+      } catch {
+        result = null;
+      }
+      if (result) {
+        resolve(result);
+        return;
+      }
       if (code !== 0) {
         const error = new Error('USER_ACTION_RESUME_FAILED');
         error.code = 'USER_ACTION_RESUME_FAILED';
@@ -54,13 +64,9 @@ export function runAutopilotUserActionResume({ invocation, taskId, env = process
         reject(error);
         return;
       }
-      try {
-        resolve(validateAutopilotUserActionResumeResult(JSON.parse(stdout), taskId));
-      } catch {
-        const error = new Error('USER_ACTION_RESUME_INVALID_RESULT');
-        error.code = 'USER_ACTION_RESUME_INVALID_RESULT';
-        reject(error);
-      }
+      const error = new Error('USER_ACTION_RESUME_INVALID_RESULT');
+      error.code = 'USER_ACTION_RESUME_INVALID_RESULT';
+      reject(error);
     });
   });
 }

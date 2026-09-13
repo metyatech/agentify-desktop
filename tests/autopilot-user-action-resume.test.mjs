@@ -46,6 +46,44 @@ test('resume subprocess validates task-bound result and rejects malformed or non
   await assert.rejects(failedPromise, (error) => error.code === 'USER_ACTION_RESUME_FAILED');
 });
 
+test('resume subprocess preserves a valid structured domain result on nonzero exit', async () => {
+  const resultValue = {
+    taskId: 'task-1',
+    safeToResume: false,
+    safeToSelect: true,
+    applied: false,
+    reason: 'LOCK_CONFLICT',
+    sourceReviewRound: 3,
+    expectedExecutionRound: 4,
+    userTurnCount: 1,
+    replyTurnCount: 1,
+    reviewResponseIndex: 4,
+    answerLastIndex: 5,
+    conversationUrlHash: 'a'.repeat(64),
+  };
+  const failed = child({ stdout: JSON.stringify(resultValue), code: 2 });
+  const resultPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => failed });
+  failed.emitResult();
+  assert.deepEqual(await resultPromise, resultValue);
+
+  const queryFailure = child({ stdout: JSON.stringify({ ...resultValue, reason: 'AGENTIFY_QUERY_NOT_DISPATCHED' }), code: 2 });
+  const queryPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => queryFailure });
+  queryFailure.emitResult();
+  assert.equal((await queryPromise).reason, 'AGENTIFY_QUERY_NOT_DISPATCHED');
+});
+
+test('nonzero resume exit still rejects wrong-task and unknown-field output', async () => {
+  const wrongTask = child({ stdout: JSON.stringify({ taskId: 'task-2', safeToResume: false, safeToSelect: true, applied: false, reason: 'LOCK_CONFLICT' }), code: 2 });
+  const wrongTaskPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => wrongTask });
+  wrongTask.emitResult();
+  await assert.rejects(wrongTaskPromise, (error) => error.code === 'USER_ACTION_RESUME_FAILED');
+
+  const unknownField = child({ stdout: JSON.stringify({ taskId: 'task-1', safeToResume: false, safeToSelect: true, applied: false, reason: 'LOCK_CONFLICT', unexpected: true }), code: 2 });
+  const unknownFieldPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => unknownField });
+  unknownField.emitResult();
+  await assert.rejects(unknownFieldPromise, (error) => error.code === 'USER_ACTION_RESUME_FAILED');
+});
+
 test('resume subprocess accepts an expected no-reply inspection result with exit 0', async () => {
   const pending = child({ stdout: JSON.stringify({ taskId: 'task-1', safeToResume: false, safeToSelect: false, applied: false, reason: 'USER_ACTION_REPLY_NOT_FOUND', sourceReviewRound: 3, expectedExecutionRound: 4, userTurnCount: 0, replyTurnCount: 0, reviewResponseIndex: 4, answerLastIndex: null, conversationUrlHash: 'a'.repeat(64) }) });
   const resultPromise = runAutopilotUserActionResume({ invocation, taskId: 'task-1', spawnImpl: () => pending });

@@ -1,7 +1,7 @@
 /* global window */
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
-import { autopilotActivityViewModel } from './autopilot-activity-view.mjs';
+import { activityMatchesTask, activityViewUpdate, autopilotActivityViewModel, toggleAutopilotActivityExpanded, visibleActivityCursor } from './autopilot-activity-view.mjs';
 import { createAutopilotActivityStaleScheduler } from './autopilot-activity-scheduler.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
 import {
@@ -197,6 +197,7 @@ let autopilotClarificationMessage = null;
 let autopilotProposal = null;
 let autopilotActivityExpanded = null;
 let activityNewOutputPending = false;
+let activityVisibleCursor = null;
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -269,20 +270,27 @@ function renderAutopilotState() {
 function renderAutopilotTaskProgress(snapshot) {
   const root = el('autopilotTaskProgress');
   const previousTimeline = root.querySelector('.autopilotActivityTimeline');
+  const previousScrollTop = previousTimeline?.scrollTop || 0;
   const wasAtBottom = !previousTimeline || previousTimeline.scrollHeight - previousTimeline.scrollTop - previousTimeline.clientHeight < 8;
-  if (previousTimeline && !wasAtBottom) activityNewOutputPending = true;
   if (wasAtBottom) activityNewOutputPending = false;
+  const activitySnapshot = activityMatchesTask(lastState.autopilotActivity, snapshot) ? lastState.autopilotActivity : null;
+  const nextCursor = visibleActivityCursor(activitySnapshot);
+  const update = activityViewUpdate(activityVisibleCursor, activitySnapshot ? nextCursor : null, wasAtBottom, activityNewOutputPending);
+  activityNewOutputPending = update.showNewOutput;
+  activityVisibleCursor = activitySnapshot ? nextCursor : null;
   root.innerHTML = '';
   const view = autopilotStatusViewModel(snapshot);
   const context = document.createElement('div');
   context.className = 'autopilotProgressContext';
   context.textContent = view.contextLabel || 'Autopilot task progress';
   root.appendChild(context);
-  const activity = renderAutopilotActivity(lastState.autopilotActivity, { wasAtBottom });
+  const activity = renderAutopilotActivity(activitySnapshot, { wasAtBottom, previousScrollTop });
   if (activity) root.appendChild(activity);
   const headline = document.createElement('div');
-  headline.className = `autopilotProgressHeadline status-${view.kind}`;
-  headline.textContent = view.statusLabel || view.label;
+  const activityView = activitySnapshot ? autopilotActivityViewModel(activitySnapshot) : null;
+  const liveActivity = activityView && ['running', 'starting'].includes(activityView.kind) && !activityView.activityStale;
+  headline.className = `autopilotProgressHeadline status-${liveActivity ? 'running' : view.kind}`;
+  headline.textContent = liveActivity ? activityView.statusLabel : view.statusLabel || view.label;
   root.appendChild(headline);
   if (view.executionLabel) {
     const execution = document.createElement('div'); execution.className = 'autopilotProgressMeta'; execution.textContent = view.executionLabel; root.appendChild(execution);
@@ -358,9 +366,15 @@ function renderAutopilotTaskProgress(snapshot) {
     updated.textContent = view.updatedLabel;
     root.appendChild(updated);
   }
+  if (view.stale && liveActivity && view.statusAgeLabel) {
+    const statusAge = document.createElement('div');
+    statusAge.className = 'autopilotProgressMeta';
+    statusAge.textContent = view.statusAgeLabel;
+    root.appendChild(statusAge);
+  }
 }
 
-function renderAutopilotActivity(snapshot, { wasAtBottom }) {
+function renderAutopilotActivity(snapshot, { wasAtBottom, previousScrollTop = 0 }) {
   if (!snapshot) return null;
   const root = document.createElement('section');
   root.className = 'autopilotActivity';
@@ -400,16 +414,17 @@ function renderAutopilotActivity(snapshot, { wasAtBottom }) {
   newOutput.type = 'button';
   newOutput.className = 'autopilotActivityNewOutput';
   newOutput.textContent = '↓ 新しい出力';
-  newOutput.hidden = !activityNewOutputPending || expanded === false;
+  newOutput.hidden = !activityNewOutputPending || !expanded;
   root.appendChild(newOutput);
   toggle.onclick = () => {
-    autopilotActivityExpanded = !timeline.hidden;
-    timeline.hidden = autopilotActivityExpanded;
-    toggle.setAttribute('aria-expanded', autopilotActivityExpanded ? 'true' : 'false');
+    const next = toggleAutopilotActivityExpanded(autopilotActivityExpanded ?? expanded);
+    autopilotActivityExpanded = next.expanded;
+    timeline.hidden = next.hidden;
+    toggle.setAttribute('aria-expanded', next.ariaExpanded);
     if (!timeline.hidden) { timeline.scrollTop = timeline.scrollHeight; activityNewOutputPending = false; newOutput.hidden = true; }
   };
-  newOutput.onclick = () => { timeline.hidden = false; toggle.setAttribute('aria-expanded', 'true'); timeline.scrollTop = timeline.scrollHeight; activityNewOutputPending = false; newOutput.hidden = true; };
-  if (expanded && wasAtBottom) timeline.scrollTop = timeline.scrollHeight;
+  newOutput.onclick = () => { autopilotActivityExpanded = true; timeline.hidden = false; toggle.setAttribute('aria-expanded', 'true'); timeline.scrollTop = timeline.scrollHeight; activityNewOutputPending = false; newOutput.hidden = true; };
+  if (expanded) timeline.scrollTop = wasAtBottom ? timeline.scrollHeight : Math.min(previousScrollTop, timeline.scrollHeight);
   return root;
 }
 

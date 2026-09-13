@@ -20,3 +20,10 @@ test('activity stale scheduler refreshes once after the heartbeat boundary and r
   timers[1].callback();
   assert.equal(staleCalls, 1);
 });
+
+test('activity stale scheduler applies the same timeout to starting state', () => {
+  const timers = [];
+  const scheduler = createAutopilotActivityStaleScheduler({ now: () => Date.parse('2026-09-13T00:00:00.000Z'), setTimeoutImpl: (callback, delay) => { timers.push({ callback, delay }); return timers.at(-1); }, clearTimeoutImpl: () => {} });
+  scheduler.schedule({ processState: 'starting', lastActivityAt: null });
+  assert.equal(timers[0].delay, AUTOPILOT_ACTIVITY_STALE_AFTER_MS + 1);
+});

@@ -1,10 +1,42 @@
 export const AUTOPILOT_ACTIVITY_STALE_AFTER_MS = 15_000;
 
+export function activityMatchesTask(activity, status) {
+  if (!activity || !status || activity.taskId !== status.taskId) return false;
+  return status.phase !== 'executing' || !Number.isInteger(status.round) || activity.round >= status.round;
+}
+
+export function toggleAutopilotActivityExpanded(activityExpanded) {
+  const expanded = !Boolean(activityExpanded);
+  return { expanded, hidden: !expanded, ariaExpanded: String(expanded) };
+}
+
+export function visibleActivityCursor(activity) {
+  const events = Array.isArray(activity?.events) ? activity.events : [];
+  return {
+    taskId: typeof activity?.taskId === 'string' ? activity.taskId : '',
+    executionId: typeof activity?.executionId === 'string' ? activity.executionId : '',
+    lastVisibleSeq: events.reduce((max, record) => record?.event?.kind === 'lifecycle' && record?.event?.state === 'heartbeat' ? max : Math.max(max, Number.isSafeInteger(record?.seq) ? record.seq : 0), 0),
+  };
+}
+
+export function activityViewUpdate(previousCursor, nextCursor, wasAtBottom, pending = false) {
+  const newVisibleOutput = Boolean(previousCursor && nextCursor && (
+    previousCursor.taskId !== nextCursor.taskId || previousCursor.executionId !== nextCursor.executionId
+      ? nextCursor.lastVisibleSeq > 0
+      : nextCursor.lastVisibleSeq > previousCursor.lastVisibleSeq
+  ));
+  return {
+    newVisibleOutput,
+    showNewOutput: wasAtBottom ? false : pending || newVisibleOutput,
+    scrollMode: wasAtBottom ? 'bottom' : 'preserve',
+  };
+}
+
 export function autopilotActivityViewModel(activity, now = Date.now()) {
   if (!activity) return { kind: 'empty', statusLabel: 'Codex activity unavailable', events: [], expanded: false };
   const storedProcessState = activity.processState || 'unknown';
   const lastActivityMs = Date.parse(activity.lastActivityAt || '');
-  const heartbeatStale = storedProcessState === 'running' && (!Number.isFinite(lastActivityMs) || now - lastActivityMs > AUTOPILOT_ACTIVITY_STALE_AFTER_MS);
+  const heartbeatStale = ['starting', 'running'].includes(storedProcessState) && (!Number.isFinite(lastActivityMs) || now - lastActivityMs > AUTOPILOT_ACTIVITY_STALE_AFTER_MS);
   const processState = heartbeatStale ? 'unknown' : (activity.effectiveProcessState || storedProcessState);
   const kind = processState === 'running' || processState === 'starting' ? processState : processState;
   const statusLabel = processState === 'running'
@@ -26,7 +58,7 @@ export function autopilotActivityViewModel(activity, now = Date.now()) {
     pidLabel: Number.isInteger(activity.pid) ? `PID ${activity.pid}` : null,
     lastActivityLabel: relativeLabel('Last activity', activity.lastActivityAt, now),
     lastOutputLabel: relativeLabel('Last output', activity.lastOutputAt, now),
-    events: Array.isArray(activity.events) ? activity.events : [],
+    events: Array.isArray(activity.events) ? activity.events.filter((record) => !(record?.event?.kind === 'lifecycle' && record?.event?.state === 'heartbeat')) : [],
     expanded: processState === 'running' || processState === 'starting',
     activityStale: heartbeatStale || activity.activityStale === true || processState === 'unknown',
   };

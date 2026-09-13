@@ -1512,7 +1512,7 @@ export function startHttpApi({
         if (typeof onAutopilotActivity !== 'function') return sendJson(res, 503, { error: 'autopilot_activity_unavailable' });
         const body = await parseBody(req, { maxBytes: 64 * 1024 });
         const result = await onAutopilotActivity({ envelope: validateAutopilotActivityEnvelope(body) });
-        return sendJson(res, 200, { ok: true, accepted: result?.accepted !== false, activity: result?.state || result || null }, { maxBytes: 2 * 1024 * 1024 + 8 * 1024 });
+        return sendJson(res, 200, { ok: true, accepted: result?.accepted !== false });
       }
 
       if (url.pathname === '/autopilot/proposal-tickets' && req.method === 'GET') {

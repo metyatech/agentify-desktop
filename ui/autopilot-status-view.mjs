@@ -39,5 +39,12 @@ export function autopilotStatusViewModel(snapshot, now = Date.now()) {
     errorCode: snapshot.error?.code || null,
     errorMessage: snapshot.error?.message || null,
     updatedLabel: snapshot.updatedAt ? `Updated ${new Date(snapshot.updatedAt).toLocaleString()}` : null,
+    statusAgeLabel: Number.isFinite(ageMs) ? `Autopilot status update: ${formatAge(ageMs)} ago` : null,
   };
+}
+
+function formatAge(ms) {
+  if (ms < 60_000) return `${Math.max(1, Math.floor(ms / 1000))}s`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ${Math.floor((ms % 60_000) / 1000)}s`;
+  return `${Math.floor(ms / 3_600_000)}h ${Math.floor((ms % 3_600_000) / 60_000)}m`;
 }

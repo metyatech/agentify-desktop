@@ -7,7 +7,8 @@ export function createAutopilotActivityStaleScheduler({ now = () => Date.now(), 
   const cancel = () => { generation += 1; if (timerId !== null) clearTimeoutImpl(timerId); timerId = null; scheduledAt = null; };
   const schedule = (activity) => {
     const last = Date.parse(activity?.lastActivityAt || '');
-    const staleAt = activity?.processState === 'running' && Number.isFinite(last) ? last + AUTOPILOT_ACTIVITY_STALE_AFTER_MS + 1 : null;
+    const live = ['starting', 'running'].includes(activity?.processState);
+    const staleAt = live ? (Number.isFinite(last) ? last : now()) + AUTOPILOT_ACTIVITY_STALE_AFTER_MS + 1 : null;
     if (staleAt === null || staleAt <= now()) return cancel();
     if (timerId !== null && scheduledAt === staleAt) return;
     cancel();

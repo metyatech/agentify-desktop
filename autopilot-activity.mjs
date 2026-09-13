@@ -9,10 +9,13 @@ export const AUTOPILOT_ACTIVITY_STALE_AFTER_MS = 15_000;
 export const AUTOPILOT_ACTIVITY_MAX_EVENTS = 500;
 export const AUTOPILOT_ACTIVITY_MAX_BYTES = 2 * 1024 * 1024;
 export const AUTOPILOT_ACTIVITY_MAX_EVENT_BYTES = 64 * 1024;
+export const AUTOPILOT_ACTIVITY_MAX_FILE_BYTES = AUTOPILOT_ACTIVITY_MAX_BYTES + 1024;
 
 const PROCESS_STATES = new Set(['starting', 'running', 'exited', 'failed']);
 const EVENT_KINDS = new Set(['lifecycle', 'message', 'command', 'file', 'tool', 'thinking']);
 const ENVELOPE_KEYS = new Set(['schemaVersion', 'taskId', 'round', 'executionId', 'seq', 'emittedAt', 'process', 'event']);
+const STATE_KEYS = new Set(['schemaVersion', 'taskId', 'round', 'executionId', 'processState', 'pid', 'startedAt', 'finishedAt', 'lastActivityAt', 'lastOutputAt', 'lastSeq', 'events']);
+const RECORD_KEYS = new Set(['seq', 'emittedAt', 'pid', 'event']);
 
 export function autopilotActivityPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, AUTOPILOT_ACTIVITY_FILE);
@@ -45,7 +48,7 @@ export async function createAutopilotActivityStore({
   const view = () => {
     if (!current) return null;
     const lastMs = current.lastActivityAt ? Date.parse(current.lastActivityAt) : NaN;
-    const activityStale = current.processState === 'running' && (!Number.isFinite(lastMs) || now() - lastMs > staleAfterMs);
+    const activityStale = ['starting', 'running'].includes(current.processState) && (!Number.isFinite(lastMs) || now() - lastMs > staleAfterMs);
     return { ...current, activityStale, effectiveProcessState: activityStale ? 'unknown' : current.processState };
   };
   return {
@@ -77,8 +80,18 @@ function isNewExecution(current, envelope) {
 
 function isAllowedNewExecution(current, envelope) {
   const isStart = envelope.event.kind === 'lifecycle' && envelope.event.state === 'started';
-  if (!isStart) return envelope.round > current.round && Date.parse(envelope.emittedAt) >= Date.parse(current.lastActivityAt || current.startedAt || envelope.emittedAt);
-  return envelope.round > current.round || Date.parse(envelope.emittedAt) >= Date.parse(current.lastActivityAt || current.startedAt || envelope.emittedAt);
+  const emittedAt = Date.parse(envelope.emittedAt);
+  const currentAt = Date.parse(current.lastActivityAt || current.startedAt || envelope.emittedAt);
+  if (current.taskId !== envelope.taskId) return isStart && emittedAt >= currentAt;
+  if (isStart || envelope.round > current.round) return emittedAt >= currentAt;
+  const currentGeneration = executionGeneration(current.executionId);
+  const nextGeneration = executionGeneration(envelope.executionId);
+  return emittedAt >= currentAt && currentGeneration !== null && nextGeneration !== null && nextGeneration > currentGeneration;
+}
+
+function executionGeneration(executionId) {
+  const match = /^(\d{13})-/u.exec(executionId);
+  return match ? Number(match[1]) : null;
 }
 
 function createState(envelope) {
@@ -94,7 +107,7 @@ function createState(envelope) {
     lastActivityAt: envelope.emittedAt,
     lastOutputAt: isOutputEvent(envelope.event) ? envelope.emittedAt : null,
     lastSeq: envelope.seq,
-    events: [recordFor(envelope)],
+    events: isVisibleEvent(envelope.event) ? [recordFor(envelope)] : [],
   };
 }
 
@@ -109,9 +122,18 @@ function appendEvent(current, envelope) {
     lastActivityAt: envelope.emittedAt,
     lastOutputAt: isOutputEvent(envelope.event) ? envelope.emittedAt : current.lastOutputAt,
     lastSeq: envelope.seq,
-    events: [...current.events, event].slice(-AUTOPILOT_ACTIVITY_MAX_EVENTS),
+    events: isVisibleEvent(envelope.event) ? appendVisibleRecord(current.events, event).slice(-AUTOPILOT_ACTIVITY_MAX_EVENTS) : current.events,
   };
   while (Buffer.byteLength(JSON.stringify(next), 'utf8') > AUTOPILOT_ACTIVITY_MAX_BYTES && next.events.length > 1) next.events.shift();
+  return next;
+}
+
+function appendVisibleRecord(events, record) {
+  if (record.event.kind !== 'command' || !record.event.itemId) return [...events, record];
+  const index = events.findLastIndex((entry) => entry.event?.kind === 'command' && entry.event.itemId === record.event.itemId);
+  if (index < 0) return [...events, record];
+  const next = [...events];
+  next[index] = record;
   return next;
 }
 
@@ -123,19 +145,54 @@ function nextProcessState(previous, envelope) {
 }
 
 function isOutputEvent(event) { return event.kind !== 'lifecycle' || event.state === 'failed'; }
+function isVisibleEvent(event) { return event.kind !== 'lifecycle' || event.state !== 'heartbeat'; }
 function recordFor(envelope) { return { seq: envelope.seq, emittedAt: envelope.emittedAt, pid: envelope.process.pid, event: envelope.event }; }
 
 async function persist(stateDir, value) {
   await fs.mkdir(stateDir, { recursive: true });
-  await atomicWriteFile(autopilotActivityPath(stateDir), `${JSON.stringify(value, null, 2)}\n`);
+  await atomicWriteFile(autopilotActivityPath(stateDir), `${JSON.stringify(value)}\n`);
 }
 
 async function readPersistedActivity(stateDir) {
   try {
-    const value = JSON.parse(await fs.readFile(autopilotActivityPath(stateDir), 'utf8'));
-    if (!value || value.schemaVersion !== 1 || !Array.isArray(value.events)) return null;
-    return value;
+    const activityPath = autopilotActivityPath(stateDir);
+    const stats = await fs.lstat(activityPath);
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.size > AUTOPILOT_ACTIVITY_MAX_FILE_BYTES) return null;
+    const value = JSON.parse(await fs.readFile(activityPath, 'utf8'));
+    const state = validatePersistedState(value);
+    return Buffer.byteLength(JSON.stringify(state), 'utf8') <= AUTOPILOT_ACTIVITY_MAX_BYTES ? state : null;
   } catch { return null; }
+}
+
+function validatePersistedState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== 1 || Object.keys(value).some((key) => !STATE_KEYS.has(key))) throw invalidActivity('persisted state is invalid');
+  const taskId = safeText(value.taskId, 'taskId', 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(taskId)) throw invalidActivity('persisted taskId is invalid');
+  const executionId = safeText(value.executionId, 'executionId', 256);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(executionId)) throw invalidActivity('persisted executionId is invalid');
+  if (!Number.isInteger(value.round) || value.round < 1 || value.round > 10 || !PROCESS_STATES.has(value.processState)) throw invalidActivity('persisted identity is invalid');
+  if (value.pid !== null && (!Number.isInteger(value.pid) || value.pid < 1)) throw invalidActivity('persisted pid is invalid');
+  for (const field of ['startedAt', 'finishedAt', 'lastActivityAt', 'lastOutputAt']) if (value[field] !== null) canonicalTimestamp(value[field], field);
+  if (!Number.isSafeInteger(value.lastSeq) || value.lastSeq < 0 || !Array.isArray(value.events) || value.events.length > AUTOPILOT_ACTIVITY_MAX_EVENTS) throw invalidActivity('persisted state bounds are invalid');
+  const records = value.events.map(validatePersistedRecord);
+  if (records.some((record) => record.seq > value.lastSeq) || new Set(records.map((record) => record.seq)).size !== records.length) throw invalidActivity('persisted sequence is invalid');
+  return {
+    schemaVersion: 1, taskId, round: value.round, executionId, processState: value.processState, pid: value.pid,
+    startedAt: value.startedAt, finishedAt: value.finishedAt, lastActivityAt: value.lastActivityAt, lastOutputAt: value.lastOutputAt,
+    lastSeq: value.lastSeq, events: records.filter((record) => isVisibleEvent(record.event)),
+  };
+}
+
+function validatePersistedRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some((key) => !RECORD_KEYS.has(key))) throw invalidActivity('persisted event record is invalid');
+  if (!Number.isSafeInteger(value.seq) || value.seq < 1) throw invalidActivity('persisted event sequence is invalid');
+  const emittedAt = canonicalTimestamp(value.emittedAt, 'event.emittedAt');
+  const pid = value.pid === null ? null : value.pid;
+  if (pid !== null && (!Number.isInteger(pid) || pid < 1)) throw invalidActivity('persisted event pid is invalid');
+  const event = validateEvent(value.event);
+  const record = { seq: value.seq, emittedAt, pid, event };
+  if (Buffer.byteLength(JSON.stringify(record), 'utf8') > AUTOPILOT_ACTIVITY_MAX_EVENT_BYTES) throw invalidActivity('persisted event is too large');
+  return record;
 }
 
 function validateEvent(value) {

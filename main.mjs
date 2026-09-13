@@ -35,7 +35,8 @@ import { createAutopilotProposalService } from './autopilot-proposal.mjs';
 import { createAutopilotProposalIpcFailure, createAutopilotProposalIpcSuccess } from './autopilot-proposal-ipc.mjs';
 import { defaultCodexSelection, listCodexModels, validateCodexSelection } from './codex-models.mjs';
 import { detectCodexDeepLink, isCodexThreadId } from './codex-deep-link.mjs';
-import { createAutopilotWatcherManager } from './autopilot-watcher-manager.mjs';
+import { createAutopilotWatcherManager, readAutopilotWatcherConfig } from './autopilot-watcher-manager.mjs';
+import { runAutopilotUserActionResume } from './autopilot-user-action-resume.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,15 +85,31 @@ function createControlCenterDiagnosticLogger(stateDir) {
 
 export async function resolveAutopilotWatcherConfig(stateDir) {
   const explicitRoot = String(process.env.AI_AUTOPILOT_ROOT || '').trim();
-  if (explicitRoot) return { root: path.resolve(explicitRoot), registration: null, error: null };
+  let root = explicitRoot ? path.resolve(explicitRoot) : null;
+  let registration = null;
   try {
-    const registration = await readWatcherRegistration(stateDir);
-    if (!registration) return { root: null, registration: null, error: null };
-    const stat = await fs.lstat(registration.controllerEntryPath);
-    if (!stat.isFile()) return { root: null, registration, error: 'Watcher registration controller entry is not a file.' };
-    return { root: registration.managementRoot, registration, error: null };
+    if (!root) {
+      registration = await readWatcherRegistration(stateDir);
+      if (!registration) return { root: null, registration: null, invocation: null, error: null };
+      root = registration.managementRoot;
+    }
+    const config = await readAutopilotWatcherConfig(root);
+    const stat = await fs.lstat(config.controllerEntryPath);
+    if (!stat.isFile()) return { root: null, registration, invocation: null, error: 'Watcher registration controller entry is not a file.' };
+    if (registration && path.resolve(registration.controllerEntryPath) !== path.resolve(config.controllerEntryPath)) return { root: null, registration, invocation: null, error: 'Watcher registration controller entry does not match watch config.' };
+    return {
+      root,
+      registration,
+      invocation: {
+        managementRoot: root,
+        nodeExecutable: config.nodeExecutable,
+        controllerEntryPath: config.controllerEntryPath,
+        controllerRepoRoot: config.controllerRepoRoot,
+      },
+      error: null,
+    };
   } catch (error) {
-    return { root: null, registration: null, error: 'Watcher registration is invalid or unreadable.' };
+    return { root: null, registration, invocation: null, error: 'Watcher registration or watch config is invalid or unreadable.' };
   }
 }
 
@@ -500,34 +517,10 @@ async function main() {
   ipcMain.handle('agentify:resumeAutopilotUserAction', async (_evt, args) => {
     const taskId = String(args?.taskId || '').trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(taskId)) throw new Error('invalid_task_id');
-    const root = watcherConfig.root;
-    if (!root) throw new Error(watcherConfig.error || 'autopilot_root_unavailable');
+    const invocation = watcherConfig.invocation;
+    if (!invocation) throw new Error(watcherConfig.error || 'autopilot_root_unavailable');
     if (userActionResumeInflight.has(taskId)) return await userActionResumeInflight.get(taskId);
-    const promise = new Promise((resolve, reject) => {
-      const entry = path.join(root, 'bin', 'ai-autopilot.mjs');
-      const child = spawn(process.execPath, [entry, 'watch', 'user-action-resume', taskId, '--apply', '--json'], {
-        cwd: root,
-        env: { ...process.env, AI_AUTOPILOT_ROOT: root },
-        windowsHide: true,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout?.on('data', (chunk) => { stdout = `${stdout}${chunk}`.slice(-64 * 1024); });
-      child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-16 * 1024); });
-      child.once('error', reject);
-      child.once('exit', (code) => {
-        if (code !== 0) {
-          const error = new Error(stderr.trim() || `user_action_resume_failed_${code}`);
-          error.code = 'USER_ACTION_RESUME_FAILED';
-          reject(error);
-          return;
-        }
-        try { resolve(JSON.parse(stdout)); }
-        catch { reject(new Error('user_action_resume_invalid_result')); }
-      });
-    }).finally(() => userActionResumeInflight.delete(taskId));
+    const promise = runAutopilotUserActionResume({ invocation, taskId }).finally(() => userActionResumeInflight.delete(taskId));
     userActionResumeInflight.set(taskId, promise);
     return await promise;
   });

@@ -20,6 +20,7 @@
     "autopilot-proposal.mjs",
     "autopilot-proposal-ticket.mjs",
     "autopilot-watcher-manager.mjs",
+    "autopilot-user-action-resume.mjs",
     "autopilot-status.mjs",
     "autopilot-activity.mjs",
     "autopilot-watch-status.mjs",

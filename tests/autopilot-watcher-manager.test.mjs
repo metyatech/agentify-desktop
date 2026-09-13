@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createAutopilotWatcherManager, watcherPaths } from '../autopilot-watcher-manager.mjs';
+import { createAutopilotWatcherManager, readAutopilotWatcherConfig, watcherPaths } from '../autopilot-watcher-manager.mjs';
 
 function fixture(files, { alive = () => false } = {}) {
   const calls = [];
@@ -85,4 +85,16 @@ test('manager reports Not configured without guessing a management root', async 
   const manager = createAutopilotWatcherManager();
   assert.equal((await manager.start()).status, 'not-configured');
   assert.equal((await manager.inspect()).status, 'not-configured');
+});
+
+test('watcher config preserves distinct management and controller roots', async () => {
+  const root = 'X:/management';
+  const paths = watcherPaths(root);
+  const files = {
+    [paths.config]: JSON.stringify({ enabled: true, nodeExecutable: 'X:/node/node.exe', controllerEntryPath: 'X:/management/repos/owner/ai-autopilot/bin/ai-autopilot.mjs', controllerRepoRoot: 'X:/management/repos/owner/ai-autopilot' }),
+  };
+  const config = await readAutopilotWatcherConfig(root, { readFile: async (file) => files[file] });
+  assert.equal(config.controllerRepoRoot, 'X:\\management\\repos\\owner\\ai-autopilot');
+  assert.equal(config.controllerEntryPath, 'X:\\management\\repos\\owner\\ai-autopilot\\bin\\ai-autopilot.mjs');
+  assert.notEqual(config.controllerEntryPath, 'X:\\management\\bin\\ai-autopilot.mjs');
 });

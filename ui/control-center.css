@@ -189,6 +189,34 @@ body {
 .autopilotProgressLine { margin-top: 7px; color: #e9ecf2; font-size: 13px; overflow-wrap: anywhere; }
 .autopilotProgressMeta { margin-top: 6px; color: rgba(233,236,242,0.68); font-size: 12px; overflow-wrap: anywhere; }
 .autopilotProgressError { margin-top: 8px; color: #fecaca; font-size: 12px; overflow-wrap: anywhere; }
+.autopilotActivity {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid rgba(147,197,253,0.18);
+  border-radius: 12px;
+  background: rgba(15,23,42,0.36);
+}
+.autopilotActivityHeader { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.autopilotActivityHeader.status-running, .autopilotActivityHeader.status-starting { color: #bfdbfe; }
+.autopilotActivityHeader.status-exited { color: #bbf7d0; }
+.autopilotActivityHeader.status-failed { color: #fecaca; }
+.autopilotActivityHeader.status-unknown { color: #fde68a; }
+.autopilotActivityStatus { font-weight: 650; }
+.autopilotActivityMeta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; color: rgba(233,236,242,0.66); font-size: 11px; }
+.autopilotActivityToggle { margin-top: 12px; border: 0; padding: 0; background: transparent; color: #bfdbfe; cursor: pointer; font: inherit; font-size: 12px; font-weight: 700; text-decoration: underline; text-underline-offset: 2px; }
+.autopilotActivityTimeline { max-height: 310px; overflow-y: auto; margin-top: 10px; padding-right: 4px; }
+.autopilotActivityEvent { margin-top: 8px; padding: 9px 10px; border-left: 2px solid rgba(147,197,253,0.28); border-radius: 0 9px 9px 0; background: rgba(0,0,0,0.18); color: rgba(233,236,242,0.86); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.autopilotActivityEvent:first-child { margin-top: 0; }
+.autopilotActivitySender, .autopilotActivityLabel { color: #e9ecf2; font-weight: 700; }
+.autopilotActivityMessage { margin-top: 4px; white-space: pre-wrap; }
+.autopilotActivityCommand, .autopilotActivityOutput, .autopilotActivityPaths { display: block; margin-top: 5px; color: #e9ecf2; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.autopilotActivityOutput { max-height: 150px; overflow: auto; color: rgba(233,236,242,0.72); font-size: 11px; }
+.autopilotActivityEventState { margin-top: 5px; color: rgba(233,236,242,0.68); font-size: 11px; }
+.autopilotActivityPaths { padding-left: 20px; margin-bottom: 0; }
+.autopilotActivityPaths li { margin-top: 3px; }
+.autopilotActivityEvent.isThinking { color: #c4b5fd; }
+.autopilotActivityNewOutput { display: block; margin: 9px auto 0; border: 1px solid rgba(147,197,253,0.28); border-radius: 999px; padding: 5px 10px; background: rgba(37,99,235,0.18); color: #dbeafe; cursor: pointer; font: inherit; font-size: 11px; }
+.autopilotActivityToggle:focus-visible, .autopilotActivityNewOutput:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
 
 .grid {
   display: grid;

@@ -10,6 +10,7 @@ import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
 import { validateAutopilotStatus } from './autopilot-status.mjs';
 import { validateAutopilotWatchStatus } from './autopilot-watch-status.mjs';
+import { validateAutopilotActivityEnvelope } from './autopilot-activity.mjs';
 import { AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES, validateAutopilotProposalTicket } from './autopilot-proposal-ticket.mjs';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
@@ -267,6 +268,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'stale_autopilot_status') return { code: 409, body: { error: 'stale_autopilot_status', data: error?.data || null } };
   if (msg === 'invalid_autopilot_watch_status') return { code: 400, body: { error: 'invalid_autopilot_watch_status', data: error?.data || null } };
   if (msg === 'stale_autopilot_watch_status') return { code: 409, body: { error: 'stale_autopilot_watch_status', data: error?.data || null } };
+  if (msg === 'invalid_autopilot_activity') return { code: 400, body: { error: 'invalid_autopilot_activity', data: error?.data || null } };
   if (msg === 'autopilot_status_not_terminal') return { code: 409, body: { error: 'autopilot_status_not_terminal' } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
   if (msg === 'invalid_vendor') return { code: 400, body: { error: 'invalid_vendor', data: error?.data || null } };
@@ -1024,6 +1026,8 @@ export function startHttpApi({
   onAutopilotStatus,
   getAutopilotWatchStatus,
   onAutopilotWatchStatus,
+  getAutopilotActivity,
+  onAutopilotActivity,
   getAutopilotProposalTicket,
   getAutopilotProposalTickets,
   resolveAutopilotProposalApproval,
@@ -1498,6 +1502,17 @@ export function startHttpApi({
         const body = await parseBody(req, { maxBytes: 16 * 1024 });
         const snapshot = await onAutopilotWatchStatus({ snapshot: validateAutopilotWatchStatus(body) });
         return sendJson(res, 200, { ok: true, snapshot: snapshot || null });
+      }
+
+      if (url.pathname === '/autopilot/activity' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, activity: (await getAutopilotActivity?.()) || null }, { maxBytes: 2 * 1024 * 1024 + 8 * 1024 });
+      }
+
+      if (url.pathname === '/autopilot/activity' && req.method === 'POST') {
+        if (typeof onAutopilotActivity !== 'function') return sendJson(res, 503, { error: 'autopilot_activity_unavailable' });
+        const body = await parseBody(req, { maxBytes: 64 * 1024 });
+        const result = await onAutopilotActivity({ envelope: validateAutopilotActivityEnvelope(body) });
+        return sendJson(res, 200, { ok: true, accepted: result?.accepted !== false, activity: result?.state || result || null }, { maxBytes: 2 * 1024 * 1024 + 8 * 1024 });
       }
 
       if (url.pathname === '/autopilot/proposal-tickets' && req.method === 'GET') {

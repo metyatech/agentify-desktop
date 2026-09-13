@@ -21,6 +21,7 @@ import { TabRegistry } from './tab-registry.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState, readWatcherRegistration } from './state.mjs';
 import { createAutopilotStatusStore } from './autopilot-status.mjs';
 import { createAutopilotWatchStatusStore } from './autopilot-watch-status.mjs';
+import { createAutopilotActivityStore } from './autopilot-activity.mjs';
 import { createAutopilotProposalTicketStore } from './autopilot-proposal-ticket.mjs';
 import { selectCurrentAutopilotProposalTicket } from './autopilot-current-proposal.mjs';
 import { resolveAutopilotProposalApproval } from './autopilot-approval.mjs';
@@ -182,6 +183,7 @@ async function main() {
   const token = await ensureToken(stateDir);
   const autopilotStatus = await createAutopilotStatusStore({ stateDir });
   const autopilotWatchStatus = await createAutopilotWatchStatusStore({ stateDir });
+  const autopilotActivity = await createAutopilotActivityStore({ stateDir });
   const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
   const watcherConfig = await resolveAutopilotWatcherConfig(stateDir);
   const autopilotWatcher = createAutopilotWatcherManager({ root: watcherConfig.root, initialError: watcherConfig.error });
@@ -283,6 +285,11 @@ async function main() {
   const emitTabsChanged = () => {
     try {
       if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:tabsChanged');
+    } catch {}
+  };
+  const emitAutopilotActivityChanged = () => {
+    try {
+      if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:autopilotActivityChanged');
     } catch {}
   };
   browserBackend = await createBrowserBackend({
@@ -464,6 +471,7 @@ async function main() {
       autopilot: autopilotProposal.availability(),
       autopilotStatus: autopilotStatus.get(),
       autopilotWatchStatus: autopilotWatchStatus.get(),
+      autopilotActivity: autopilotActivity.get(),
       autopilotProposalTicket: currentProposalTicket.ticket,
       autopilotProposalTicketError: currentProposalTicket.error,
       codexModels,
@@ -488,6 +496,7 @@ async function main() {
     return { ok: result === undefined };
   });
   ipcMain.handle('agentify:restartAutopilotWatcher', async () => ({ watcher: await autopilotWatcher.restart() }));
+  ipcMain.handle('agentify:getAutopilotActivity', async () => autopilotActivity.get());
   ipcMain.handle('agentify:clearAutopilotStatus', async () => {
     const snapshot = autopilotStatus.get();
     if (snapshot && !['completed', 'blocked'].includes(snapshot.status)) throw new Error('autopilot_status_not_terminal');
@@ -824,6 +833,12 @@ async function main() {
           const stored = await autopilotWatchStatus.update(snapshot);
           emitTabsChanged();
           return stored;
+        },
+        getAutopilotActivity: async () => autopilotActivity.get(),
+        onAutopilotActivity: async ({ envelope }) => {
+          const result = await autopilotActivity.update(envelope);
+          if (result.accepted) emitAutopilotActivityChanged();
+          return result;
         },
         getAutopilotProposalTicket: async ({ proposalId = null } = {}) => proposalId
           ? await autopilotProposalTicket.get(proposalId)

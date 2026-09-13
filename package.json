@@ -21,6 +21,7 @@
     "autopilot-proposal-ticket.mjs",
     "autopilot-watcher-manager.mjs",
     "autopilot-status.mjs",
+    "autopilot-activity.mjs",
     "autopilot-watch-status.mjs",
     "browser-backend.mjs",
     "codex-deep-link.mjs",

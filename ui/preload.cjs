@@ -71,6 +71,7 @@ contextBridge.exposeInMainWorld('agentifyDesktop', {
   requestAutopilotProposal: async () => unwrapAutopilotProposalResult(await ipcRenderer.invoke('agentify:requestAutopilotProposal')),
   openCodexThread: (args) => ipcRenderer.invoke('agentify:openCodexThread', args || {}),
   restartAutopilotWatcher: () => ipcRenderer.invoke('agentify:restartAutopilotWatcher'),
+  getAutopilotActivity: () => ipcRenderer.invoke('agentify:getAutopilotActivity'),
   clearAutopilotStatus: () => ipcRenderer.invoke('agentify:clearAutopilotStatus'),
   openStateDir: () => ipcRenderer.invoke('agentify:openStateDir'),
   openArtifactsDir: () => ipcRenderer.invoke('agentify:openArtifactsDir'),
@@ -88,6 +89,14 @@ contextBridge.exposeInMainWorld('agentifyDesktop', {
       try {
         ipcRenderer.removeListener('agentify:tabsChanged', handler);
       } catch {}
+    };
+  },
+  onAutopilotActivityChanged: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const handler = () => cb();
+    ipcRenderer.on('agentify:autopilotActivityChanged', handler);
+    return () => {
+      try { ipcRenderer.removeListener('agentify:autopilotActivityChanged', handler); } catch {}
     };
   }
 });

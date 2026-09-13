@@ -1,6 +1,8 @@
 /* global window */
 
 import { autopilotStatusViewModel } from './autopilot-status-view.mjs';
+import { autopilotActivityViewModel } from './autopilot-activity-view.mjs';
+import { createAutopilotActivityStaleScheduler } from './autopilot-activity-scheduler.mjs';
 import { createAutopilotStatusStaleScheduler } from './autopilot-status-scheduler.mjs';
 import {
   autopilotProposalViewModel,
@@ -154,6 +156,7 @@ function defaultState() {
     autopilot: { key: 'autopilot-production', tabCount: 0, tabId: null, vendorId: null, inflightQueries: 0, activeQueries: 0, ready: false },
     autopilotStatus: null,
     autopilotWatchStatus: null,
+    autopilotActivity: null,
     autopilotProposalTicket: null,
     autopilotProposalTicketError: null
     ,codexModels: [], codexModelCatalogStatus: 'loading', codexModelError: null, codexDeepLinkAvailable: false
@@ -192,6 +195,8 @@ let autopilotRequestInFlight = false;
 let autopilotErrorMessage = null;
 let autopilotClarificationMessage = null;
 let autopilotProposal = null;
+let autopilotActivityExpanded = null;
+let activityNewOutputPending = false;
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -258,16 +263,23 @@ function renderAutopilotState() {
   renderAutopilotTaskProgress(lastState.autopilotStatus);
   autopilotStatusScheduler.schedule(lastState.autopilotStatus);
   autopilotWatchStatusScheduler.schedule(lastState.autopilotWatchStatus);
+  autopilotActivityScheduler.schedule(lastState.autopilotActivity);
 }
 
 function renderAutopilotTaskProgress(snapshot) {
   const root = el('autopilotTaskProgress');
+  const previousTimeline = root.querySelector('.autopilotActivityTimeline');
+  const wasAtBottom = !previousTimeline || previousTimeline.scrollHeight - previousTimeline.scrollTop - previousTimeline.clientHeight < 8;
+  if (previousTimeline && !wasAtBottom) activityNewOutputPending = true;
+  if (wasAtBottom) activityNewOutputPending = false;
   root.innerHTML = '';
   const view = autopilotStatusViewModel(snapshot);
   const context = document.createElement('div');
   context.className = 'autopilotProgressContext';
   context.textContent = view.contextLabel || 'Autopilot task progress';
   root.appendChild(context);
+  const activity = renderAutopilotActivity(lastState.autopilotActivity, { wasAtBottom });
+  if (activity) root.appendChild(activity);
   const headline = document.createElement('div');
   headline.className = `autopilotProgressHeadline status-${view.kind}`;
   headline.textContent = view.statusLabel || view.label;
@@ -348,6 +360,90 @@ function renderAutopilotTaskProgress(snapshot) {
   }
 }
 
+function renderAutopilotActivity(snapshot, { wasAtBottom }) {
+  if (!snapshot) return null;
+  const root = document.createElement('section');
+  root.className = 'autopilotActivity';
+  const view = autopilotActivityViewModel(snapshot);
+  const header = document.createElement('div');
+  header.className = `autopilotActivityHeader status-${view.kind}`;
+  const title = document.createElement('strong');
+  title.textContent = 'Codex';
+  header.appendChild(title);
+  const status = document.createElement('span');
+  status.className = 'autopilotActivityStatus';
+  status.textContent = view.statusLabel;
+  header.appendChild(status);
+  root.appendChild(header);
+  const meta = document.createElement('div');
+  meta.className = 'autopilotActivityMeta';
+  for (const label of [view.elapsedLabel, view.pidLabel, view.lastActivityLabel, view.lastOutputLabel]) {
+    if (!label) continue;
+    const item = document.createElement('span'); item.textContent = label; meta.appendChild(item);
+  }
+  root.appendChild(meta);
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'autopilotActivityToggle';
+  toggle.textContent = 'Codex の実行内容';
+  const expanded = autopilotActivityExpanded ?? view.expanded;
+  toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  root.appendChild(toggle);
+  const timeline = document.createElement('div');
+  timeline.className = 'autopilotActivityTimeline';
+  timeline.setAttribute('role', 'log');
+  timeline.setAttribute('aria-label', 'Codex activity timeline');
+  timeline.hidden = !expanded;
+  for (const record of view.events) appendActivityRecord(timeline, record);
+  root.appendChild(timeline);
+  const newOutput = document.createElement('button');
+  newOutput.type = 'button';
+  newOutput.className = 'autopilotActivityNewOutput';
+  newOutput.textContent = '↓ 新しい出力';
+  newOutput.hidden = !activityNewOutputPending || expanded === false;
+  root.appendChild(newOutput);
+  toggle.onclick = () => {
+    autopilotActivityExpanded = !timeline.hidden;
+    timeline.hidden = autopilotActivityExpanded;
+    toggle.setAttribute('aria-expanded', autopilotActivityExpanded ? 'true' : 'false');
+    if (!timeline.hidden) { timeline.scrollTop = timeline.scrollHeight; activityNewOutputPending = false; newOutput.hidden = true; }
+  };
+  newOutput.onclick = () => { timeline.hidden = false; toggle.setAttribute('aria-expanded', 'true'); timeline.scrollTop = timeline.scrollHeight; activityNewOutputPending = false; newOutput.hidden = true; };
+  if (expanded && wasAtBottom) timeline.scrollTop = timeline.scrollHeight;
+  return root;
+}
+
+function appendActivityRecord(timeline, record) {
+  const event = record?.event || {};
+  const row = document.createElement('article');
+  row.className = `autopilotActivityEvent activity-${event.kind || 'unknown'}`;
+  if (event.kind === 'message') {
+    const label = document.createElement('div'); label.className = 'autopilotActivitySender'; label.textContent = 'Codex'; row.appendChild(label);
+    const text = document.createElement('div'); text.className = 'autopilotActivityMessage'; text.textContent = event.text || ''; row.appendChild(text);
+  } else if (event.kind === 'command') {
+    appendActivityLabel(row, 'Command');
+    appendActivityCode(row, event.command || '');
+    appendActivityState(row, event.state, event.exitCode);
+    if (event.output) { const details = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = 'Output'; details.appendChild(summary); appendActivityCode(details, event.output, true); row.appendChild(details); }
+  } else if (event.kind === 'file') {
+    appendActivityLabel(row, 'Changed files');
+    const list = document.createElement('ul'); list.className = 'autopilotActivityPaths';
+    for (const path of Array.isArray(event.paths) ? event.paths : []) { const item = document.createElement('li'); item.textContent = path; list.appendChild(item); }
+    row.appendChild(list); if (event.summary) { const summary = document.createElement('div'); summary.textContent = event.summary; row.appendChild(summary); }
+  } else if (event.kind === 'tool') {
+    appendActivityLabel(row, `Tool ${event.tool || 'activity'}`); appendActivityState(row, event.state); if (event.summary) { const summary = document.createElement('div'); summary.textContent = event.summary; row.appendChild(summary); }
+  } else if (event.kind === 'thinking') {
+    row.classList.add('isThinking'); row.textContent = event.state === 'completed' ? '考え中… 完了' : '考え中…';
+  } else if (event.kind === 'lifecycle') {
+    row.textContent = event.label || 'Codex activity'; appendActivityState(row, event.state, event.exitCode);
+  } else return;
+  timeline.appendChild(row);
+}
+
+function appendActivityLabel(root, value) { const label = document.createElement('div'); label.className = 'autopilotActivityLabel'; label.textContent = value; root.appendChild(label); }
+function appendActivityCode(root, value, block = false) { const code = document.createElement('code'); code.className = block ? 'autopilotActivityOutput' : 'autopilotActivityCommand'; code.textContent = value; root.appendChild(code); }
+function appendActivityState(root, state, exitCode = null) { const status = document.createElement('div'); status.className = 'autopilotActivityEventState'; status.textContent = state === 'completed' ? `✓ Completed${Number.isInteger(exitCode) ? ` · exit ${exitCode}` : ''}` : state === 'failed' ? `✕ Failed${Number.isInteger(exitCode) ? ` · exit ${exitCode}` : ''}` : state === 'started' ? '● Running' : state || ''; root.appendChild(status); }
+
 function setActivityText(html) {
   el('statusLine').innerHTML = html;
 }
@@ -374,6 +470,9 @@ const autopilotStatusScheduler = createAutopilotStatusStaleScheduler({
 });
 const autopilotWatchStatusScheduler = createAutopilotWatchStatusStaleScheduler({
   onStale: () => refresh().catch(() => {}),
+});
+const autopilotActivityScheduler = createAutopilotActivityStaleScheduler({
+  onStale: () => renderAutopilotTaskProgress(lastState.autopilotStatus),
 });
 
 function showStartupFailure(error) {
@@ -554,6 +653,7 @@ async function refresh({ initial = false } = {}) {
     const watchFoldersData =
       (await callApi('listWatchFolders', undefined, { fallback: { folders: [] }, required: initial, timeoutMs: startupTimeoutMs })) || { folders: [] };
     lastState = { ...defaultState(), ...state };
+    if (hasApi('getAutopilotActivity')) lastState.autopilotActivity = (await callApi('getAutopilotActivity', undefined, { fallback: lastState.autopilotActivity })) || lastState.autopilotActivity;
     const authoritativeProposal = deriveAutopilotProposalAuthority({
       proposalTicket: lastState.autopilotProposalTicket,
       watchStatus: lastState.autopilotWatchStatus,
@@ -1053,11 +1153,14 @@ async function main() {
     }
   };
 
+  let unsubscribeTabsChanged = null;
+  let unsubscribeActivityChanged = null;
   if (hasApi('onTabsChanged')) {
     try {
       const b = getBridge();
       hasLiveUpdates = true;
-      b?.onTabsChanged?.(() => refresh().catch(() => {}));
+      unsubscribeTabsChanged = b?.onTabsChanged?.(() => refresh().catch(() => {})) || null;
+      unsubscribeActivityChanged = b?.onAutopilotActivityChanged?.(() => refresh().catch(() => {})) || null;
     } catch (e) {
       hasLiveUpdates = false;
       statusText(`Live updates unavailable: ${e?.message || String(e)}. Refresh still works.`, 'warn');
@@ -1072,6 +1175,9 @@ async function main() {
   window.addEventListener('beforeunload', () => {
     autopilotStatusScheduler.cancel();
     autopilotWatchStatusScheduler.cancel();
+    autopilotActivityScheduler.cancel();
+    unsubscribeTabsChanged?.();
+    unsubscribeActivityChanged?.();
   }, { once: true });
   await refresh({ initial: true });
 }

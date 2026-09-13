@@ -82,7 +82,7 @@ function isAllowedNewExecution(current, envelope) {
   const isStart = envelope.event.kind === 'lifecycle' && envelope.event.state === 'started';
   const emittedAt = Date.parse(envelope.emittedAt);
   const currentAt = Date.parse(current.lastActivityAt || current.startedAt || envelope.emittedAt);
-  if (current.taskId !== envelope.taskId) return isStart && emittedAt >= currentAt;
+  if (current.taskId !== envelope.taskId) return (isStart || isNewerGeneration(current.executionId, envelope.executionId)) && emittedAt >= currentAt;
   if (isStart || envelope.round > current.round) return emittedAt >= currentAt;
   const currentGeneration = executionGeneration(current.executionId);
   const nextGeneration = executionGeneration(envelope.executionId);
@@ -90,8 +90,16 @@ function isAllowedNewExecution(current, envelope) {
 }
 
 function executionGeneration(executionId) {
-  const match = /^(\d{13})-/u.exec(executionId);
-  return match ? Number(match[1]) : null;
+  const match = /^(\d{1,15})-/u.exec(executionId);
+  if (!match) return null;
+  const generation = Number(match[1]);
+  return Number.isSafeInteger(generation) && generation > 0 ? generation : null;
+}
+
+function isNewerGeneration(currentExecutionId, nextExecutionId) {
+  const currentGeneration = executionGeneration(currentExecutionId);
+  const nextGeneration = executionGeneration(nextExecutionId);
+  return currentGeneration !== null && nextGeneration !== null && nextGeneration > currentGeneration;
 }
 
 function createState(envelope) {
@@ -211,8 +219,10 @@ function validateEvent(value) {
 }
 
 function safeText(value, field, max) {
-  if (typeof value !== 'string' || !value.trim() || value.length > max || /[\u0000-\u001f\u007f]/u.test(value)) throw invalidActivity(`${field} is invalid`);
-  return value.trim();
+  if (typeof value !== 'string') throw invalidActivity(`${field} is invalid`);
+  const normalized = value.replace(/\r\n?/gu, '\n');
+  if (!normalized.trim() || normalized.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(normalized)) throw invalidActivity(`${field} is invalid`);
+  return normalized.trim();
 }
 function nullableText(value, max) { return value === null || value === undefined ? null : safeText(value, 'event.text', max); }
 function canonicalTimestamp(value, field) {

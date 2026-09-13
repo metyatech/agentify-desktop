@@ -10,6 +10,7 @@ import {
   AUTOPILOT_ACTIVITY_MAX_FILE_BYTES,
   autopilotActivityPath,
   createAutopilotActivityStore,
+  validateAutopilotActivityEnvelope,
 } from '../autopilot-activity.mjs';
 import { startHttpApi } from '../http-api.mjs';
 
@@ -78,6 +79,63 @@ test('new execution without a start event recovers only from a newer generation 
   assert.equal(store.get().executionId, '1000000000001-execution-2');
   assert.equal((await store.update(envelope({ executionId: '1000000000000-execution-1', seq: 99, emittedAt: '2026-09-13T00:00:02.000Z', process: { pid: 1234, state: 'running' }, event: { kind: 'message', state: 'completed', text: 'late old execution' } }))).accepted, false);
   assert.equal(store.get().events.some((record) => record.event.text === 'late old execution'), false);
+  await fs.rm(stateDir, { recursive: true, force: true });
+});
+
+test('newer cross-task activity recovers when the start event was lost and rejects late old task data', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-activity-cross-task-'));
+  const store = await createAutopilotActivityStore({ stateDir });
+  await store.update(envelope({ taskId: 'task-A', executionId: '1000-execution-1', emittedAt: '2026-09-13T00:00:00.000Z' }));
+  const recovered = await store.update(envelope({
+    taskId: 'task-B', executionId: '2000-execution-2', seq: 1, emittedAt: '2026-09-13T00:00:01.000Z',
+    process: { pid: 2345, state: 'running' }, event: { kind: 'message', state: 'completed', text: 'recovered task B' },
+  }));
+  assert.equal(recovered.accepted, true);
+  assert.equal(store.get().taskId, 'task-B');
+  assert.equal(store.get().executionId, '2000-execution-2');
+  assert.equal(store.get().events[0].event.text, 'recovered task B');
+  const late = await store.update(envelope({
+    taskId: 'task-A', executionId: '1000-execution-1', seq: 99, emittedAt: '2026-09-13T00:00:02.000Z',
+    process: { pid: 1234, state: 'running' }, event: { kind: 'message', state: 'completed', text: 'late task A' },
+  }));
+  assert.equal(late.accepted, false);
+  assert.equal(store.get().taskId, 'task-B');
+  assert.equal(store.get().events.some((record) => record.event.text === 'late task A'), false);
+  await fs.rm(stateDir, { recursive: true, force: true });
+});
+
+test('cross-task recovery fails closed without generation proof while explicit start remains valid', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-activity-cross-task-validation-'));
+  const store = await createAutopilotActivityStore({ stateDir });
+  await store.update(envelope({ taskId: 'task-A', executionId: '1000-execution-1', emittedAt: '2026-09-13T00:00:00.000Z' }));
+  const legacy = await store.update(envelope({
+    taskId: 'task-B', executionId: 'legacy-execution-2', seq: 1, emittedAt: '2026-09-13T00:00:01.000Z',
+    process: { pid: 2345, state: 'running' }, event: { kind: 'message', state: 'completed', text: 'must reject' },
+  }));
+  assert.equal(legacy.accepted, false);
+  const started = await store.update(envelope({
+    taskId: 'task-B', executionId: 'legacy-execution-2', seq: 1, emittedAt: '2026-09-13T00:00:01.000Z',
+    process: { pid: 2345, state: 'starting' }, event: { kind: 'lifecycle', state: 'started', label: 'Codex started', exitCode: null },
+  }));
+  assert.equal(started.accepted, true);
+  assert.equal(store.get().taskId, 'task-B');
+  await fs.rm(stateDir, { recursive: true, force: true });
+});
+
+test('multiline activity is normalized, persisted, and reopened without flattening', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-activity-multiline-'));
+  const store = await createAutopilotActivityStore({ stateDir });
+  await store.update(envelope({ event: { kind: 'message', state: 'completed', text: 'Implemented Undo test.\r\nRunning UE 5.7 next.' } }));
+  await store.update(envelope({
+    seq: 2, emittedAt: '2026-09-13T00:00:01.000Z', process: { pid: 1234, state: 'running' },
+    event: { kind: 'command', itemId: 'cmd-1', state: 'completed', command: 'npm test', output: 'PASS test-a\r\nPASS test-b\r\nexit 0', exitCode: 0 },
+  }));
+  assert.equal(store.get().events[0].event.text, 'Implemented Undo test.\nRunning UE 5.7 next.');
+  assert.equal(store.get().events[1].event.output, 'PASS test-a\nPASS test-b\nexit 0');
+  const reopened = await createAutopilotActivityStore({ stateDir });
+  assert.equal(reopened.get().events[0].event.text, 'Implemented Undo test.\nRunning UE 5.7 next.');
+  assert.equal(reopened.get().events[1].event.output, 'PASS test-a\nPASS test-b\nexit 0');
+  assert.throws(() => validateAutopilotActivityEnvelope(envelope({ event: { kind: 'message', state: 'completed', text: 'unsafe\u0000text' } })));
   await fs.rm(stateDir, { recursive: true, force: true });
 });
 

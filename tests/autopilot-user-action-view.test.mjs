@@ -12,11 +12,17 @@ test('user-action view keeps unmatched or non-action tasks hidden', () => {
 
 test('user-action view exposes bounded states and enables only an exact detected reply', () => {
   const base = { userAction: { taskId: 'task-1', userTurnCount: 2, replyTurnCount: 2, canResume: true } };
-  assert.equal(autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'waiting-for-reply' } }).heading, '回答待ち');
+  const waiting = autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'waiting-for-reply' } });
+  assert.equal(waiting.heading, '回答待ち');
+  assert.equal(waiting.buttonLabel, '回答を確認');
+  assert.equal(waiting.canCheck, true);
   const detected = autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'reply-detected' } });
   assert.equal(detected.heading, '回答を検出しました');
   assert.equal(detected.buttonLabel, 'この回答で再開');
   assert.equal(detected.canResume, true);
+  const stale = autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'stale' } });
+  assert.equal(stale.buttonLabel, '回答を再確認');
+  assert.equal(stale.canCheck, true);
   assert.equal(autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'authorized' } }).canResume, false);
   assert.equal(autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'resuming' } }).heading, '再開中…');
   assert.equal(autopilotUserActionViewModel(blocked, { ...base, userAction: { ...base.userAction, state: 'stale' } }).heading, '回答を再確認してください');

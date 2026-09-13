@@ -397,9 +397,9 @@ function appendUserActionResume(root, snapshot) {
   button.type = 'button';
   button.className = 'btn primary autopilotUserActionButton';
   button.textContent = view.buttonLabel;
-  button.setAttribute('aria-label', `${taskId}をこの回答で再開`);
+  button.setAttribute('aria-label', `${taskId}を${view.buttonLabel}`);
   const busy = userActionResumeInFlight.has(taskId);
-  button.disabled = busy || !view.canResume;
+  button.disabled = busy || (!view.canResume && !view.canCheck);
   button.setAttribute('aria-busy', busy ? 'true' : 'false');
   button.onclick = async () => {
     if (button.disabled || userActionResumeInFlight.has(taskId)) return;
@@ -407,8 +407,8 @@ function appendUserActionResume(root, snapshot) {
     renderAutopilotTaskProgress(lastState.autopilotStatus);
     try {
       const result = await callApi('resumeAutopilotUserAction', { taskId }, { required: true });
-      if (!result?.applied && result?.reason !== 'USER_ACTION_ALREADY_AUTHORIZED') throw new Error(result?.reason || 'USER_ACTION_RESUME_NOT_APPLIED');
-      statusText('再開を承認しました。Watcherが回答と状態を再確認しています。', 'muted');
+      if (!result?.applied && !['USER_ACTION_ALREADY_AUTHORIZED', 'USER_ACTION_REPLY_NOT_FOUND'].includes(result?.reason)) throw new Error(result?.reason || 'USER_ACTION_RESUME_NOT_APPLIED');
+      statusText(result?.applied ? '再開を承認しました。Watcherが回答と状態を再確認しています。' : '回答はまだ検出されませんでした。', 'muted');
     } catch (error) {
       statusText(`再開を承認できませんでした: ${String(error?.code || error?.message || error)}`, 'error');
     } finally {

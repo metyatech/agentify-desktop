@@ -22,6 +22,26 @@ const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
 const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
 const MAX_CONVERSATION_HISTORY_ITERATIONS = 240;
 
+function conversationUrlHash(url) {
+  return crypto.createHash('sha256').update(String(url || ''), 'utf8').digest('hex');
+}
+
+async function assertExpectedConversation(controller, expectedConversationUrlHash) {
+  if (expectedConversationUrlHash === undefined || expectedConversationUrlHash === null || expectedConversationUrlHash === '') return;
+  const expected = String(expectedConversationUrlHash).trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(expected)) {
+    const error = new Error('invalid_expected_conversation_hash');
+    error.data = { requestDispatched: false };
+    throw error;
+  }
+  const currentUrl = await controller?.getUrl?.();
+  if (conversationUrlHash(currentUrl) !== expected) {
+    const error = new Error('task_conversation_changed');
+    error.data = { requestDispatched: false, messageDispatchState: 'not-dispatched' };
+    throw error;
+  }
+}
+
 async function boundedProviderStop(controller, { expectedOperationId, reason = 'user_stop' } = {}) {
   if (!controller || typeof controller.requestStop !== 'function') {
     return { status: 'not_attempted', reason: 'controller_stop_unavailable', requested: false, clicked: false };
@@ -275,6 +295,8 @@ export function mapErrorToHttp(error) {
   if (msg === 'invalid_artifact_mode') return { code: 400, body: { error: 'invalid_artifact_mode', data: error?.data || null } };
   if (msg === 'relative_path_not_allowed') return { code: 400, body: { error: 'relative_path_not_allowed', data: error?.data || null } };
   if (msg === 'missing_url') return { code: 400, body: { error: 'missing_url' } };
+  if (msg === 'invalid_expected_conversation_hash') return { code: 400, body: { error: 'invalid_expected_conversation_hash', data: error?.data || null } };
+  if (msg === 'task_conversation_changed') return { code: 409, body: { error: 'task_conversation_changed', data: error?.data || null } };
   if (msg === 'missing_prompt') return { code: 400, body: { error: 'missing_prompt' } };
   if (msg === 'missing_attachment_path') return { code: 400, body: { error: 'missing_attachment_path', data: error?.data || null } };
   if (msg === 'missing_context_path') return { code: 400, body: { error: 'missing_context_path', data: error?.data || null } };
@@ -1741,6 +1763,7 @@ export function startHttpApi({
       if (url.pathname === '/query' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 5_000_000 });
         const timeoutMs = positiveIntOr(body.timeoutMs, 10 * 60_000, 30 * 60_000);
+        const expectedConversationUrlHash = body.expectedConversationUrlHash;
         const prompt = String(body.prompt || '');
         if (!prompt.trim()) throw new Error('missing_prompt');
         if (prompt.length > 200_000) throw new Error('prompt_too_large');
@@ -1834,12 +1857,14 @@ export function startHttpApi({
             const controller = tabs.getControllerById(tabId);
             const result = await runExclusive(controller, async () => {
               throwIfOperationActive(op);
+              await assertExpectedConversation(controller, expectedConversationUrlHash);
               return await controller.query({
                 prompt: packed.prompt,
                 attachments: packed.attachments,
                 timeoutMs,
                 signal,
                 operationId: op.id,
+                beforeDispatch: () => assertExpectedConversation(controller, expectedConversationUrlHash),
                 onProgress: (patch) => patchActiveQuery(tabId, patch)
               });
             });
@@ -1878,6 +1903,7 @@ export function startHttpApi({
       if (url.pathname === '/send' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 5_000_000 });
         const timeoutMs = positiveIntOr(body.timeoutMs, 3 * 60_000, 30 * 60_000);
+        const expectedConversationUrlHash = body.expectedConversationUrlHash;
         const text = String(body.text || '');
         if (!text.trim()) throw new Error('missing_prompt');
         if (text.length > 200_000) throw new Error('prompt_too_large');
@@ -1931,6 +1957,7 @@ export function startHttpApi({
             stopAfterSend,
             signal,
             operationId: op.id,
+            beforeDispatch: () => assertExpectedConversation(controller, expectedConversationUrlHash),
             onProgress: (patch) => patchActiveQuery(tabId, patch)
           });
           setLastOutcome(tabId, {

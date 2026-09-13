@@ -7736,7 +7736,7 @@ export class ChatGPTController {
     throw err;
   }
 
-  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, signal = null, operationId = null } = {}) {
+  async query({ prompt, attachments = [], timeoutMs = 10 * 60_000, onProgress = null, signal = null, operationId = null, beforeDispatch = null } = {}) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
     throwIfSignalAborted(signal);
@@ -7835,6 +7835,7 @@ export class ChatGPTController {
       await this.#persistDraftLease(run, 'prompt-owned');
       this.#throwIfStopRequested();
       const baseline = await this.#captureChatGPTAssistantBaseline();
+      await beforeDispatch?.();
       await this.#persistDraftLease(run, 'dispatch-started');
       await this.#clickSend({ timeoutMs });
       if (run.sendConfirmed) await this.#persistDraftLease(run, 'send-confirmed');
@@ -7895,7 +7896,7 @@ export class ChatGPTController {
     }
   }
 
-  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null, operationId = null } = {}) {
+  async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null, signal = null, operationId = null, beforeDispatch = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');
     if (prompt.length > 200_000) throw new Error('prompt_too_large');
@@ -7966,6 +7967,7 @@ export class ChatGPTController {
         run.promptLength = Number(typed?.promptLength) || prompt.length;
         await this.#persistDraftLease(run, 'prompt-owned');
         this.#throwIfStopRequested();
+        await beforeDispatch?.();
         await this.#persistDraftLease(run, 'dispatch-started');
         await this.#clickSend({ timeoutMs });
         if (run.sendConfirmed) await this.#persistDraftLease(run, 'send-confirmed');

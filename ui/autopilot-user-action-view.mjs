@@ -10,6 +10,7 @@ export function autopilotUserActionViewModel(snapshot, watchStatus) {
   const userTurnCount = boundedCount(source?.userTurnCount);
   const replyTurnCount = boundedCount(source?.replyTurnCount);
   const canResume = source?.canResume === true && state === 'reply-detected';
+  const canCheck = state === 'waiting-for-reply' || state === 'stale';
   return {
     visible: true,
     taskId,
@@ -17,6 +18,7 @@ export function autopilotUserActionViewModel(snapshot, watchStatus) {
     userTurnCount,
     replyTurnCount,
     canResume,
+    canCheck,
     heading: state === 'reply-detected'
       ? '回答を検出しました'
       : state === 'authorized'
@@ -33,7 +35,9 @@ export function autopilotUserActionViewModel(snapshot, watchStatus) {
           : state === 'stale'
             ? '会話が変わったため、最新の回答を検出してから再度承認してください。'
             : 'ChatGPTで必要事項に回答してください。回答するとここで再開できます。',
-    buttonLabel: 'この回答で再開',
+    buttonLabel: state === 'waiting-for-reply'
+      ? '回答を確認'
+      : state === 'stale' ? '回答を再確認' : 'この回答で再開',
   };
 }
 

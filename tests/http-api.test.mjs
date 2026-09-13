@@ -835,6 +835,46 @@ test('http-api: /send calls the mutex-owning controller directly and completes o
   assert.equal(status.data.runtime.activeQueries.length, 0);
 });
 
+test('http-api: task-bound query and send reject a changed conversation before controller dispatch', async (t) => {
+  let queryCalls = 0;
+  let sendCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    getUrl: async () => 'https://chatgpt.com/c/unrelated',
+    query: async () => { queryCalls += 1; return { text: 'must not query' }; },
+    send: async ({ beforeDispatch }) => { await beforeDispatch?.(); sendCalls += 1; return { ok: true }; },
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'autopilot-production', vendorId: 'chatgpt' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller,
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/c/unrelated', tabs: tabs.listTabs() }),
+  });
+  t.after(() => server.close());
+  const hash = 'a'.repeat(64);
+  const query = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'autopilot-production', prompt: 'query', expectedConversationUrlHash: hash } });
+  assert.equal(query.res.status, 409);
+  assert.equal(query.data.error, 'task_conversation_changed');
+  assert.equal(query.data.data?.requestDispatched, false);
+  const send = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/send', body: { key: 'autopilot-production', text: 'send', expectedConversationUrlHash: hash } });
+  assert.equal(send.res.status, 409);
+  assert.equal(send.data.error, 'task_conversation_changed');
+  assert.equal(send.data.data?.requestDispatched, false);
+  assert.equal(queryCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
 test('http-api: stopped /send releases every runtime guard and the next send succeeds', async (t) => {
   let firstSend = true;
   let releaseFirst = null;

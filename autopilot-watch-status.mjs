@@ -17,8 +17,10 @@ const PROPOSAL_STATES = new Set([
   'completed',
   'blocked',
 ]);
-const ALLOWED_KEYS = new Set(['schemaVersion', 'tabKey', 'status', 'lastPollAt', 'lastError', 'proposal', 'updatedAt']);
+const USER_ACTION_STATES = new Set(['waiting-for-reply', 'reply-detected', 'authorized', 'resuming', 'stale']);
+const ALLOWED_KEYS = new Set(['schemaVersion', 'tabKey', 'status', 'lastPollAt', 'lastError', 'proposal', 'userAction', 'updatedAt']);
 const PROPOSAL_KEYS = new Set(['proposalId', 'taskId', 'approvalCode', 'state', 'updatedAt']);
+const USER_ACTION_KEYS = new Set(['taskId', 'sourceReviewRound', 'state', 'userTurnCount', 'replyTurnCount', 'detectedAt', 'canResume', 'reason']);
 
 export function autopilotWatchStatusPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, AUTOPILOT_WATCH_STATUS_FILE);
@@ -34,7 +36,8 @@ export function validateAutopilotWatchStatus(value) {
   const updatedAt = canonicalTimestamp(value.updatedAt, 'updatedAt');
   const lastError = value.lastError === null ? null : validateError(value.lastError);
   const proposal = value.proposal === null ? null : validateProposal(value.proposal);
-  return { schemaVersion: 1, tabKey, status: value.status, lastPollAt, lastError, proposal, updatedAt };
+  const userAction = value.userAction === null || value.userAction === undefined ? null : validateUserAction(value.userAction);
+  return { schemaVersion: 1, tabKey, status: value.status, lastPollAt, lastError, proposal, userAction, updatedAt };
 }
 
 export async function createAutopilotWatchStatusStore({
@@ -105,6 +108,19 @@ function validateError(value) {
   const code = safeText(value.code, 'lastError.code', 64);
   if (!/^[A-Z][A-Z0-9_]{1,63}$/u.test(code)) throw invalidWatchStatus('lastError.code is invalid');
   return { code, message: safeText(value.message, 'lastError.message', 160) };
+}
+
+function validateUserAction(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some((key) => !USER_ACTION_KEYS.has(key))) throw invalidWatchStatus('userAction is invalid');
+  const taskId = safeText(value.taskId, 'userAction.taskId', 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(taskId)) throw invalidWatchStatus('userAction.taskId is invalid');
+  if (!Number.isSafeInteger(value.sourceReviewRound) || value.sourceReviewRound < 1 || value.sourceReviewRound > 10) throw invalidWatchStatus('userAction.sourceReviewRound is invalid');
+  if (!USER_ACTION_STATES.has(value.state)) throw invalidWatchStatus('userAction.state is invalid');
+  for (const key of ['userTurnCount', 'replyTurnCount']) if (!Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > 64) throw invalidWatchStatus(`userAction.${key} is invalid`);
+  const detectedAt = value.detectedAt === null ? null : canonicalTimestamp(value.detectedAt, 'userAction.detectedAt');
+  if (typeof value.canResume !== 'boolean') throw invalidWatchStatus('userAction.canResume is invalid');
+  const reason = value.reason === null ? null : safeText(value.reason, 'userAction.reason', 96);
+  return { taskId, sourceReviewRound: value.sourceReviewRound, state: value.state, userTurnCount: value.userTurnCount, replyTurnCount: value.replyTurnCount, detectedAt, canResume: value.canResume, reason };
 }
 
 function canonicalTimestamp(value, field, { nullable = false } = {}) {

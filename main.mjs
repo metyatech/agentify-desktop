@@ -187,6 +187,7 @@ async function main() {
   const autopilotProposalTicket = await createAutopilotProposalTicketStore({ stateDir });
   const watcherConfig = await resolveAutopilotWatcherConfig(stateDir);
   const autopilotWatcher = createAutopilotWatcherManager({ root: watcherConfig.root, initialError: watcherConfig.error });
+  const userActionResumeInflight = new Map();
   const selectors = await loadSelectors(stateDir);
   const vendors = await loadVendors();
   let settings = await readSettings(stateDir);
@@ -496,6 +497,40 @@ async function main() {
     return { ok: result === undefined };
   });
   ipcMain.handle('agentify:restartAutopilotWatcher', async () => ({ watcher: await autopilotWatcher.restart() }));
+  ipcMain.handle('agentify:resumeAutopilotUserAction', async (_evt, args) => {
+    const taskId = String(args?.taskId || '').trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(taskId)) throw new Error('invalid_task_id');
+    const root = watcherConfig.root;
+    if (!root) throw new Error(watcherConfig.error || 'autopilot_root_unavailable');
+    if (userActionResumeInflight.has(taskId)) return await userActionResumeInflight.get(taskId);
+    const promise = new Promise((resolve, reject) => {
+      const entry = path.join(root, 'bin', 'ai-autopilot.mjs');
+      const child = spawn(process.execPath, [entry, 'watch', 'user-action-resume', taskId, '--apply', '--json'], {
+        cwd: root,
+        env: { ...process.env, AI_AUTOPILOT_ROOT: root },
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.on('data', (chunk) => { stdout = `${stdout}${chunk}`.slice(-64 * 1024); });
+      child.stderr?.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-16 * 1024); });
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        if (code !== 0) {
+          const error = new Error(stderr.trim() || `user_action_resume_failed_${code}`);
+          error.code = 'USER_ACTION_RESUME_FAILED';
+          reject(error);
+          return;
+        }
+        try { resolve(JSON.parse(stdout)); }
+        catch { reject(new Error('user_action_resume_invalid_result')); }
+      });
+    }).finally(() => userActionResumeInflight.delete(taskId));
+    userActionResumeInflight.set(taskId, promise);
+    return await promise;
+  });
   ipcMain.handle('agentify:getAutopilotActivity', async () => autopilotActivity.get());
   ipcMain.handle('agentify:clearAutopilotStatus', async () => {
     const snapshot = autopilotStatus.get();

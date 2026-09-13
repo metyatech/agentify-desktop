@@ -349,6 +349,17 @@ only the Agentify display snapshot and never deletes task state, worktrees,
 branches, evidence, or the watcher ledger. The API rejects clearing a running
 snapshot.
 
+When a blocked task has `USER_ACTION_REQUIRED`, the card shows `回答待ち`.
+After the watcher finds a stable, complete same-conversation reply, it shows
+`回答を検出しました` and the number of user replies. The single
+`この回答で再開` button calls the configured ai-autopilot authorization
+boundary for that task. Reply detection by itself never resumes execution;
+the explicit click is required. After the click the card shows
+`再開を承認しました` and then `再開中…` while the watcher revalidates the
+exact snapshot and launches the same task at the next execution round. The
+watch-status and renderer state contain only counts, state, and bounded reason
+codes; the response transcript remains in the task-local artifact.
+
 On Windows, Agentify manages the watcher from a controller-owned registration
 file, `autopilot-watcher-registration.json`, in the Agentify state directory.
 The registration is written atomically by `ai-autopilot watch install`; when no

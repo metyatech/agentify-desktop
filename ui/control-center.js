@@ -10,6 +10,7 @@ import {
   isAutopilotProposalRequestDisabled,
 } from './autopilot-proposal-view.mjs';
 import { createAutopilotWatchStatusStaleScheduler } from './autopilot-watch-status-scheduler.mjs';
+import { autopilotUserActionViewModel } from './autopilot-user-action-view.mjs';
 import {
   callControlCenterApi,
   safeControlCenterErrorCode,
@@ -198,6 +199,7 @@ let autopilotProposal = null;
 let autopilotActivityExpanded = null;
 let activityNewOutputPending = false;
 let activityVisibleCursor = null;
+const userActionResumeInFlight = new Set();
 
 function renderAutopilotState() {
   const button = el('btnAutopilotProposal');
@@ -343,6 +345,7 @@ function renderAutopilotTaskProgress(snapshot) {
   phase.className = 'autopilotProgressLine';
   phase.textContent = `${view.phaseLabel} — ${view.roundLabel}`;
   root.appendChild(phase);
+  appendUserActionResume(root, snapshot);
   const target = document.createElement('div');
   target.className = 'autopilotProgressLine';
   target.textContent = view.targetLabel;
@@ -372,6 +375,49 @@ function renderAutopilotTaskProgress(snapshot) {
     statusAge.textContent = view.statusAgeLabel;
     root.appendChild(statusAge);
   }
+}
+
+function appendUserActionResume(root, snapshot) {
+  const view = autopilotUserActionViewModel(snapshot, lastState.autopilotWatchStatus);
+  if (!view.visible) return;
+  const { taskId } = view;
+  const section = document.createElement('section');
+  section.className = 'autopilotUserActionResume';
+  section.setAttribute('aria-labelledby', `user-action-${taskId}`);
+  const heading = document.createElement('div');
+  heading.className = 'autopilotUserActionHeading';
+  heading.id = `user-action-${taskId}`;
+  heading.textContent = view.heading;
+  section.appendChild(heading);
+  const detail = document.createElement('div');
+  detail.className = 'autopilotProgressMeta';
+  detail.textContent = view.detail;
+  section.appendChild(detail);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn primary autopilotUserActionButton';
+  button.textContent = view.buttonLabel;
+  button.setAttribute('aria-label', `${taskId}をこの回答で再開`);
+  const busy = userActionResumeInFlight.has(taskId);
+  button.disabled = busy || !view.canResume;
+  button.setAttribute('aria-busy', busy ? 'true' : 'false');
+  button.onclick = async () => {
+    if (button.disabled || userActionResumeInFlight.has(taskId)) return;
+    userActionResumeInFlight.add(taskId);
+    renderAutopilotTaskProgress(lastState.autopilotStatus);
+    try {
+      const result = await callApi('resumeAutopilotUserAction', { taskId }, { required: true });
+      if (!result?.applied && result?.reason !== 'USER_ACTION_ALREADY_AUTHORIZED') throw new Error(result?.reason || 'USER_ACTION_RESUME_NOT_APPLIED');
+      statusText('再開を承認しました。Watcherが回答と状態を再確認しています。', 'muted');
+    } catch (error) {
+      statusText(`再開を承認できませんでした: ${String(error?.code || error?.message || error)}`, 'error');
+    } finally {
+      userActionResumeInFlight.delete(taskId);
+      await refresh().catch(() => {});
+    }
+  };
+  section.appendChild(button);
+  root.appendChild(section);
 }
 
 function renderAutopilotActivity(snapshot, { wasAtBottom, previousScrollTop = 0 }) {

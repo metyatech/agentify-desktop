@@ -71,6 +71,7 @@ contextBridge.exposeInMainWorld('agentifyDesktop', {
   requestAutopilotProposal: async () => unwrapAutopilotProposalResult(await ipcRenderer.invoke('agentify:requestAutopilotProposal')),
   openCodexThread: (args) => ipcRenderer.invoke('agentify:openCodexThread', args || {}),
   restartAutopilotWatcher: () => ipcRenderer.invoke('agentify:restartAutopilotWatcher'),
+  resumeAutopilotUserAction: (args) => ipcRenderer.invoke('agentify:resumeAutopilotUserAction', { taskId: String(args?.taskId || '').trim() }),
   getAutopilotActivity: () => ipcRenderer.invoke('agentify:getAutopilotActivity'),
   clearAutopilotStatus: () => ipcRenderer.invoke('agentify:clearAutopilotStatus'),
   openStateDir: () => ipcRenderer.invoke('agentify:openStateDir'),

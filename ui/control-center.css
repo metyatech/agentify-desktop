@@ -189,6 +189,9 @@ body {
 .autopilotProgressLine { margin-top: 7px; color: #e9ecf2; font-size: 13px; overflow-wrap: anywhere; }
 .autopilotProgressMeta { margin-top: 6px; color: rgba(233,236,242,0.68); font-size: 12px; overflow-wrap: anywhere; }
 .autopilotProgressError { margin-top: 8px; color: #fecaca; font-size: 12px; overflow-wrap: anywhere; }
+.autopilotUserActionResume { margin-top: 12px; padding: 12px; border: 1px solid rgba(147,197,253,0.45); border-radius: 10px; background: rgba(30,64,175,0.16); }
+.autopilotUserActionHeading { color: #dbeafe; font-weight: 750; font-size: 14px; }
+.autopilotUserActionButton { margin-top: 10px; min-height: 36px; }
 .autopilotActivity {
   margin: 12px 0;
   padding: 12px;

@@ -680,7 +680,9 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
           passCount,
           signatures,
           mismatchCount,
-          stabilized: false
+          stabilized: false,
+          passSummaries,
+          passDiffs
         })
       };
     }

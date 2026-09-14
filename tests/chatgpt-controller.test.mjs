@@ -1486,6 +1486,58 @@ test('chatgpt-controller: complete-history pass diagnostics classify component c
   assert.equal(serializedDiagnostics.includes('private-turn-id-'), false);
 });
 
+test('chatgpt-controller: complete-history preserves valid diagnostics before an invalid pass', () => {
+  const validA = completeDiagnosticTraversalFixture({});
+  const validB = completeDiagnosticTraversalFixture({ positionOffset: 10, textChangeAt: 2 });
+  const invalidTimeout = completeDiagnosticTraversalFixture({});
+  invalidTimeout.reason = 'timeout';
+  const timeoutResult = verifyCompleteHistoryFixedPoint([validA, validB, invalidTimeout], { maxTurns: 50 });
+  const timeoutDiagnostics = timeoutResult.result.diagnostics.completeVerification;
+  assert.equal(timeoutResult.complete, false);
+  assert.equal(timeoutResult.reason, 'timeout');
+  assert.equal(timeoutDiagnostics.passCount, 3);
+  assert.equal(timeoutDiagnostics.passSummaries.length, 2);
+  assert.equal(timeoutDiagnostics.passDiffs.length, 1);
+  assert.equal(timeoutDiagnostics.passDiffs[0].positionOnlyDifferenceCount, 3);
+  assert.equal(timeoutDiagnostics.passDiffs[0].positionAndTextDifferenceCount, 1);
+  assert.equal(JSON.stringify(timeoutDiagnostics).includes('private-turn-'), false);
+  assert.equal(JSON.stringify(timeoutDiagnostics).includes('private-message-'), false);
+
+  const ambiguous = completeDiagnosticTraversalFixture({});
+  ambiguous.snapshots = [[
+    { role: 'user', text: 'private-ambiguous', messageId: 'private-duplicate' },
+    { role: 'user', text: 'private-ambiguous', messageId: 'private-duplicate' }
+  ]];
+  const ambiguousResult = verifyCompleteHistoryFixedPoint([validA, validB, ambiguous], { maxTurns: 50 });
+  const ambiguousDiagnostics = ambiguousResult.result.diagnostics.completeVerification;
+  assert.equal(ambiguousResult.complete, false);
+  assert.equal(ambiguousResult.reason, 'merge-ambiguous');
+  assert.equal(ambiguousDiagnostics.passCount, 3);
+  assert.equal(ambiguousDiagnostics.passSummaries.length, 2);
+  assert.equal(ambiguousDiagnostics.passDiffs.length, 1);
+
+  const gap = completeDiagnosticTraversalFixture({});
+  gap.snapshots = [
+    validA.snapshots[0],
+    [{ role: 'user', text: 'private-gap', messageId: 'private-gap' }]
+  ];
+  const gapResult = verifyCompleteHistoryFixedPoint([validA, gap], { maxTurns: 50 });
+  const gapDiagnostics = gapResult.result.diagnostics.completeVerification;
+  assert.equal(gapResult.complete, false);
+  assert.equal(gapResult.reason, 'history-gap');
+  assert.equal(gapDiagnostics.passCount, 2);
+  assert.equal(gapDiagnostics.passSummaries.length, 1);
+  assert.equal(gapDiagnostics.passDiffs.length, 0);
+
+  const invalidFirst = verifyCompleteHistoryFixedPoint([invalidTimeout], { maxTurns: 50 });
+  const invalidFirstDiagnostics = invalidFirst.result.diagnostics.completeVerification;
+  assert.equal(invalidFirst.complete, false);
+  assert.equal(invalidFirst.reason, 'timeout');
+  assert.equal(invalidFirstDiagnostics.passCount, 1);
+  assert.equal(invalidFirstDiagnostics.passSummaries.length, 0);
+  assert.equal(invalidFirstDiagnostics.passDiffs.length, 0);
+});
+
 test('chatgpt-controller: complete history does not stabilize changing full-history signatures', () => {
   const textChanged = verifyCompleteHistoryFixedPoint([
     completeTraversalFixture(28),

@@ -1351,6 +1351,41 @@ test('chatgpt-controller: complete history requires a full-history fixed point',
     verification.result.diagnostics.completeVerification.signatures[0],
     verification.result.diagnostics.completeVerification.signatures[1]
   );
+
+  const productionRegression = verifyCompleteHistoryFixedPoint([
+    completeTraversalFixture(10),
+    completeTraversalFixture(20),
+    completeTraversalFixture(25),
+    completeTraversalFixture(28),
+    completeTraversalFixture(28)
+  ], { maxTurns: 50 });
+  assert.equal(productionRegression.complete, true);
+  assert.equal(productionRegression.result.diagnostics.completeVerification.passCount, 5);
+  assert.equal(productionRegression.result.diagnostics.completeVerification.mismatchCount, 3);
+  assert.equal(productionRegression.result.mergedTurns.length, 28);
+
+  const sevenPassStable = verifyCompleteHistoryFixedPoint([
+    completeTraversalFixture(10),
+    completeTraversalFixture(11),
+    completeTraversalFixture(12),
+    completeTraversalFixture(13),
+    completeTraversalFixture(14),
+    completeTraversalFixture(15),
+    completeTraversalFixture(15)
+  ], { maxTurns: 50 });
+  assert.equal(sevenPassStable.complete, true);
+  assert.equal(sevenPassStable.result.diagnostics.completeVerification.passCount, 7);
+  assert.equal(sevenPassStable.result.diagnostics.completeVerification.mismatchCount, 5);
+});
+
+test('chatgpt-controller: fixed-point diagnostics retain only recent signatures while counting every pass', () => {
+  const traversals = Array.from({ length: 10 }, (_, index) => completeTraversalFixture(index + 10));
+  const verification = verifyCompleteHistoryFixedPoint(traversals, { maxTurns: 50 });
+  assert.equal(verification.complete, false);
+  assert.equal(verification.reason, 'history-fixed-point-unproven');
+  assert.equal(verification.result.diagnostics.completeVerification.passCount, 10);
+  assert.equal(verification.result.diagnostics.completeVerification.mismatchCount, 9);
+  assert.equal(verification.result.diagnostics.completeVerification.signatures.length, 8);
 });
 
 test('chatgpt-controller: complete history does not stabilize changing full-history signatures', () => {

@@ -485,7 +485,7 @@ function conversationWindowSignature(turns = []) {
 }
 
 const COMPLETE_HISTORY_REQUIRED_STABLE_PASSES = 2;
-const COMPLETE_HISTORY_MAX_VERIFICATION_PASSES = 3;
+const COMPLETE_HISTORY_DIAGNOSTIC_SIGNATURE_LIMIT = 8;
 
 function completeHistoryTraversalCandidate(result, limits) {
   const merged = mergeConversationSnapshots(result?.snapshots);
@@ -533,7 +533,7 @@ function completeHistoryVerificationResult(candidate, {
         requiredConsecutiveStablePasses: COMPLETE_HISTORY_REQUIRED_STABLE_PASSES,
         stabilized,
         mismatchCount,
-        signatures: signatures.slice(-COMPLETE_HISTORY_MAX_VERIFICATION_PASSES),
+        signatures: signatures.slice(-COMPLETE_HISTORY_DIAGNOSTIC_SIGNATURE_LIMIT),
         budgetExhausted
       }
     }
@@ -546,7 +546,7 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
   const signatures = [];
   let latestCandidate = null;
   let passCount = 0;
-  for (const traversal of Array.isArray(traversals) ? traversals.slice(0, COMPLETE_HISTORY_MAX_VERIFICATION_PASSES) : []) {
+  for (const traversal of Array.isArray(traversals) ? traversals : []) {
     passCount += 1;
     const candidate = completeHistoryTraversalCandidate(traversal, { maxTurns });
     latestCandidate = candidate;
@@ -4786,7 +4786,7 @@ export class ChatGPTController {
     const traversals = [];
     let verification = null;
 
-    while (passCount < COMPLETE_HISTORY_MAX_VERIFICATION_PASSES) {
+    while (Date.now() < deadlineAt) {
       if (Date.now() >= deadlineAt) break;
       passCount += 1;
       traversals.push(await this.#readCompleteConversationTurns({
@@ -4797,8 +4797,11 @@ export class ChatGPTController {
         deadlineAt
       }));
       verification = verifyCompleteHistoryFixedPoint(traversals, { maxTurns: limits.maxTurns });
-      if (verification.reason !== 'history-fixed-point-unproven') return verification.result;
-      if (passCount >= COMPLETE_HISTORY_MAX_VERIFICATION_PASSES || Date.now() >= deadlineAt) break;
+      if (verification.reason !== 'history-fixed-point-unproven') {
+        verification.result.diagnostics.completeVerification.budgetExhausted = Date.now() >= deadlineAt;
+        return verification.result;
+      }
+      if (Date.now() >= deadlineAt) break;
     }
 
     if (!verification) verification = verifyCompleteHistoryFixedPoint([], { maxTurns: limits.maxTurns });

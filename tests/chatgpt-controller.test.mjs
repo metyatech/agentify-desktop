@@ -3089,6 +3089,86 @@ test('chatgpt-controller: merge identity ignores position hints and reports real
   ]);
   assert.equal(fallbackConflict.ambiguous, true);
   assert.ok(fallbackConflict.mergeDiagnostics.reasonCounts.fallbackIdentityConflict > 0);
+  assert.equal(fallbackConflict.mergeDiagnostics.identityConflicts[0].identityKind, 'fallback');
+  assert.equal(fallbackConflict.mergeDiagnostics.identityConflictSummary.durableConflictCount, 0);
+  assert.doesNotMatch(JSON.stringify(fallbackConflict.mergeDiagnostics), /same/u);
+  assert.doesNotMatch(JSON.stringify(fallbackConflict.mergeDiagnostics), /answer-a|answer-b/u);
+});
+
+test('chatgpt-controller: merge identity conflicts expose bounded privacy-safe diagnostics', () => {
+  const makeConflict = (existing, incoming) => mergeConversationSnapshots([
+    [{ role: existing.role, text: existing.text, messageId: existing.messageId, positionHint: existing.positionHint }],
+    [{ role: incoming.role, text: incoming.text, messageId: incoming.messageId, positionHint: incoming.positionHint }],
+  ]);
+  const text = 'private-conflict-text-7d2a9c';
+  const changedText = 'private-conflict-text-7d2a9c-mutated';
+  const textConflict = makeConflict(
+    { role: 'user', text, messageId: 'private-message-id-7d2a9c', positionHint: 1 },
+    { role: 'user', text: changedText, messageId: 'private-message-id-7d2a9c', positionHint: 1 },
+  );
+  const textDetail = textConflict.mergeDiagnostics.identityConflicts[0];
+  assert.equal(textConflict.ambiguous, true);
+  assert.equal(textConflict.mergeDiagnostics.reasonCounts.durableIdentityConflict, 1);
+  assert.equal(textDetail.identityKind, 'message-id');
+  assert.equal(textDetail.roleChanged, false);
+  assert.equal(textDetail.textChanged, true);
+  assert.equal(textDetail.textRelation, 'existing-prefix-of-incoming');
+  assert.equal(textDetail.existingTextLength, text.length);
+  assert.equal(textDetail.incomingTextLength, changedText.length);
+  assert.equal(textConflict.mergeDiagnostics.identityConflictSummary.textConflictCount, 1);
+  assert.equal(textConflict.mergeDiagnostics.identityConflictSummary.existingPrefixOfIncomingCount, 1);
+  const serializedTextConflict = JSON.stringify(textConflict.mergeDiagnostics);
+  assert.doesNotMatch(serializedTextConflict, /private-message-id-7d2a9c/u);
+  assert.doesNotMatch(serializedTextConflict, /private-conflict-text-7d2a9c/u);
+
+  const roleConflict = makeConflict(
+    { role: 'user', text: 'same-role-change-text', messageId: 'private-role-id' },
+    { role: 'assistant', text: 'same-role-change-text', messageId: 'private-role-id' },
+  );
+  assert.equal(roleConflict.mergeDiagnostics.identityConflicts[0].roleChanged, true);
+  assert.equal(roleConflict.mergeDiagnostics.identityConflicts[0].textChanged, false);
+
+  const roleAndTextConflict = makeConflict(
+    { role: 'user', text: 'role-and-text-before', messageId: 'private-role-text-id' },
+    { role: 'assistant', text: 'role-and-text-after', messageId: 'private-role-text-id' },
+  );
+  assert.equal(roleAndTextConflict.mergeDiagnostics.identityConflicts[0].roleChanged, true);
+  assert.equal(roleAndTextConflict.mergeDiagnostics.identityConflicts[0].textChanged, true);
+  assert.equal(roleAndTextConflict.mergeDiagnostics.identityConflictSummary.roleAndTextConflictCount, 1);
+
+  const prefixShrink = makeConflict(
+    { role: 'user', text: 'private-long-text-8f31-extra', messageId: 'private-prefix-shrink-id' },
+    { role: 'user', text: 'private-long-text-8f31', messageId: 'private-prefix-shrink-id' },
+  );
+  assert.equal(prefixShrink.mergeDiagnostics.identityConflicts[0].textRelation, 'incoming-prefix-of-existing');
+  assert.equal(prefixShrink.mergeDiagnostics.identityConflictSummary.incomingPrefixOfExistingCount, 1);
+
+  const unrelated = makeConflict(
+    { role: 'user', text: 'private-unrelated-left', messageId: 'private-unrelated-id' },
+    { role: 'user', text: 'private-unrelated-right', messageId: 'private-unrelated-id' },
+  );
+  assert.equal(unrelated.mergeDiagnostics.identityConflicts[0].textRelation, 'different');
+  assert.equal(unrelated.mergeDiagnostics.identityConflictSummary.unrelatedTextChangeCount, 1);
+
+  const positionOnly = mergeConversationSnapshots([
+    [{ role: 'user', text: 'private-position-stable', messageId: 'private-position-id', positionHint: 1 }],
+    [{ role: 'user', text: 'private-position-stable', messageId: 'private-position-id', positionHint: 9 }],
+  ]);
+  assert.equal(positionOnly.ambiguous, false);
+  assert.equal(positionOnly.mergeDiagnostics.reasonCounts.durableIdentityConflict, 0);
+  assert.deepEqual(positionOnly.mergeDiagnostics.identityConflicts, []);
+
+  const manyConflicts = mergeConversationSnapshots([
+    Array.from({ length: 10 }, (_, index) => ({ role: 'user', text: `private-many-a-${index}`, messageId: `private-many-id-${index}` })),
+    Array.from({ length: 10 }, (_, index) => ({ role: 'user', text: `private-many-b-${index}`, messageId: `private-many-id-${index}` })),
+  ]);
+  assert.equal(manyConflicts.mergeDiagnostics.reasonCounts.durableIdentityConflict, 10);
+  assert.equal(manyConflicts.mergeDiagnostics.identityConflictSummary.durableConflictCount, 10);
+  assert.equal(manyConflicts.mergeDiagnostics.identityConflicts.length, 8);
+  const serializedManyConflicts = JSON.stringify(manyConflicts.mergeDiagnostics);
+  assert.doesNotMatch(serializedManyConflicts, /private-many-id-0/u);
+  assert.doesNotMatch(serializedManyConflicts, /private-many-a-0/u);
+  assert.doesNotMatch(serializedManyConflicts, /private-many-b-0/u);
 });
 
 test('chatgpt-controller: complete history window script resolves a message ancestor and exposes a native wheel target', () => {

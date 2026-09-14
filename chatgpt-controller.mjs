@@ -70,6 +70,7 @@ const CONVERSATION_LAYOUT_SETTLE_STABLE_SAMPLES = 3;
 const START_MARKER_PROBE_MAX_WHEELS = 24;
 const START_MARKER_PROBE_TOP_SAMPLES = 3;
 const START_MARKER_PROBE_TOP_SAMPLE_WAIT_MS = 240;
+const MERGE_IDENTITY_CONFLICT_DIAGNOSTIC_LIMIT = 8;
 
 let latestProviderStopGeneration = 0;
 
@@ -357,6 +358,16 @@ export function mergeConversationSnapshots(snapshots = []) {
   const indegree = new Map();
   const orderPairs = new Set();
   const reasonCounts = { durableIdentityConflict: 0, fallbackIdentityConflict: 0, duplicateIdentityInSnapshot: 0, orderConflict: 0, cycle: 0, disconnectedWindow: 0, invalidObservation: 0 };
+  const identityConflicts = [];
+  const identityConflictSummary = {
+    durableConflictCount: 0,
+    roleConflictCount: 0,
+    textConflictCount: 0,
+    roleAndTextConflictCount: 0,
+    existingPrefixOfIncomingCount: 0,
+    incomingPrefixOfExistingCount: 0,
+    unrelatedTextChangeCount: 0,
+  };
   let ambiguous = false;
   let continuous = true;
   let previousKeys = null;
@@ -367,7 +378,48 @@ export function mergeConversationSnapshots(snapshots = []) {
       indegree.set(to, (indegree.get(to) || 0) + 1);
     }
   };
-  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+  const recordIdentityConflict = ({ key, snapshotIndex, observationIndex, existing, incoming }) => {
+    const roleChanged = existing.role !== incoming.role;
+    const textChanged = existing.text !== incoming.text;
+    const identityKind = key.startsWith('message:') ? 'message-id' : key.startsWith('turn:') ? 'turn-id' : 'fallback';
+    const existingTextDigest = textDigest(existing.text).slice(0, 32);
+    const incomingTextDigest = textDigest(incoming.text).slice(0, 32);
+    const textRelation = !textChanged
+      ? 'equal'
+      : incoming.text.startsWith(existing.text)
+        ? 'existing-prefix-of-incoming'
+        : existing.text.startsWith(incoming.text)
+          ? 'incoming-prefix-of-existing'
+          : 'different';
+    if (identityKind !== 'fallback') identityConflictSummary.durableConflictCount += 1;
+    if (roleChanged) identityConflictSummary.roleConflictCount += 1;
+    if (textChanged) identityConflictSummary.textConflictCount += 1;
+    if (roleChanged && textChanged) identityConflictSummary.roleAndTextConflictCount += 1;
+    if (textRelation === 'existing-prefix-of-incoming') identityConflictSummary.existingPrefixOfIncomingCount += 1;
+    else if (textRelation === 'incoming-prefix-of-existing') identityConflictSummary.incomingPrefixOfExistingCount += 1;
+    else if (textRelation === 'different') identityConflictSummary.unrelatedTextChangeCount += 1;
+    if (identityConflicts.length < MERGE_IDENTITY_CONFLICT_DIAGNOSTIC_LIMIT) {
+      identityConflicts.push({
+        identityHash: crypto.createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 32),
+        identityKind,
+        snapshotIndex,
+        observationIndex,
+        roleChanged,
+        textChanged,
+        existingRole: existing.role === 'user' || existing.role === 'assistant' ? existing.role : null,
+        incomingRole: incoming.role === 'user' || incoming.role === 'assistant' ? incoming.role : null,
+        existingTextDigest,
+        incomingTextDigest,
+        existingTextLength: existing.text.length,
+        incomingTextLength: incoming.text.length,
+        textLengthDelta: incoming.text.length - existing.text.length,
+        textRelation,
+        existingPositionHint: Number.isInteger(existing.positionHint) ? existing.positionHint : null,
+        incomingPositionHint: Number.isInteger(incoming.positionHint) ? incoming.positionHint : null,
+      });
+    }
+  };
+  for (const [snapshotIndex, snapshot] of (Array.isArray(snapshots) ? snapshots : []).entries()) {
     const observations = Array.isArray(snapshot) ? snapshot : snapshot?.turns;
     if (!Array.isArray(observations) || observations.length === 0) {
       continuous = false;
@@ -375,7 +427,7 @@ export function mergeConversationSnapshots(snapshots = []) {
       continue;
     }
     const keys = [];
-    for (const observation of observations) {
+    for (const [observationIndex, observation] of observations.entries()) {
       if (observation?.role !== 'user' && observation?.role !== 'assistant') {
         ambiguous = true;
         reasonCounts.invalidObservation += 1;
@@ -404,6 +456,7 @@ export function mergeConversationSnapshots(snapshots = []) {
       const existing = records.get(key);
       if (existing && (existing.role !== value.role || existing.text !== value.text)) {
         ambiguous = true;
+        recordIdentityConflict({ key, snapshotIndex, observationIndex, existing, incoming: value });
         if (key.startsWith('fingerprint:')) reasonCounts.fallbackIdentityConflict += 1;
         else reasonCounts.durableIdentityConflict += 1;
       } else if (!existing) {
@@ -459,7 +512,19 @@ export function mergeConversationSnapshots(snapshots = []) {
       ...(identityProvenance ? { identityProvenance } : {})
     };
   });
-  return { turns, ambiguous, continuous, observedTurnCount: records.size, mergeDiagnostics: { ambiguous, continuous, reasonCounts } };
+  return {
+    turns,
+    ambiguous,
+    continuous,
+    observedTurnCount: records.size,
+    mergeDiagnostics: {
+      ambiguous,
+      continuous,
+      reasonCounts,
+      identityConflicts,
+      identityConflictSummary,
+    },
+  };
 }
 
 function validateConversationHistoryOptions({ historyMode, historyTimeoutMs, historyMaxIterations }) {

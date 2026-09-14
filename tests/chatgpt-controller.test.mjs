@@ -872,6 +872,30 @@ function completeTraversalFixture(count, { textChangeAt = null, reverse = false,
   };
 }
 
+function completeDiagnosticTraversalFixture({ count = 4, positionOffset = 0, textChangeAt = null, reverse = false, identityMode = 'message' } = {}) {
+  const turns = Array.from({ length: count }, (_, index) => {
+    const turn = {
+      role: index % 2 ? 'assistant' : 'user',
+      text: textChangeAt === index ? `private-turn-${index}-changed` : `private-turn-${index}`,
+      positionHint: index + positionOffset
+    };
+    if (identityMode === 'message') turn.messageId = `private-message-${index}`;
+    else if (identityMode === 'turn') turn.turnId = `private-turn-id-${index}`;
+    return turn;
+  });
+  if (reverse) turns.reverse();
+  return {
+    snapshots: [{ turns }],
+    startReached: true,
+    startPositionProof: true,
+    tailProven: true,
+    snapshotStable: true,
+    scrollRestored: true,
+    reason: null,
+    diagnostics: {}
+  };
+}
+
 function createScrollVisibilityProbePage({
   visibilityAfterNormalize = 'visible',
   windowChanges = true,
@@ -1386,6 +1410,80 @@ test('chatgpt-controller: fixed-point diagnostics retain only recent signatures 
   assert.equal(verification.result.diagnostics.completeVerification.passCount, 10);
   assert.equal(verification.result.diagnostics.completeVerification.mismatchCount, 9);
   assert.equal(verification.result.diagnostics.completeVerification.signatures.length, 8);
+  assert.equal(verification.result.diagnostics.completeVerification.passSummaries.length, 8);
+  assert.equal(verification.result.diagnostics.completeVerification.passDiffs.length, 8);
+});
+
+test('chatgpt-controller: complete-history pass diagnostics classify component changes without raw data', () => {
+  const identical = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({}),
+    completeDiagnosticTraversalFixture({})
+  ], { maxTurns: 50 });
+  const identicalDiagnostics = identical.result.diagnostics.completeVerification;
+  assert.equal(identical.complete, true);
+  assert.equal(identicalDiagnostics.passSummaries.length, 2);
+  assert.equal(identicalDiagnostics.passDiffs[0].sameIdTextSignature, true);
+  assert.equal(identicalDiagnostics.passDiffs[0].sameIdPositionSignature, true);
+  assert.equal(identicalDiagnostics.passDiffs[0].sameIdentityOrder, true);
+  assert.equal(identicalDiagnostics.passDiffs[0].positionOnlyDifferenceCount, 0);
+  assert.equal(identicalDiagnostics.passDiffs[0].textOnlyDifferenceCount, 0);
+
+  const positionOnly = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({}),
+    completeDiagnosticTraversalFixture({ positionOffset: 10 })
+  ], { maxTurns: 50 });
+  const positionDiff = positionOnly.result.diagnostics.completeVerification.passDiffs[0];
+  const positionFrom = positionOnly.result.diagnostics.completeVerification.passSummaries[0];
+  const positionTo = positionOnly.result.diagnostics.completeVerification.passSummaries[1];
+  assert.notEqual(positionFrom.fullSignature, positionTo.fullSignature);
+  assert.equal(positionDiff.sameIdTextSignature, true);
+  assert.equal(positionDiff.sameIdPositionSignature, false);
+  assert.equal(positionDiff.sameTextSequenceSignature, true);
+  assert.equal(positionDiff.positionOnlyDifferenceCount, 4);
+  assert.equal(positionDiff.textOnlyDifferenceCount, 0);
+
+  const textOnly = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({}),
+    completeDiagnosticTraversalFixture({ textChangeAt: 2 }),
+    completeDiagnosticTraversalFixture({ textChangeAt: 2 })
+  ], { maxTurns: 50 });
+  const textDiff = textOnly.result.diagnostics.completeVerification.passDiffs[0];
+  assert.equal(textDiff.sameIdPositionSignature, true);
+  assert.equal(textDiff.sameIdTextSignature, false);
+  assert.equal(textDiff.samePositionSequenceSignature, true);
+  assert.equal(textDiff.textOnlyDifferenceCount, 1);
+
+  const identityOrder = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({}),
+    completeDiagnosticTraversalFixture({ reverse: true }),
+    completeDiagnosticTraversalFixture({ reverse: true })
+  ], { maxTurns: 50 });
+  const identityDiff = identityOrder.result.diagnostics.completeVerification.passDiffs[0];
+  assert.equal(identityDiff.sameIdentitySet, true);
+  assert.equal(identityDiff.sameIdentityOrder, false);
+  assert.equal(identityDiff.sameIdTextSignature, false);
+
+  const addedRemoved = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({ count: 3 }),
+    completeDiagnosticTraversalFixture({ count: 4 }),
+    completeDiagnosticTraversalFixture({ count: 4 })
+  ], { maxTurns: 50 });
+  const addedDiff = addedRemoved.result.diagnostics.completeVerification.passDiffs[0];
+  assert.equal(addedDiff.addedIdentityCount, 1);
+  assert.equal(addedDiff.removedIdentityCount, 0);
+
+  const fallback = verifyCompleteHistoryFixedPoint([
+    completeDiagnosticTraversalFixture({ identityMode: 'fallback' }),
+    completeDiagnosticTraversalFixture({ identityMode: 'fallback' })
+  ], { maxTurns: 50 });
+  const fallbackDiagnostics = fallback.result.diagnostics.completeVerification;
+  assert.equal(fallbackDiagnostics.passSummaries[0].messageIdCount, 0);
+  assert.equal(fallbackDiagnostics.passSummaries[0].turnIdOnlyCount, 0);
+  assert.equal(fallbackDiagnostics.passSummaries[0].fallbackIdentityCount, 4);
+  const serializedDiagnostics = JSON.stringify(fallbackDiagnostics);
+  assert.equal(serializedDiagnostics.includes('private-turn-'), false);
+  assert.equal(serializedDiagnostics.includes('private-message-'), false);
+  assert.equal(serializedDiagnostics.includes('private-turn-id-'), false);
 });
 
 test('chatgpt-controller: complete history does not stabilize changing full-history signatures', () => {

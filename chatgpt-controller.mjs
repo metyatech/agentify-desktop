@@ -514,13 +514,131 @@ function completeHistoryTraversalCandidate(result, limits) {
   };
 }
 
+function completeHistoryDiagnosticObservationKey(observation) {
+  const messageId = String(observation?.messageId || '').trim();
+  if (messageId) return `message:${messageId}`;
+  const turnId = String(observation?.turnId || '').trim();
+  if (turnId) return `turn:${turnId}`;
+  const role = observation?.role || null;
+  const text = normalizeConversationText(observation?.text);
+  return `fingerprint:${String(observation?.fingerprint || `${role}\u0000${text}`).slice(0, 256)}`;
+}
+
+function completeHistoryDiagnosticTurns(candidate) {
+  const observations = new Map();
+  for (const snapshot of Array.isArray(candidate?.snapshots) ? candidate.snapshots : []) {
+    const entries = Array.isArray(snapshot) ? snapshot : snapshot?.turns;
+    for (const observation of Array.isArray(entries) ? entries : []) {
+      const key = completeHistoryDiagnosticObservationKey(observation);
+      if (observations.has(key)) continue;
+      const normalizedText = normalizeConversationText(observation?.text);
+      observations.set(key, {
+        role: observation?.role || null,
+        messageId: String(observation?.messageId || '').trim() || null,
+        turnId: String(observation?.turnId || '').trim() || null,
+        positionHint: Number.isInteger(observation?.positionHint) ? observation.positionHint : null,
+        textDigest: textDigest(normalizedText)
+      });
+    }
+  }
+  return (Array.isArray(candidate?.mergedTurns) ? candidate.mergedTurns : []).map((turn, index) => {
+    const key = completeHistoryDiagnosticObservationKey(turn);
+    const observation = observations.get(key);
+    const messageId = observation?.messageId || String(turn?.messageId || '').trim() || null;
+    const turnId = observation?.turnId || String(turn?.turnId || '').trim() || null;
+    const normalizedText = normalizeConversationText(turn?.text);
+    return {
+      key,
+      role: observation?.role || turn?.role || null,
+      messageId,
+      turnId,
+      identity: messageId || turnId || '',
+      positionHint: observation?.positionHint ?? (Number.isInteger(turn?.positionHint) ? turn.positionHint : null),
+      textDigest: observation?.textDigest || turn?.textDigest || textDigest(normalizedText),
+      index
+    };
+  });
+}
+
+function completeHistoryDiagnosticHash(value) {
+  return textDigest(JSON.stringify(value)).slice(0, 32);
+}
+
+function completeHistoryPassSummary(candidate, pass) {
+  const turns = completeHistoryDiagnosticTurns(candidate);
+  const idTextEntries = turns.map((turn) => [turn.role, turn.identity, turn.textDigest]);
+  const idPositionEntries = turns.map((turn) => [turn.role, turn.identity, turn.positionHint]);
+  const idOrderEntries = turns.map((turn) => [turn.role, turn.identity]);
+  const positions = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
+  return {
+    pass,
+    turnCount: turns.length,
+    rangeMin: positions.length ? Math.min(...positions) : null,
+    rangeMax: positions.length ? Math.max(...positions) : null,
+    fullSignature: textDigest(conversationWindowSignature(turns)).slice(0, 32),
+    idTextSignature: completeHistoryDiagnosticHash(idTextEntries),
+    idPositionSignature: completeHistoryDiagnosticHash(idPositionEntries),
+    idOrderSignature: completeHistoryDiagnosticHash(idOrderEntries),
+    positionSequenceSignature: completeHistoryDiagnosticHash(turns.map((turn) => turn.positionHint)),
+    textSequenceSignature: completeHistoryDiagnosticHash(turns.map((turn) => turn.textDigest)),
+    messageIdCount: turns.filter((turn) => turn.identity && turn.key.startsWith('message:')).length,
+    turnIdOnlyCount: turns.filter((turn) => turn.identity && turn.key.startsWith('turn:')).length,
+    fallbackIdentityCount: turns.filter((turn) => turn.key.startsWith('fingerprint:')).length,
+    turns
+  };
+}
+
+function completeHistoryPassDiff(from, to) {
+  const fromByIdentity = new Map(from.turns.map((turn) => [turn.key, turn]));
+  const toByIdentity = new Map(to.turns.map((turn) => [turn.key, turn]));
+  const fromKeys = from.turns.map((turn) => turn.key);
+  const toKeys = to.turns.map((turn) => turn.key);
+  const commonKeys = fromKeys.filter((key) => toByIdentity.has(key));
+  let positionOnlyDifferenceCount = 0;
+  let textOnlyDifferenceCount = 0;
+  let roleDifferenceCount = 0;
+  let positionAndTextDifferenceCount = 0;
+  for (const key of commonKeys) {
+    const left = fromByIdentity.get(key);
+    const right = toByIdentity.get(key);
+    const positionChanged = left.positionHint !== right.positionHint;
+    const textChanged = left.textDigest !== right.textDigest;
+    const roleChanged = left.role !== right.role;
+    if (roleChanged) roleDifferenceCount += 1;
+    if (positionChanged && textChanged) positionAndTextDifferenceCount += 1;
+    else if (positionChanged && !textChanged && !roleChanged) positionOnlyDifferenceCount += 1;
+    else if (textChanged && !positionChanged && !roleChanged) textOnlyDifferenceCount += 1;
+  }
+  const fromSet = new Set(fromKeys);
+  const toSet = new Set(toKeys);
+  return {
+    fromPass: from.pass,
+    toPass: to.pass,
+    sameTurnCount: from.turns.length === to.turns.length,
+    sameIdentitySet: fromKeys.length === toKeys.length && fromKeys.every((key) => toSet.has(key)),
+    sameIdentityOrder: fromKeys.length === toKeys.length && fromKeys.every((key, index) => key === toKeys[index]),
+    sameIdTextSignature: from.idTextSignature === to.idTextSignature,
+    sameIdPositionSignature: from.idPositionSignature === to.idPositionSignature,
+    samePositionSequenceSignature: from.positionSequenceSignature === to.positionSequenceSignature,
+    sameTextSequenceSignature: from.textSequenceSignature === to.textSequenceSignature,
+    positionOnlyDifferenceCount,
+    textOnlyDifferenceCount,
+    roleDifferenceCount,
+    positionAndTextDifferenceCount,
+    addedIdentityCount: toKeys.filter((key) => !fromSet.has(key)).length,
+    removedIdentityCount: fromKeys.filter((key) => !toSet.has(key)).length
+  };
+}
+
 function completeHistoryVerificationResult(candidate, {
   passCount,
   signatures,
   mismatchCount,
   stabilized,
   budgetExhausted = false,
-  reason = candidate.reason
+  reason = candidate.reason,
+  passSummaries = [],
+  passDiffs = []
 }) {
   return {
     ...candidate,
@@ -534,6 +652,8 @@ function completeHistoryVerificationResult(candidate, {
         stabilized,
         mismatchCount,
         signatures: signatures.slice(-COMPLETE_HISTORY_DIAGNOSTIC_SIGNATURE_LIMIT),
+        passSummaries: passSummaries.slice(-COMPLETE_HISTORY_DIAGNOSTIC_SIGNATURE_LIMIT).map(({ turns, ...summary }) => summary),
+        passDiffs: passDiffs.slice(-COMPLETE_HISTORY_DIAGNOSTIC_SIGNATURE_LIMIT),
         budgetExhausted
       }
     }
@@ -546,6 +666,8 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
   const signatures = [];
   let latestCandidate = null;
   let passCount = 0;
+  const passSummaries = [];
+  const passDiffs = [];
   for (const traversal of Array.isArray(traversals) ? traversals : []) {
     passCount += 1;
     const candidate = completeHistoryTraversalCandidate(traversal, { maxTurns });
@@ -564,6 +686,10 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
     }
     const signature = textDigest(conversationWindowSignature(candidate.mergedTurns)).slice(0, 32);
     signatures.push(signature);
+    const summary = completeHistoryPassSummary(candidate, passCount);
+    const previousSummary = passSummaries.at(-1);
+    if (previousSummary) passDiffs.push(completeHistoryPassDiff(previousSummary, summary));
+    passSummaries.push(summary);
     if (previousSignature !== null) {
       if (signature === previousSignature) {
         return {
@@ -573,7 +699,9 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
             passCount,
             signatures,
             mismatchCount,
-            stabilized: true
+            stabilized: true,
+            passSummaries,
+            passDiffs
           })
         };
       }
@@ -601,6 +729,8 @@ export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MA
       signatures,
       mismatchCount,
       stabilized: false,
+      passSummaries,
+      passDiffs,
       reason: 'history-fixed-point-unproven'
     })
   };

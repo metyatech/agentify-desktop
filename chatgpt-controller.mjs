@@ -484,6 +484,128 @@ function conversationWindowSignature(turns = []) {
   ]));
 }
 
+const COMPLETE_HISTORY_REQUIRED_STABLE_PASSES = 2;
+const COMPLETE_HISTORY_MAX_VERIFICATION_PASSES = 3;
+
+function completeHistoryTraversalCandidate(result, limits) {
+  const merged = mergeConversationSnapshots(result?.snapshots);
+  let reason = result?.reason || null;
+  if (!reason && result?.tailProven !== true) reason = 'history-tail-unproven';
+  if (!reason && result?.startReached !== true) reason = 'history-start-unproven';
+  if (!reason && result?.startPositionProof !== true) reason = 'history-start-unproven';
+  if (!reason && !result?.snapshotStable) reason = 'history-snapshot-unstable';
+  if (!reason && !result?.scrollRestored) reason = 'scroll-restore-failed';
+  if (!reason && merged.ambiguous) reason = 'merge-ambiguous';
+  if (!reason && !merged.continuous) reason = 'history-gap';
+  if (!reason && merged.turns.length > limits.maxTurns) reason = 'turn-limit';
+  const diagnostics = result?.diagnostics && typeof result.diagnostics === 'object'
+    ? { ...result.diagnostics }
+    : {};
+  diagnostics.mergeAmbiguous = merged.ambiguous;
+  diagnostics.mergeContinuous = merged.continuous;
+  diagnostics.mergeDiagnostics = merged.mergeDiagnostics;
+  return {
+    ...result,
+    reason,
+    diagnostics,
+    mergedTurns: merged.turns,
+    mergedObservedTurnCount: merged.observedTurnCount,
+    completeTraversalProven: !reason
+  };
+}
+
+function completeHistoryVerificationResult(candidate, {
+  passCount,
+  signatures,
+  mismatchCount,
+  stabilized,
+  budgetExhausted = false,
+  reason = candidate.reason
+}) {
+  return {
+    ...candidate,
+    reason,
+    diagnostics: {
+      ...(candidate.diagnostics || {}),
+      completeVerification: {
+        attempted: true,
+        passCount,
+        requiredConsecutiveStablePasses: COMPLETE_HISTORY_REQUIRED_STABLE_PASSES,
+        stabilized,
+        mismatchCount,
+        signatures: signatures.slice(-COMPLETE_HISTORY_MAX_VERIFICATION_PASSES),
+        budgetExhausted
+      }
+    }
+  };
+}
+
+export function verifyCompleteHistoryFixedPoint(traversals = [], { maxTurns = MAX_CONVERSATION_TURNS } = {}) {
+  let previousSignature = null;
+  let mismatchCount = 0;
+  const signatures = [];
+  let latestCandidate = null;
+  let passCount = 0;
+  for (const traversal of Array.isArray(traversals) ? traversals.slice(0, COMPLETE_HISTORY_MAX_VERIFICATION_PASSES) : []) {
+    passCount += 1;
+    const candidate = completeHistoryTraversalCandidate(traversal, { maxTurns });
+    latestCandidate = candidate;
+    if (!candidate.completeTraversalProven) {
+      return {
+        complete: false,
+        reason: candidate.reason,
+        result: completeHistoryVerificationResult(candidate, {
+          passCount,
+          signatures,
+          mismatchCount,
+          stabilized: false
+        })
+      };
+    }
+    const signature = textDigest(conversationWindowSignature(candidate.mergedTurns)).slice(0, 32);
+    signatures.push(signature);
+    if (previousSignature !== null) {
+      if (signature === previousSignature) {
+        return {
+          complete: true,
+          reason: null,
+          result: completeHistoryVerificationResult(candidate, {
+            passCount,
+            signatures,
+            mismatchCount,
+            stabilized: true
+          })
+        };
+      }
+      mismatchCount += 1;
+    }
+    previousSignature = signature;
+  }
+  if (!latestCandidate) {
+    latestCandidate = completeHistoryTraversalCandidate({
+      snapshots: [],
+      startReached: false,
+      startPositionProof: false,
+      tailProven: false,
+      snapshotStable: false,
+      reason: 'history-fixed-point-unproven',
+      diagnostics: {},
+      scrollRestored: false
+    }, { maxTurns });
+  }
+  return {
+    complete: false,
+    reason: 'history-fixed-point-unproven',
+    result: completeHistoryVerificationResult(latestCandidate, {
+      passCount,
+      signatures,
+      mismatchCount,
+      stabilized: false,
+      reason: 'history-fixed-point-unproven'
+    })
+  };
+}
+
 function conversationWindowIdentitySignature(turns = []) {
   return JSON.stringify((Array.isArray(turns) ? turns : []).map((turn) => [
     turn?.role || null,
@@ -3687,8 +3809,14 @@ export class ChatGPTController {
     return String(text || '');
   }
 
-  async #readCompleteConversationTurns({ limits, historyTimeoutMs, historyMaxIterations, tailOnly = false }) {
-    const operationStartedAt = Date.now();
+  async #readCompleteConversationTurns({
+    limits,
+    historyTimeoutMs,
+    historyMaxIterations,
+    tailOnly = false,
+    operationStartedAt = Date.now(),
+    deadlineAt = null
+  }) {
     const snapshots = [];
     let initialNative = null;
     try {
@@ -3877,7 +4005,12 @@ export class ChatGPTController {
       if (!stable) diagnostics.urlStable = false;
       return stable;
     };
-    const historyElapsedMs = () => Date.now() - (historyStartedAt ?? operationStartedAt);
+    const historyElapsedMs = () => deadlineAt === null
+      ? Date.now() - (historyStartedAt ?? operationStartedAt)
+      : Math.max(0, Date.now() - (deadlineAt - historyTimeoutMs));
+    const historyBudgetExpired = () => deadlineAt === null
+      ? historyElapsedMs() > historyTimeoutMs
+      : Date.now() >= deadlineAt;
     const readWindow = async () => {
       diagnostics.reads.fullReadCount += 1;
       return await this.#eval(buildConversationWindowReadScript(limits));
@@ -4022,7 +4155,7 @@ export class ChatGPTController {
       };
     };
     const nativeWheel = async (direction, state) => {
-      if ((historyStartedAt !== null ? Date.now() - historyStartedAt : Date.now() - operationStartedAt) > historyTimeoutMs || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
+      if (historyBudgetExpired() || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
       if (isChromeCdp) {
         let runtime = null;
         try {
@@ -4448,7 +4581,7 @@ export class ChatGPTController {
         let proofDirection = current.scroller.atBottom ? -1 : 1;
         let oppositeAttempted = false;
         let proofNoProgress = 0;
-        while (!diagnostics.nativeScrollControlProven && !reason && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
+        while (!diagnostics.nativeScrollControlProven && !reason && iterations < historyMaxIterations && !historyBudgetExpired()) {
           const before = current;
           const result = await nativeWheel(proofDirection, before);
           const entry = {
@@ -4495,7 +4628,7 @@ export class ChatGPTController {
           }
           if (proofNoProgress >= 2) reason = 'history-native-scroll-no-progress';
         }
-        if (!diagnostics.nativeScrollControlProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-native-scroll-no-progress';
+        if (!diagnostics.nativeScrollControlProven && !reason) reason = historyBudgetExpired() ? 'timeout' : 'history-native-scroll-no-progress';
         }
       }
 
@@ -4503,7 +4636,7 @@ export class ChatGPTController {
         tailProofStartedAt = Date.now();
         let tailStableCount = 0;
         let previousTail = null;
-        while (!reason && iterations < historyMaxIterations && historyElapsedMs() <= historyTimeoutMs) {
+        while (!reason && iterations < historyMaxIterations && !historyBudgetExpired()) {
           const result = await nativeWheel(1, current);
           if (!result.ok) { reason = result.reason; break; }
           if (result.state.scroller.atBottom && !result.state.loading) {
@@ -4520,7 +4653,7 @@ export class ChatGPTController {
             }
           } else tailStableCount = 0;
         }
-        if (!diagnostics.tailProven && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-tail-unproven';
+        if (!diagnostics.tailProven && !reason) reason = historyBudgetExpired() ? 'timeout' : 'history-tail-unproven';
       }
 
       if (!reason && tailOnly && diagnostics.tailProven) {
@@ -4534,7 +4667,7 @@ export class ChatGPTController {
         topProofStartedAt = Date.now();
         diagnostics.topProofStartedAtIteration = iterations;
         let noProgressCount = 0;
-        while (historyElapsedMs() <= historyTimeoutMs && !reason) {
+        while (!historyBudgetExpired() && !reason) {
           const currentMin = conversationTurnRange(current?.turns).min;
           if (!current?.scroller?.atTop
             && (currentMin === 0 || currentMin === 1)) {
@@ -4545,7 +4678,7 @@ export class ChatGPTController {
             diagnostics.iterationLimitReachedAtTop = diagnostics.iterationLimitReached;
             let stableTopCount = 0;
             let previousTop = null;
-            for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && historyElapsedMs() <= historyTimeoutMs; sample += 1) {
+            for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && !historyBudgetExpired(); sample += 1) {
               await sleep(CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS);
               const settled = await this.#eval(buildConversationWindowReadScript(limits));
               if (!currentUrlIsStable(settled)) { reason = 'conversation-changed'; break; }
@@ -4586,7 +4719,7 @@ export class ChatGPTController {
           else noProgressCount += 1;
           if (noProgressCount >= 3) { reason = 'history-native-scroll-no-progress'; break; }
         }
-        if (!startReached && !reason) reason = historyElapsedMs() > historyTimeoutMs ? 'timeout' : 'history-start-unproven';
+        if (!startReached && !reason) reason = historyBudgetExpired() ? 'timeout' : 'history-start-unproven';
       }
 
     } finally {
@@ -4625,7 +4758,7 @@ export class ChatGPTController {
       tailProven: diagnostics.tailProven,
       startProven: diagnostics.startProven
     };
-    const clockStart = historyStartedAt ?? operationStartedAt;
+    const clockStart = deadlineAt === null ? (historyStartedAt ?? operationStartedAt) : deadlineAt - historyTimeoutMs;
     const now = Date.now();
     const elapsed = Math.max(0, now - clockStart);
     diagnostics.timing.historyElapsedMs = elapsed;
@@ -4644,6 +4777,33 @@ export class ChatGPTController {
       scrollRestored: diagnostics.scrollRestored,
       diagnostics
     };
+  }
+
+  async #readCompleteConversationTurnsWithFixedPoint({ limits, historyTimeoutMs, historyMaxIterations }) {
+    const operationStartedAt = Date.now();
+    const deadlineAt = operationStartedAt + historyTimeoutMs;
+    let passCount = 0;
+    const traversals = [];
+    let verification = null;
+
+    while (passCount < COMPLETE_HISTORY_MAX_VERIFICATION_PASSES) {
+      if (Date.now() >= deadlineAt) break;
+      passCount += 1;
+      traversals.push(await this.#readCompleteConversationTurns({
+        limits,
+        historyTimeoutMs,
+        historyMaxIterations,
+        operationStartedAt,
+        deadlineAt
+      }));
+      verification = verifyCompleteHistoryFixedPoint(traversals, { maxTurns: limits.maxTurns });
+      if (verification.reason !== 'history-fixed-point-unproven') return verification.result;
+      if (passCount >= COMPLETE_HISTORY_MAX_VERIFICATION_PASSES || Date.now() >= deadlineAt) break;
+    }
+
+    if (!verification) verification = verifyCompleteHistoryFixedPoint([], { maxTurns: limits.maxTurns });
+    verification.result.diagnostics.completeVerification.budgetExhausted = Date.now() >= deadlineAt;
+    return verification.result;
   }
 
   async readConversationTurns({
@@ -4678,7 +4838,7 @@ export class ChatGPTController {
 
     return await this.runExclusive(async () => {
       const result = mode === 'complete'
-        ? await this.#readCompleteConversationTurns({
+        ? await this.#readCompleteConversationTurnsWithFixedPoint({
           limits,
           historyTimeoutMs: historyOptions.historyTimeoutMs,
           historyMaxIterations: historyOptions.historyMaxIterations

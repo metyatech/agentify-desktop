@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
+export const AUTOPILOT_WATCHER_SHUTDOWN_TIMEOUT_MS = 2_000;
+
 export function watcherPaths(root) {
   const tasks = path.join(root, 'tasks');
   return { config: path.join(tasks, '.conversation-watch', 'config.json'), lock: path.join(tasks, '.conversation-watch', 'watch.lock.json'), controllerLock: path.join(tasks, '.controller-run.lock.json') };
@@ -21,9 +23,10 @@ export async function readAutopilotWatcherConfig(root, { readFile = fs.readFile 
   return validateAutopilotWatcherConfig(JSON.parse(await readFile(paths.config, 'utf8')));
 }
 
-export function createAutopilotWatcherManager({ root = null, initialError = null, readFile = fs.readFile, lstat = fs.lstat, unlink = fs.unlink, spawnImpl = spawn, isPidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, platform = process.platform, env = process.env, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), startupTimeoutMs = 2_000 } = {}) {
+export function createAutopilotWatcherManager({ root = null, initialError = null, readFile = fs.readFile, lstat = fs.lstat, unlink = fs.unlink, spawnImpl = spawn, isPidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } }, platform = process.platform, env = process.env, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), startupTimeoutMs = 2_000, shutdownTimeoutMs = AUTOPILOT_WATCHER_SHUTDOWN_TIMEOUT_MS, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
   const paths = root ? watcherPaths(root) : null;
   let child = null;
+  let childFailure = null;
   let current = initialError
     ? { status: 'error', detail: initialError }
     : root ? { status: 'offline', detail: 'Watcher is not configured.' } : { status: 'not-configured', detail: 'Watcher is not configured.' };
@@ -50,13 +53,59 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
   const waitForRunning = async () => {
     const deadline = Date.now() + Math.max(0, startupTimeoutMs);
     while (Date.now() <= deadline) {
+      if (childFailure) return childFailure;
+      if (current.status === 'error') return current;
       const state = await inspect();
       if (state.status === 'running' || state.status === 'error') return state;
+      if (childFailure) return childFailure;
+      if (current.status === 'error') return current;
       if (!child || child.exitCode !== null) return current;
       await sleep(50);
     }
     current = { status: 'error', detail: 'Watcher did not create a live lock after starting.' };
     return current;
+  };
+  const waitForOwnedChildExit = async (ownedChild) => {
+    if (!ownedChild || ownedChild.exitCode !== null) return true;
+    if (typeof ownedChild.once !== 'function') return false;
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const finish = (exited) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeoutImpl(timer);
+        ownedChild.removeListener?.('exit', onExit);
+        ownedChild.removeListener?.('error', onError);
+        resolve(exited);
+      };
+      const onExit = () => finish(true);
+      const onError = () => finish(ownedChild.exitCode !== null);
+      ownedChild.once('exit', onExit);
+      ownedChild.once('error', onError);
+      timer = setTimeoutImpl(() => finish(false), Math.max(0, shutdownTimeoutMs));
+      try {
+        ownedChild.kill();
+      } catch {
+        finish(false);
+        return;
+      }
+      if (ownedChild.exitCode !== null) finish(true);
+    });
+  };
+  const stopOwnedChild = async () => {
+    const ownedChild = child;
+    if (!ownedChild || ownedChild.exitCode !== null) {
+      if (child === ownedChild) child = null;
+      return true;
+    }
+    const exited = await waitForOwnedChildExit(ownedChild);
+    if (!exited) {
+      current = { status: 'error', detail: 'Watcher child did not exit within the shutdown timeout.' };
+      return false;
+    }
+    if (child === ownedChild) child = null;
+    return true;
   };
   const start = async () => {
     if (initialError) return current;
@@ -67,10 +116,17 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
     if (config.enabled !== true) return state;
     if (child && child.exitCode === null) return await waitForRunning();
     current = { status: 'starting', detail: 'Watcher is starting.' };
-    child = spawnImpl(config.nodeExecutable, [config.controllerEntryPath, 'watch', 'run'], { cwd: config.controllerRepoRoot, env: { ...env, AI_AUTOPILOT_ROOT: root }, windowsHide: true, shell: false, stdio: 'ignore', detached: false });
-    child.once?.('error', (error) => { current = { status: 'error', detail: String(error?.message || error) }; });
-    child.once?.('exit', (code) => { child = null; if (code !== 0) current = { status: 'error', detail: `Watcher exited (${code}).` }; else current = { status: 'offline', detail: 'Watcher stopped.' }; });
+    childFailure = null;
+    try {
+      child = spawnImpl(config.nodeExecutable, [config.controllerEntryPath, 'watch', 'run'], { cwd: config.controllerRepoRoot, env: { ...env, AI_AUTOPILOT_ROOT: root }, windowsHide: true, shell: false, stdio: 'ignore', detached: false });
+    } catch (error) {
+      child = null;
+      current = { status: 'error', detail: `Watcher failed to start: ${String(error?.message || error)}` };
+      return current;
+    }
+    child.once?.('error', (error) => { childFailure = { status: 'error', detail: String(error?.message || error) }; current = childFailure; });
+    child.once?.('exit', (code) => { child = null; if (code !== 0) { childFailure = { status: 'error', detail: `Watcher exited (${code}).` }; current = childFailure; } else current = { status: 'offline', detail: 'Watcher stopped.' }; });
     return await waitForRunning();
   };
-  return { paths, inspect, getState: inspect, start, async restart() { if (child && child.exitCode === null) { try { child.kill(); } catch {} child = null; } return await start(); }, getStatus: () => current, async stop() { if (child && child.exitCode === null) { try { child.kill(); } catch {} } child = null; } };
+  return { paths, inspect, getState: inspect, start, async restart() { if (!(await stopOwnedChild())) return current; return await start(); }, getStatus: () => current, async stop() { await stopOwnedChild(); } };
 }

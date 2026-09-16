@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const IPC_ERROR_MESSAGE_MAX_LENGTH = 256;
 const IPC_DISPATCH_STATES = new Set(['pending', 'claimed', 'dispatching', 'dispatched', 'cancelled', 'unknown']);
 const IPC_OWNERSHIP_PHASES = new Set(['prepared', 'attachments-owned', 'prompt-owned', 'dispatch-started', 'send-confirmed', 'cleanup-required', 'cleared']);
+const WATCHER_STATES = new Set(['running', 'starting', 'offline', 'error', 'not-configured']);
 
 function boundedIpcId(value) {
   const text = String(value || '').trim();
@@ -17,6 +18,15 @@ function boundedIpcMethod(value) {
 function boundedIpcPhase(value) {
   const text = String(value || '').trim();
   return /^[a-z][a-z0-9_-]{0,63}$/u.test(text) ? text : null;
+}
+
+function sanitizeWatcherState(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    status: WATCHER_STATES.has(source.status) ? source.status : 'error',
+    pid: Number.isInteger(source.pid) && source.pid > 0 ? source.pid : undefined,
+    detail: typeof source.detail === 'string' ? source.detail.slice(0, 256) : undefined,
+  };
 }
 
 function sanitizeIpcDiagnostics(value) {
@@ -98,6 +108,14 @@ contextBridge.exposeInMainWorld('agentifyDesktop', {
     ipcRenderer.on('agentify:autopilotActivityChanged', handler);
     return () => {
       try { ipcRenderer.removeListener('agentify:autopilotActivityChanged', handler); } catch {}
+    };
+  },
+  onAutopilotWatcherChanged: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const handler = (_event, state) => cb(sanitizeWatcherState(state));
+    ipcRenderer.on('agentify:autopilotWatcherChanged', handler);
+    return () => {
+      try { ipcRenderer.removeListener('agentify:autopilotWatcherChanged', handler); } catch {}
     };
   }
 });

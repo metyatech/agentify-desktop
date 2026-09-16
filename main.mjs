@@ -36,6 +36,7 @@ import { createAutopilotProposalIpcFailure, createAutopilotProposalIpcSuccess } 
 import { defaultCodexSelection, listCodexModels, validateCodexSelection } from './codex-models.mjs';
 import { detectCodexDeepLink, isCodexThreadId } from './codex-deep-link.mjs';
 import { createAutopilotWatcherManager, readAutopilotWatcherConfig } from './autopilot-watcher-manager.mjs';
+import { createAutopilotWatcherSupervisor } from './autopilot-watcher-supervisor.mjs';
 import { runAutopilotUserActionResume } from './autopilot-user-action-resume.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -248,6 +249,7 @@ async function main() {
   let controlWin = null;
   let quitting = false;
   const orchestrators = new Map(); // key -> { child, pid, startedAt }
+  let lastAutopilotWatcherStateKey = null;
   const orchestratorHistory = new Map(); // key -> { pid, startedAt, exitedAt, exitCode, signal, logPath }
   const logControlCenterDiagnostic = createControlCenterDiagnosticLogger(stateDir);
   showControlCenter = async () => {
@@ -309,6 +311,23 @@ async function main() {
     try {
       if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:autopilotActivityChanged');
     } catch {}
+  };
+  const emitAutopilotWatcherChanged = (state) => {
+    const nextKey = JSON.stringify({
+      status: state?.status || null,
+      pid: Number.isInteger(state?.pid) ? state.pid : null,
+      detail: typeof state?.detail === 'string' ? state.detail : null,
+    });
+    if (nextKey === lastAutopilotWatcherStateKey) return;
+    lastAutopilotWatcherStateKey = nextKey;
+    try {
+      if (controlWin && !controlWin.isDestroyed()) controlWin.webContents.send('agentify:autopilotWatcherChanged', state);
+    } catch {}
+  };
+  const inspectAutopilotWatcher = async () => {
+    const state = await autopilotWatcher.getState();
+    emitAutopilotWatcherChanged(state);
+    return state;
   };
   browserBackend = await createBrowserBackend({
     kind: browserBackendKind,
@@ -476,7 +495,7 @@ async function main() {
         },
       };
     }
-    const watcherStatus = await autopilotWatcher.getState();
+    const watcherStatus = await inspectAutopilotWatcher();
     return {
       ok: true,
       vendors,
@@ -513,7 +532,11 @@ async function main() {
     const result = await shell.openExternal(`codex://threads/${threadId}`);
     return { ok: result === undefined };
   });
-  ipcMain.handle('agentify:restartAutopilotWatcher', async () => ({ watcher: await autopilotWatcher.restart() }));
+  ipcMain.handle('agentify:restartAutopilotWatcher', async () => {
+    const watcher = await autopilotWatcher.restart();
+    emitAutopilotWatcherChanged(watcher);
+    return { watcher };
+  });
   ipcMain.handle('agentify:resumeAutopilotUserAction', async (_evt, args) => {
     const taskId = String(args?.taskId || '').trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/u.test(taskId)) throw new Error('invalid_task_id');
@@ -924,7 +947,13 @@ async function main() {
   // The watcher resolves persistent tabs through the live HTTP API. Start it
   // only after the browser, restored tabs, server, and published state are
   // all ready, so a fresh runtime tab id is visible before reconciliation.
-  await autopilotWatcher.start();
+  const initialWatcherState = await autopilotWatcher.start();
+  emitAutopilotWatcherChanged(initialWatcherState);
+  const watcherSupervisor = createAutopilotWatcherSupervisor({
+    watcher: autopilotWatcher,
+    onStateChanged: emitAutopilotWatcherChanged,
+  });
+  await watcherSupervisor.start();
 
   const shutdown = createGracefulShutdown({
     closeServer: (done) => {
@@ -942,6 +971,7 @@ async function main() {
       await watchFolders.stop();
     },
     stopAutopilotWatcher: async () => {
+      watcherSupervisor.stop();
       await autopilotWatcher.stop();
     },
     disposeBrowserBackend: async () => {

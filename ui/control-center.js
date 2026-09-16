@@ -554,6 +554,7 @@ let lastRefreshAt = 0;
 let hasLiveUpdates = false;
 let tabsAreHidden = false;
 let settingsDirty = false;
+let watcherHealthTimer = null;
 const autopilotStatusScheduler = createAutopilotStatusStaleScheduler({
   onStale: () => renderAutopilotTaskProgress(lastState.autopilotStatus),
 });
@@ -576,6 +577,12 @@ function showStartupFailure(error) {
     message.textContent = '起動に失敗しました。Refreshで再試行してください。';
     message.classList.add('isError');
   }
+}
+
+function applyAutopilotWatcherState(watcher) {
+  if (!watcher || typeof watcher.status !== 'string') return;
+  lastState = { ...lastState, autopilotWatcher: watcher };
+  renderAutopilotState();
 }
 
 function updateSaveEnabled() {
@@ -1244,6 +1251,7 @@ async function main() {
 
   let unsubscribeTabsChanged = null;
   let unsubscribeActivityChanged = null;
+  let unsubscribeWatcherChanged = null;
   if (hasApi('onTabsChanged')) {
     try {
       const b = getBridge();
@@ -1260,6 +1268,15 @@ async function main() {
     statusText('Live updates unavailable in this window. Refresh still works.', 'warn');
     setInterval(() => refresh().catch(() => {}), 3000);
   }
+  if (hasApi('onAutopilotWatcherChanged')) {
+    try {
+      unsubscribeWatcherChanged = getBridge()?.onAutopilotWatcherChanged?.(applyAutopilotWatcherState) || null;
+    } catch (e) {
+      if (hasLiveUpdates) watcherHealthTimer = setInterval(() => refresh().catch(() => {}), 3000);
+    }
+  } else if (hasLiveUpdates) {
+    watcherHealthTimer = setInterval(() => refresh().catch(() => {}), 3000);
+  }
 
   window.addEventListener('beforeunload', () => {
     autopilotStatusScheduler.cancel();
@@ -1267,6 +1284,8 @@ async function main() {
     autopilotActivityScheduler.cancel();
     unsubscribeTabsChanged?.();
     unsubscribeActivityChanged?.();
+    unsubscribeWatcherChanged?.();
+    if (watcherHealthTimer !== null) clearInterval(watcherHealthTimer);
   }, { once: true });
   await refresh({ initial: true });
 }

@@ -1040,8 +1040,10 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
     };
     const isScrollable = (node) => {
       if (!node) return false;
-      const style = getComputedStyle(node);
-      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight;
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(getComputedStyle(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const describeNode = (node) => ({
@@ -1089,7 +1091,7 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
         selected: nearest.length === 1 ? nearest[0] : null,
         ambiguous: nearest.length > 1,
         diagnostic: {
-          candidateCount: candidates.length,
+          candidateCount: nearest.length,
           selectedMessageDescendantCount: nearest.length === 1 ? nearest[0].descendants : 0,
           selected: nearest.length === 1 ? nearest[0].details : null,
           selectedPath: nearest.length === 1 ? nearest[0].path : null,
@@ -1333,8 +1335,10 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     };
     const isScrollable = (node) => {
       if (!node) return false;
-      const style = getComputedStyle(node);
-      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight;
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(getComputedStyle(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const describeNode = (node) => ({
@@ -1378,7 +1382,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
         selected: nearest.length === 1 ? nearest[0] : null,
         ambiguous: nearest.length > 1,
         diagnostic: {
-          candidateCount: candidates.length,
+          candidateCount: nearest.length,
           selectedMessageDescendantCount: nearest.length === 1 ? nearest[0].descendants : 0,
           selected: nearest.length === 1 ? nearest[0].details : null,
           selectedPath: nearest.length === 1 ? nearest[0].path : null,
@@ -1478,8 +1482,10 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const isScrollable = (node) => {
       if (!node) return false;
-      const style = getComputedStyle(node);
-      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && Number(node.scrollHeight) > Number(node.clientHeight);
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(getComputedStyle(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
     const nodes = messageNodes();
     const chains = nodes.map((node) => {
@@ -1532,7 +1538,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
       signature,
       range,
       startBoundary: { firstMessagePosition: Number.isInteger(first?.positionHint) ? first.positionHint : null, firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null, positionZeroMessageNodeCount: messagePositionZeroCount, positionZeroMarkerInsideScrollerCount: positionZeroMarkerCount, positionOneMessageNodeCount: turns.filter((turn) => turn.positionHint === 1).length },
-      scroller: selected ? { candidateCount: candidates.length, selectedMessageDescendantCount: nearest[0].descendants, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: candidates.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
+      scroller: selected ? { candidateCount: nearest.length, selectedMessageDescendantCount: nearest[0].descendants, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
     };
   })()`;
 }
@@ -1628,8 +1634,10 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const isScrollable = (node) => {
       if (!node) return false;
-      const style = getComputedStyle(node);
-      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && Number(node.scrollHeight) > Number(node.clientHeight);
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(getComputedStyle(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
     const resolveScroller = (messages) => {
       const chains = messages.map((node) => {
@@ -1648,7 +1656,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
       candidates.sort((left, right) => left.distance - right.distance);
       const nearestDistance = candidates[0]?.distance;
       const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
-      return { selected: nearest.length === 1 ? nearest[0].node : null, candidates, ambiguous: nearest.length > 1 };
+      return { selected: nearest.length === 1 ? nearest[0].node : null, candidates, nearest, ambiguous: nearest.length > 1 };
     };
     const messages = messageNodes();
     const resolved = resolveScroller(messages);
@@ -1744,7 +1752,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
       windowSignature,
       structuralSignature,
       scroller: scroller ? {
-        candidateCount: resolved.candidates.length,
+        candidateCount: resolved.nearest.length,
         selectedMessageDescendantCount: resolved.candidates.filter((candidate) => candidate.node === scroller)[0]?.descendants || 0,
         scrollTop: Number(scroller.scrollTop),
         scrollHeight: Number(scroller.scrollHeight),
@@ -1752,7 +1760,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
         atTop: Number(scroller.scrollTop) <= 1,
         atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
         point
-      } : { candidateCount: resolved.candidates.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
+      } : { candidateCount: resolved.nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
       markers,
       markerPositions: {
         minimum: positions.length ? Math.min(...positions) : null,
@@ -1805,8 +1813,10 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const isScrollable = (node) => {
       if (!node) return false;
-      const style = getComputedStyle(node);
-      return (style.overflowY === 'auto' || style.overflowY === 'scroll') && Number(node.scrollHeight) > Number(node.clientHeight);
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(getComputedStyle(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
     const chains = nodes.map((node) => {
       const chain = [];
@@ -1816,7 +1826,7 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
       return chain;
     });
     const common = chains.length ? chains[0].filter((node) => chains.every((chain) => chain.includes(node))) : [];
-    const candidates = common.filter((node) => !isNavigationRegion(node) && isScrollable(node));
+    const candidates = common.filter((node) => !isNavigationRegion(node) && isScrollable(node) && nodes.some((message) => node.contains?.(message)));
     const distances = candidates.map((node) => ({ node, distance: Math.max(...chains.map((chain) => chain.indexOf(node))) }));
     const nearestDistance = distances.length ? Math.min(...distances.map((item) => item.distance)) : null;
     const nearest = distances.filter((item) => item.distance === nearestDistance);

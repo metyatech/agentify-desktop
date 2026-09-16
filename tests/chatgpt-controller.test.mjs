@@ -670,6 +670,107 @@ function createCompleteHistoryDom({ initialScrollTop = 480, positionHints = true
   return { context, scroller, getNodes: () => currentNodes, getUrl: () => url };
 }
 
+function evaluateConversationWindowReadWithDom({
+  documentScrollHeight = 2_000,
+  documentClientHeight = 400,
+  documentOverflowY = 'visible',
+  innerScroller = null
+} = {}) {
+  const body = {
+    tagName: 'BODY',
+    parentElement: null,
+    id: '',
+    className: '',
+    scrollHeight: documentScrollHeight,
+    clientHeight: documentClientHeight,
+    scrollTop: 0,
+    contains(node) {
+      let current = node;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    matches: () => false,
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+  };
+  const scroller = innerScroller
+    ? {
+        tagName: 'DIV',
+        parentElement: body,
+        id: 'conversation-scroll',
+        className: 'conversation-scroll-region',
+        scrollHeight: innerScroller.scrollHeight ?? 1_400,
+        clientHeight: innerScroller.clientHeight ?? 400,
+        scrollTop: innerScroller.scrollTop ?? 480,
+        contains(node) {
+          let current = node;
+          while (current) {
+            if (current === this) return true;
+            current = current.parentElement;
+          }
+          return false;
+        },
+        matches: () => false,
+        getAttribute: () => null,
+        getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+      }
+    : null;
+  const parent = scroller || body;
+  const messages = [0, 1].map((position) => ({
+    tagName: 'ARTICLE',
+    parentElement: parent,
+    id: `conversation-turn-${position}`,
+    className: '',
+    innerText: `turn-${position}`,
+    textContent: `turn-${position}`,
+    matches: () => false,
+    querySelectorAll: () => [],
+    cloneNode() {
+      return {
+        innerText: this.innerText,
+        textContent: this.textContent,
+        matches: () => false,
+        querySelectorAll: () => [],
+        remove() {}
+      };
+    },
+    getAttribute(name) {
+      if (name === 'data-message-author-role') return position % 2 ? 'assistant' : 'user';
+      if (name === 'data-message-id') return `message-${position}`;
+      if (name === 'data-testid') return `conversation-turn-${position}`;
+      return null;
+    },
+    closest: () => null,
+    contains(child) { return child === this; },
+    getBoundingClientRect: () => ({ left: 10, top: 10, right: 200, bottom: 40, width: 190, height: 30 })
+  }));
+  const document = {
+    scrollingElement: body,
+    documentElement: body,
+    querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]') return messages;
+      if (selector === '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]') return messages;
+      return [];
+    }
+  };
+  const context = {
+    document,
+    location: { href: 'https://chatgpt.com/c/native-wheel-test' },
+    innerWidth: 1_000,
+    innerHeight: 800,
+    getComputedStyle(node) {
+      if (node === body) return { overflowY: documentOverflowY };
+      if (node === scroller) return { overflowY: innerScroller?.overflowY || 'auto' };
+      return { overflowY: 'visible' };
+    }
+  };
+  context.globalThis = context;
+  return vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), context);
+}
+
 function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
   const windows = windowCount > 5
@@ -3181,6 +3282,56 @@ test('chatgpt-controller: complete history window script resolves a message ance
   assert.match(source, /common\.filter\(\(node\) => !isNavigationRegion\(node\) && isScrollable\(node\)\)/u);
   assert.match(source, /getBoundingClientRect/u);
   assert.doesNotMatch(source, /scrollTop\s*=\s*target/u);
+});
+
+test('chatgpt-controller: document scrolling element is accepted with a real scroll range', () => {
+  const result = evaluateConversationWindowReadWithDom();
+  assert.equal(result.scroller.candidateCount, 1);
+  assert.equal(result.scroller.selected.tagName, 'BODY');
+  assert.equal(result.scroller.selected.overflowY, 'visible');
+  assert.equal(result.scroller.scrollHeight > result.scroller.clientHeight, true);
+});
+
+test('chatgpt-controller: nearer overflow scroller remains preferred over document scrolling element', () => {
+  const result = evaluateConversationWindowReadWithDom({
+    innerScroller: { overflowY: 'auto', scrollHeight: 1_400, clientHeight: 400 }
+  });
+  assert.equal(result.scroller.candidateCount, 1);
+  assert.equal(result.scroller.selected.id, 'conversation-scroll');
+  assert.equal(result.scroller.selected.overflowY, 'auto');
+});
+
+test('chatgpt-controller: document scrolling element without a scroll range is rejected', () => {
+  const result = evaluateConversationWindowReadWithDom({ documentScrollHeight: 400, documentClientHeight: 400 });
+  assert.equal(result.scroller.candidateCount, 0);
+  assert.equal(result.scroller.selected, null);
+});
+
+test('chatgpt-controller: ordinary visible element with a scroll range is not a scroller', () => {
+  const result = evaluateConversationWindowReadWithDom({
+    documentScrollHeight: 400,
+    documentClientHeight: 400,
+    innerScroller: { overflowY: 'visible', scrollHeight: 1_400, clientHeight: 400 }
+  });
+  assert.equal(result.scroller.candidateCount, 0);
+  assert.equal(result.scroller.selected, null);
+});
+
+test('chatgpt-controller: document-scroller resolution enters complete-history traversal', async () => {
+  const documentWindow = evaluateConversationWindowReadWithDom();
+  assert.equal(documentWindow.scroller.candidateCount, 1);
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, layoutSnapshots: [documentWindow] });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1_000,
+    maxTotalChars: 5_000,
+    historyMode: 'complete',
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.scroller.candidateCount, 1);
 });
 
 test('chatgpt-controller: traversal read is lightweight and carries bounded identity state', () => {

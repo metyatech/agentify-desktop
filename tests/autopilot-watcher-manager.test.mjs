@@ -60,6 +60,66 @@ test('manager confirms the spawned watcher lock before reporting Running and nev
   assert.equal(paths.controllerLock.endsWith('.controller-run.lock.json'), true);
 });
 
+test('final shutdown prevents an in-flight start from spawning after inspection resumes', async () => {
+  const files = {};
+  const paths = watcherPaths('D:/shutdown-race');
+  files[paths.config] = config;
+  let inspectionEntered;
+  const inspectionEnteredPromise = new Promise((resolve) => { inspectionEntered = resolve; });
+  let releaseInspection;
+  const inspectionGate = new Promise((resolve) => { releaseInspection = resolve; });
+  let blockFirstConfigRead = true;
+  let spawnCount = 0;
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.kill = () => { child.exitCode = 0; child.emit('exit', 0); };
+  const manager = createAutopilotWatcherManager({
+    root: 'D:/shutdown-race',
+    readFile: async (file) => {
+      if (file === paths.config && blockFirstConfigRead) {
+        blockFirstConfigRead = false;
+        inspectionEntered();
+        await inspectionGate;
+      }
+      if (!(file in files)) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; }
+      return files[file];
+    },
+    lstat: async (file) => { if (file === paths.controllerLock) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return {}; },
+    unlink: async (file) => { delete files[file]; },
+    spawnImpl: () => { spawnCount += 1; files[paths.lock] = JSON.stringify({ pid: 4001 }); return child; },
+    isPidAlive: (pid) => pid === 4001,
+    sleep: async () => {},
+    startupTimeoutMs: 100,
+    env: {},
+  });
+
+  const start = manager.start();
+  await inspectionEnteredPromise;
+  const stop = manager.stop();
+  releaseInspection();
+  await Promise.all([start, stop]);
+  assert.equal(spawnCount, 0);
+});
+
+test('final shutdown keeps later starts offline without spawning', async () => {
+  const files = {};
+  const paths = watcherPaths('D:/shutdown-before-start');
+  files[paths.config] = config;
+  let spawnCount = 0;
+  const manager = createAutopilotWatcherManager({
+    root: 'D:/shutdown-before-start',
+    readFile: async (file) => { if (!(file in files)) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return files[file]; },
+    lstat: async (file) => { if (file === paths.controllerLock) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return {}; },
+    unlink: async (file) => { delete files[file]; },
+    spawnImpl: () => { spawnCount += 1; throw new Error('unexpected spawn'); },
+    env: {},
+  });
+
+  await manager.stop();
+  assert.equal((await manager.start()).status, 'offline');
+  assert.equal(spawnCount, 0);
+});
+
 test('getState refreshes an externally started watcher and does not leave a dead PID Running', async () => {
   let alive = true;
   const f = fixture({});

@@ -22,9 +22,11 @@ test('main supervises watcher health after readiness and stops it during shutdow
   const source = await fs.readFile(mainPath, 'utf8');
   const supervisorStart = source.indexOf('await watcherSupervisor.start();');
   const watcherStart = source.indexOf('const initialWatcherState = await autopilotWatcher.start();');
-  const shutdownStop = source.indexOf('watcherSupervisor.stop();');
+  const shutdownStop = source.indexOf('const supervisorStop = watcherSupervisor.stop();');
+  const watcherFinalStop = source.indexOf('await autopilotWatcher.stop();', shutdownStop);
   assert.ok(supervisorStart > watcherStart);
   assert.ok(shutdownStop > supervisorStart);
+  assert.ok(watcherFinalStop > shutdownStop);
   assert.match(source, /agentify:autopilotWatcherChanged/u);
   assert.match(source, /const watcherStatus = await inspectAutopilotWatcher\(\);/u);
 });

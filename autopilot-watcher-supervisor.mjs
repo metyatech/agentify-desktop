@@ -79,6 +79,7 @@ export function createAutopilotWatcherSupervisor({
       clearIntervalImpl(timer);
       timer = null;
     }
+    return healthCheckInFlight || Promise.resolve();
   };
 
   return { start, stop, inspectNow, isRunning: () => !stopped };

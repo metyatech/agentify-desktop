@@ -971,8 +971,9 @@ async function main() {
       await watchFolders.stop();
     },
     stopAutopilotWatcher: async () => {
-      watcherSupervisor.stop();
+      const supervisorStop = watcherSupervisor.stop();
       await autopilotWatcher.stop();
+      await supervisorStop;
     },
     disposeBrowserBackend: async () => {
       await browserBackend.dispose?.();

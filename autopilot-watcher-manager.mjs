@@ -27,12 +27,18 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
   const paths = root ? watcherPaths(root) : null;
   let child = null;
   let childFailure = null;
+  let finalShutdownRequested = false;
   let current = initialError
     ? { status: 'error', detail: initialError }
     : root ? { status: 'offline', detail: 'Watcher is not configured.' } : { status: 'not-configured', detail: 'Watcher is not configured.' };
+  const stoppedState = () => {
+    current = { status: 'offline', detail: 'Watcher stopped.' };
+    return current;
+  };
   const readJson = async (file) => JSON.parse(await readFile(file, 'utf8'));
   const readConfig = async () => validateAutopilotWatcherConfig(await readJson(paths.config));
   const inspect = async () => {
+    if (finalShutdownRequested) return stoppedState();
     if (initialError) return current;
     if (!root) {
       current = { status: 'not-configured', detail: 'Watcher is not configured.' };
@@ -53,9 +59,11 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
   const waitForRunning = async () => {
     const deadline = Date.now() + Math.max(0, startupTimeoutMs);
     while (Date.now() <= deadline) {
+      if (finalShutdownRequested) return stoppedState();
       if (childFailure) return childFailure;
       if (current.status === 'error') return current;
       const state = await inspect();
+      if (finalShutdownRequested) return stoppedState();
       if (state.status === 'running' || state.status === 'error') return state;
       if (childFailure) return childFailure;
       if (current.status === 'error') return current;
@@ -108,15 +116,19 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
     return true;
   };
   const start = async () => {
+    if (finalShutdownRequested) return stoppedState();
     if (initialError) return current;
     if (!root) return { status: 'not-configured', detail: 'Watcher is not configured.' };
     const state = await inspect();
+    if (finalShutdownRequested) return stoppedState();
     if (state.status === 'running' || state.status === 'error') return state;
-    let config; try { config = await readConfig(); } catch { return state; }
+    let config; try { config = await readConfig(); } catch { return finalShutdownRequested ? stoppedState() : state; }
+    if (finalShutdownRequested) return stoppedState();
     if (config.enabled !== true) return state;
     if (child && child.exitCode === null) return await waitForRunning();
     current = { status: 'starting', detail: 'Watcher is starting.' };
     childFailure = null;
+    if (finalShutdownRequested) return stoppedState();
     try {
       child = spawnImpl(config.nodeExecutable, [config.controllerEntryPath, 'watch', 'run'], { cwd: config.controllerRepoRoot, env: { ...env, AI_AUTOPILOT_ROOT: root }, windowsHide: true, shell: false, stdio: 'ignore', detached: false });
     } catch (error) {
@@ -128,5 +140,17 @@ export function createAutopilotWatcherManager({ root = null, initialError = null
     child.once?.('exit', (code) => { child = null; if (code !== 0) { childFailure = { status: 'error', detail: `Watcher exited (${code}).` }; current = childFailure; } else current = { status: 'offline', detail: 'Watcher stopped.' }; });
     return await waitForRunning();
   };
-  return { paths, inspect, getState: inspect, start, async restart() { if (!(await stopOwnedChild())) return current; return await start(); }, getStatus: () => current, async stop() { await stopOwnedChild(); } };
+  return {
+    paths,
+    inspect,
+    getState: inspect,
+    start,
+    async restart() { if (!(await stopOwnedChild())) return current; return await start(); },
+    getStatus: () => current,
+    async stop() {
+      finalShutdownRequested = true;
+      stoppedState();
+      await stopOwnedChild();
+    },
+  };
 }

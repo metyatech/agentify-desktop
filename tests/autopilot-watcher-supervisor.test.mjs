@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createAutopilotWatcherManager, watcherPaths } from '../autopilot-watcher-manager.mjs';
 import { createAutopilotWatcherSupervisor } from '../autopilot-watcher-supervisor.mjs';
 
 function clock() {
@@ -152,7 +153,7 @@ test('state changes are published and stop cancels future health checks', async 
   await supervisor.start();
   running = false;
   await timers.callbacks[0]();
-  supervisor.stop();
+  await supervisor.stop();
   assert.deepEqual(published, ['running', 'error']);
   assert.deepEqual(timers.cleared, [1]);
 });
@@ -171,9 +172,67 @@ test('shutdown prevents a pending health check from starting a watcher', async (
     clearIntervalImpl: timers.clearInterval,
   });
   const pending = supervisor.start();
-  supervisor.stop();
+  const stopping = supervisor.stop();
   release();
-  await pending;
+  await Promise.all([pending, stopping]);
   assert.equal(starts, 0);
+  assert.deepEqual(timers.cleared, [1]);
+});
+
+test('final shutdown closes the manager gate while supervisor start is inspecting', async () => {
+  const timers = timerHarness();
+  const files = {};
+  const paths = watcherPaths('D:/supervisor-shutdown-race');
+  files[paths.config] = JSON.stringify({ enabled: true, nodeExecutable: 'D:/node.exe', controllerEntryPath: 'D:/controller.mjs', controllerRepoRoot: 'D:/' });
+  let configReads = 0;
+  let managerStartEntered;
+  const managerStartEnteredPromise = new Promise((resolve) => { managerStartEntered = resolve; });
+  let releaseManagerStart;
+  const managerStartGate = new Promise((resolve) => { releaseManagerStart = resolve; });
+  let spawnCount = 0;
+  const manager = createAutopilotWatcherManager({
+    root: 'D:/supervisor-shutdown-race',
+    readFile: async (file) => {
+      if (file === paths.config && ++configReads === 2) {
+        managerStartEntered();
+        await managerStartGate;
+      }
+      if (!(file in files)) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; }
+      return files[file];
+    },
+    lstat: async (file) => { if (file === paths.controllerLock) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; } return {}; },
+    unlink: async (file) => { delete files[file]; },
+    spawnImpl: () => { spawnCount += 1; throw new Error('unexpected spawn'); },
+    env: {},
+  });
+  const supervisor = createAutopilotWatcherSupervisor({ watcher: manager, setIntervalImpl: timers.setInterval, clearIntervalImpl: timers.clearInterval });
+
+  const healthCheck = supervisor.start();
+  await managerStartEnteredPromise;
+  const supervisorStop = supervisor.stop();
+  const managerStop = manager.stop();
+  releaseManagerStart();
+  await Promise.all([healthCheck, supervisorStop, managerStop]);
+  assert.equal(spawnCount, 0);
+});
+
+test('stop drains an in-flight health check', async () => {
+  const timers = timerHarness();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const supervisor = createAutopilotWatcherSupervisor({
+    watcher: { getState: async () => { await gate; return { status: 'running', pid: 61 }; }, start: async () => ({ status: 'running', pid: 61 }) },
+    setIntervalImpl: timers.setInterval,
+    clearIntervalImpl: timers.clearInterval,
+  });
+  const pending = supervisor.start();
+  const stopping = supervisor.stop();
+  let drained = false;
+  stopping.then(() => { drained = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+  release();
+  await Promise.all([pending, stopping]);
+  assert.equal(drained, true);
   assert.deepEqual(timers.cleared, [1]);
 });

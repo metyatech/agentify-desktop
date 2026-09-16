@@ -771,9 +771,13 @@ function evaluateConversationWindowReadWithDom({
   return vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), context);
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
   const events = [];
-  const windows = windowCount > 5
+  const windows = Array.isArray(windowRanges)
+    ? windowRanges
+    : Number.isInteger(windowSize) && windowSize > 0
+    ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: windowSize }, (_, offset) => index * windowSize + offset))
+    : windowCount > 5
     ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: 7 }, (_, offset) => index * 5 + offset))
     : [
       [0, 1, 2, 3, 4, 5, 6],
@@ -789,6 +793,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
   let wheelCount = 0;
   let readCount = 0;
   let restoreCount = 0;
+  let directTopCount = 0;
   let scrollTopOverride = null;
   let scrollHeightOverride = null;
   let loadingOverride = null;
@@ -842,6 +847,15 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
     onEvaluate: async (js) => {
       if (js.includes('const operation = "top";')) {
         events.push('conversation-scroll-top');
+        directTopCount += 1;
+        const planned = typeof directTopPlan === 'function'
+          ? await directTopPlan({ attempt: directTopCount, windowIndex, scrollTop: scrollTopOverride })
+          : Array.isArray(directTopPlan) ? directTopPlan[directTopCount - 1] : null;
+        if (planned && typeof planned === 'object') {
+          if (Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
+          if (Number.isFinite(Number(planned.scrollTop))) scrollTopOverride = Number(planned.scrollTop);
+          if (typeof planned.loading === 'boolean') loadingOverride = planned.loading;
+        }
         scrollTopOverride = 0;
         return { ok: true, scrollTop: 0 };
       }
@@ -950,7 +964,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, posi
   }
   if (!nativeWheel) page.mouseWheel = undefined;
   if (!scrollGesture) page.scrollGesture = undefined;
-  return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, getRestoreCount: () => restoreCount, originalWindowIndex };
+  return { page, events, snapshot, getWindowIndex: () => windowIndex, getWheelCount: () => wheelCount, getRestoreCount: () => restoreCount, getDirectTopCount: () => directTopCount, originalWindowIndex };
 }
 
 function completeTraversalFixture(count, { textChangeAt = null, reverse = false, reason = null, snapshots = null } = {}) {
@@ -2228,7 +2242,7 @@ test('chatgpt-controller: successful scrollGesture without a DOM transition rema
     historyMaxIterations: 30
   });
   assert.equal(result.history.complete, false);
-  assert.equal(result.history.reason, 'history-native-scroll-no-progress');
+  assert.equal(result.history.reason, 'history-start-unproven');
   assert.equal(result.history.diagnostics.nativeScrollControlProven, false);
 });
 
@@ -2652,7 +2666,7 @@ test('chatgpt-controller: complete history rejects native wheel dispatch without
   const harness = createNativeWheelHistoryPage({ windowChanges: false });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, false);
-  assert.equal(result.history.reason, 'history-native-scroll-no-progress');
+  assert.equal(result.history.reason, 'history-start-unproven');
   assert.ok(harness.getWheelCount() >= 2);
   assert.equal(result.history.diagnostics.nativeScrollControlProven, false);
 });
@@ -2841,7 +2855,7 @@ test('chatgpt-controller: successful and no-progress wheel diagnostics do not re
 
   const noProgress = createNativeWheelHistoryPage({ windowChanges: false });
   const stalled = await createController(noProgress.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
-  assert.equal(stalled.history.reason, 'history-native-scroll-no-progress');
+  assert.equal(stalled.history.reason, 'history-start-unproven');
   assert.equal(stalled.history.diagnostics.nativeInput.failurePhase, null);
   assert.equal(stalled.history.diagnostics.nativeInput.errorMessage, null);
 });
@@ -3046,15 +3060,55 @@ test('chatgpt-controller: zero-origin low range candidate also establishes direc
   assert.equal(result.history.diagnostics.wheelUpAttempts, 1);
 });
 
-test('chatgpt-controller: range min two does not trigger direct top', async () => {
+test('chatgpt-controller: stalled native input uses direct top fallback for a live-like virtualized range', async () => {
   const harness = createNativeWheelHistoryPage({
-    initialWindow: 4,
-    positionOffset: 2,
-    mouseWheelPlan: ({ attempt }) => attempt === 1 ? { windowIndex: 0, scrollTop: 100 } : null
+    initialWindow: 1,
+    windowRanges: [[0, 1, 2, 3, 4, 5], [5, 6, 7, 8, 9]],
+    backend: 'chrome-cdp',
+    windowChanges: false,
+    directTopPlan: () => ({ windowIndex: 0 })
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.nativeScrollControlProven, false);
+  assert.equal(result.history.diagnostics.directTop.fallbackTriggered, true);
+  assert.equal(result.history.diagnostics.directTop.fallbackReason, 'native-no-progress');
+  assert.equal(result.history.diagnostics.directTop.commandSucceeded, true);
+  assert.equal(result.history.diagnostics.startProven, true);
+  assert.equal(result.history.diagnostics.startProofMode, 'zero-origin');
+  assert.equal(result.history.scrollRestored, true);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+  assert.ok(harness.getDirectTopCount() >= 2);
+});
+
+test('chatgpt-controller: direct top fallback cannot prove start when virtualization stays above the boundary', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 1,
+    windowRanges: [[2, 3, 4, 5, 6], [7, 8, 9, 10, 11]],
+    windowChanges: false,
+    directTopPlan: () => ({})
   });
   const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
-  assert.equal(result.history.diagnostics.directTop.candidateDetected, false);
-  assert.equal(result.history.diagnostics.wheelUpAttempts, 2);
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-start-unproven');
+  assert.equal(result.history.diagnostics.directTop.fallbackTriggered, true);
+  assert.equal(result.history.diagnostics.directTop.commandSucceeded, true);
+  assert.equal(result.history.diagnostics.startProven, false);
+  assert.equal(result.history.scrollRestored, true);
+});
+
+test('chatgpt-controller: range min two may use direct top fallback but still requires strict start proof', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 1,
+    windowRanges: [[2, 3, 4, 5, 6], [2, 3, 4, 5, 6]],
+    windowChanges: false
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 5000, historyMaxIterations: 30 });
+  assert.equal(result.history.diagnostics.directTop.candidateDetected, true);
+  assert.equal(result.history.diagnostics.directTop.candidateRangeMin, 2);
+  assert.equal(result.history.diagnostics.directTop.fallbackTriggered, true);
+  assert.equal(result.history.diagnostics.startProven, false);
   assert.equal(result.history.reason, 'history-start-unproven');
 });
 

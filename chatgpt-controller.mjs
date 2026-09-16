@@ -4063,6 +4063,8 @@ export class ChatGPTController {
       directTop: {
         candidateDetected: false,
         candidateRangeMin: null,
+        fallbackTriggered: false,
+        fallbackReason: null,
         attempted: false,
         commandSucceeded: false,
         atTopVerified: false,
@@ -4833,9 +4835,16 @@ export class ChatGPTController {
             oppositeAttempted = true;
             continue;
           }
-          if (proofNoProgress >= 2) reason = 'history-native-scroll-no-progress';
+          if (proofNoProgress >= 2) {
+            diagnostics.directTop.fallbackTriggered = true;
+            diagnostics.directTop.fallbackReason = 'native-no-progress';
+            if (await establishDirectTop(afterMin)) break;
+          }
         }
-        if (!diagnostics.nativeScrollControlProven && !reason) reason = historyBudgetExpired() ? 'timeout' : 'history-native-scroll-no-progress';
+        if (!diagnostics.nativeScrollControlProven && !reason
+          && !(diagnostics.directTop.fallbackTriggered && diagnostics.directTop.commandSucceeded && diagnostics.directTop.atTopVerified)) {
+          reason = historyBudgetExpired() ? 'timeout' : 'history-native-scroll-no-progress';
+        }
         }
       }
 
@@ -4924,7 +4933,12 @@ export class ChatGPTController {
             && (!Number.isInteger(conversationTurnRange(before.turns).min) || result.range.min < conversationTurnRange(before.turns).min);
           if (result.windowChanged || result.physicalChanged || rangeProgress) noProgressCount = 0;
           else noProgressCount += 1;
-          if (noProgressCount >= 3) { reason = 'history-native-scroll-no-progress'; break; }
+          if (noProgressCount >= 3) {
+            diagnostics.directTop.fallbackTriggered = true;
+            diagnostics.directTop.fallbackReason = 'native-no-progress';
+            if (!await establishDirectTop(result.range?.min)) break;
+            continue;
+          }
         }
         if (!startReached && !reason) reason = historyBudgetExpired() ? 'timeout' : 'history-start-unproven';
       }

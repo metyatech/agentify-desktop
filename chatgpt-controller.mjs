@@ -241,6 +241,202 @@ function historyMetadata({ mode, complete = false, reason = null, startReached =
   return metadata;
 }
 
+export function buildChatGPTDomModelScript({ lightweight = false } = {}) {
+  return String.raw`(() => {
+    const currentUnitSelector = '[data-content-search-unit-key]';
+    const legacyMessageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], article[data-turn="user"], article[data-turn="assistant"]';
+    const excludedSelector = [
+      'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
+      '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
+      '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
+      '[aria-label*="composer" i]'
+    ].join(',');
+    const normalize = (value) => String(value || '')
+      .replace(/\u0000/g, '')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => line.replace(/[ \t]+$/u, ''))
+      .join('\n')
+      .trim();
+    const visibleText = (node) => {
+      const clone = ${lightweight ? 'node' : "typeof node.cloneNode === 'function' ? node.cloneNode(true) : node"};
+      if (clone.matches?.(excludedSelector)) clone.remove();
+      else clone.querySelectorAll?.(excludedSelector)?.forEach((child) => child.remove());
+      return normalize(clone.innerText || clone.textContent || '');
+    };
+    const parseLegacyPosition = (node) => {
+      let current = node;
+      while (current) {
+        for (const value of [current.id, current.getAttribute?.('data-testid'), current.getAttribute?.('data-conversation-turn'), current.getAttribute?.('data-turn')]) {
+          const match = String(value || '').match(/conversation-turn-(\d+)/i);
+          if (match) return Number(match[1]);
+        }
+        current = current.parentElement;
+      }
+      return null;
+    };
+    const currentUnitRecords = () => {
+      const nodes = Array.from(document.querySelectorAll?.(currentUnitSelector) || []);
+      const records = [];
+      const seenKeys = new Set();
+      let malformedCount = 0;
+      for (const [domIndex, node] of nodes.entries()) {
+        const unitKey = String(node.getAttribute?.('data-content-search-unit-key') || '').trim();
+        const match = /^(.*):([0-9]{1,3}):(user|assistant)$/u.exec(unitKey);
+        const wrapper = node.closest?.('[data-turn-key]') || null;
+        const turnKey = String(wrapper?.getAttribute?.('data-turn-key') || '').trim();
+        const valid = !!match
+          && !!turnKey
+          && match[1] === turnKey
+          && Number.isSafeInteger(Number(match[2]))
+          && Number(match[2]) >= 0
+          && Number(match[2]) <= 999
+          && !seenKeys.has(unitKey);
+        if (!valid) {
+          malformedCount += 1;
+          continue;
+        }
+        seenKeys.add(unitKey);
+        records.push({
+          node,
+          role: match[3],
+          messageId: unitKey,
+          turnId: turnKey,
+          positionHint: null,
+          domMode: 'content-search-unit',
+          domIndex,
+          text: visibleText(node)
+        });
+      }
+      return { nodes, records, malformedCount };
+    };
+    const legacyRecords = () => {
+      const entries = [
+        ...Array.from(document.querySelectorAll?.('[data-message-author-role="user"], article[data-turn="user"]') || []).map((node) => ({ node, roleHint: 'user' })),
+        ...Array.from(document.querySelectorAll?.('[data-message-author-role="assistant"], article[data-turn="assistant"]') || []).map((node) => ({ node, roleHint: 'assistant' })),
+        ...Array.from(document.querySelectorAll?.('[data-message-author-role="user"], [data-message-author-role="assistant"]') || []).map((node) => ({ node, roleHint: null })),
+        ...Array.from(document.querySelectorAll?.(legacyMessageSelector) || []).map((node) => ({ node, roleHint: null }))
+      ];
+      const nodes = [...new Set(entries.map(({ node }) => node))];
+      const records = [];
+      for (const [domIndex, node] of nodes.entries()) {
+        let parent = node.parentElement;
+        let nested = false;
+        while (parent) {
+          if (parent.matches?.(legacyMessageSelector)) {
+            nested = true;
+            break;
+          }
+          parent = parent.parentElement;
+        }
+        if (nested) {
+          continue;
+        }
+        const hints = [...new Set(entries.filter((entry) => entry.node === node).map((entry) => entry.roleHint).filter(Boolean))];
+        const role = String(node.getAttribute?.('data-message-author-role') || node.getAttribute?.('data-turn') || hints[0] || '').trim();
+        if ((role !== 'user' && role !== 'assistant') || hints.some((hint) => hint !== role)) continue;
+        const messageId = String(node.getAttribute?.('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute?.('data-message-id') || '').trim();
+        const turnId = String(node.getAttribute?.('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute?.('data-turn-id') || '').trim();
+        records.push({
+          node,
+          role,
+          messageId: messageId || null,
+          turnId: turnId || null,
+          positionHint: parseLegacyPosition(node),
+          domMode: 'legacy-author-role',
+          domIndex,
+          text: visibleText(node)
+        });
+      }
+      return records;
+    };
+    const compareNodes = (left, right) => {
+      if (left.node === right.node) return 0;
+      const relation = left.node.compareDocumentPosition?.(right.node) || 0;
+      if (relation & 4) return -1;
+      if (relation & 2) return 1;
+      return left.domIndex - right.domIndex;
+    };
+    const commonAncestor = (nodes) => {
+      if (!nodes.length) return null;
+      const chains = nodes.map((node) => {
+        const chain = [];
+        let current = node.parentElement;
+        while (current) {
+          chain.push(current);
+          current = current.parentElement;
+        }
+        return chain;
+      });
+      return chains[0].find((node) => chains.every((chain) => chain.includes(node))) || null;
+    };
+    const virtualizerTopOffset = (currentRecords) => {
+      const wrappers = [...new Set(currentRecords.map((record) => record.node.closest?.('[data-turn-key]')).filter(Boolean))];
+      const hostCandidates = [];
+      let current = commonAncestor(wrappers);
+      while (current) {
+        const inlineMargin = String(current.style?.marginTop || '').trim();
+        if (inlineMargin) {
+          const value = Number.parseFloat(inlineMargin);
+          if (Number.isFinite(value)) hostCandidates.push({ node: current, value });
+        }
+        current = current.parentElement;
+      }
+      const host = hostCandidates.length === 1 ? hostCandidates[0] : null;
+      return {
+        host,
+        hostCount: hostCandidates.length,
+        offsetPx: host ? host.value : null,
+        wrappers
+      };
+    };
+    const read = () => {
+      const current = currentUnitRecords();
+      const legacy = legacyRecords();
+      const conflicts = [];
+      const currentRecords = current.records;
+      const legacyWithoutDuplicates = legacy.filter((legacyRecord) => {
+        const duplicate = currentRecords.find((currentRecord) => {
+          const sameIdentity = (legacyRecord.messageId && legacyRecord.messageId === currentRecord.messageId)
+            || (legacyRecord.turnId && legacyRecord.turnId === currentRecord.turnId);
+          const nested = legacyRecord.node.contains?.(currentRecord.node) || currentRecord.node.contains?.(legacyRecord.node);
+          return sameIdentity || nested;
+        });
+        if (!duplicate) return true;
+        if (duplicate.role !== legacyRecord.role) conflicts.push({ legacyRole: legacyRecord.role, currentRole: duplicate.role });
+        return false;
+      });
+      const records = [...currentRecords, ...legacyWithoutDuplicates].sort(compareNodes);
+      const virtualizer = virtualizerTopOffset(currentRecords);
+      const mode = currentRecords.length && legacy.length
+        ? 'mixed'
+        : currentRecords.length
+          ? 'content-search-unit'
+          : legacy.length
+            ? 'legacy-author-role'
+            : null;
+      const invalid = current.malformedCount > 0 || conflicts.length > 0;
+      return {
+        valid: !invalid,
+        reason: invalid ? 'message-dom-invalid' : null,
+        records: invalid ? [] : records,
+        diagnostics: {
+          messageDomMode: mode,
+          legacyMessageNodeCount: legacy.length,
+          currentMessageUnitCount: current.nodes.length,
+          validCurrentMessageUnitCount: currentRecords.length,
+          malformedCurrentMessageUnitCount: current.malformedCount,
+          renderedTurnWrapperCount: document.querySelectorAll('[data-turn-key]').length,
+          virtualizerTopOffsetPx: virtualizer.offsetPx,
+          virtualizerHostCount: virtualizer.hostCount,
+          mixedRepresentationConflict: conflicts.length > 0
+        }
+      };
+    };
+    return { read, visibleText, parseLegacyPosition };
+  })()`;
+}
+
 function mergeConversationSnapshotsLegacy(snapshots = []) {
   const records = new Map();
   const positions = new Map();
@@ -829,6 +1025,11 @@ export function conversationStartBoundaryProof(state, { physicalTopStable = fals
   const positionOneMessageNodeCount = Number.isInteger(boundary.positionOneMessageNodeCount)
     ? boundary.positionOneMessageNodeCount
     : null;
+  const virtualizedOrigin = boundary.virtualizedOrigin && typeof boundary.virtualizedOrigin === 'object'
+    ? boundary.virtualizedOrigin
+    : state?.virtualizedOrigin && typeof state.virtualizedOrigin === 'object'
+      ? state.virtualizedOrigin
+      : null;
   const evidence = {
     rangeMin,
     firstMessagePosition,
@@ -837,14 +1038,25 @@ export function conversationStartBoundaryProof(state, { physicalTopStable = fals
     positionZeroMarkerInsideScrollerCount,
     positionOneMessageNodeCount
   };
-  if (!physicalTopStable) return { proven: false, mode: null, ...evidence };
+  if (!physicalTopStable) return { proven: false, mode: null, ...evidence, virtualizedOrigin };
   if (rangeMin === 0) return { proven: true, mode: 'zero-origin', ...evidence };
   const oneOrigin = rangeMin === 1
     && firstMessagePosition === 1
     && firstMessageRole === 'user'
     && positionZeroMessageNodeCount === 0
     && positionZeroMarkerInsideScrollerCount === 0;
-  return { proven: oneOrigin, mode: oneOrigin ? 'one-origin' : null, ...evidence };
+  if (oneOrigin) return { proven: true, mode: 'one-origin', ...evidence };
+  const virtualizedOriginProven = virtualizedOrigin?.domMode === 'content-search-unit'
+    && virtualizedOrigin?.scrollerCandidateCount === 1
+    && virtualizedOrigin?.turnHostCount === 1
+    && virtualizedOrigin?.topOffsetPx === 0
+    && Number(virtualizedOrigin?.validMessageCount) > 0
+    && Number(virtualizedOrigin?.malformedMessageCount) === 0
+    && virtualizedOrigin?.firstMessageRole === 'user'
+    && virtualizedOrigin?.loading === false
+    && state?.scroller?.atTop === true
+    && state?.urlStable !== false;
+  return { proven: virtualizedOriginProven, mode: virtualizedOriginProven ? 'virtualized-origin' : null, ...evidence, virtualizedOrigin };
 }
 
 function probeWindowSummary(state) {
@@ -987,13 +1199,7 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
     const topStableSamples = ${CONVERSATION_HISTORY_TOP_STABLE_SAMPLES};
     const tailStableWaitMs = ${CONVERSATION_HISTORY_SCROLL_WAIT_MS * 2};
     const tailStableSamples = 3;
-    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
-    const excludedSelector = [
-      'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
-      '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
-      '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
-      '[aria-label*="composer" i]'
-    ].join(',');
+    const domModel = ${buildChatGPTDomModelScript()};
     const normalize = (value) => String(value || '').replace(/\\u0000/g, '').replace(/\\r\\n?/g, '\\n').split('\\n').map((line) => line.replace(/[ \\t]+$/u, '')).join('\\n').trim();
     const digest = (value) => {
       let hash = 2166136261;
@@ -1001,37 +1207,17 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
       return (hash >>> 0).toString(16).padStart(8, '0');
     };
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
-      let parent = node.parentElement;
-      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
-      return true;
-    });
-    const visibleText = (node) => {
-      const clone = node.cloneNode(true);
-      if (clone.matches?.(excludedSelector)) clone.remove(); else clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
-      return normalize(clone.innerText || clone.textContent || '');
-    };
-    const parsePosition = (node) => {
-      let current = node;
-      while (current) {
-        for (const value of [current.id, current.getAttribute?.('data-testid'), current.getAttribute?.('data-conversation-turn'), current.getAttribute?.('data-turn')]) {
-          const match = String(value || '').match(/conversation-turn-(\\d+)/i);
-          if (match) return Number(match[1]);
-        }
-        current = current.parentElement;
-      }
-      return null;
-    };
+    const domSnapshot = () => domModel.read();
+    const messageNodes = () => domSnapshot().records.map((record) => record.node);
+    const visibleText = (node) => domModel.visibleText(node);
+    const parsePosition = (node) => domModel.parseLegacyPosition(node);
     const extract = () => {
-      const raw = messageNodes().map((node, domIndex) => {
-      const role = node.getAttribute('data-message-author-role');
-      if (role !== 'user' && role !== 'assistant') return null;
-      const text = visibleText(node);
+      const model = domSnapshot();
+      const raw = model.records.map((record, domIndex) => {
+      const { node, role, messageId, turnId, positionHint } = record;
+      const text = record.text || visibleText(node);
       if (!text) return null;
-      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
-      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
-      const positionHint = parsePosition(node);
-      return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint, domIndex };
+      return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint, domMode: record.domMode, domIndex };
       }).filter(Boolean);
       return raw.map((turn, index) => ({
         ...turn,
@@ -1095,7 +1281,8 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
           selectedMessageDescendantCount: nearest.length === 1 ? nearest[0].descendants : 0,
           selected: nearest.length === 1 ? nearest[0].details : null,
           selectedPath: nearest.length === 1 ? nearest[0].path : null,
-          candidates: candidates.slice(0, 8).map((candidate) => ({ ...candidate.details, messageDescendantCount: candidate.descendants, path: candidate.path }))
+          candidates: candidates.slice(0, 8).map((candidate) => ({ ...candidate.details, messageDescendantCount: candidate.descendants, path: candidate.path })),
+          ...domSnapshot().diagnostics
         }
       };
     };
@@ -1283,7 +1470,9 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     const maxTurns = ${maxTurns};
     const maxCharsPerTurn = ${maxCharsPerTurn};
     const maxTotalChars = ${maxTotalChars};
-    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const domModel = ${buildChatGPTDomModelScript()};
+    const domSnapshot = () => domModel.read();
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], [data-content-search-unit-key]';
     const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
     const excludedSelector = [
       'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
@@ -1297,11 +1486,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       for (const char of String(value || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
       return (hash >>> 0).toString(16).padStart(8, '0');
     };
-    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
-      let parent = node.parentElement;
-      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
-      return true;
-    });
+    const messageNodes = () => domSnapshot().records.map((record) => record.node);
     const visibleText = (node) => {
       const clone = node.cloneNode(true);
       if (clone.matches?.(excludedSelector)) clone.remove(); else clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
@@ -1318,15 +1503,14 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       }
       return null;
     };
+    const model = domSnapshot();
     const extract = () => {
-      const raw = messageNodes().map((node, domIndex) => {
-        const role = node.getAttribute('data-message-author-role');
-        if (role !== 'user' && role !== 'assistant') return null;
-        const text = visibleText(node);
+      const model = domSnapshot();
+      const raw = model.records.map((record, domIndex) => {
+        const { node, role, messageId, turnId, positionHint } = record;
+        const text = record.text || visibleText(node);
         if (!text) return null;
-        const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
-        const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
-        return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint: parsePosition(node), domIndex };
+        return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint, domMode: record.domMode, domIndex };
       }).filter(Boolean);
       return raw.map((turn, index) => ({
         ...turn,
@@ -1386,7 +1570,8 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
           selectedMessageDescendantCount: nearest.length === 1 ? nearest[0].descendants : 0,
           selected: nearest.length === 1 ? nearest[0].details : null,
           selectedPath: nearest.length === 1 ? nearest[0].path : null,
-          candidates: candidates.slice(0, 8).map((candidate) => ({ ...candidate.details, messageDescendantCount: candidate.descendants, path: candidate.path }))
+          candidates: candidates.slice(0, 8).map((candidate) => ({ ...candidate.details, messageDescendantCount: candidate.descendants, path: candidate.path })),
+          ...domSnapshot().diagnostics
         }
       };
     };
@@ -1420,6 +1605,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     const point = validRect && right - left > 20 && bottom - top > 20
       ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) }
       : null;
+    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
     return {
       url: location.href,
@@ -1434,7 +1620,17 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
         firstMessageRole: firstMessage?.role === 'user' || firstMessage?.role === 'assistant' ? firstMessage.role : null,
         positionZeroMessageNodeCount,
         positionZeroMarkerInsideScrollerCount,
-        positionOneMessageNodeCount
+        positionOneMessageNodeCount,
+        virtualizedOrigin: {
+          domMode: model.diagnostics.messageDomMode,
+          scrollerCandidateCount: resolved.diagnostic.candidateCount,
+          turnHostCount: model.diagnostics.virtualizerHostCount,
+          topOffsetPx: model.diagnostics.virtualizerTopOffsetPx,
+          validMessageCount: model.diagnostics.validCurrentMessageUnitCount,
+          malformedMessageCount: model.diagnostics.malformedCurrentMessageUnitCount,
+          firstMessageRole: firstMessage?.role === 'user' || firstMessage?.role === 'assistant' ? firstMessage.role : null,
+          loading
+        }
       },
       scroller: scroller ? {
         ...resolved.diagnostic,
@@ -1455,7 +1651,9 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const maxTurns = ${maxTurns};
     const maxCharsPerTurn = ${maxCharsPerTurn};
     const maxTotalChars = ${maxTotalChars};
-    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
+    const domModel = ${buildChatGPTDomModelScript({ lightweight: true })};
+    const domSnapshot = () => domModel.read();
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], [data-content-search-unit-key]';
     const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
     const normalize = (value) => String(value || '').replace(/\\u0000/g, '').replace(/\\s+/g, ' ').trim();
     const digest = (value) => {
@@ -1463,11 +1661,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
       for (const char of String(value || '')) { hash ^= char.codePointAt(0); hash = Math.imul(hash, 16777619); }
       return (hash >>> 0).toString(16).padStart(8, '0');
     };
-    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
-      let parent = node.parentElement;
-      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
-      return true;
-    });
+    const messageNodes = () => domSnapshot().records.map((record) => record.node);
     const parsePosition = (node) => {
       let current = node;
       while (current) {
@@ -1487,7 +1681,8 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
       const overflowY = String(getComputedStyle(node)?.overflowY || '');
       return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
     };
-    const nodes = messageNodes();
+    const model = domSnapshot();
+    const nodes = model.records.map((record) => record.node);
     const chains = nodes.map((node) => {
       const chain = [];
       let current = node.parentElement;
@@ -1502,13 +1697,12 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
     const selected = nearest.length === 1 ? nearest[0].node : null;
     const inScroller = selected ? nodes.filter((node) => selected.contains?.(node)) : [];
-    const turns = inScroller.map((node, domIndex) => {
-      const role = node.getAttribute('data-message-author-role');
-      const rawText = String(node.innerText || node.textContent || '');
+    const turns = model.records.filter((record) => inScroller.includes(record.node)).map((record, domIndex) => {
+      const node = record.node;
+      const role = record.role;
+      const rawText = String(record.text || node.innerText || node.textContent || '');
       const text = normalize(rawText.slice(0, 512));
-      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
-      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
-      return { role, messageId: messageId || null, turnId: turnId || null, positionHint: parsePosition(node), textDigest: digest(text), textLength: rawText.length, domIndex };
+      return { role, messageId: record.messageId || null, turnId: record.turnId || null, positionHint: record.positionHint, domMode: record.domMode, textDigest: digest(text), textLength: rawText.length, domIndex };
     }).filter((turn) => turn.role === 'user' || turn.role === 'assistant');
     const values = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
     const range = { min: values.length ? Math.min(...values) : null, max: values.length ? Math.max(...values) : null };
@@ -1537,8 +1731,24 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
       windowSignature: signature,
       signature,
       range,
-      startBoundary: { firstMessagePosition: Number.isInteger(first?.positionHint) ? first.positionHint : null, firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null, positionZeroMessageNodeCount: messagePositionZeroCount, positionZeroMarkerInsideScrollerCount: positionZeroMarkerCount, positionOneMessageNodeCount: turns.filter((turn) => turn.positionHint === 1).length },
-      scroller: selected ? { candidateCount: nearest.length, selectedMessageDescendantCount: nearest[0].descendants, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
+      startBoundary: {
+        firstMessagePosition: Number.isInteger(first?.positionHint) ? first.positionHint : null,
+        firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null,
+        positionZeroMessageNodeCount: messagePositionZeroCount,
+        positionZeroMarkerInsideScrollerCount: positionZeroMarkerCount,
+        positionOneMessageNodeCount: turns.filter((turn) => turn.positionHint === 1).length,
+        virtualizedOrigin: {
+          domMode: model.diagnostics.messageDomMode,
+          scrollerCandidateCount: nearest.length,
+          turnHostCount: model.diagnostics.virtualizerHostCount,
+          topOffsetPx: model.diagnostics.virtualizerTopOffsetPx,
+          validMessageCount: model.diagnostics.validCurrentMessageUnitCount,
+          malformedMessageCount: model.diagnostics.malformedCurrentMessageUnitCount,
+          firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null,
+          loading
+        }
+      },
+      scroller: selected ? { candidateCount: nearest.length, selectedMessageDescendantCount: nearest[0].descendants, ...model.diagnostics, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: nearest.length, selectedMessageDescendantCount: 0, ...model.diagnostics, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
     };
   })()`;
 }
@@ -1548,8 +1758,10 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
     const maxTurns = ${maxTurns};
     const maxCharsPerTurn = ${maxCharsPerTurn};
     const maxTotalChars = ${maxTotalChars};
-    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
-    const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';
+    const domModel = ${buildChatGPTDomModelScript()};
+    const domSnapshot = () => domModel.read();
+    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], [data-content-search-unit-key]';
+    const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn], [data-turn-key]';
     const excludedSelector = [
       'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
       '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
@@ -1563,11 +1775,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
       return (hash >>> 0).toString(16).padStart(8, '0');
     };
     const bounded = (value, max = 160) => String(value || '').replace(/[\\u0000-\\u001f\\u007f]/gu, ' ').replace(/\\s+/gu, ' ').trim().slice(0, max);
-    const messageNodes = () => Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
-      let parent = node.parentElement;
-      while (parent) { if (parent.matches?.(messageSelector)) return false; parent = parent.parentElement; }
-      return true;
-    });
+    const messageNodes = () => domSnapshot().records.map((record) => record.node);
     const visibleText = (node) => {
       const clone = node.cloneNode(true);
       if (clone.matches?.(excludedSelector)) clone.remove(); else clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
@@ -1606,9 +1814,11 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
         visibility: bounded(style?.visibility, 16)
       };
     };
+    const model = domSnapshot();
+    const recordByNode = new Map(model.records.map((record) => [record.node, record]));
     const messageCounts = (node, messages) => ({
-      user: messages.filter((message) => node.contains?.(message) && message.getAttribute('data-message-author-role') === 'user').length,
-      assistant: messages.filter((message) => node.contains?.(message) && message.getAttribute('data-message-author-role') === 'assistant').length
+      user: messages.filter((message) => node.contains?.(message) && recordByNode.get(message)?.role === 'user').length,
+      assistant: messages.filter((message) => node.contains?.(message) && recordByNode.get(message)?.role === 'assistant').length
     });
     const markerAttributes = (node) => ({
       tagName: bounded(node?.tagName, 32),
@@ -1658,16 +1868,15 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
       const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
       return { selected: nearest.length === 1 ? nearest[0].node : null, candidates, nearest, ambiguous: nearest.length > 1 };
     };
-    const messages = messageNodes();
+    const messages = model.records.map((record) => record.node);
     const resolved = resolveScroller(messages);
     const scroller = resolved.selected;
-    const turns = messages.map((node, domIndex) => {
-      const role = node.getAttribute('data-message-author-role');
-      const text = visibleText(node);
+    const turns = model.records.map((record, domIndex) => {
+      const node = record.node;
+      const role = record.role;
+      const text = record.text || visibleText(node);
       const source = parsePositionWithSource(node);
-      const messageId = String(node.getAttribute('data-message-id') || node.closest?.('[data-message-id]')?.getAttribute('data-message-id') || '').trim();
-      const turnId = String(node.getAttribute('data-turn-id') || node.closest?.('[data-turn-id]')?.getAttribute('data-turn-id') || '').trim();
-      return { node, domIndex, role, text, position: Number.isInteger(source.parsedPosition) ? source.parsedPosition : null, source, messageId: !!messageId, turnId: !!turnId };
+      return { node, domIndex, role, text, position: record.positionHint, source, messageId: !!record.messageId, turnId: !!record.turnId, domMode: record.domMode };
     }).filter((turn) => (turn.role === 'user' || turn.role === 'assistant') && turn.text);
     const markerNodes = Array.from(document.querySelectorAll(markerSelector));
     const markers = markerNodes.slice(0, 40).map((node) => markerRecord(node, messages, !!scroller?.contains?.(node)));
@@ -1743,15 +1952,17 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
     const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
     const windowSignature = digest(JSON.stringify(turns.map((turn) => [turn.role, turn.messageId, turn.turnId, turn.position, digest(turn.text)])));
     const structuralSignature = digest(JSON.stringify({ positions: uniquePositions, first: textMessages[0]?.parsedPosition ?? null, markerCount: markers.length }));
+    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     return {
       url: location.href,
       limitExceeded: !!limitKind,
       limitKind,
-      loading: Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0,
+      loading,
       range,
       windowSignature,
       structuralSignature,
       scroller: scroller ? {
+        ...model.diagnostics,
         candidateCount: resolved.nearest.length,
         selectedMessageDescendantCount: resolved.candidates.filter((candidate) => candidate.node === scroller)[0]?.descendants || 0,
         scrollTop: Number(scroller.scrollTop),
@@ -1760,7 +1971,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
         atTop: Number(scroller.scrollTop) <= 1,
         atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
         point
-      } : { candidateCount: resolved.nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
+      } : { ...model.diagnostics, candidateCount: resolved.nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
       markers,
       markerPositions: {
         minimum: positions.length ? Math.min(...positions) : null,
@@ -1801,15 +2012,9 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
     const operation = ${JSON.stringify(operation)};
     const targetDistance = ${Math.max(0, Math.trunc(Number(distanceFromBottom) || 0))};
     const targetTop = operation === 'top' ? 0 : null;
-    const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
-    const nodes = Array.from(document.querySelectorAll(messageSelector)).filter((node) => {
-      let parent = node.parentElement;
-      while (parent) {
-        if (parent.matches?.(messageSelector)) return false;
-        parent = parent.parentElement;
-      }
-      return true;
-    });
+    const domModel = ${buildChatGPTDomModelScript()};
+    const model = domModel.read();
+    const nodes = model.records.map((record) => record.node);
     const isNavigationRegion = (node) => node.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
     const isScrollable = (node) => {
       if (!node) return false;
@@ -1866,7 +2071,7 @@ export function isChatGPTAttachmentCardDisplayName(fileName, displayName) {
 
 export function isChatGPTCurrentDraftAttachmentCard(card) {
   if (!card || typeof card.closest !== 'function') return false;
-  return !card.closest('[data-message-author-role], article[data-turn], [data-testid*="conversation-turn" i]');
+  return !card.closest('[data-message-author-role], article[data-turn], [data-testid*="conversation-turn" i], [data-content-search-unit-key], [data-turn-key]');
 }
 
 export function mapChatGPTAttachmentCardNames(selectedFileNames, cardDisplayNames) {
@@ -5078,13 +5283,7 @@ export class ChatGPTController {
         const maxTurns = ${limits.maxTurns};
         const maxCharsPerTurn = ${limits.maxCharsPerTurn};
         const maxTotalChars = ${limits.maxTotalChars};
-        const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"]';
-        const excludedSelector = [
-          'button', 'svg', '[role="button"]', 'form', 'textarea', 'input', 'select',
-          '[contenteditable="true"]', '[data-testid*="copy" i]', '[data-testid*="feedback" i]',
-          '[aria-label*="copy" i]', '[aria-label*="feedback" i]', '[data-testid*="composer" i]',
-          '[aria-label*="composer" i]'
-        ].join(',');
+        const domModel = ${buildChatGPTDomModelScript()};
         const normalize = (value) => String(value || '')
           .replace(/\\u0000/g, '')
           .replace(/\\r\\n?/g, '\\n')
@@ -5092,38 +5291,13 @@ export class ChatGPTController {
           .map((line) => line.replace(/[ \\t]+$/u, ''))
           .join('\\n')
           .trim();
-        const nodes = Array.from(document.querySelectorAll(messageSelector));
+        const model = domModel.read();
         const turns = [];
-
-        for (let domIndex = 0; domIndex < nodes.length; domIndex += 1) {
-          const node = nodes[domIndex];
-          let parent = node.parentElement;
-          let nested = false;
-          while (parent) {
-            if (parent.matches?.(messageSelector)) {
-              nested = true;
-              break;
-            }
-            parent = parent.parentElement;
-          }
-          if (nested) continue;
-
-          const role = node.getAttribute('data-message-author-role');
-          if (role !== 'user' && role !== 'assistant') continue;
-
-          const clone = node.cloneNode(true);
-          if (clone.matches?.(excludedSelector)) {
-            clone.remove();
-          } else {
-            clone.querySelectorAll?.(excludedSelector).forEach((child) => child.remove());
-          }
-          const text = normalize(clone.innerText || clone.textContent || '');
+        for (let domIndex = 0; domIndex < model.records.length; domIndex += 1) {
+          const record = model.records[domIndex];
+          const text = normalize(record.text || '');
           if (!text) continue;
-          const directId = String(node.getAttribute('data-message-id') || '').trim();
-          const nearestMessage = node.closest?.('[data-message-id]');
-          const nearestTurn = node.closest?.('[data-turn-id]');
-          const stableId = directId || String(nearestMessage?.getAttribute('data-message-id') || '').trim() || String(nearestTurn?.getAttribute('data-turn-id') || '').trim();
-          turns.push({ role, text, index: domIndex, messageId: stableId || null });
+          turns.push({ role: record.role, text, index: domIndex, messageId: record.messageId || record.turnId || null, turnId: record.turnId || null, positionHint: record.positionHint });
         }
 
         const selectedTurns = turns.slice(Math.max(0, turns.length - maxTurns));
@@ -5606,12 +5780,13 @@ export class ChatGPTController {
       if (!el) return { ok:false, error:'missing_prompt_textarea' };
       el.focus();
       const r = el.getBoundingClientRect();
-      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-      const lastUserTurn = userTurns[userTurns.length - 1] || null;
-      const lastUserId = lastUserTurn
-        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')]
-          .map((value) => String(value || '').trim()).find(Boolean) || ''
-        : '';
+      const domModel = ${buildChatGPTDomModelScript()};
+      const userRecords = domModel.read().records.filter((record) => record.role === 'user');
+      const userTurns = userRecords.map((record) => record.node);
+      const lastUserRecord = userRecords[userRecords.length - 1] || null;
+      const lastUserTurn = lastUserRecord?.node || null;
+      const lastUserId = lastUserRecord?.messageId || [lastUserTurn?.id, lastUserTurn?.getAttribute?.('data-testid')]
+        .map((value) => String(value || '').trim()).find(Boolean) || '';
       const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
       const lastUserText = String(lastUserTurn?.innerText || '');
       const lastUserTextDigest = await (async (value) => {
@@ -5741,12 +5916,13 @@ export class ChatGPTController {
   async #captureUserTurnBaseline({ updateRun = true } = {}) {
     const result = await this.#eval(`(async () => {
       const agentifyUserTurnBaseline = true;
-      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-      const lastUserTurn = userTurns[userTurns.length - 1] || null;
-      const lastUserId = lastUserTurn
-        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')]
-          .map((value) => String(value || '').trim()).find(Boolean) || ''
-        : '';
+      const domModel = ${buildChatGPTDomModelScript()};
+      const userRecords = domModel.read().records.filter((record) => record.role === 'user');
+      const userTurns = userRecords.map((record) => record.node);
+      const lastUserRecord = userRecords[userRecords.length - 1] || null;
+      const lastUserTurn = lastUserRecord?.node || null;
+      const lastUserId = lastUserRecord?.messageId || [lastUserTurn?.id, lastUserTurn?.getAttribute?.('data-testid')]
+        .map((value) => String(value || '').trim()).find(Boolean) || '';
       const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
       const lastUserText = String(lastUserTurn?.innerText || '');
       const bytes = new TextEncoder().encode(normalizeUserTurnText(lastUserText));
@@ -5848,15 +6024,13 @@ export class ChatGPTController {
           }
           const normalSend = chatgptComposer ? Array.from(chatgptComposer.querySelectorAll(chatgptSendSel)).find(visible) : null;
           const normalStopVisible = !!(chatgptComposer && Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible));
-          const chatgptUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-          const lastUserTurn = chatgptUserTurns[chatgptUserTurns.length - 1] || null;
-          const lastUserId = lastUserTurn
-            ? [
-                lastUserTurn.getAttribute('data-message-id'),
-                lastUserTurn.id,
-                lastUserTurn.getAttribute('data-testid')
-              ].map((value) => String(value || '').trim()).find(Boolean) || ''
-            : '';
+          const domModel = ${buildChatGPTDomModelScript()};
+          const userRecords = domModel.read().records.filter((record) => record.role === 'user');
+          const chatgptUserTurns = userRecords.map((record) => record.node);
+          const lastUserRecord = userRecords[userRecords.length - 1] || null;
+          const lastUserTurn = lastUserRecord?.node || null;
+          const lastUserId = lastUserRecord?.messageId || [lastUserTurn?.id, lastUserTurn?.getAttribute?.('data-testid')]
+            .map((value) => String(value || '').trim()).find(Boolean) || '';
           const activePromptText = activePrompt?.matches('textarea, input')
             ? String(activePrompt.value || '')
             : String(activePrompt?.innerText || activePrompt?.textContent || '');
@@ -6254,15 +6428,13 @@ export class ChatGPTController {
         const normalStop = chatgptComposer
           ? Array.from(chatgptComposer.querySelectorAll(chatgptStopSel)).find(visible)
           : null;
-        const chatgptUserTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-        const lastUserTurn = chatgptUserTurns[chatgptUserTurns.length - 1] || null;
-        const lastUserId = lastUserTurn
-          ? [
-              lastUserTurn.getAttribute('data-message-id'),
-              lastUserTurn.id,
-              lastUserTurn.getAttribute('data-testid')
-          ].map((value) => String(value || '').trim()).find(Boolean) || ''
-            : '';
+        const domModel = ${buildChatGPTDomModelScript()};
+        const userRecords = domModel.read().records.filter((record) => record.role === 'user');
+        const chatgptUserTurns = userRecords.map((record) => record.node);
+        const lastUserRecord = userRecords[userRecords.length - 1] || null;
+        const lastUserTurn = lastUserRecord?.node || null;
+        const lastUserId = lastUserRecord?.messageId || [lastUserTurn?.id, lastUserTurn?.getAttribute?.('data-testid')]
+          .map((value) => String(value || '').trim()).find(Boolean) || '';
         const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
         const digestUserText = async (value) => {
           const bytes = new TextEncoder().encode(normalizeUserTurnText(value));
@@ -7688,11 +7860,13 @@ export class ChatGPTController {
       if (!composer) return { ok: false, reason: 'active_composer_not_found' };
       const promptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
       if (promptText !== expectedPrompt) return { ok: false, reason: 'prompt_changed', promptTextLength: promptText.trim().length };
-      const userTurns = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]'));
-      const lastUserTurn = userTurns[userTurns.length - 1] || null;
-      const lastUserId = lastUserTurn
-        ? [lastUserTurn.getAttribute('data-message-id'), lastUserTurn.id, lastUserTurn.getAttribute('data-testid')].map((value) => String(value || '').trim()).find(Boolean) || ''
-        : '';
+      const domModel = ${buildChatGPTDomModelScript()};
+      const userRecords = domModel.read().records.filter((record) => record.role === 'user');
+      const userTurns = userRecords.map((record) => record.node);
+      const lastUserRecord = userRecords[userRecords.length - 1] || null;
+      const lastUserTurn = lastUserRecord?.node || null;
+      const lastUserId = lastUserRecord?.messageId || [lastUserTurn?.id, lastUserTurn?.getAttribute?.('data-testid')]
+        .map((value) => String(value || '').trim()).find(Boolean) || '';
       const normalizeUserTurnText = ${normalizeUserTurnText.toString()};
       const lastUserText = String(lastUserTurn?.innerText || '');
       const lastUserTextDigest = await (async (value) => {
@@ -7831,7 +8005,7 @@ export class ChatGPTController {
         const selectedFileNames = names(Array.from(currentUploadInput?.files || []).map((file) => file.name));
         const cardCount = Array.from(composer.querySelectorAll('[role="group"][aria-label]')).filter(isFileCard).filter(isCurrentDraftFileCard).length;
         const promptText = promptNode.matches('textarea, input') ? String(promptNode.value || '') : String(promptNode.innerText || promptNode.textContent || '');
-        const userTurnCount = Array.from(document.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')).length;
+        const userTurnCount = ${buildChatGPTDomModelScript()}.read().records.filter((record) => record.role === 'user').length;
         return {
           selectedFileNames,
           cardCount,
@@ -7866,16 +8040,18 @@ export class ChatGPTController {
       if (!isChatGPT) {
         return { isChatGPT: false, assistantCount: 0, lastAssistantId: '', lastAssistantText: '' };
       }
-      const assistantBaseline = '[data-message-author-role="assistant"], article[data-turn="assistant"]';
-      const nodes = Array.from(document.querySelectorAll(assistantBaseline));
-      const lastNode = nodes[nodes.length - 1] || null;
-      const lastAssistantId = lastNode
-        ? [
-            lastNode.getAttribute('data-message-id'),
-            lastNode.id,
-            lastNode.getAttribute('data-testid')
-          ].map((value) => String(value || '').trim()).find(Boolean) || ''
-        : '';
+      // Keep a stable marker for the baseline evaluation path used by the
+      // provider harness while the normalized DOM model supplies the data.
+      const assistantBaseline = '[data-content-search-unit-key$=":assistant"]';
+      const domModel = ${buildChatGPTDomModelScript()};
+      const assistantRecords = domModel.read().records.filter((record) => record.role === 'assistant');
+      const nodes = assistantRecords.map((record) => record.node);
+      const lastRecord = assistantRecords[assistantRecords.length - 1] || null;
+      const lastNode = lastRecord?.node || null;
+      const lastAssistantId = lastRecord?.messageId || [
+        lastNode?.id,
+        lastNode?.getAttribute?.('data-testid')
+      ].map((value) => String(value || '').trim()).find(Boolean) || '';
       return {
         isChatGPT: true,
         assistantCount: nodes.length,
@@ -7888,7 +8064,7 @@ export class ChatGPTController {
   async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400, baseline = null } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
-    const chatgptAssistantSel = JSON.stringify('[data-message-author-role="assistant"], article[data-turn="assistant"]');
+    const chatgptAssistantSel = JSON.stringify('[data-content-search-unit-key$=":assistant"], [data-message-author-role="assistant"], article[data-turn="assistant"]');
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const now = this.responseClock;
@@ -7989,18 +8165,19 @@ export class ChatGPTController {
           sendPresent = !!send;
           sendEnabled = send ? !send.disabled && String(send.getAttribute('aria-disabled') || '').toLowerCase() !== 'true' : true;
         }
-        const assistantCandidates = isChatGPT ? ${chatgptAssistantSel} : ${assistantSel};
-        const nodes = Array.from(document.querySelectorAll(assistantCandidates));
+        const assistantCandidates = isChatGPT
+          ? '[data-content-search-unit-key$=":assistant"]'
+          : ${assistantSel};
+        const domModel = isChatGPT ? ${buildChatGPTDomModelScript()} : null;
+        const assistantRecords = domModel ? domModel.read().records.filter((record) => record.role === 'assistant') : [];
+        const nodes = isChatGPT ? assistantRecords.map((record) => record.node) : Array.from(document.querySelectorAll(${assistantSel}));
+        const lastRecord = assistantRecords[assistantRecords.length - 1] || null;
         const lastNode = nodes[nodes.length - 1];
-        const lastAssistantId = lastNode
-          ? [
-              lastNode.getAttribute('data-message-id'),
-              lastNode.id,
-              lastNode.getAttribute('data-testid')
-            ].map((value) => String(value || '').trim()).find(Boolean) || ''
-          : '';
+        const lastAssistantId = isChatGPT
+          ? (lastRecord?.messageId || [lastNode?.id, lastNode?.getAttribute?.('data-testid')].map((value) => String(value || '').trim()).find(Boolean) || '')
+          : (lastNode ? [lastNode.getAttribute('data-message-id'), lastNode.id, lastNode.getAttribute('data-testid')].map((value) => String(value || '').trim()).find(Boolean) || '' : '');
         const fallbackMainText = isChatGPT ? '' : ((document.querySelector('main') || document.body)?.innerText || '').trim();
-        const txt = (lastNode ? lastNode.innerText : fallbackMainText).trim();
+        const txt = (lastRecord ? lastRecord.text : lastNode ? lastNode.innerText : fallbackMainText).trim();
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;

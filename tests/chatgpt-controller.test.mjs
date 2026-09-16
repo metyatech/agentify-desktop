@@ -12,6 +12,7 @@ import {
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
   conversationSemanticAnchorSignature,
   conversationSemanticTailSignature,
+  buildChatGPTDomModelScript,
   buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
   conversationStartBoundaryProof,
@@ -769,6 +770,94 @@ function evaluateConversationWindowReadWithDom({
   };
   context.globalThis = context;
   return vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), context);
+}
+
+function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy = false, innerScroller = true } = {}) {
+  const body = {
+    tagName: 'BODY', parentElement: null, id: '', className: '', scrollHeight: 2_000, clientHeight: 800, scrollTop: 0,
+    matches: () => false,
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+  };
+  const scroller = {
+    tagName: 'DIV', parentElement: body, id: innerScroller ? 'conversation-scroll' : '', className: 'thread-scroll-container overflow-y-auto',
+    scrollHeight: 1_600, clientHeight: 800, scrollTop: 0,
+    matches: () => false,
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+  };
+  const selection = { tagName: 'DIV', parentElement: innerScroller ? scroller : body, style: {}, matches: () => false, getAttribute: () => null };
+  const host = { tagName: 'DIV', parentElement: selection, style: { marginTop: `${offsetPx}px` }, matches: () => false, getAttribute: () => null };
+  const wrappers = [];
+  const units = [];
+  const contains = (root, child) => {
+    let current = child;
+    while (current) {
+      if (current === root) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+  body.contains = (child) => child === body || contains(body, child);
+  scroller.contains = (child) => child === scroller || contains(scroller, child);
+  const makeUnit = (turnKey, unitIndex, role) => {
+    const unitKey = `${turnKey}:${unitIndex}:${role}`;
+    const action = { remove() {} };
+    const unit = {
+      tagName: 'DIV', parentElement: null, innerText: role === 'assistant' ? 'assistant answer Copy' : 'user prompt', textContent: role === 'assistant' ? 'assistant answer Copy' : 'user prompt',
+      getAttribute(name) { return name === 'data-content-search-unit-key' ? unitKey : null; },
+      closest(selector) { return selector === '[data-turn-key]' ? this.parentElement : null; },
+      contains(child) { return child === this || contains(this, child); },
+      cloneNode() {
+        return { innerText: role === 'assistant' ? 'assistant answer' : 'user prompt', textContent: role === 'assistant' ? 'assistant answer' : 'user prompt', matches: () => false, querySelectorAll: () => [action] };
+      }
+    };
+    return unit;
+  };
+  for (const [turnKey, entries] of [['turn-a', [['0', 'user'], ['2', 'assistant']]], ['turn-b', [['0', 'user']]]]) {
+    const wrapper = {
+      tagName: 'DIV', parentElement: host, style: {}, id: '', className: '',
+      getAttribute(name) { return name === 'data-turn-key' ? turnKey : null; },
+      closest(selector) { return selector === '[data-turn-key]' ? this : null; },
+      contains(child) { return child === this || contains(this, child); },
+      matches: () => false
+    };
+    wrappers.push(wrapper);
+    for (const [unitIndex, role] of entries) {
+      const unit = makeUnit(turnKey, unitIndex, role);
+      unit.parentElement = wrapper;
+      units.push(unit);
+    }
+  }
+  if (malformed) {
+    const bad = makeUnit('different-turn', 0, 'assistant');
+    bad.parentElement = wrappers[0];
+    bad.getAttribute = (name) => name === 'data-content-search-unit-key' ? 'turn-a:not-a-role' : null;
+    units.push(bad);
+  }
+  if (legacy) {
+    wrappers[0].getAttribute = (name) => name === 'data-turn-key' ? 'turn-a' : name === 'data-message-author-role' ? 'user' : null;
+  }
+  const document = {
+    scrollingElement: body,
+    documentElement: body,
+    querySelectorAll(selector) {
+      if (selector === '[data-content-search-unit-key]') return units;
+      if (selector === '[data-turn-key]') return wrappers;
+      if (selector.includes('[data-message-author-role="user"]')) return legacy ? [wrappers[0]] : [];
+      if (selector.includes('[data-message-author-role="assistant"]') || selector.includes('article[data-turn')) return [];
+      return [];
+    }
+  };
+  const context = {
+    document,
+    location: { href: 'https://chatgpt.com/c/current-dom-test' },
+    innerWidth: 1_000,
+    innerHeight: 800,
+    getComputedStyle(node) { return { overflowY: node === (innerScroller ? scroller : body) ? (innerScroller ? 'auto' : 'visible') : 'visible' }; }
+  };
+  context.globalThis = context;
+  return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
 function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
@@ -3393,6 +3482,83 @@ test('chatgpt-controller: traversal read is lightweight and carries bounded iden
   assert.match(source, /const traversalRead = true;/u);
   assert.match(source, /textDigest/u);
   assert.doesNotMatch(source, /cloneNode/u);
+});
+
+test('chatgpt-controller: current content-search units normalize roles and stable identities without positions', () => {
+  const { result } = evaluateCurrentDomModel({ offsetPx: 4_800 });
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.messageDomMode, 'content-search-unit');
+  assert.equal(result.diagnostics.currentMessageUnitCount, 3);
+  assert.equal(result.diagnostics.validCurrentMessageUnitCount, 3);
+  assert.equal(result.diagnostics.malformedCurrentMessageUnitCount, 0);
+  assert.equal(result.diagnostics.renderedTurnWrapperCount, 2);
+  assert.equal(result.diagnostics.virtualizerTopOffsetPx, 4_800);
+  assert.deepEqual(Array.from(result.records, (record) => [record.role, record.messageId, record.turnId, record.positionHint]), [
+    ['user', 'turn-a:0:user', 'turn-a', null],
+    ['assistant', 'turn-a:2:assistant', 'turn-a', null],
+    ['user', 'turn-b:0:user', 'turn-b', null]
+  ]);
+  assert.equal(result.records[1].text, 'assistant answer');
+});
+
+test('chatgpt-controller: malformed current unit keys fail closed', () => {
+  const { result } = evaluateCurrentDomModel({ malformed: true });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, 'message-dom-invalid');
+  assert.equal(result.diagnostics.malformedCurrentMessageUnitCount, 1);
+  assert.equal(result.records.length, 0);
+});
+
+test('chatgpt-controller: mixed legacy and current markers do not duplicate a logical message', () => {
+  const { result } = evaluateCurrentDomModel({ legacy: true, offsetPx: 0 });
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.messageDomMode, 'mixed');
+  assert.equal(result.diagnostics.mixedRepresentationConflict, false);
+  assert.equal(result.records.length, 3);
+  assert.deepEqual(Array.from(result.records, (record) => record.messageId), ['turn-a:0:user', 'turn-a:2:assistant', 'turn-b:0:user']);
+});
+
+test('chatgpt-controller: current units resolve the shared conversation scroller and visible window', () => {
+  const fixture = evaluateCurrentDomModel({ offsetPx: 4_800 });
+  const result = vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), fixture.context);
+  assert.equal(result.scroller.candidateCount, 1);
+  assert.equal(result.scroller.selected.id, 'conversation-scroll');
+  assert.equal(result.scroller.selected.overflowY, 'auto');
+  assert.equal(result.turns.length, 3);
+  assert.deepEqual(Array.from(result.turns, (turn) => turn.positionHint), [null, null, null]);
+  assert.equal(result.scroller.messageDomMode, 'content-search-unit');
+});
+
+test('chatgpt-controller: current virtualizer offset above zero cannot prove conversation start', () => {
+  const fixture = evaluateCurrentDomModel({ offsetPx: 4_800 });
+  const state = vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), fixture.context);
+  const proof = conversationStartBoundaryProof({ ...state, urlStable: true }, { physicalTopStable: true });
+  assert.equal(proof.proven, false);
+  assert.equal(proof.mode, null);
+});
+
+test('chatgpt-controller: current virtualizer origin proof requires an explicit zero offset', () => {
+  const fixture = evaluateCurrentDomModel({ offsetPx: 0 });
+  const state = vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), fixture.context);
+  const proof = conversationStartBoundaryProof({ ...state, urlStable: true }, { physicalTopStable: true });
+  assert.equal(proof.proven, true);
+  assert.equal(proof.mode, 'virtualized-origin');
+});
+
+test('chatgpt-controller: current stable unit IDs merge overlapping virtualized windows', () => {
+  const result = mergeConversationSnapshots([
+    [
+      { role: 'user', text: 'first', messageId: 'turn-a:0:user', turnId: 'turn-a', positionHint: null },
+      { role: 'assistant', text: 'answer', messageId: 'turn-a:2:assistant', turnId: 'turn-a', positionHint: null }
+    ],
+    [
+      { role: 'assistant', text: 'answer', messageId: 'turn-a:2:assistant', turnId: 'turn-a', positionHint: null },
+      { role: 'user', text: 'second', messageId: 'turn-b:0:user', turnId: 'turn-b', positionHint: null }
+    ]
+  ]);
+  assert.equal(result.ambiguous, false);
+  assert.equal(result.turns.length, 3);
+  assert.deepEqual(result.turns.map((turn) => turn.messageId), ['turn-a:0:user', 'turn-a:2:assistant', 'turn-b:0:user']);
 });
 
 test('chatgpt-controller: complete history backfills from the tail through virtualization and restores a middle position', async () => {

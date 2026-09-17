@@ -772,7 +772,7 @@ function evaluateConversationWindowReadWithDom({
   return vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), context);
 }
 
-function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy = false, innerScroller = true } = {}) {
+function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy = false, innerScroller = true, missingContentTurn = false, mismatchedContentTurn = false, missingVirtualizerWrapper = false } = {}) {
   const body = {
     tagName: 'BODY', parentElement: null, id: '', className: '', scrollHeight: 2_000, clientHeight: 800, scrollTop: 0,
     matches: () => false,
@@ -800,43 +800,68 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   };
   body.contains = (child) => child === body || contains(body, child);
   scroller.contains = (child) => child === scroller || contains(scroller, child);
-  const makeUnit = (turnKey, unitIndex, role) => {
-    const unitKey = `${turnKey}:${unitIndex}:${role}`;
+  const makeUnit = (contentTurnKey, unitIndex, role) => {
+    const unitKey = `${contentTurnKey}:${unitIndex}:${role}`;
     const action = { remove() {} };
+    let contentTurn = null;
+    let virtualizerWrapper = null;
     const unit = {
       tagName: 'DIV', parentElement: null, innerText: role === 'assistant' ? 'assistant answer Copy' : 'user prompt', textContent: role === 'assistant' ? 'assistant answer Copy' : 'user prompt',
       getAttribute(name) { return name === 'data-content-search-unit-key' ? unitKey : null; },
-      closest(selector) { return selector === '[data-turn-key]' ? this.parentElement : null; },
+      closest(selector) {
+        if (selector === '[data-content-search-turn-key]') return contentTurn;
+        if (selector === '[data-turn-key]') return virtualizerWrapper;
+        return null;
+      },
       contains(child) { return child === this || contains(this, child); },
       cloneNode() {
         return { innerText: role === 'assistant' ? 'assistant answer' : 'user prompt', textContent: role === 'assistant' ? 'assistant answer' : 'user prompt', matches: () => false, querySelectorAll: () => [action] };
       }
     };
+    unit.setParents = (content, wrapper) => {
+      contentTurn = content;
+      virtualizerWrapper = wrapper;
+    };
     return unit;
   };
-  for (const [turnKey, entries] of [['turn-a', [['0', 'user'], ['2', 'assistant']]], ['turn-b', [['0', 'user']]]]) {
+  for (const [contentTurnKey, virtualizerTurnKey, entries] of [
+    ['turn-a', 'virtual-wrapper-a', [['0', 'user'], ['2', 'assistant']]],
+    ['turn-b', 'virtual-wrapper-b', [['0', 'user']]]
+  ]) {
     const wrapper = {
       tagName: 'DIV', parentElement: host, style: {}, id: '', className: '',
-      getAttribute(name) { return name === 'data-turn-key' ? turnKey : null; },
+      getAttribute(name) { return name === 'data-turn-key' ? virtualizerTurnKey : null; },
       closest(selector) { return selector === '[data-turn-key]' ? this : null; },
+      contains(child) { return child === this || contains(this, child); },
+      matches: () => false
+    };
+    const contentTurn = {
+      tagName: 'DIV', parentElement: wrapper, style: {},
+      getAttribute(name) {
+        if (name !== 'data-content-search-turn-key') return null;
+        return mismatchedContentTurn ? `different-${contentTurnKey}` : contentTurnKey;
+      },
+      closest(selector) { return selector === '[data-content-search-turn-key]' ? this : selector === '[data-turn-key]' ? wrapper : null; },
       contains(child) { return child === this || contains(this, child); },
       matches: () => false
     };
     wrappers.push(wrapper);
     for (const [unitIndex, role] of entries) {
-      const unit = makeUnit(turnKey, unitIndex, role);
-      unit.parentElement = wrapper;
+      const unit = makeUnit(contentTurnKey, unitIndex, role);
+      unit.parentElement = missingContentTurn ? wrapper : contentTurn;
+      unit.setParents(missingContentTurn ? null : contentTurn, missingVirtualizerWrapper ? null : wrapper);
       units.push(unit);
     }
   }
   if (malformed) {
     const bad = makeUnit('different-turn', 0, 'assistant');
     bad.parentElement = wrappers[0];
+    bad.setParents(null, wrappers[0]);
     bad.getAttribute = (name) => name === 'data-content-search-unit-key' ? 'turn-a:not-a-role' : null;
     units.push(bad);
   }
   if (legacy) {
-    wrappers[0].getAttribute = (name) => name === 'data-turn-key' ? 'turn-a' : name === 'data-message-author-role' ? 'user' : null;
+    wrappers[0].getAttribute = (name) => name === 'data-turn-key' ? 'virtual-wrapper-a' : name === 'data-message-author-role' ? 'user' : null;
   }
   const document = {
     scrollingElement: body,
@@ -3528,14 +3553,20 @@ function createCurrentTraversalSafetyFixture() {
     return control;
   };
   const textFor = (baseText, currentControls) => [baseText, ...currentControls.filter((control) => !control.removed).map((control) => control.label)].join('\n');
-  const makeUnit = (turnKey, unitIndex, role, baseText, labels = []) => {
-    const unitKey = `${turnKey}:${unitIndex}:${role}`;
+  const makeUnit = (contentTurnKey, unitIndex, role, baseText, labels = []) => {
+    const unitKey = `${contentTurnKey}:${unitIndex}:${role}`;
+    let contentTurn = null;
+    let virtualizerWrapper = null;
     const unit = {
       tagName: 'DIV', parentElement: null,
       get innerText() { return textFor(baseText, controls.filter((control) => control.owner === this)); },
       get textContent() { return this.innerText; },
       getAttribute(name) { return name === 'data-content-search-unit-key' ? unitKey : null; },
-      closest(selector) { return selector === '[data-turn-key]' ? this.parentElement : null; },
+      closest(selector) {
+        if (selector === '[data-content-search-turn-key]') return contentTurn;
+        if (selector === '[data-turn-key]') return virtualizerWrapper;
+        return null;
+      },
       contains(child) { return child === this || contains(this, child); },
       querySelectorAll() { return controls.filter((control) => control.owner === this && !control.removed); },
       cloneNode() {
@@ -3554,21 +3585,33 @@ function createCurrentTraversalSafetyFixture() {
       control.owner = unit;
       controls.push(control);
     }
+    unit.setParents = (content, wrapper) => {
+      contentTurn = content;
+      virtualizerWrapper = wrapper;
+    };
     return unit;
   };
   for (const [turnKey, role, unitIndex, text, labels] of [
-    ['turn-a', 'user', '0', 'Question', []],
-    ['turn-a', 'assistant', '2', 'Answer text', ['Copy', 'citation']]
+    ['content-a', 'user', '0', 'Question', []],
+    ['content-a', 'assistant', '2', 'Answer text', ['Copy', 'citation']]
   ]) {
     const wrapper = {
       tagName: 'DIV', parentElement: host, style: {},
-      getAttribute(name) { return name === 'data-turn-key' ? turnKey : null; },
+      getAttribute(name) { return name === 'data-turn-key' ? `virtual-${turnKey}` : null; },
       closest(selector) { return selector === '[data-turn-key]' ? this : null; },
       contains(child) { return child === this || contains(this, child); },
       matches: () => false
     };
+    const contentTurn = {
+      tagName: 'DIV', parentElement: wrapper, style: {},
+      getAttribute(name) { return name === 'data-content-search-turn-key' ? turnKey : null; },
+      closest(selector) { return selector === '[data-content-search-turn-key]' ? this : selector === '[data-turn-key]' ? wrapper : null; },
+      contains(child) { return child === this || contains(this, child); },
+      matches: () => false
+    };
     const unit = makeUnit(turnKey, unitIndex, role, text, labels);
-    unit.parentElement = wrapper;
+    unit.parentElement = contentTurn;
+    unit.setParents(contentTurn, wrapper);
     wrappers.push(wrapper);
     units.push(unit);
   }
@@ -3608,8 +3651,8 @@ test('chatgpt-controller: traversal reads filter current controls without mutati
   assert.ok(fixture.cloneRemoveCalls > 0);
   assert.deepEqual(fixture.structure(), before);
   assert.deepEqual(Array.from(result.turns, (turn) => [turn.role, turn.messageId, turn.textLength]), [
-    ['user', 'turn-a:0:user', 8],
-    ['assistant', 'turn-a:2:assistant', 11]
+    ['user', 'content-a:0:user', 8],
+    ['assistant', 'content-a:2:assistant', 11]
   ]);
   assert.equal(result.turns.length, 2);
 });
@@ -3634,14 +3677,43 @@ test('chatgpt-controller: current content-search units normalize roles and stabl
   assert.equal(result.diagnostics.currentMessageUnitCount, 3);
   assert.equal(result.diagnostics.validCurrentMessageUnitCount, 3);
   assert.equal(result.diagnostics.malformedCurrentMessageUnitCount, 0);
+  assert.equal(result.diagnostics.contentTurnKeyValidatedCount, 3);
+  assert.equal(result.diagnostics.virtualizerWrapperPresentCount, 3);
   assert.equal(result.diagnostics.renderedTurnWrapperCount, 2);
   assert.equal(result.diagnostics.virtualizerTopOffsetPx, 4_800);
-  assert.deepEqual(Array.from(result.records, (record) => [record.role, record.messageId, record.turnId, record.positionHint]), [
-    ['user', 'turn-a:0:user', 'turn-a', null],
-    ['assistant', 'turn-a:2:assistant', 'turn-a', null],
-    ['user', 'turn-b:0:user', 'turn-b', null]
+  assert.deepEqual(Array.from(result.records, (record) => [record.role, record.messageId, record.turnId, record.virtualizerTurnKey, record.positionHint]), [
+    ['user', 'turn-a:0:user', 'turn-a', 'virtual-wrapper-a', null],
+    ['assistant', 'turn-a:2:assistant', 'turn-a', 'virtual-wrapper-a', null],
+    ['user', 'turn-b:0:user', 'turn-b', 'virtual-wrapper-b', null]
   ]);
   assert.equal(result.records[1].text, 'assistant answer');
+});
+
+test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {
+  const { result } = evaluateCurrentDomModel({ offsetPx: 0 });
+  assert.equal(result.valid, true);
+  assert.deepEqual(Array.from(result.records, (record) => ({
+    messageId: record.messageId,
+    turnId: record.turnId,
+    virtualizerTurnKey: record.virtualizerTurnKey
+  })), [
+    { messageId: 'turn-a:0:user', turnId: 'turn-a', virtualizerTurnKey: 'virtual-wrapper-a' },
+    { messageId: 'turn-a:2:assistant', turnId: 'turn-a', virtualizerTurnKey: 'virtual-wrapper-a' },
+    { messageId: 'turn-b:0:user', turnId: 'turn-b', virtualizerTurnKey: 'virtual-wrapper-b' }
+  ]);
+});
+
+test('chatgpt-controller: current units fail closed without exact logical content-turn binding or virtualizer structure', () => {
+  for (const options of [
+    { missingContentTurn: true },
+    { mismatchedContentTurn: true },
+    { missingVirtualizerWrapper: true }
+  ]) {
+    const { result } = evaluateCurrentDomModel(options);
+    assert.equal(result.valid, false);
+    assert.equal(result.reason, 'message-dom-invalid');
+    assert.equal(result.records.length, 0);
+  }
 });
 
 test('chatgpt-controller: malformed current unit keys fail closed', () => {
@@ -3702,6 +3774,30 @@ test('chatgpt-controller: current stable unit IDs merge overlapping virtualized 
   assert.equal(result.ambiguous, false);
   assert.equal(result.turns.length, 3);
   assert.deepEqual(result.turns.map((turn) => turn.messageId), ['turn-a:0:user', 'turn-a:2:assistant', 'turn-b:0:user']);
+});
+
+test('chatgpt-controller: virtualizer remounts do not duplicate stable logical current units', () => {
+  const result = mergeConversationSnapshots([
+    [
+      { role: 'assistant', text: 'answer', messageId: 'content-a:2:assistant', turnId: 'content-a', virtualizerTurnKey: 'virtual-A1', positionHint: null }
+    ],
+    [
+      { role: 'assistant', text: 'answer', messageId: 'content-a:2:assistant', turnId: 'content-a', virtualizerTurnKey: 'virtual-A2', positionHint: null }
+    ]
+  ]);
+  assert.equal(result.ambiguous, false);
+  assert.equal(result.turns.length, 1);
+  assert.deepEqual({
+    role: result.turns[0].role,
+    text: result.turns[0].text,
+    messageId: result.turns[0].messageId,
+    turnId: result.turns[0].turnId
+  }, {
+    role: 'assistant',
+    text: 'answer',
+    messageId: 'content-a:2:assistant',
+    turnId: 'content-a'
+  });
 });
 
 test('chatgpt-controller: complete history backfills from the tail through virtualization and restores a middle position', async () => {

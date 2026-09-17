@@ -293,11 +293,15 @@ export function buildChatGPTDomModelScript() {
       for (const [domIndex, node] of nodes.entries()) {
         const unitKey = String(node.getAttribute?.('data-content-search-unit-key') || '').trim();
         const match = /^(.*):([0-9]{1,3}):(user|assistant)$/u.exec(unitKey);
-        const wrapper = node.closest?.('[data-turn-key]') || null;
-        const turnKey = String(wrapper?.getAttribute?.('data-turn-key') || '').trim();
+        const contentTurn = node.closest?.('[data-content-search-turn-key]') || null;
+        const contentTurnKey = String(contentTurn?.getAttribute?.('data-content-search-turn-key') || '').trim();
+        const virtualizerWrapper = node.closest?.('[data-turn-key]') || null;
+        const virtualizerTurnKey = String(virtualizerWrapper?.getAttribute?.('data-turn-key') || '').trim();
         const valid = !!match
-          && !!turnKey
-          && match[1] === turnKey
+          && !!contentTurnKey
+          && !!virtualizerWrapper
+          && !!virtualizerTurnKey
+          && match[1] === contentTurnKey
           && Number.isSafeInteger(Number(match[2]))
           && Number(match[2]) >= 0
           && Number(match[2]) <= 999
@@ -311,7 +315,8 @@ export function buildChatGPTDomModelScript() {
           node,
           role: match[3],
           messageId: unitKey,
-          turnId: turnKey,
+          turnId: contentTurnKey,
+          virtualizerTurnKey,
           positionHint: null,
           domMode: 'content-search-unit',
           domIndex,
@@ -436,6 +441,8 @@ export function buildChatGPTDomModelScript() {
           currentMessageUnitCount: current.nodes.length,
           validCurrentMessageUnitCount: currentRecords.length,
           malformedCurrentMessageUnitCount: current.malformedCount,
+          contentTurnKeyValidatedCount: currentRecords.length,
+          virtualizerWrapperPresentCount: currentRecords.filter((record) => record.virtualizerTurnKey).length,
           renderedTurnWrapperCount: document.querySelectorAll('[data-turn-key]').length,
           virtualizerTopOffsetPx: virtualizer.offsetPx,
           virtualizerHostCount: virtualizer.hostCount,

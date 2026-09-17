@@ -32,6 +32,9 @@ const CONVERSATION_HISTORY_RESTORE_ATTEMPTS = 4;
 const CONVERSATION_HISTORY_RESTORE_SETTLE_WAIT_MS = 240;
 const CONVERSATION_HISTORY_TAIL_RECHECK_WAIT_MS = 200;
 const CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES = 3;
+const CONVERSATION_HISTORY_TOP_MATERIALIZATION_WAIT_MS = 3_000;
+const CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS = 200;
+const CONVERSATION_HISTORY_TOP_MATERIALIZATION_MAX_ATTEMPTS = 2;
 const CONVERSATION_TAIL_TIMEOUT_MS = 5_000;
 const CONVERSATION_TAIL_MAX_ITERATIONS = 16;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -1022,6 +1025,63 @@ function conversationWindowIdentitySignature(turns = []) {
     turn?.messageId || turn?.turnId || '',
     Number.isInteger(turn?.positionHint) ? turn.positionHint : null
   ]));
+}
+
+function conversationDirectionalIdentityKey(turn, index) {
+  const messageId = String(turn?.messageId || '').trim();
+  if (messageId) return `message:${messageId}`;
+  const turnId = String(turn?.turnId || '').trim();
+  if (turnId) return `turn:${turnId}`;
+  return Number.isInteger(turn?.positionHint) ? `position:${turn.positionHint}` : null;
+}
+
+export function conversationDirectionalProgress(beforeTurns = [], afterTurns = []) {
+  const before = Array.isArray(beforeTurns) ? beforeTurns : [];
+  const after = Array.isArray(afterTurns) ? afterTurns : [];
+  const beforeKeys = before.map(conversationDirectionalIdentityKey);
+  const afterKeys = after.map(conversationDirectionalIdentityKey);
+  if (beforeKeys.length === 0 || afterKeys.length === 0 || beforeKeys.some((key) => !key) || afterKeys.some((key) => !key)) return 'ambiguous';
+  if (new Set(beforeKeys).size !== beforeKeys.length || new Set(afterKeys).size !== afterKeys.length) return 'ambiguous';
+  const beforeByKey = new Map(beforeKeys.map((key, index) => [key, before[index]]));
+  const afterByKey = new Map(afterKeys.map((key, index) => [key, after[index]]));
+  for (const key of beforeKeys) {
+    const matching = afterByKey.get(key);
+    if (!matching) continue;
+    if (beforeByKey.get(key)?.role !== matching.role) return 'ambiguous';
+  }
+  const sharedBefore = beforeKeys.filter((key) => afterByKey.has(key));
+  const sharedAfter = afterKeys.filter((key) => beforeByKey.has(key));
+  if (sharedBefore.length === 0 || JSON.stringify(sharedBefore) !== JSON.stringify(sharedAfter)) return 'ambiguous';
+  if (JSON.stringify(beforeKeys) === JSON.stringify(afterKeys)) return 'same';
+  const firstSharedBefore = beforeKeys.indexOf(sharedBefore[0]);
+  const lastSharedBefore = beforeKeys.lastIndexOf(sharedBefore.at(-1));
+  const firstSharedAfter = afterKeys.indexOf(sharedAfter[0]);
+  const lastSharedAfter = afterKeys.lastIndexOf(sharedAfter.at(-1));
+  const beforePrefixOnly = beforeKeys.slice(0, firstSharedBefore).every((key) => !afterByKey.has(key));
+  const beforeSuffixOnly = beforeKeys.slice(lastSharedBefore + 1).every((key) => !afterByKey.has(key));
+  const afterPrefixOnly = afterKeys.slice(0, firstSharedAfter).every((key) => !beforeByKey.has(key));
+  const afterSuffixOnly = afterKeys.slice(lastSharedAfter + 1).every((key) => !beforeByKey.has(key));
+  const afterPrefixLength = afterKeys.slice(0, firstSharedAfter).length;
+  const afterSuffixLength = afterKeys.slice(lastSharedAfter + 1).length;
+  const revealsOlder = afterPrefixOnly && afterPrefixLength > 0 && beforeSuffixOnly && afterSuffixLength === 0;
+  const revealsNewer = afterSuffixOnly && afterSuffixLength > 0 && beforePrefixOnly && afterPrefixLength === 0;
+  if (revealsOlder && !revealsNewer) return 'older';
+  if (revealsNewer && !revealsOlder) return 'newer';
+  return 'ambiguous';
+}
+
+function conversationVirtualizerTopOffset(state) {
+  const candidates = [
+    state?.scroller?.virtualizerTopOffsetPx,
+    state?.startBoundary?.virtualizedOrigin?.topOffsetPx
+  ];
+  const value = candidates.find((candidate) => Number.isFinite(Number(candidate)) && Number(candidate) >= 0);
+  return value === undefined ? null : Number(value);
+}
+
+function conversationUsesCurrentDom(state) {
+  return state?.scroller?.messageDomMode === 'content-search-unit'
+    || state?.startBoundary?.virtualizedOrigin?.domMode === 'content-search-unit';
 }
 
 export function conversationStartBoundaryProof(state, { physicalTopStable = false } = {}) {
@@ -4298,6 +4358,20 @@ export class ChatGPTController {
       },
       observedRange: { min: null, max: null },
       oldestProgression: [],
+      olderProgressCount: 0,
+      olderNoProgressCount: 0,
+      semanticOlderProgressCount: 0,
+      virtualizerOffsetProgressCount: 0,
+      initialVirtualizerTopOffsetPx: null,
+      lowestVirtualizerTopOffsetPx: null,
+      finalVirtualizerTopOffsetPx: null,
+      topMaterialization: {
+        attempted: false,
+        attempts: 0,
+        polls: 0,
+        progressObserved: false,
+        stalled: false
+      },
       tailProven: false,
       startProven: false,
       startProofMode: null,
@@ -4424,6 +4498,14 @@ export class ChatGPTController {
     let iterations = 0;
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
+      const virtualizerTopOffsetPx = conversationVirtualizerTopOffset(state);
+      if (virtualizerTopOffsetPx !== null) {
+        diagnostics.initialVirtualizerTopOffsetPx ??= virtualizerTopOffsetPx;
+        diagnostics.lowestVirtualizerTopOffsetPx = diagnostics.lowestVirtualizerTopOffsetPx === null
+          ? virtualizerTopOffsetPx
+          : Math.min(diagnostics.lowestVirtualizerTopOffsetPx, virtualizerTopOffsetPx);
+        diagnostics.finalVirtualizerTopOffsetPx = virtualizerTopOffsetPx;
+      }
       const range = conversationTurnRange(state?.turns);
       const values = [range.min, range.max, diagnostics.observedRange.min, diagnostics.observedRange.max].filter((value) => Number.isInteger(value));
       diagnostics.observedRange = values.length
@@ -4575,12 +4657,25 @@ export class ChatGPTController {
       const afterSignature = conversationWindowIdentitySignature(after?.turns);
       const windowChanged = beforeSignature !== afterSignature;
       const physicalChanged = Number(before?.scroller?.scrollTop) !== Number(after?.scroller?.scrollTop);
+      const semanticDirection = conversationDirectionalProgress(before?.turns, after?.turns);
+      const beforeVirtualizerTopOffsetPx = conversationVirtualizerTopOffset(before);
+      const virtualizerTopOffsetPx = conversationVirtualizerTopOffset(after);
+      const virtualizerOffsetProgress = direction < 0
+        && conversationUsesCurrentDom(before)
+        && conversationUsesCurrentDom(after)
+        && beforeVirtualizerTopOffsetPx !== null
+        && virtualizerTopOffsetPx !== null
+        && virtualizerTopOffsetPx < beforeVirtualizerTopOffsetPx;
       if (windowChanged) diagnostics.conversationWindowChangeCount += 1;
       if (physicalChanged) diagnostics.physicalScrollChangeCount += 1;
       if (direction < 0 && diagnostics.oldestProgression.length < 80) diagnostics.oldestProgression.push(conversationTurnRange(after?.turns).min);
       return {
         windowChanged,
         physicalChanged,
+        semanticDirection,
+        beforeVirtualizerTopOffsetPx,
+        virtualizerTopOffsetPx,
+        virtualizerOffsetProgress,
         beforeRange: conversationTurnRange(before?.turns),
         range: conversationTurnRange(after?.turns)
       };
@@ -4798,6 +4893,72 @@ export class ChatGPTController {
       }
       entry.reason = entry.loading ? 'direct-top-loading' : 'direct-top-not-verified';
       reason ||= 'history-direct-top-failed';
+      return false;
+    };
+    const directionalProgressFor = (before, after, direction) => {
+      const semanticDirection = conversationDirectionalProgress(before?.turns, after?.turns);
+      const semanticProgress = direction < 0
+        ? semanticDirection === 'older'
+        : semanticDirection === 'newer';
+      const beforeRange = conversationTurnRange(before?.turns);
+      const afterRange = conversationTurnRange(after?.turns);
+      const rangeProgress = direction < 0
+        ? Number.isInteger(afterRange.min) && (!Number.isInteger(beforeRange.min) || afterRange.min < beforeRange.min)
+        : Number.isInteger(afterRange.max) && (!Number.isInteger(beforeRange.max) || afterRange.max > beforeRange.max);
+      const offsetProgress = direction < 0
+        && conversationUsesCurrentDom(before)
+        && conversationUsesCurrentDom(after)
+        && conversationVirtualizerTopOffset(before) !== null
+        && conversationVirtualizerTopOffset(after) !== null
+        && conversationVirtualizerTopOffset(after) < conversationVirtualizerTopOffset(before);
+      return {
+        semanticDirection,
+        semanticProgress,
+        rangeProgress,
+        offsetProgress,
+        progress: semanticProgress || rangeProgress || offsetProgress
+      };
+    };
+    const recordOlderProgress = ({ semanticProgress, offsetProgress, progress }) => {
+      if (semanticProgress) diagnostics.semanticOlderProgressCount += 1;
+      if (offsetProgress) diagnostics.virtualizerOffsetProgressCount += 1;
+      if (progress) {
+        diagnostics.olderProgressCount += 1;
+        diagnostics.olderNoProgressCount = 0;
+      } else {
+        diagnostics.olderNoProgressCount += 1;
+      }
+      return progress;
+    };
+    const waitForTopMaterialization = async () => {
+      if (!conversationUsesCurrentDom(current)
+        || current?.scroller?.atTop !== true
+        || current?.loading === true
+        || !(conversationVirtualizerTopOffset(current) > 0)
+        || diagnostics.topMaterialization.attempts >= CONVERSATION_HISTORY_TOP_MATERIALIZATION_MAX_ATTEMPTS) {
+        return false;
+      }
+      diagnostics.topMaterialization.attempted = true;
+      diagnostics.topMaterialization.attempts += 1;
+      const deadline = Date.now() + CONVERSATION_HISTORY_TOP_MATERIALIZATION_WAIT_MS;
+      let before = current;
+      while (!historyBudgetExpired() && Date.now() <= deadline) {
+        await sleep(CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS);
+        let state = null;
+        try { state = await readWindow(); } catch { state = null; }
+        diagnostics.topMaterialization.polls += 1;
+        if (!state || !currentUrlIsStable(state) || state.limitExceeded || state.scroller?.candidateCount !== 1) break;
+        const progress = directionalProgressFor(before, state, -1);
+        current = state;
+        if (progress.progress) {
+          diagnostics.topMaterialization.progressObserved = true;
+          recordOlderProgress(progress);
+          addSnapshot(state);
+          return true;
+        }
+        before = state;
+      }
+      diagnostics.topMaterialization.stalled = true;
       return false;
     };
     const restore = async () => {
@@ -5018,6 +5179,8 @@ export class ChatGPTController {
           const entry = {
             changed: result.windowChanged === true,
             physicalChanged: result.physicalChanged === true,
+            semanticDirection: result.semanticDirection || null,
+            virtualizerOffsetProgress: result.virtualizerOffsetProgress === true,
             beforeRange: result.beforeRange || null,
             range: result.range || conversationTurnRange(result.state?.turns)
           };
@@ -5025,6 +5188,8 @@ export class ChatGPTController {
           if (proofDirection > 0 && !diagnostics.firstNativeDown) diagnostics.firstNativeDown = entry;
           if (!result.ok) { reason = result.reason; break; }
           const candidateMin = result.range?.min;
+          const directionalProgress = directionalProgressFor(before, result.state, proofDirection);
+          if (proofDirection < 0) recordOlderProgress(directionalProgress);
           if (proofDirection < 0
             && !result.state?.scroller?.atTop
             && (candidateMin === 0 || candidateMin === 1)) {
@@ -5033,6 +5198,7 @@ export class ChatGPTController {
               diagnostics.nativeScrollControlProven = true;
               break;
             }
+            if (conversationUsesCurrentDom(result.state)) break;
             reason = 'history-native-scroll-unproven';
             break;
           }
@@ -5040,14 +5206,10 @@ export class ChatGPTController {
             diagnostics.nativeScrollControlProven = true;
             break;
           }
-          const beforeMin = conversationTurnRange(before?.turns).min;
-          const afterMin = result.range?.min;
-          const beforeMax = conversationTurnRange(before?.turns).max;
-          const afterMax = result.range?.max;
-          const rangeProgress = proofDirection < 0
-            ? Number.isInteger(afterMin) && (!Number.isInteger(beforeMin) || afterMin < beforeMin)
-            : Number.isInteger(afterMax) && (!Number.isInteger(beforeMax) || afterMax > beforeMax);
-          if (result.physicalChanged || rangeProgress) {
+          if (directionalProgress.progress
+            || (result.physicalChanged
+              && !conversationUsesCurrentDom(before)
+              && !conversationUsesCurrentDom(result.state))) {
             proofNoProgress = 0;
             continue;
           }
@@ -5060,7 +5222,7 @@ export class ChatGPTController {
           if (proofNoProgress >= 2) {
             diagnostics.directTop.fallbackTriggered = true;
             diagnostics.directTop.fallbackReason = 'native-no-progress';
-            if (await establishDirectTop(afterMin)) break;
+            if (await establishDirectTop(result.range?.min)) break;
           }
         }
         if (!diagnostics.nativeScrollControlProven && !reason
@@ -5111,6 +5273,23 @@ export class ChatGPTController {
             && (currentMin === 0 || currentMin === 1)) {
             if (!await establishDirectTop(currentMin)) break;
           }
+          const currentTopOffset = conversationVirtualizerTopOffset(current);
+          if (current?.scroller?.atTop === true
+            && !current.loading
+            && conversationUsesCurrentDom(current)
+            && currentTopOffset !== null
+            && currentTopOffset > 0) {
+            if (await waitForTopMaterialization()) continue;
+            diagnostics.topMaterialization.stalled = true;
+            if (!diagnostics.directTop.fallbackTriggered) {
+              diagnostics.directTop.fallbackTriggered = true;
+              diagnostics.directTop.fallbackReason = 'native-no-progress';
+              if (!await establishDirectTop(currentMin)) break;
+              continue;
+            }
+            reason = 'history-virtualizer-stalled';
+            break;
+          }
           if (current?.scroller?.atTop && !current.loading) {
             diagnostics.iterationLimitReached = iterations >= historyMaxIterations;
             diagnostics.iterationLimitReachedAtTop = diagnostics.iterationLimitReached;
@@ -5151,9 +5330,9 @@ export class ChatGPTController {
           const before = current;
           const result = await nativeWheel(-1, current);
           if (!result.ok) { reason = result.reason; break; }
-          const rangeProgress = Number.isInteger(result.range?.min)
-            && (!Number.isInteger(conversationTurnRange(before.turns).min) || result.range.min < conversationTurnRange(before.turns).min);
-          if (result.windowChanged || result.physicalChanged || rangeProgress) noProgressCount = 0;
+          const directionalProgress = directionalProgressFor(before, result.state, -1);
+          recordOlderProgress(directionalProgress);
+          if (directionalProgress.progress) noProgressCount = 0;
           else noProgressCount += 1;
           if (noProgressCount >= 3) {
             diagnostics.directTop.fallbackTriggered = true;
@@ -5172,6 +5351,8 @@ export class ChatGPTController {
       if (!windowRestored && !reason) reason = 'history-window-restore-failed';
     }
     if (!diagnostics.scrollRestored && !reason) reason = 'scroll-restore-failed';
+    const finalVirtualizerTopOffsetPx = conversationVirtualizerTopOffset(current);
+    if (finalVirtualizerTopOffsetPx !== null) diagnostics.finalVirtualizerTopOffsetPx = finalVirtualizerTopOffsetPx;
     const finalRange = conversationTurnRange(current?.turns);
     diagnostics.scroller = current?.scroller
       ? {
@@ -5196,7 +5377,7 @@ export class ChatGPTController {
       finalMax: finalRange.max
     };
     diagnostics.progress = {
-      olderWindowObserved: diagnostics.oldestProgression.some((value, index, values) => index > 0 && Number.isInteger(value) && Number.isInteger(values[index - 1]) && value < values[index - 1]),
+      olderWindowObserved: diagnostics.olderProgressCount > 0,
       scrollProgressObserved: diagnostics.conversationWindowChangeCount > 0,
       tailProven: diagnostics.tailProven,
       startProven: diagnostics.startProven

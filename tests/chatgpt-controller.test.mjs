@@ -16,6 +16,7 @@ import {
   buildChatGPTDomModelScript,
   buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
+  conversationDirectionalProgress,
   conversationStartBoundaryProof,
   verifyCompleteHistoryFixedPoint,
   mergeConversationSnapshots,
@@ -886,7 +887,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -912,6 +913,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
   let scrollTopOverride = null;
   let scrollHeightOverride = null;
   let loadingOverride = null;
+  let virtualizerTopOffsetOverride = Number.isFinite(Number(virtualizerTopOffsetPx)) ? Number(virtualizerTopOffsetPx) : null;
   const initialState = initialBrowserWindowState || (backend === 'chrome-cdp' ? 'minimized' : null);
   let browserWindowState = initialState;
   let adapterMinimized = backend === 'chrome-cdp' ? initialState === 'minimized' : null;
@@ -940,7 +942,19 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         firstMessageRole: positionHints ? (rawPositions[0] % 2 ? 'assistant' : 'user') : null,
         positionZeroMessageNodeCount: positionHints && positions.includes(0) ? 1 : 0,
         positionZeroMarkerInsideScrollerCount: positionHints && positions.includes(0) ? 1 : 0,
-        positionOneMessageNodeCount: positionHints && positions.includes(1) ? 1 : 0
+        positionOneMessageNodeCount: positionHints && positions.includes(1) ? 1 : 0,
+        ...(currentDom ? {
+          virtualizedOrigin: {
+            domMode: 'content-search-unit',
+            scrollerCandidateCount: 1,
+            turnHostCount: 1,
+            topOffsetPx: virtualizerTopOffsetOverride,
+            validMessageCount: positions.length,
+            malformedMessageCount: 0,
+            firstMessageRole: rawPositions[0] % 2 ? 'assistant' : 'user',
+            loading: loadingOverride === true
+          }
+        } : {})
       },
       scroller: {
         candidateCount: 1,
@@ -953,7 +967,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         clientHeight: 400,
         atTop: (Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250) <= 1,
         atBottom: windowIndex === windows.length - 1,
-        point: { x: 500, y: 400 }
+        point: { x: 500, y: 400 },
+        ...(currentDom ? {
+          messageDomMode: 'content-search-unit',
+          virtualizerTopOffsetPx: virtualizerTopOffsetOverride,
+          virtualizerHostCount: 1,
+          validCurrentMessageUnitCount: positions.length,
+          malformedCurrentMessageUnitCount: 0
+        } : {})
       }
     };
   };
@@ -970,6 +991,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
           if (Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
           if (Number.isFinite(Number(planned.scrollTop))) scrollTopOverride = Number(planned.scrollTop);
           if (typeof planned.loading === 'boolean') loadingOverride = planned.loading;
+          if (Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
         }
         scrollTopOverride = 0;
         return { ok: true, scrollTop: 0 };
@@ -986,6 +1008,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
             : Array.isArray(restorePlan) ? restorePlan[restoreCount - 1] : null;
         loadingOverride = typeof planned?.loading === 'boolean' ? planned.loading : false;
         if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollHeight))) scrollHeightOverride = Number(planned.scrollHeight);
+        if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
         if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
         else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
         scrollTopOverride = planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollTop))
@@ -997,6 +1020,11 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       const traversalRead = js.includes('const traversalRead = true;');
       if (!traversalRead) readCount += 1;
       if (Number.isInteger(changeUrlOnReadAt) && readCount === changeUrlOnReadAt) url = 'https://chatgpt.com/c/changed';
+      if (currentDom && typeof virtualizerTopOffsetPlan === 'function') {
+        const planned = await virtualizerTopOffsetPlan({ readCount, traversalRead, windowIndex, currentOffset: virtualizerTopOffsetOverride });
+        if (planned !== null && planned !== undefined && Number.isFinite(Number(planned))) virtualizerTopOffsetOverride = Number(planned);
+        if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
+      }
       const state = snapshot();
       if (traversalRead && typeof onTraversalRead === 'function') await onTraversalRead({ readCount, windowIndex, state: structuredClone(state) });
       const layoutOverride = !traversalRead && Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
@@ -1028,6 +1056,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
           if (matching >= 0) windowIndex = matching;
         }
         scrollTopOverride = Number.isFinite(Number(planned.scrollTop)) ? Number(planned.scrollTop) : null;
+        if (Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
         return;
       }
       scrollTopOverride = null;
@@ -1930,7 +1959,7 @@ test('chatgpt-controller: an already-bottom Chrome baseline uses read-only direc
   assert.equal(result.history.diagnostics.gestureAttemptsDown, 0);
 });
 
-test('chatgpt-controller: top proof consumes the state from the final allowed wheel', async () => {
+test('chatgpt-controller: top proof bounds physical-only jitter without treating it as older progress', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 4,
     mouseWheelPlan: ({ attempt, deltaY }) => {
@@ -1951,12 +1980,13 @@ test('chatgpt-controller: top proof consumes the state from the final allowed wh
     historyMaxIterations: 80
   });
   const diagnostics = result.history.diagnostics;
-  assert.equal(harness.getWheelCount(), 160);
+  assert.ok(harness.getWheelCount() < 160);
   assert.equal(typeof diagnostics.iterationLimitReached, 'boolean');
   assert.equal(typeof diagnostics.iterationLimitReachedAtTop, 'boolean');
-  assert.equal(result.history.startReached, true);
-  assert.equal(result.history.complete, true);
-  assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).at(-1).endsWith(':0:-720'), true);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.complete, false);
+  assert.notEqual(result.history.reason, 'timeout');
+  assert.ok(harness.events.some((event) => event.startsWith('mouse-wheel:')));
 });
 
 test('chatgpt-controller: Chrome complete history does not fall back to scrollGesture when mouseWheel fails', async () => {
@@ -3014,6 +3044,100 @@ test('chatgpt-controller: successful and no-progress wheel diagnostics do not re
   assert.equal(stalled.history.reason, 'history-start-unproven');
   assert.equal(stalled.history.diagnostics.nativeInput.failurePhase, null);
   assert.equal(stalled.history.diagnostics.nativeInput.errorMessage, null);
+});
+
+test('chatgpt-controller: stable IDs classify older, newer, same, and remount transitions without position hints', () => {
+  const message = (id, role = 'user') => ({ messageId: id, role, text: id, positionHint: null });
+  assert.equal(conversationDirectionalProgress([message('m5'), message('m6')], [message('m3'), message('m4'), message('m5')]), 'older');
+  assert.equal(conversationDirectionalProgress([message('m3'), message('m4')], [message('m4'), message('m5'), message('m6')]), 'newer');
+  assert.equal(conversationDirectionalProgress([message('m5'), message('m6')], [message('m5'), message('m6')]), 'same');
+  assert.equal(conversationDirectionalProgress([message('m5', 'user')], [message('m5', 'assistant')]), 'ambiguous');
+  assert.equal(conversationDirectionalProgress([message('m5'), message('m6')], [message('m7'), message('m8')]), 'ambiguous');
+  assert.equal(conversationDirectionalProgress([
+    { messageId: 'm5', role: 'user', text: 'm5', positionHint: null, virtualizerTurnKey: 'virtual-A' },
+    { messageId: 'm6', role: 'assistant', text: 'm6', positionHint: null, virtualizerTurnKey: 'virtual-A' }
+  ], [
+    { messageId: 'm5', role: 'user', text: 'm5', positionHint: null, virtualizerTurnKey: 'virtual-B' },
+    { messageId: 'm6', role: 'assistant', text: 'm6', positionHint: null, virtualizerTurnKey: 'virtual-B' }
+  ]), 'same');
+});
+
+test('chatgpt-controller: physical jitter does not reset semantic older no-progress and fails as a bounded virtualizer stall', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    positionHints: false,
+    backend: 'chrome-cdp',
+    currentDom: true,
+    virtualizerTopOffsetPx: 1_600,
+    windowChanges: true,
+    mouseWheelPlan: ({ attempt }) => ({ scrollTop: attempt % 2 ? 1 : 0 }),
+    directTopPlan: () => ({})
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 240 });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-virtualizer-stalled');
+  assert.ok(result.history.diagnostics.physicalScrollChangeCount > 0);
+  assert.equal(result.history.diagnostics.semanticOlderProgressCount, 0);
+  assert.ok(result.history.diagnostics.olderNoProgressCount > 0);
+  assert.equal(result.history.diagnostics.topMaterialization.stalled, true);
+  assert.equal(result.history.diagnostics.directTop.attempted, true);
+  assert.ok(harness.getWheelCount() < 20);
+});
+
+test('chatgpt-controller: current DOM stable IDs and decreasing virtualizer offsets prove older traversal without position hints', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3], [2, 3, 4, 5], [4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPlan: ({ windowIndex }) => windowIndex * 1_600
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.ok(result.history.diagnostics.semanticOlderProgressCount >= 2);
+  assert.ok(result.history.diagnostics.virtualizerOffsetProgressCount >= 2);
+  assert.equal(result.history.diagnostics.initialVirtualizerTopOffsetPx, 3_200);
+  assert.equal(result.history.diagnostics.lowestVirtualizerTopOffsetPx, 0);
+  assert.equal(result.history.diagnostics.finalVirtualizerTopOffsetPx, 3_200);
+  assert.equal(result.history.diagnostics.progress.olderWindowObserved, true);
+  assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
+});
+
+test('chatgpt-controller: bounded top materialization wait accepts delayed current-DOM offset progress', async () => {
+  let materializationPolls = 0;
+  let materializationArmed = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 1,
+    windowRanges: [[0, 1, 2, 3], [0, 1, 2, 3], [1, 2, 3, 4]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 1_600,
+    restorePlan: () => {
+      materializationPolls = 0;
+      return { virtualizerTopOffsetPx: 1_600 };
+    },
+    mouseWheelPlan: ({ attempt }) => {
+      if (attempt >= 2) materializationArmed = true;
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead, currentOffset, windowIndex }) => {
+      if (materializationArmed && windowIndex === 0 && !traversalRead && currentOffset > 0) {
+        materializationPolls += 1;
+        return { virtualizerTopOffsetPx: materializationPolls >= 3 ? 0 : currentOffset };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.topMaterialization.attempted, true);
+  assert.equal(result.history.diagnostics.topMaterialization.attempts, 1);
+  assert.ok(result.history.diagnostics.topMaterialization.polls >= 3);
+  assert.equal(result.history.diagnostics.topMaterialization.progressObserved, true);
+  assert.ok(result.history.diagnostics.virtualizerOffsetProgressCount > 0);
+  assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
 });
 
 test('chatgpt-controller: complete history proves an already-tail start without a native down round trip', async () => {

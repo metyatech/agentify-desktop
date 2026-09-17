@@ -677,7 +677,8 @@ function evaluateConversationWindowReadWithDom({
   documentScrollHeight = 2_000,
   documentClientHeight = 400,
   documentOverflowY = 'visible',
-  innerScroller = null
+  innerScroller = null,
+  loadingNodes = []
 } = {}) {
   const body = {
     tagName: 'BODY',
@@ -756,6 +757,7 @@ function evaluateConversationWindowReadWithDom({
     querySelectorAll(selector) {
       if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"]') return messages;
       if (selector === '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]') return messages;
+      if (selector === '[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]') return loadingNodes;
       return [];
     }
   };
@@ -767,7 +769,7 @@ function evaluateConversationWindowReadWithDom({
     getComputedStyle(node) {
       if (node === body) return { overflowY: documentOverflowY };
       if (node === scroller) return { overflowY: innerScroller?.overflowY || 'auto' };
-      return { overflowY: 'visible' };
+      return { overflowY: 'visible', display: 'block', visibility: 'visible', opacity: '1' };
     }
   };
   context.globalThis = context;
@@ -3706,6 +3708,39 @@ test('chatgpt-controller: complete history window script resolves a message ance
   assert.match(source, /common\.filter\(\(node\) => !isNavigationRegion\(node\) && isScrollable\(node\)\)/u);
   assert.match(source, /getBoundingClientRect/u);
   assert.doesNotMatch(source, /scrollTop\s*=\s*target/u);
+});
+
+test('chatgpt-controller: conversation loading ignores a busy sidebar profile control', () => {
+  const sidebar = { tagName: 'ASIDE' };
+  const profileButton = {
+    tagName: 'BUTTON', hidden: false,
+    matches(selector) { return selector.includes('button'); },
+    closest(selector) {
+      if (selector.includes('button')) return this;
+      if (selector.includes('aside') || selector.includes('sidebar')) return sidebar;
+      return null;
+    },
+    getAttribute(name) {
+      if (name === 'aria-busy') return 'true';
+      if (name === 'aria-label') return 'プロフィールメニューを開く';
+      return null;
+    },
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 40, bottom: 40, width: 40, height: 40 })
+  };
+  const result = evaluateConversationWindowReadWithDom({ loadingNodes: [profileButton] });
+  assert.equal(result.loading, false);
+});
+
+test('chatgpt-controller: conversation loading keeps a visible non-navigation progress indicator', () => {
+  const progress = {
+    tagName: 'DIV', hidden: false,
+    matches: () => false,
+    closest: () => null,
+    getAttribute(name) { return name === 'role' ? 'progressbar' : null; },
+    getBoundingClientRect: () => ({ left: 20, top: 20, right: 120, bottom: 28, width: 100, height: 8 })
+  };
+  const result = evaluateConversationWindowReadWithDom({ loadingNodes: [progress] });
+  assert.equal(result.loading, true);
 });
 
 test('chatgpt-controller: document scrolling element is accepted with a real scroll range', () => {

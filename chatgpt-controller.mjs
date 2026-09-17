@@ -84,6 +84,25 @@ function nextProviderStopGeneration() {
   return latestProviderStopGeneration;
 }
 
+function buildConversationLoadingStateScript() {
+  return String.raw`(() => {
+    const selector = '[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]';
+    const interactiveSelector = 'button, [role="button"], form, textarea, input, select, [contenteditable="true"]';
+    const navigationSelector = 'nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]';
+    return Array.from(document.querySelectorAll(selector)).some((node) => {
+      if (node.matches?.(interactiveSelector) || node.closest?.(interactiveSelector) || node.closest?.(navigationSelector)) return false;
+      if (node.hidden === true || node.getAttribute?.('aria-hidden') === 'true') return false;
+      const style = getComputedStyle(node);
+      if (style?.display === 'none' || style?.visibility === 'hidden' || style?.visibility === 'collapse') return false;
+      const opacity = String(style?.opacity ?? '').trim();
+      if (opacity !== '' && Number(opacity) === 0) return false;
+      const rect = node.getBoundingClientRect?.();
+      if (rect && (!(Number(rect.width) > 0) || !(Number(rect.height) > 0))) return false;
+      return true;
+    });
+  })()`;
+}
+
 function normalizeConversationText(value) {
   return String(value || '')
     .replace(/\u0000/g, '')
@@ -1409,7 +1428,7 @@ export function buildCompleteConversationReadScript({ maxTurns, maxCharsPerTurn,
       scroller.dispatchEvent(new WheelEvent('wheel', { deltaY, bubbles: true, cancelable: true }));
       scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
     };
-    const isLoading = () => Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const isLoading = () => ${buildConversationLoadingStateScript()};
     const range = (turns) => {
       const values = turns.map((turn) => turn.positionHint).filter((value) => Number.isInteger(value));
       return { min: values.length ? Math.min(...values) : null, max: values.length ? Math.max(...values) : null };
@@ -1697,7 +1716,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
     const point = validRect && right - left > 20 && bottom - top > 20
       ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) }
       : null;
-    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const loading = ${buildConversationLoadingStateScript()};
     const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
     const rawScrollTop = Number(scroller?.scrollTop);
     const scrollHeight = Number(scroller?.scrollHeight);
@@ -1715,7 +1734,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       turns: turns.slice(-maxTurns),
       limitExceeded: !!limitKind,
       limitKind,
-      loading: Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0,
+      loading,
       signature,
       range,
       startBoundary: {
@@ -1824,7 +1843,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const right = validRect ? Math.min(viewportWidth || rect.right, rect.right) : 0;
     const bottom = validRect ? Math.min(viewportHeight || rect.bottom, rect.bottom) : 0;
     const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
-    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const loading = ${buildConversationLoadingStateScript()};
     const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, turn.textDigest]));
     const rawScrollTop = Number(selected?.scrollTop);
     const scrollHeight = Number(selected?.scrollHeight);
@@ -2070,7 +2089,7 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
     const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
     const windowSignature = digest(JSON.stringify(turns.map((turn) => [turn.role, turn.messageId, turn.turnId, turn.position, digest(turn.text)])));
     const structuralSignature = digest(JSON.stringify({ positions: uniquePositions, first: textMessages[0]?.parsedPosition ?? null, markerCount: markers.length }));
-    const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const loading = ${buildConversationLoadingStateScript()};
     const rawScrollTop = Number(scroller?.scrollTop);
     const scrollHeight = Number(scroller?.scrollHeight);
     const clientHeight = Number(scroller?.clientHeight);

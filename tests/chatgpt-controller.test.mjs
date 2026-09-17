@@ -273,13 +273,13 @@ function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelS
   return { page, events, getWheelCount: () => wheelIndex };
 }
 
-function startMarkerSnapshot({ range = { min: 1, max: 3 }, atTop = true, scrollTop = 0, scrollHeight = 1_000, clientHeight = 400, markerPositions = [1, 2, 3], turnZero = null, firstMessagePosition = 1, firstMessageRole = 'user', windowSignature = 'aaa11111', structuralSignature = 'bbb22222' } = {}) {
+function startMarkerSnapshot({ range = { min: 1, max: 3 }, atTop = true, atBottom = false, scrollTop = 0, scrollHeight = 1_000, clientHeight = 400, verticalScrollMode = 'normal', markerPositions = [1, 2, 3], turnZero = null, firstMessagePosition = 1, firstMessageRole = 'user', windowSignature = 'aaa11111', structuralSignature = 'bbb22222' } = {}) {
   const positions = markerPositions.map((position) => ({ parsedPosition: position, insideSelectedScroller: true }));
   const zero = turnZero || { elementCount: 0, insideScrollerCount: 0, visibleElementCount: 0, containsUserMessage: false, containsAssistantMessage: false, rawMarkers: [] };
   return {
     url: 'https://chatgpt.com/c/start-marker-test', limitExceeded: false, limitKind: null, loading: false,
     range, windowSignature, structuralSignature,
-    scroller: { candidateCount: 1, selectedMessageDescendantCount: 3, scrollTop, scrollHeight, clientHeight, atTop, atBottom: false, point: { x: 500, y: 300 } },
+    scroller: { candidateCount: 1, selectedMessageDescendantCount: 3, scrollTop, scrollHeight, clientHeight, verticalScrollMode, atTop, atBottom, point: { x: 500, y: 300 } },
     markerPositions: { minimum: Math.min(...markerPositions), maximum: Math.max(...markerPositions), uniquePositions: markerPositions, hasPosition0: markerPositions.includes(0), hasPosition1: markerPositions.includes(1) },
     turnZero: zero,
     positionOne: { elementCount: markerPositions.includes(1) ? 1 : 0, containsUserMessage: firstMessagePosition === 1, containsAssistantMessage: firstMessagePosition === 1 && firstMessageRole === 'assistant', rawMarkers: [] },
@@ -887,7 +887,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -924,6 +924,14 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
   const snapshot = () => {
     const rawPositions = windows[windowIndex];
     const positions = rawPositions.map((position) => position + positionOffset);
+    const defaultScrollTop = reverseScroll
+      ? -(windows.length - 1 - windowIndex) * 250
+      : windowIndex * 250;
+    const rawScrollTop = Number.isFinite(scrollTopOverride) ? scrollTopOverride : defaultScrollTop;
+    const scrollHeight = Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight;
+    const maxScrollDistance = Math.max(0, scrollHeight - 400);
+    const distanceFromBottom = reverseScroll ? Math.max(0, -rawScrollTop) : Math.max(0, maxScrollDistance - rawScrollTop);
+    const distanceFromTop = reverseScroll ? Math.max(0, maxScrollDistance + rawScrollTop) : Math.max(0, rawScrollTop);
     return {
       url,
       turns: positions.map((position) => ({
@@ -962,11 +970,15 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         selected: { tagName: 'DIV', id: 'conversation-scroll', className: 'conversation-scroll-region', role: '', overflowY: 'auto' },
         selectedPath: 'body>main>div#conversation-scroll',
         candidates: [],
-        scrollTop: Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250,
-        scrollHeight: Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight,
+        scrollTop: rawScrollTop,
+        scrollHeight,
         clientHeight: 400,
-        atTop: (Number.isFinite(scrollTopOverride) ? scrollTopOverride : windowIndex * 250) <= 1,
-        atBottom: windowIndex === windows.length - 1,
+        maxScrollDistance,
+        verticalScrollMode: reverseScroll ? 'reverse' : 'normal',
+        distanceFromTop,
+        distanceFromBottom,
+        atTop: reverseScroll ? distanceFromTop <= 2 : rawScrollTop <= 1,
+        atBottom: reverseScroll ? distanceFromBottom <= 2 : windowIndex === windows.length - 1,
         point: { x: 500, y: 400 },
         ...(currentDom ? {
           messageDomMode: 'content-search-unit',
@@ -993,8 +1005,10 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
           if (typeof planned.loading === 'boolean') loadingOverride = planned.loading;
           if (Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
         }
-        scrollTopOverride = 0;
-        return { ok: true, scrollTop: 0 };
+        const topScroll = reverseScroll ? -Math.max(0, (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight) - 400) : 0;
+        scrollTopOverride = topScroll;
+        if (reverseScroll && (!planned || !Number.isInteger(planned.windowIndex))) windowIndex = 0;
+        return { ok: true, scrollTop: topScroll, verticalScrollMode: reverseScroll ? 'reverse' : 'normal' };
       }
       if (js.includes('const targetDistance =')) {
         events.push('conversation-scroll-restore');
@@ -1011,10 +1025,11 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
         if (planned && typeof planned === 'object' && Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
         else windowIndex = distance === 0 ? windows.length - 1 : originalWindowIndex;
+        const maxScrollDistance = Math.max(0, (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight) - 400);
         scrollTopOverride = planned && typeof planned === 'object' && Number.isFinite(Number(planned.scrollTop))
           ? Number(planned.scrollTop)
-          : (Number.isFinite(scrollHeightOverride) ? scrollHeightOverride : defaultScrollHeight) - 400 - distance;
-        return { ok: true, scrollTop: windowIndex * 250 };
+          : reverseScroll ? -Math.min(maxScrollDistance, distance) : maxScrollDistance - Math.min(maxScrollDistance, distance);
+        return { ok: true, scrollTop: scrollTopOverride, verticalScrollMode: reverseScroll ? 'reverse' : 'normal' };
       }
       if (!js.includes('const maxTurns =')) throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
       const traversalRead = js.includes('const traversalRead = true;');
@@ -1036,6 +1051,16 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         if (layoutScroller && typeof layoutScroller === 'object') {
           Object.assign(state.scroller, layoutScroller);
           if (Number.isFinite(Number(layoutScroller.scrollTop))) scrollTopOverride = Number(layoutScroller.scrollTop);
+          const layoutScrollTop = Number(state.scroller.scrollTop);
+          const layoutScrollHeight = Number(state.scroller.scrollHeight);
+          const layoutClientHeight = Number(state.scroller.clientHeight);
+          const layoutMaxDistance = Math.max(0, layoutScrollHeight - layoutClientHeight);
+          state.scroller.maxScrollDistance = layoutMaxDistance;
+          state.scroller.verticalScrollMode = reverseScroll ? 'reverse' : 'normal';
+          state.scroller.distanceFromBottom = reverseScroll ? Math.max(0, -layoutScrollTop) : Math.max(0, layoutMaxDistance - layoutScrollTop);
+          state.scroller.distanceFromTop = reverseScroll ? Math.max(0, layoutMaxDistance + layoutScrollTop) : Math.max(0, layoutScrollTop);
+          if (layoutScroller.atTop === undefined) state.scroller.atTop = reverseScroll ? state.scroller.distanceFromTop <= 2 : layoutScrollTop <= 1;
+          if (layoutScroller.atBottom === undefined) state.scroller.atBottom = reverseScroll ? state.scroller.distanceFromBottom <= 2 : windowIndex === windows.length - 1;
         }
       }
       if (readCount === limitExceededAtRead) return { ...state, limitExceeded: true, limitKind };
@@ -1957,6 +1982,40 @@ test('chatgpt-controller: an already-bottom Chrome baseline uses read-only direc
   assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
   assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
   assert.equal(result.history.diagnostics.gestureAttemptsDown, 0);
+});
+
+test('chatgpt-controller: reverse vertical scroller treats raw zero as tail and negative scroll as older history', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    backend: 'chrome-cdp',
+    positionHints: false,
+    currentDom: true,
+    reverseScroll: true,
+    virtualizerTopOffsetPx: 6_400,
+    virtualizerTopOffsetPlan: ({ windowIndex }) => windowIndex * 1_600
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyMode: 'complete',
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true, JSON.stringify(result.history));
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.layoutSettle.final.verticalScrollMode, 'reverse');
+  assert.equal(result.history.diagnostics.tailEntry.mode, 'direct-bottom');
+  assert.equal(result.history.diagnostics.tailEntry.alreadyAtBottom, true);
+  assert.equal(result.history.diagnostics.tailEntry.directVerified, true);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.ok(result.history.diagnostics.wheelUpAttempts > 0);
+  assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
+  assert.equal(result.history.diagnostics.progress.tailProven, true);
+  assert.equal(result.history.diagnostics.progress.startProven, true);
+  assert.equal(result.history.diagnostics.conversationRestore.verified, true);
+  assert.equal(result.history.diagnostics.conversationRestore.initialDistanceFromBottom, 0);
+  assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
 });
 
 test('chatgpt-controller: top proof bounds physical-only jitter without treating it as older progress', async () => {
@@ -10446,6 +10505,20 @@ test('chatgpt-controller: start-marker diagnostic distinguishes message turn zer
   assert.equal(hiddenZeroResult.turnZeroElementExists, true);
   assert.equal(hiddenZeroResult.turnZeroContainsConversationMessage, false);
   assert.equal(hiddenZeroResult.firstMessagePosition, 1);
+});
+
+test('chatgpt-controller: start-marker diagnostic treats reverse raw zero as tail and negative scroll as top', async () => {
+  const tail = startMarkerSnapshot({ atTop: false, atBottom: true, scrollTop: 0, verticalScrollMode: 'reverse', windowSignature: 'reverse-tail', structuralSignature: 'reverse-tail-structure' });
+  const top = startMarkerSnapshot({ atTop: true, atBottom: false, scrollTop: -600, verticalScrollMode: 'reverse', markerPositions: [1, 2], windowSignature: 'reverse-top', structuralSignature: 'reverse-top-structure' });
+  const harness = createStartMarkerDiagnosticPage({ snapshot: tail, initialAtTop: false, wheelSnapshots: [top] });
+  const result = await createController(harness.page).diagnoseConversationStartMarkers();
+  assert.equal(result.layoutSettle.verified, true);
+  assert.equal(result.wheelAttempts, 1);
+  assert.equal(harness.getWheelCount(), 1);
+  assert.equal(result.physicalTopReached, true);
+  assert.equal(result.physicalTopStable, true);
+  assert.equal(result.conversationRestore.verified, true);
+  assert.equal(result.reason, null);
 });
 
 test('chatgpt-controller: start-marker diagnostic uses bounded older traversal and stops on the physical top', async () => {

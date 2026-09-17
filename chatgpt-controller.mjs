@@ -1081,6 +1081,20 @@ function conversationUsesCurrentDom(state) {
     || state?.startBoundary?.virtualizedOrigin?.domMode === 'content-search-unit';
 }
 
+function conversationScrollerDistanceFromBottom(state) {
+  const scroller = state?.scroller;
+  const direct = Number(scroller?.distanceFromBottom);
+  if (Number.isFinite(direct) && direct >= 0) return direct;
+  const scrollTop = Number(scroller?.scrollTop);
+  const scrollHeight = Number(scroller?.scrollHeight);
+  const clientHeight = Number(scroller?.clientHeight);
+  if (![scrollTop, scrollHeight, clientHeight].every(Number.isFinite)) return null;
+  const maxDistance = Math.max(0, scrollHeight - clientHeight);
+  return scroller?.verticalScrollMode === 'reverse'
+    ? Math.max(0, -scrollTop)
+    : Math.max(0, maxDistance - scrollTop);
+}
+
 export function conversationStartBoundaryProof(state, { physicalTopStable = false } = {}) {
   const boundary = state?.startBoundary || {};
   const rangeMin = Number.isInteger(state?.range?.min) ? state.range.min : null;
@@ -1144,6 +1158,7 @@ function probeWindowSummary(state) {
     scrollHeight: Number.isFinite(Number(scroller?.scrollHeight)) ? Number(scroller.scrollHeight) : null,
     atTop: typeof scroller?.atTop === 'boolean' ? scroller.atTop : null,
     atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
+    verticalScrollMode: ['normal', 'reverse'].includes(scroller?.verticalScrollMode) ? scroller.verticalScrollMode : null,
     windowSignature: signature ? textDigest(signature).slice(0, 32) : null
   };
 }
@@ -1161,6 +1176,7 @@ function conversationLayoutSummary(state) {
     clientHeight: Number.isFinite(Number(scroller?.clientHeight)) ? Number(scroller.clientHeight) : null,
     atTop: typeof scroller?.atTop === 'boolean' ? scroller.atTop : null,
     atBottom: typeof scroller?.atBottom === 'boolean' ? scroller.atBottom : null,
+    verticalScrollMode: ['normal', 'reverse'].includes(scroller?.verticalScrollMode) ? scroller.verticalScrollMode : null,
     windowSignature: sourceSignature == null ? null : textDigest(String(sourceSignature)).slice(0, 32),
     loading: state?.loading === true,
     candidateCount: Number.isInteger(scroller?.candidateCount) ? scroller.candidateCount : 0
@@ -1175,6 +1191,7 @@ function conversationLayoutSummaryEqual(left, right) {
     && close(left.clientHeight, right.clientHeight)
     && left.atTop === right.atTop
     && left.atBottom === right.atBottom
+    && left.verticalScrollMode === right.verticalScrollMode
     && left.range.min === right.range.min
     && left.range.max === right.range.max
     && left.windowSignature === right.windowSignature;
@@ -1189,6 +1206,7 @@ function conversationLayoutSummaryReady(summary) {
     && Number.isFinite(summary.clientHeight)
     && typeof summary.atTop === 'boolean'
     && typeof summary.atBottom === 'boolean'
+    && ['normal', 'reverse'].includes(summary.verticalScrollMode)
     && typeof summary.windowSignature === 'string'
     && summary.windowSignature.length > 0;
 }
@@ -1681,6 +1699,17 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       : null;
     const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, digest(turn.text)]));
+    const rawScrollTop = Number(scroller?.scrollTop);
+    const scrollHeight = Number(scroller?.scrollHeight);
+    const clientHeight = Number(scroller?.clientHeight);
+    const maxScrollDistance = Number.isFinite(scrollHeight) && Number.isFinite(clientHeight) ? Math.max(0, scrollHeight - clientHeight) : null;
+    const verticalScrollMode = scroller && String(getComputedStyle(scroller)?.flexDirection || '') === 'column-reverse' ? 'reverse' : 'normal';
+    const distanceFromBottom = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, -rawScrollTop) : Math.max(0, maxScrollDistance - rawScrollTop))
+      : null;
+    const distanceFromTop = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, maxScrollDistance + rawScrollTop) : Math.max(0, rawScrollTop))
+      : null;
     return {
       url: location.href,
       turns: turns.slice(-maxTurns),
@@ -1708,11 +1737,15 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
       },
       scroller: scroller ? {
         ...resolved.diagnostic,
-        scrollTop: Number(scroller.scrollTop),
-        scrollHeight: Number(scroller.scrollHeight),
-        clientHeight: Number(scroller.clientHeight),
-        atTop: Number(scroller.scrollTop) <= 1,
-        atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
+        scrollTop: rawScrollTop,
+        scrollHeight,
+        clientHeight,
+        maxScrollDistance,
+        verticalScrollMode,
+        distanceFromTop,
+        distanceFromBottom,
+        atTop: Number.isFinite(distanceFromTop) && distanceFromTop <= 2,
+        atBottom: Number.isFinite(distanceFromBottom) && distanceFromBottom <= 2,
         point
       } : { ...resolved.diagnostic, atTop: false, atBottom: false, point: null }
     };
@@ -1793,6 +1826,17 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const point = validRect && right - left > 20 && bottom - top > 20 ? { x: Math.round(left + (right - left) / 2), y: Math.round(top + Math.min((bottom - top) * 0.45, (bottom - top) - 12)) } : null;
     const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
     const signature = JSON.stringify(turns.map((turn) => [turn.role, turn.messageId || turn.turnId || '', turn.positionHint ?? null, turn.textDigest]));
+    const rawScrollTop = Number(selected?.scrollTop);
+    const scrollHeight = Number(selected?.scrollHeight);
+    const clientHeight = Number(selected?.clientHeight);
+    const maxScrollDistance = Number.isFinite(scrollHeight) && Number.isFinite(clientHeight) ? Math.max(0, scrollHeight - clientHeight) : null;
+    const verticalScrollMode = selected && String(getComputedStyle(selected)?.flexDirection || '') === 'column-reverse' ? 'reverse' : 'normal';
+    const distanceFromBottom = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, -rawScrollTop) : Math.max(0, maxScrollDistance - rawScrollTop))
+      : null;
+    const distanceFromTop = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, maxScrollDistance + rawScrollTop) : Math.max(0, rawScrollTop))
+      : null;
     const messagePositionZeroCount = turns.filter((turn) => turn.positionHint === 0).length;
     const positionZeroMarkerCount = selected ? Array.from(document.querySelectorAll(markerSelector)).filter((node) => selected.contains?.(node) && parsePosition(node) === 0).length : 0;
     const first = turns[0] || null;
@@ -1822,7 +1866,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
           loading
         }
       },
-      scroller: selected ? { candidateCount: nearest.length, selectedMessageDescendantCount: nearest[0].descendants, ...model.diagnostics, scrollTop: Number(selected.scrollTop), scrollHeight: Number(selected.scrollHeight), clientHeight: Number(selected.clientHeight), atTop: Number(selected.scrollTop) <= 1, atBottom: Number(selected.scrollTop) >= Math.max(0, Number(selected.scrollHeight) - Number(selected.clientHeight) - 2), point } : { candidateCount: nearest.length, selectedMessageDescendantCount: 0, ...model.diagnostics, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null }
+      scroller: selected ? { candidateCount: nearest.length, selectedMessageDescendantCount: nearest[0].descendants, ...model.diagnostics, scrollTop: rawScrollTop, scrollHeight, clientHeight, maxScrollDistance, verticalScrollMode, distanceFromTop, distanceFromBottom, atTop: Number.isFinite(distanceFromTop) && distanceFromTop <= 2, atBottom: Number.isFinite(distanceFromBottom) && distanceFromBottom <= 2, point } : { candidateCount: nearest.length, selectedMessageDescendantCount: 0, ...model.diagnostics, scrollTop: null, scrollHeight: null, clientHeight: null, maxScrollDistance: null, verticalScrollMode: null, distanceFromTop: null, distanceFromBottom: null, atTop: false, atBottom: false, point: null }
     };
   })()`;
 }
@@ -2027,6 +2071,17 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
     const windowSignature = digest(JSON.stringify(turns.map((turn) => [turn.role, turn.messageId, turn.turnId, turn.position, digest(turn.text)])));
     const structuralSignature = digest(JSON.stringify({ positions: uniquePositions, first: textMessages[0]?.parsedPosition ?? null, markerCount: markers.length }));
     const loading = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [data-testid*="loading" i]')).length > 0;
+    const rawScrollTop = Number(scroller?.scrollTop);
+    const scrollHeight = Number(scroller?.scrollHeight);
+    const clientHeight = Number(scroller?.clientHeight);
+    const maxScrollDistance = Number.isFinite(scrollHeight) && Number.isFinite(clientHeight) ? Math.max(0, scrollHeight - clientHeight) : null;
+    const verticalScrollMode = scroller && String(getComputedStyle(scroller)?.flexDirection || '') === 'column-reverse' ? 'reverse' : 'normal';
+    const distanceFromBottom = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, -rawScrollTop) : Math.max(0, maxScrollDistance - rawScrollTop))
+      : null;
+    const distanceFromTop = Number.isFinite(rawScrollTop) && Number.isFinite(maxScrollDistance)
+      ? (verticalScrollMode === 'reverse' ? Math.max(0, maxScrollDistance + rawScrollTop) : Math.max(0, rawScrollTop))
+      : null;
     return {
       url: location.href,
       limitExceeded: !!limitKind,
@@ -2039,11 +2094,15 @@ export function buildConversationStartMarkerDiagnosticScript({ maxTurns, maxChar
         ...model.diagnostics,
         candidateCount: resolved.nearest.length,
         selectedMessageDescendantCount: resolved.candidates.filter((candidate) => candidate.node === scroller)[0]?.descendants || 0,
-        scrollTop: Number(scroller.scrollTop),
-        scrollHeight: Number(scroller.scrollHeight),
-        clientHeight: Number(scroller.clientHeight),
-        atTop: Number(scroller.scrollTop) <= 1,
-        atBottom: Number(scroller.scrollTop) >= Math.max(0, Number(scroller.scrollHeight) - Number(scroller.clientHeight) - 2),
+        scrollTop: rawScrollTop,
+        scrollHeight,
+        clientHeight,
+        maxScrollDistance,
+        verticalScrollMode,
+        distanceFromTop,
+        distanceFromBottom,
+        atTop: Number.isFinite(distanceFromTop) && distanceFromTop <= 2,
+        atBottom: Number.isFinite(distanceFromBottom) && distanceFromBottom <= 2,
         point
       } : { ...model.diagnostics, candidateCount: resolved.nearest.length, selectedMessageDescendantCount: 0, scrollTop: null, scrollHeight: null, clientHeight: null, atTop: false, atBottom: false, point: null },
       markers,
@@ -2111,10 +2170,16 @@ function buildRestoreConversationScrollScript(distanceFromBottom, operation = 'r
     const nearest = distances.filter((item) => item.distance === nearestDistance);
     if (nearest.length !== 1) return { ok: false, reason: nearest.length > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found' };
     const node = nearest[0].node;
-    node.scrollTop = targetTop === null
-      ? Math.max(0, node.scrollHeight - node.clientHeight - targetDistance)
-      : targetTop;
-    return { ok: true, scrollTop: node.scrollTop };
+    const maxScrollDistance = Math.max(0, Number(node.scrollHeight) - Number(node.clientHeight));
+    const verticalScrollMode = String(getComputedStyle(node)?.flexDirection || '') === 'column-reverse' ? 'reverse' : 'normal';
+    const boundedDistance = Math.min(maxScrollDistance, targetDistance);
+    const targetScrollTop = operation === 'top'
+      ? (verticalScrollMode === 'reverse' ? -maxScrollDistance : 0)
+      : (verticalScrollMode === 'reverse' ? -boundedDistance : maxScrollDistance - boundedDistance);
+    node.scrollTo?.({ top: targetScrollTop, left: 0, behavior: 'auto' });
+    node.scrollTop = targetScrollTop;
+    node.dispatchEvent?.(new Event('scroll', { bubbles: true }));
+    return { ok: true, scrollTop: Number(node.scrollTop), targetScrollTop, verticalScrollMode };
   })()`;
 }
 
@@ -4060,9 +4125,7 @@ export class ChatGPTController {
       };
       const restoreConversation = async () => {
         const restore = result.conversationRestore;
-        const distance = normalizedBaseline?.scroller
-          ? Number(normalizedBaseline.scroller.scrollHeight) - Number(normalizedBaseline.scroller.clientHeight) - Number(normalizedBaseline.scroller.scrollTop)
-          : NaN;
+        const distance = conversationScrollerDistanceFromBottom(normalizedBaseline);
         restore.initialDistanceFromBottom = Number.isFinite(distance) && distance >= 0 ? distance : null;
         const baselineSignature = normalizedBaseline?.windowSignature || null;
         if (restore.initialDistanceFromBottom === null || !baselineSignature) {
@@ -4083,7 +4146,7 @@ export class ChatGPTController {
           try { last = await readWindow(); } catch { restore.lastFailureReason = 'read-failed'; continue; }
           if (!await sameUrl(last?.url)) { restore.lastFailureReason = 'url-changed'; break; }
           if (last?.limitExceeded) { restore.lastFailureReason = 'limit-exceeded'; continue; }
-          const restoredDistance = Number(last?.scroller?.scrollHeight) - Number(last?.scroller?.clientHeight) - Number(last?.scroller?.scrollTop);
+          const restoredDistance = conversationScrollerDistanceFromBottom(last);
           const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - restore.initialDistanceFromBottom) <= 2;
           const signatureMatched = last?.windowSignature === baselineSignature;
           restore.finalDistanceFromBottom = Number.isFinite(restoredDistance) ? restoredDistance : null;
@@ -4097,7 +4160,7 @@ export class ChatGPTController {
           restore.lastFailureReason = signatureMatched ? 'distance-mismatch' : 'signature-mismatch';
         }
         if (last?.scroller) {
-          const finalDistance = Number(last.scroller.scrollHeight) - Number(last.scroller.clientHeight) - Number(last.scroller.scrollTop);
+          const finalDistance = conversationScrollerDistanceFromBottom(last);
           restore.finalDistanceFromBottom = Number.isFinite(finalDistance) ? finalDistance : null;
         }
         return false;
@@ -4202,7 +4265,7 @@ export class ChatGPTController {
         if (!baseline?.scroller || baseline.scroller.candidateCount !== 1) { result.reason = baseline?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found'; return result; }
         if (baseline.limitExceeded) { result.reason = baseline.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large'; return result; }
         let current = baseline;
-        const atTop = (state) => state?.scroller?.atTop === true || Number(state?.scroller?.scrollTop) <= 1;
+        const atTop = (state) => state?.scroller?.atTop === true;
         if (!atTop(current)) {
           for (let attempt = 1; attempt <= START_MARKER_PROBE_MAX_WHEELS; attempt += 1) {
             const step = await readStage();
@@ -4627,7 +4690,7 @@ export class ChatGPTController {
         } else {
           current = settledLayout.state;
           initialScrollTop = Number(current?.scroller?.scrollTop);
-          initialDistanceFromBottom = Number(current?.scroller?.scrollHeight) - Number(current?.scroller?.clientHeight) - initialScrollTop;
+          initialDistanceFromBottom = conversationScrollerDistanceFromBottom(current);
           originalSemanticAnchorSignature = conversationSemanticAnchorSignature(current?.turns);
           restoreMode = current?.scroller?.atBottom === true ? 'bottom' : 'anchored-window';
           diagnostics.conversationRestore.mode = restoreMode;
@@ -4995,7 +5058,7 @@ export class ChatGPTController {
             restoreDiagnostics.lastFailureReason = 'scroller-missing';
             continue;
           }
-          const currentDistance = currentScrollHeight - currentClientHeight - Number(currentState.scroller?.scrollTop);
+          const currentDistance = conversationScrollerDistanceFromBottom(currentState);
           const alreadyAtTarget = tailOnly
             && targetMode === 'bottom'
             && currentState.scroller.atBottom === true
@@ -5029,7 +5092,7 @@ export class ChatGPTController {
             restoreDiagnostics.lastFailureReason = restored.scroller?.candidateCount > 1 ? 'scroller-ambiguous' : 'scroller-missing';
             continue;
           }
-          const restoredDistance = Number(restored.scroller?.scrollHeight) - Number(restored.scroller?.clientHeight) - Number(restored.scroller?.scrollTop);
+          const restoredDistance = conversationScrollerDistanceFromBottom(restored);
           const distanceMatched = Number.isFinite(restoredDistance) && Math.abs(restoredDistance - targetDistance) <= 2;
           const bottomMatched = restored.scroller.atBottom === true && restored.loading === false;
           const anchorLoadingMatched = restored.loading === false;

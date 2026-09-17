@@ -3176,6 +3176,44 @@ test('chatgpt-controller: physical jitter does not reset semantic older no-progr
   assert.ok(harness.getWheelCount() < 20);
 });
 
+test('chatgpt-controller: reverse current-DOM scrolling keeps monotonic physical older progress until virtualized windows materialize', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 3,
+    windowRanges: [
+      [0, 1, 2, 3, 4, 5],
+      [4, 5, 6, 7, 8, 9],
+      [8, 9, 10, 11, 12, 13],
+      [12, 13, 14, 15, 16, 17]
+    ],
+    positionHints: false,
+    backend: 'chrome-cdp',
+    currentDom: true,
+    reverseScroll: true,
+    virtualizerTopOffsetPx: 18_000,
+    restorePlan: () => ({ virtualizerTopOffsetPx: 18_000 }),
+    directTopPlan: () => ({ windowIndex: 0, virtualizerTopOffsetPx: 0 }),
+    mouseWheelPlan: ({ attempt, deltaY }) => {
+      if (deltaY > 0) return { windowIndex: 3, scrollTop: 0, virtualizerTopOffsetPx: 18_000 };
+      const step = ((attempt - 1) % 5) + 1;
+      if (step === 1) return { windowIndex: 3, scrollTop: -200, virtualizerTopOffsetPx: 18_000 };
+      if (step === 2) return { windowIndex: 3, scrollTop: -400, virtualizerTopOffsetPx: 18_000 };
+      if (step === 3) return { windowIndex: 2, scrollTop: -600, virtualizerTopOffsetPx: 12_000 };
+      if (step === 4) return { windowIndex: 1, scrollTop: -800, virtualizerTopOffsetPx: 6_000 };
+      return { windowIndex: 0, scrollTop: -1_000, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 20_000, historyMaxIterations: 60 });
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.firstNativeUp.changed, false);
+  assert.equal(result.history.diagnostics.firstNativeUp.physicalChanged, true);
+  assert.equal(result.history.diagnostics.nativeScrollControlProven, true);
+  assert.equal(result.history.diagnostics.wheelDownAttempts, 0);
+  assert.equal(result.history.diagnostics.directTop.fallbackTriggered, false);
+  assert.equal(result.history.diagnostics.mergeContinuous, true);
+  assert.equal(result.turns.length, 18);
+});
+
 test('chatgpt-controller: current DOM stable IDs and decreasing virtualizer offsets prove older traversal without position hints', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 2,

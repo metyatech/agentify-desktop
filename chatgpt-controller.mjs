@@ -4575,6 +4575,7 @@ export class ChatGPTController {
     let tailSnapshot = null;
     let tailBaselineSignature = null;
     let iterations = 0;
+    let furthestOlderDistanceFromBottom = null;
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
       const virtualizerTopOffsetPx = conversationVirtualizerTopOffset(state);
@@ -5009,6 +5010,16 @@ export class ChatGPTController {
       }
       return progress;
     };
+    const recordPhysicalOlderAdvance = (before, after) => {
+      if (!conversationUsesCurrentDom(before) || !conversationUsesCurrentDom(after)) return false;
+      const beforeDistance = conversationScrollerDistanceFromBottom(before);
+      const afterDistance = conversationScrollerDistanceFromBottom(after);
+      if (!Number.isFinite(beforeDistance) || !Number.isFinite(afterDistance)) return false;
+      if (!Number.isFinite(furthestOlderDistanceFromBottom)) furthestOlderDistanceFromBottom = beforeDistance;
+      if (afterDistance <= furthestOlderDistanceFromBottom + 2) return false;
+      furthestOlderDistanceFromBottom = afterDistance;
+      return true;
+    };
     const waitForTopMaterialization = async () => {
       if (!conversationUsesCurrentDom(current)
         || current?.scroller?.atTop !== true
@@ -5268,6 +5279,9 @@ export class ChatGPTController {
           if (!result.ok) { reason = result.reason; break; }
           const candidateMin = result.range?.min;
           const directionalProgress = directionalProgressFor(before, result.state, proofDirection);
+          const physicalOlderAdvance = proofDirection < 0
+            ? recordPhysicalOlderAdvance(before, result.state)
+            : false;
           if (proofDirection < 0) recordOlderProgress(directionalProgress);
           if (proofDirection < 0
             && !result.state?.scroller?.atTop
@@ -5282,6 +5296,12 @@ export class ChatGPTController {
             break;
           }
           if (result.windowChanged) {
+            diagnostics.nativeScrollControlProven = true;
+            break;
+          }
+          if (physicalOlderAdvance
+            && conversationUsesCurrentDom(before)
+            && conversationUsesCurrentDom(result.state)) {
             diagnostics.nativeScrollControlProven = true;
             break;
           }
@@ -5410,8 +5430,9 @@ export class ChatGPTController {
           const result = await nativeWheel(-1, current);
           if (!result.ok) { reason = result.reason; break; }
           const directionalProgress = directionalProgressFor(before, result.state, -1);
+          const physicalOlderAdvance = recordPhysicalOlderAdvance(before, result.state);
           recordOlderProgress(directionalProgress);
-          if (directionalProgress.progress) noProgressCount = 0;
+          if (directionalProgress.progress || physicalOlderAdvance) noProgressCount = 0;
           else noProgressCount += 1;
           if (noProgressCount >= 3) {
             diagnostics.directTop.fallbackTriggered = true;

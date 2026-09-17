@@ -3477,11 +3477,154 @@ test('chatgpt-controller: document-scroller resolution enters complete-history t
   assert.equal(result.history.diagnostics.scroller.candidateCount, 1);
 });
 
-test('chatgpt-controller: traversal read is lightweight and carries bounded identity state', () => {
-  const source = buildConversationTraversalReadScript({ maxTurns: 10, maxCharsPerTurn: 1000, maxTotalChars: 5000 });
-  assert.match(source, /const traversalRead = true;/u);
-  assert.match(source, /textDigest/u);
-  assert.doesNotMatch(source, /cloneNode/u);
+function createCurrentTraversalSafetyFixture() {
+  let realDomRemoveCalls = 0;
+  let cloneRemoveCalls = 0;
+  const controls = [];
+  const body = {
+    tagName: 'BODY', parentElement: null, scrollHeight: 2_000, clientHeight: 800, scrollTop: 0,
+    matches: () => false,
+    getAttribute: () => null,
+    contains(child) { return child === this || child?.parentElement === this || child?.parentElement?.parentElement === this; },
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+  };
+  const scroller = {
+    tagName: 'DIV', parentElement: body, id: 'conversation-scroll', scrollHeight: 1_600, clientHeight: 800, scrollTop: 0,
+    matches: () => false,
+    getAttribute: () => null,
+    contains(child) {
+      let current = child;
+      while (current) {
+        if (current === this) return true;
+        current = current.parentElement;
+      }
+      return false;
+    },
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 1_000, bottom: 800, width: 1_000, height: 800 })
+  };
+  const host = { tagName: 'DIV', parentElement: scroller, style: { marginTop: '0px' }, matches: () => false, getAttribute: () => null };
+  const wrappers = [];
+  const units = [];
+  const contains = (root, child) => {
+    let current = child;
+    while (current) {
+      if (current === root) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+  const makeControl = (label, clone) => {
+    const control = {
+      label,
+      removed: false,
+      matches: (selector) => selector.includes('button') || selector.includes('chatgpt-library-file-citation'),
+      remove() {
+        if (this.removed) return;
+        this.removed = true;
+        if (clone) cloneRemoveCalls += 1;
+        else realDomRemoveCalls += 1;
+      }
+    };
+    return control;
+  };
+  const textFor = (baseText, currentControls) => [baseText, ...currentControls.filter((control) => !control.removed).map((control) => control.label)].join('\n');
+  const makeUnit = (turnKey, unitIndex, role, baseText, labels = []) => {
+    const unitKey = `${turnKey}:${unitIndex}:${role}`;
+    const unit = {
+      tagName: 'DIV', parentElement: null,
+      get innerText() { return textFor(baseText, controls.filter((control) => control.owner === this)); },
+      get textContent() { return this.innerText; },
+      getAttribute(name) { return name === 'data-content-search-unit-key' ? unitKey : null; },
+      closest(selector) { return selector === '[data-turn-key]' ? this.parentElement : null; },
+      contains(child) { return child === this || contains(this, child); },
+      querySelectorAll() { return controls.filter((control) => control.owner === this && !control.removed); },
+      cloneNode() {
+        const cloneControls = labels.map((label) => makeControl(label, true));
+        const clone = {
+          matches: () => false,
+          querySelectorAll: () => cloneControls.filter((control) => !control.removed),
+          get innerText() { return textFor(baseText, cloneControls); },
+          get textContent() { return this.innerText; }
+        };
+        return clone;
+      }
+    };
+    for (const label of labels) {
+      const control = makeControl(label, false);
+      control.owner = unit;
+      controls.push(control);
+    }
+    return unit;
+  };
+  for (const [turnKey, role, unitIndex, text, labels] of [
+    ['turn-a', 'user', '0', 'Question', []],
+    ['turn-a', 'assistant', '2', 'Answer text', ['Copy', 'citation']]
+  ]) {
+    const wrapper = {
+      tagName: 'DIV', parentElement: host, style: {},
+      getAttribute(name) { return name === 'data-turn-key' ? turnKey : null; },
+      closest(selector) { return selector === '[data-turn-key]' ? this : null; },
+      contains(child) { return child === this || contains(this, child); },
+      matches: () => false
+    };
+    const unit = makeUnit(turnKey, unitIndex, role, text, labels);
+    unit.parentElement = wrapper;
+    wrappers.push(wrapper);
+    units.push(unit);
+  }
+  const document = {
+    scrollingElement: body,
+    documentElement: body,
+    querySelectorAll(selector) {
+      if (selector === '[data-content-search-unit-key]') return units;
+      if (selector === '[data-turn-key]') return wrappers;
+      if (selector.includes('[data-message-author-role="user"]') || selector.includes('[data-message-author-role="assistant"]')) return [];
+      if (selector.includes('[id*="conversation-turn-"')) return [];
+      return [];
+    }
+  };
+  const context = {
+    document,
+    location: { href: 'https://chatgpt.com/c/traversal-side-effect-test' },
+    innerWidth: 1_000,
+    innerHeight: 800,
+    getComputedStyle(node) { return { overflowY: node === scroller ? 'auto' : 'visible' }; }
+  };
+  context.globalThis = context;
+  const read = () => vm.runInNewContext(buildConversationTraversalReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), context);
+  const structure = () => units.map((unit) => ({
+    key: unit.getAttribute('data-content-search-unit-key'),
+    text: unit.innerText,
+    controls: controls.filter((control) => control.owner === unit && !control.removed).map((control) => control.label)
+  }));
+  return { read, structure, get realDomRemoveCalls() { return realDomRemoveCalls; }, get cloneRemoveCalls() { return cloneRemoveCalls; } };
+}
+
+test('chatgpt-controller: traversal reads filter current controls without mutating live DOM', () => {
+  const fixture = createCurrentTraversalSafetyFixture();
+  const before = fixture.structure();
+  const result = fixture.read();
+  assert.equal(fixture.realDomRemoveCalls, 0);
+  assert.ok(fixture.cloneRemoveCalls > 0);
+  assert.deepEqual(fixture.structure(), before);
+  assert.deepEqual(Array.from(result.turns, (turn) => [turn.role, turn.messageId, turn.textLength]), [
+    ['user', 'turn-a:0:user', 8],
+    ['assistant', 'turn-a:2:assistant', 11]
+  ]);
+  assert.equal(result.turns.length, 2);
+});
+
+test('chatgpt-controller: repeated traversal reads remain structurally and semantically stable', () => {
+  const fixture = createCurrentTraversalSafetyFixture();
+  const before = fixture.structure();
+  const first = fixture.read();
+  const afterFirst = fixture.structure();
+  const second = fixture.read();
+  assert.deepEqual(afterFirst, before);
+  assert.deepEqual(fixture.structure(), before);
+  assert.equal(JSON.stringify(second), JSON.stringify(first));
+  assert.equal(fixture.realDomRemoveCalls, 0);
+  assert.equal(fixture.cloneRemoveCalls, 4);
 });
 
 test('chatgpt-controller: current content-search units normalize roles and stable identities without positions', () => {

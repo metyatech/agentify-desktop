@@ -241,7 +241,7 @@ function historyMetadata({ mode, complete = false, reason = null, startReached =
   return metadata;
 }
 
-export function buildChatGPTDomModelScript({ lightweight = false } = {}) {
+export function buildChatGPTDomModelScript() {
   return String.raw`(() => {
     const currentUnitSelector = '[data-content-search-unit-key]';
     const legacyMessageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], article[data-turn="user"], article[data-turn="assistant"]';
@@ -259,10 +259,20 @@ export function buildChatGPTDomModelScript({ lightweight = false } = {}) {
       .join('\n')
       .trim();
     const visibleText = (node) => {
-      const clone = ${lightweight ? 'node' : "typeof node.cloneNode === 'function' ? node.cloneNode(true) : node"};
-      if (clone.matches?.(excludedSelector)) clone.remove();
-      else clone.querySelectorAll?.(excludedSelector)?.forEach((child) => child.remove());
-      return normalize(clone.innerText || clone.textContent || '');
+      const clone = typeof node?.cloneNode === 'function' ? node.cloneNode(true) : null;
+      if (clone) {
+        if (clone.matches?.(excludedSelector)) clone.remove();
+        else clone.querySelectorAll?.(excludedSelector)?.forEach((child) => child.remove());
+        return normalize(clone.innerText || clone.textContent || '');
+      }
+      const readWithoutExcluded = (current, root = false) => {
+        if (!current || (!root && current.matches?.(excludedSelector))) return '';
+        const children = Array.from(current.childNodes || []);
+        if (children.length) return children.map((child) => readWithoutExcluded(child)).filter(Boolean).join('\n');
+        if (current.nodeType === 3) return String(current.nodeValue || '');
+        return String(current.innerText || current.textContent || '');
+      };
+      return normalize(readWithoutExcluded(node, true));
     };
     const parseLegacyPosition = (node) => {
       let current = node;
@@ -1651,7 +1661,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
     const maxTurns = ${maxTurns};
     const maxCharsPerTurn = ${maxCharsPerTurn};
     const maxTotalChars = ${maxTotalChars};
-    const domModel = ${buildChatGPTDomModelScript({ lightweight: true })};
+    const domModel = ${buildChatGPTDomModelScript()};
     const domSnapshot = () => domModel.read();
     const messageSelector = '[data-message-author-role="user"], [data-message-author-role="assistant"], [data-content-search-unit-key]';
     const markerSelector = '[id*="conversation-turn-" i], [data-testid*="conversation-turn-" i], [data-conversation-turn], [data-turn]';

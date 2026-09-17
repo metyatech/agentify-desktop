@@ -10,6 +10,7 @@ import {
   ChatGPTController,
   DEFAULT_CONVERSATION_HISTORY_ITERATIONS,
   DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+  MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
   conversationSemanticAnchorSignature,
   conversationSemanticTailSignature,
   buildChatGPTDomModelScript,
@@ -885,7 +886,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -997,6 +998,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       if (!traversalRead) readCount += 1;
       if (Number.isInteger(changeUrlOnReadAt) && readCount === changeUrlOnReadAt) url = 'https://chatgpt.com/c/changed';
       const state = snapshot();
+      if (traversalRead && typeof onTraversalRead === 'function') await onTraversalRead({ readCount, windowIndex, state: structuredClone(state) });
       const layoutOverride = !traversalRead && Array.isArray(layoutSnapshots) && layoutSnapshots[readCount - 1] && typeof layoutSnapshots[readCount - 1] === 'object'
         ? layoutSnapshots[readCount - 1]
         : null;
@@ -1631,6 +1633,45 @@ test('chatgpt-controller: complete history requires a full-history fixed point',
   assert.equal(sevenPassStable.result.diagnostics.completeVerification.mismatchCount, 5);
 });
 
+test('chatgpt-controller: long fixed-point passes share the explicit operation deadline', async () => {
+  const realNow = Date.now;
+  let clock = 0;
+  Date.now = () => clock;
+  const createDelayedHarness = () => createNativeWheelHistoryPage({
+    initialWindow: 2,
+    onTraversalRead: ({ windowIndex }) => {
+      if (windowIndex === 0) clock += 70_000;
+    },
+  });
+  try {
+    const oldBudget = await createController(createDelayedHarness().page).readConversationTurns({
+      maxTurns: 50,
+      maxCharsPerTurn: 1000,
+      maxTotalChars: 5000,
+      historyMode: 'complete',
+      historyTimeoutMs: 60_000,
+      historyMaxIterations: 240,
+    });
+    assert.equal(oldBudget.history.complete, false);
+    assert.equal(oldBudget.history.diagnostics.completeVerification.passCount, 1);
+    assert.equal(oldBudget.history.diagnostics.completeVerification.budgetExhausted, true);
+
+    const extendedBudget = await createController(createDelayedHarness().page).readConversationTurns({
+      maxTurns: 50,
+      maxCharsPerTurn: 1000,
+      maxTotalChars: 5000,
+      historyMode: 'complete',
+      historyTimeoutMs: 180_000,
+      historyMaxIterations: 240,
+    });
+    assert.equal(extendedBudget.history.complete, true);
+    assert.equal(extendedBudget.history.diagnostics.completeVerification.passCount, 2);
+    assert.equal(extendedBudget.history.diagnostics.completeVerification.requiredConsecutiveStablePasses, 2);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 test('chatgpt-controller: fixed-point diagnostics retain only recent signatures while counting every pass', () => {
   const traversals = Array.from({ length: 10 }, (_, index) => completeTraversalFixture(index + 10));
   const verification = verifyCompleteHistoryFixedPoint(traversals, { maxTurns: 50 });
@@ -2020,8 +2061,9 @@ test('chatgpt-controller: complete history remains fail-closed for hidden, close
   assert.equal(runtimeHidden.getWheelCount(), 0);
 });
 
-test('chatgpt-controller: complete history defaults use the existing maximum budget', () => {
+test('chatgpt-controller: complete history keeps a 60 second default and allows a bounded explicit budget', () => {
   assert.equal(DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, 60_000);
+  assert.equal(MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 180_000);
   assert.equal(DEFAULT_CONVERSATION_HISTORY_ITERATIONS, 240);
 });
 

@@ -19,7 +19,8 @@ const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
 const PROVIDER_STOP_TIMEOUT_MS = 1_000;
 const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
-const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
+const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
+const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 180_000;
 const MAX_CONVERSATION_HISTORY_ITERATIONS = 240;
 
 function conversationUrlHash(url) {
@@ -2031,7 +2032,7 @@ export function startHttpApi({
         }
         const historyMode = body.historyMode === undefined ? 'visible' : String(body.historyMode).trim().toLowerCase();
         if (historyMode !== 'visible' && historyMode !== 'tail' && historyMode !== 'complete') throw new Error('conversation_history_mode_invalid');
-        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
+        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid');
         const historyMaxIterations = strictPositiveIntOr(body.historyMaxIterations, MAX_CONVERSATION_HISTORY_ITERATIONS, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid');
         const result = await controller.readConversationTurns({
           maxTurns: positiveIntOr(body.maxTurns, 100, 200),

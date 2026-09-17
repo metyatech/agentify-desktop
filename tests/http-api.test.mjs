@@ -4411,15 +4411,26 @@ test('http-api: conversation turns complete mode returns bounded history metadat
   assert.equal(calls[0].historyTimeoutMs, 1000);
   assert.equal(calls[0].historyMaxIterations, 5);
 
+  const extended = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete', historyTimeoutMs: 180_000 } });
+  assert.equal(extended.res.status, 200);
+  assert.equal(calls[1].historyTimeoutMs, 180_000);
+
   const omitted = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete' } });
   assert.equal(omitted.res.status, 200);
-  assert.equal(calls[1].historyTimeoutMs, 60_000);
-  assert.equal(calls[1].historyMaxIterations, 240);
+  assert.equal(calls[2].historyTimeoutMs, 60_000);
+  assert.equal(calls[2].historyMaxIterations, 240);
 
   const tail = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'tail' } });
   assert.equal(tail.res.status, 200);
   assert.equal(tail.data.history.mode, 'tail');
-  assert.equal(calls[2].historyMode, 'tail');
+  assert.equal(calls[3].historyMode, 'tail');
+
+  const aboveMaximum = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete', historyTimeoutMs: 180_001 } });
+  assert.equal(aboveMaximum.res.status, 400);
+  for (const historyTimeoutMs of [0, -1, 1.5, '180000ms']) {
+    const invalidTimeout = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'complete', historyTimeoutMs } });
+    assert.equal(invalidTimeout.res.status, 400);
+  }
 
   const invalidMode = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/turns', body: { key: 'review', historyMode: 'all' } });
   assert.equal(invalidMode.res.status, 400);

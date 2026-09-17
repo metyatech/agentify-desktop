@@ -1053,20 +1053,17 @@ export function conversationDirectionalProgress(beforeTurns = [], afterTurns = [
   const sharedAfter = afterKeys.filter((key) => beforeByKey.has(key));
   if (sharedBefore.length === 0 || JSON.stringify(sharedBefore) !== JSON.stringify(sharedAfter)) return 'ambiguous';
   if (JSON.stringify(beforeKeys) === JSON.stringify(afterKeys)) return 'same';
-  const firstSharedBefore = beforeKeys.indexOf(sharedBefore[0]);
-  const lastSharedBefore = beforeKeys.lastIndexOf(sharedBefore.at(-1));
-  const firstSharedAfter = afterKeys.indexOf(sharedAfter[0]);
-  const lastSharedAfter = afterKeys.lastIndexOf(sharedAfter.at(-1));
-  const beforePrefixOnly = beforeKeys.slice(0, firstSharedBefore).every((key) => !afterByKey.has(key));
-  const beforeSuffixOnly = beforeKeys.slice(lastSharedBefore + 1).every((key) => !afterByKey.has(key));
-  const afterPrefixOnly = afterKeys.slice(0, firstSharedAfter).every((key) => !beforeByKey.has(key));
-  const afterSuffixOnly = afterKeys.slice(lastSharedAfter + 1).every((key) => !beforeByKey.has(key));
-  const afterPrefixLength = afterKeys.slice(0, firstSharedAfter).length;
-  const afterSuffixLength = afterKeys.slice(lastSharedAfter + 1).length;
-  const revealsOlder = afterPrefixOnly && afterPrefixLength > 0 && beforeSuffixOnly && afterSuffixLength === 0;
-  const revealsNewer = afterSuffixOnly && afterSuffixLength > 0 && beforePrefixOnly && afterPrefixLength === 0;
-  if (revealsOlder && !revealsNewer) return 'older';
-  if (revealsNewer && !revealsOlder) return 'newer';
+  const sharedCount = sharedBefore.length;
+  const olderAnchored = sharedCount > 0
+    && JSON.stringify(beforeKeys.slice(0, sharedCount)) === JSON.stringify(sharedBefore)
+    && JSON.stringify(afterKeys.slice(-sharedCount)) === JSON.stringify(sharedAfter)
+    && afterKeys.length > sharedCount;
+  const newerAnchored = sharedCount > 0
+    && JSON.stringify(beforeKeys.slice(-sharedCount)) === JSON.stringify(sharedBefore)
+    && JSON.stringify(afterKeys.slice(0, sharedCount)) === JSON.stringify(sharedAfter)
+    && afterKeys.length > sharedCount;
+  if (olderAnchored && !newerAnchored) return 'older';
+  if (newerAnchored && !olderAnchored) return 'newer';
   return 'ambiguous';
 }
 

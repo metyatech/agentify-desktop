@@ -3053,6 +3053,18 @@ test('chatgpt-controller: stable IDs classify older, newer, same, and remount tr
   assert.equal(conversationDirectionalProgress([message('m5'), message('m6')], [message('m5'), message('m6')]), 'same');
   assert.equal(conversationDirectionalProgress([message('m5', 'user')], [message('m5', 'assistant')]), 'ambiguous');
   assert.equal(conversationDirectionalProgress([message('m5'), message('m6')], [message('m7'), message('m8')]), 'ambiguous');
+  assert.equal(conversationDirectionalProgress(
+    [message('m4'), message('m5'), message('m6'), message('m7')],
+    [message('m2'), message('m5'), message('m6')]
+  ), 'ambiguous');
+  assert.equal(conversationDirectionalProgress(
+    [message('m4'), message('m5'), message('m6'), message('m7')],
+    [message('m4'), message('m6'), message('m7')]
+  ), 'ambiguous');
+  assert.equal(conversationDirectionalProgress(
+    [message('m5'), message('m6'), message('m7'), message('m8')],
+    [message('m5'), message('m6')]
+  ), 'ambiguous');
   assert.equal(conversationDirectionalProgress([
     { messageId: 'm5', role: 'user', text: 'm5', positionHint: null, virtualizerTurnKey: 'virtual-A' },
     { messageId: 'm6', role: 'assistant', text: 'm6', positionHint: null, virtualizerTurnKey: 'virtual-A' }
@@ -3060,6 +3072,25 @@ test('chatgpt-controller: stable IDs classify older, newer, same, and remount tr
     { messageId: 'm5', role: 'user', text: 'm5', positionHint: null, virtualizerTurnKey: 'virtual-B' },
     { messageId: 'm6', role: 'assistant', text: 'm6', positionHint: null, virtualizerTurnKey: 'virtual-B' }
   ]), 'same');
+});
+
+test('chatgpt-controller: discontinuous current-DOM overlap is not semantic older progress', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[2, 5, 6], [2, 5, 6], [4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 1_600,
+    directTopPlan: () => ({})
+  });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 240 });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.reason, 'history-virtualizer-stalled');
+  assert.equal(result.history.diagnostics.semanticOlderProgressCount, 0);
+  assert.ok(result.history.diagnostics.olderNoProgressCount > 0);
+  assert.equal(result.history.diagnostics.progress.olderWindowObserved, false);
+  assert.equal(result.history.diagnostics.topMaterialization.stalled, true);
+  assert.ok(harness.getWheelCount() < 20);
 });
 
 test('chatgpt-controller: physical jitter does not reset semantic older no-progress and fails as a bounded virtualizer stall', async () => {

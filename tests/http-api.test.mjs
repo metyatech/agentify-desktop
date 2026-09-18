@@ -4443,15 +4443,16 @@ test('http-api: conversation windows requires an existing ChatGPT tab and preser
   assert.equal(creates, 0);
 });
 
-test('http-api: conversation windows rejects an oversized raw response instead of truncating it', async (t) => {
+test('http-api: conversation windows allows responses below 10MiB and rejects larger responses without truncating', async (t) => {
   const largeText = 'x'.repeat(40_000);
+  let windowCount = 30;
   const tabs = {
     listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
     getControllerById: () => ({
       readConversationWindows: async () => ({
         url: 'https://chatgpt.com/c/test',
-        windows: Array.from({ length: 30 }, (_, windowIndex) => ({ windowIndex, turns: [{ role: 'user', text: largeText, messageId: `m-${windowIndex}`, positionHint: windowIndex }] })),
-        history: { mode: 'bounded-raw-windows', windowOrder: 'newest-to-oldest', windowCount: 30, tailProven: true, startReached: false, startPositionProof: false, snapshotStable: false, iterations: 30, scrollRestored: true, reason: 'history-iteration-limit', stopReason: 'history-iteration-limit', urlStable: true, diagnostics: {} }
+        windows: Array.from({ length: windowCount }, (_, windowIndex) => ({ windowIndex, turns: [{ role: 'user', text: largeText, messageId: `m-${windowIndex}`, positionHint: windowIndex }] })),
+        history: { mode: 'bounded-raw-windows', windowOrder: 'newest-to-oldest', windowCount, tailProven: true, startReached: false, startPositionProof: false, snapshotStable: false, iterations: windowCount, scrollRestored: true, reason: 'history-iteration-limit', stopReason: 'history-iteration-limit', urlStable: true, diagnostics: {} }
       })
     })
   };
@@ -4465,9 +4466,16 @@ test('http-api: conversation windows rejects an oversized raw response instead o
     getStatus: async () => ({ ok: true })
   });
   t.after(() => server.close());
-  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/windows', body: { key: 'review' } });
-  assert.equal(result.res.status, 413);
-  assert.equal(result.data.error, 'response_too_large');
+  const port = server.address().port;
+  const belowLimit = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/windows', body: { key: 'review' } });
+  assert.equal(belowLimit.res.status, 200);
+  assert.equal(belowLimit.data.windows.length, 30);
+  assert.equal(belowLimit.data.windows[29].turns[0].messageId, 'm-29');
+
+  windowCount = 270;
+  const aboveLimit = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/windows', body: { key: 'review' } });
+  assert.equal(aboveLimit.res.status, 413);
+  assert.equal(aboveLimit.data.error, 'response_too_large');
 });
 
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {

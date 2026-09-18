@@ -14,6 +14,7 @@ import { validateAutopilotActivityEnvelope } from './autopilot-activity.mjs';
 import { AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES, validateAutopilotProposalTicket } from './autopilot-proposal-ticket.mjs';
 
 const MAX_RESPONSE_BYTES = 1_000_000;
+const MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -2095,7 +2096,7 @@ export function startHttpApi({
           windowOrder: result.history.windowOrder,
           windows: result.windows,
           history: result.history
-        });
+        }, { maxBytes: MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

@@ -263,6 +263,32 @@ function historyMetadata({ mode, complete = false, reason = null, startReached =
   return metadata;
 }
 
+function rawConversationWindowTurn(turn) {
+  const role = turn?.role === 'user' || turn?.role === 'assistant' ? turn.role : null;
+  const text = normalizeConversationText(turn?.text);
+  const messageId = typeof turn?.messageId === 'string' ? turn.messageId.trim() : '';
+  const turnId = typeof turn?.turnId === 'string' ? turn.turnId.trim() : '';
+  const positionHint = Number.isInteger(turn?.positionHint) ? turn.positionHint : null;
+  if (!role || !text) return null;
+  return {
+    role,
+    text,
+    messageId: messageId || null,
+    turnId: turnId || null,
+    ...(messageId ? { identityProvenance: 'provider-message-id' } : turnId ? { identityProvenance: 'provider-turn-id' } : {}),
+    positionHint
+  };
+}
+
+function rawConversationWindowsFromSnapshots(snapshots = []) {
+  return (Array.isArray(snapshots) ? snapshots : []).map((snapshot, windowIndex) => ({
+    windowIndex,
+    turns: (Array.isArray(snapshot) ? snapshot : snapshot?.turns)
+      ?.map(rawConversationWindowTurn)
+      .filter(Boolean) || []
+  }));
+}
+
 export function buildChatGPTDomModelScript() {
   return String.raw`(() => {
     const currentUnitSelector = '[data-content-search-unit-key]';
@@ -4382,10 +4408,12 @@ export class ChatGPTController {
     historyTimeoutMs,
     historyMaxIterations,
     tailOnly = false,
+    collectRawWindows = false,
     operationStartedAt = Date.now(),
     deadlineAt = null
   }) {
     const snapshots = [];
+    const rawSnapshots = [];
     let initialNative = null;
     try {
       initialNative = await this.getNativeInputDiagnostics();
@@ -4578,6 +4606,9 @@ export class ChatGPTController {
     let furthestOlderDistanceFromBottom = null;
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
+      if (collectRawWindows && Array.isArray(state?.turns)) {
+        rawSnapshots.push(state.turns.map((turn) => ({ ...turn })));
+      }
       const virtualizerTopOffsetPx = conversationVirtualizerTopOffset(state);
       if (virtualizerTopOffsetPx !== null) {
         diagnostics.initialVirtualizerTopOffsetPx ??= virtualizerTopOffsetPx;
@@ -4877,6 +4908,7 @@ export class ChatGPTController {
       diagnostics.tailRange = conversationTurnRange(state?.turns);
       current = state;
       if (replaceSnapshots) snapshots.length = 0;
+      if (collectRawWindows) rawSnapshots.length = 0;
       addSnapshot(state);
       if (!diagnostics.tailEntry.mode) diagnostics.tailEntry.mode = 'native-wheel-fallback';
     };
@@ -5491,7 +5523,9 @@ export class ChatGPTController {
     diagnostics.timing.topProofElapsedMs = topProofStartedAt ? Math.max(0, (restoreStartedAt || now) - topProofStartedAt) : 0;
     diagnostics.timing.restoreElapsedMs = restoreStartedAt ? Math.max(0, now - restoreStartedAt) : 0;
     return {
+      url: initialUrl,
       snapshots,
+      rawSnapshots,
       startReached,
       startPositionProof: diagnostics.startProven,
       tailProven: diagnostics.tailProven,
@@ -5744,6 +5778,77 @@ export class ChatGPTController {
         }
       }
       return { url: String(await this.getUrl()), turns, history };
+    });
+  }
+
+  async readConversationWindows({
+    maxTurnsPerWindow = 100,
+    maxCharsPerTurn = 100_000,
+    maxTotalChars = 1_000_000,
+    historyTimeoutMs = DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS,
+    historyMaxIterations = DEFAULT_CONVERSATION_HISTORY_ITERATIONS
+  } = {}) {
+    const limits = {
+      maxTurns: Number(maxTurnsPerWindow),
+      maxCharsPerTurn: Number(maxCharsPerTurn),
+      maxTotalChars: Number(maxTotalChars)
+    };
+    const historyOptions = {
+      historyTimeoutMs: Number(historyTimeoutMs),
+      historyMaxIterations: Number(historyMaxIterations)
+    };
+    if (!Number.isInteger(limits.maxTurns) || limits.maxTurns < 1 || limits.maxTurns > MAX_CONVERSATION_TURNS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+    if (!Number.isInteger(limits.maxCharsPerTurn) || limits.maxCharsPerTurn < 1 || limits.maxCharsPerTurn > MAX_CONVERSATION_TURN_CHARS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+    if (!Number.isInteger(limits.maxTotalChars) || limits.maxTotalChars < 1 || limits.maxTotalChars > MAX_CONVERSATION_TOTAL_CHARS) {
+      throw new Error('conversation_turn_limits_invalid');
+    }
+    validateConversationHistoryOptions({ historyMode: 'complete', ...historyOptions });
+
+    return await this.runExclusive(async () => {
+      const result = await this.#readCompleteConversationTurns({
+        limits,
+        historyTimeoutMs: historyOptions.historyTimeoutMs,
+        historyMaxIterations: historyOptions.historyMaxIterations,
+        collectRawWindows: true
+      });
+      const rawWindows = rawConversationWindowsFromSnapshots(result.rawSnapshots);
+      const malformedWindow = (Array.isArray(result.rawSnapshots) ? result.rawSnapshots : [])
+        .some((snapshot) => !Array.isArray(snapshot) || snapshot.length === 0 || snapshot.some((turn) => !rawConversationWindowTurn(turn)));
+      let reason = result.reason || null;
+      if (!reason && result.tailProven !== true) reason = 'history-tail-unproven';
+      if (!reason && result.diagnostics?.urlStable !== true) reason = 'conversation-changed';
+      if (!reason && result.scrollRestored !== true) reason = 'scroll-restore-failed';
+      if (!reason && result.diagnostics?.scroller?.candidateCount !== 1) reason = 'scroll-container-invalid';
+      if (!reason && malformedWindow) reason = 'conversation-window-malformed';
+
+      const failClosed = result.tailProven !== true
+        || result.scrollRestored !== true
+        || result.diagnostics?.urlStable !== true
+        || result.diagnostics?.scroller?.candidateCount !== 1
+        || result.reason === 'conversation_too_large'
+        || result.reason === 'conversation_turn_too_large'
+        || malformedWindow;
+      const windows = failClosed ? [] : rawWindows;
+      const history = {
+        mode: 'bounded-raw-windows',
+        windowOrder: 'newest-to-oldest',
+        windowCount: windows.length,
+        tailProven: result.tailProven === true,
+        startReached: result.startReached === true,
+        startPositionProof: result.startPositionProof === true,
+        snapshotStable: result.snapshotStable === true,
+        iterations: result.iterations,
+        scrollRestored: result.scrollRestored === true,
+        reason,
+        stopReason: reason || (result.startReached === true ? 'start-reached' : 'bounded-stop'),
+        urlStable: result.diagnostics?.urlStable === true,
+        diagnostics: result.diagnostics || {}
+      };
+      return { url: result.url || String(await this.getUrl()), windows, history };
     });
   }
 

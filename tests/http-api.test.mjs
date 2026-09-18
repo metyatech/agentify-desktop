@@ -4373,6 +4373,103 @@ test('http-api: conversation turns requires an existing ChatGPT tab and does not
   assert.equal(reads, 2);
 });
 
+test('http-api: conversation windows requires an existing ChatGPT tab and preserves raw window metadata', async (t) => {
+  let creates = 0;
+  let reads = 0;
+  const controller = {
+    readConversationWindows: async (options) => {
+      reads += 1;
+      assert.equal(options.maxTurnsPerWindow, 2);
+      return {
+        url: 'https://chatgpt.com/c/test',
+        windows: [{
+          windowIndex: 0,
+          turns: [{ role: 'user', text: 'hello', messageId: 'm1', turnId: null, identityProvenance: 'provider-message-id', positionHint: 31 }]
+        }],
+        history: {
+          mode: 'bounded-raw-windows',
+          windowOrder: 'newest-to-oldest',
+          windowCount: 1,
+          tailProven: true,
+          startReached: false,
+          startPositionProof: false,
+          snapshotStable: false,
+          iterations: 2,
+          scrollRestored: true,
+          reason: 'history-iteration-limit',
+          stopReason: 'history-iteration-limit',
+          urlStable: true,
+          diagnostics: {}
+        }
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    ensureTab: async () => { creates += 1; return 'created'; },
+    createTab: async () => { creates += 1; return 'created'; },
+    closeTab: async () => true,
+    getControllerById: (id) => id === 'chat-1' ? controller : (() => { throw new Error('tab_not_found'); })()
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const result = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/windows',
+    body: { key: 'review', maxTurnsPerWindow: 2, maxCharsPerTurn: 100, maxTotalChars: 500, historyMaxIterations: 2 }
+  });
+  assert.equal(result.res.status, 200);
+  assert.equal(result.data.windowOrder, 'newest-to-oldest');
+  assert.equal(result.data.history.mode, 'bounded-raw-windows');
+  assert.equal(result.data.windows[0].turns[0].positionHint, 31);
+  assert.equal(reads, 1);
+  assert.equal(creates, 0);
+
+  const missing = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/windows', body: { key: 'missing' } });
+  assert.equal(missing.res.status, 404);
+  assert.equal(missing.data.error, 'tab_not_found');
+  assert.equal(creates, 0);
+});
+
+test('http-api: conversation windows rejects an oversized raw response instead of truncating it', async (t) => {
+  const largeText = 'x'.repeat(40_000);
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => ({
+      readConversationWindows: async () => ({
+        url: 'https://chatgpt.com/c/test',
+        windows: Array.from({ length: 30 }, (_, windowIndex) => ({ windowIndex, turns: [{ role: 'user', text: largeText, messageId: `m-${windowIndex}`, positionHint: windowIndex }] })),
+        history: { mode: 'bounded-raw-windows', windowOrder: 'newest-to-oldest', windowCount: 30, tailProven: true, startReached: false, startPositionProof: false, snapshotStable: false, iterations: 30, scrollRestored: true, reason: 'history-iteration-limit', stopReason: 'history-iteration-limit', urlStable: true, diagnostics: {} }
+      })
+    })
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/windows', body: { key: 'review' } });
+  assert.equal(result.res.status, 413);
+  assert.equal(result.data.error, 'response_too_large');
+});
+
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {
   const calls = [];
   const controller = {

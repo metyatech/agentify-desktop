@@ -889,7 +889,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -938,7 +938,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       url,
       turns: positions.map((position) => ({
         role: rawPositions[positions.indexOf(position)] % 2 ? 'assistant' : 'user',
-        text: `turn-${position}`,
+        text: typeof turnText === 'function' ? turnText({ position, windowIndex }) : `turn-${position}`,
         messageId: `message-${position}`,
         turnId: null,
         positionHint: positionHints ? position : null
@@ -1637,6 +1637,112 @@ test('chatgpt-controller: complete history orchestrates native wheel input and a
   assert.equal(result.history.diagnostics.nativeScrollControlProven, true);
   assert.ok(harness.getWheelCount() > 0);
   assert.equal(harness.getWindowIndex(), harness.originalWindowIndex);
+});
+
+test('chatgpt-controller: bounded raw windows preserve proven newest-to-oldest traversal order', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2 });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.mode, 'bounded-raw-windows');
+  assert.equal(result.history.windowOrder, 'newest-to-oldest');
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.startReached, true);
+  assert.equal(result.history.startPositionProof, true);
+  assert.equal(result.history.scrollRestored, true);
+  assert.equal(result.history.windowCount, result.windows.length);
+  assert.deepEqual(result.windows[0].turns.map((turn) => turn.positionHint), [20, 21, 22, 23, 24]);
+  assert.deepEqual(result.windows.at(-1).turns.map((turn) => turn.positionHint), [0, 1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(result.windows[0].turns.slice(0, 2).map((turn) => turn.positionHint), result.windows[1].turns.slice(-2).map((turn) => turn.positionHint));
+  assert.equal(Object.hasOwn(result, 'fullHistoryComplete'), false);
+  assert.equal(Object.hasOwn(result.history, 'fullHistoryComplete'), false);
+  assert.equal(result.windows[0].turns[0].identityProvenance, 'provider-message-id');
+});
+
+test('chatgpt-controller: bounded raw windows retain conflicting durable observations without merging them', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2], [2, 3, 4], [4, 5, 6]],
+    turnText: ({ position, windowIndex }) => position === 2 ? `turn-2-variant-${windowIndex}` : `turn-${position}`
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 10,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.reason, null);
+  const variants = result.windows.flatMap((window) => window.turns)
+    .filter((turn) => turn.messageId === 'message-2')
+    .map((turn) => turn.text);
+  assert.deepEqual(new Set(variants), new Set(['turn-2-variant-0', 'turn-2-variant-1']));
+  assert.equal(result.history.diagnostics.mergeAmbiguous, undefined);
+});
+
+test('chatgpt-controller: bounded raw windows retain acquired windows at the iteration boundary', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4 });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 1
+  });
+  assert.equal(result.history.reason, 'history-iteration-limit');
+  assert.equal(result.history.stopReason, 'history-iteration-limit');
+  assert.equal(result.history.tailProven, true);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.scrollRestored, true);
+  assert.ok(result.windows.length > 0);
+  assert.equal(Object.hasOwn(result.history, 'fullHistoryComplete'), false);
+});
+
+test('chatgpt-controller: bounded raw windows fail closed on conversation changes', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, changeUrlOnWheel: true });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.reason, 'conversation-changed');
+  assert.equal(result.history.urlStable, false);
+  assert.deepEqual(result.windows, []);
+});
+
+test('chatgpt-controller: bounded raw windows fail closed when the tail cannot be proven', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 2, nativeWheel: false });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 5000,
+    historyMaxIterations: 4
+  });
+  assert.equal(result.history.reason, 'history-native-scroll-unproven');
+  assert.equal(result.history.tailProven, false);
+  assert.deepEqual(result.windows, []);
+});
+
+test('chatgpt-controller: bounded raw windows fail closed when scroll restoration fails', async () => {
+  const harness = createNativeWheelHistoryPage({ initialWindow: 4, restorePlan: () => ({ scrollTop: 0 }) });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.reason, 'scroll-restore-failed');
+  assert.equal(result.history.scrollRestored, false);
+  assert.deepEqual(result.windows, []);
 });
 
 test('chatgpt-controller: complete history requires a full-history fixed point', () => {

@@ -2057,6 +2057,47 @@ export function startHttpApi({
         return sendJson(res, 200, responseBody, { maxBytes: 2_000_000 });
       }
 
+      if (url.pathname === '/conversation/windows' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readConversationWindows !== 'function') {
+          throw new Error('conversation_windows_controller_unavailable');
+        }
+        const result = await controller.readConversationWindows({
+          maxTurnsPerWindow: positiveIntOr(body.maxTurnsPerWindow, 100, 200),
+          maxCharsPerTurn: positiveIntOr(body.maxCharsPerTurn, 100_000, 200_000),
+          maxTotalChars: positiveIntOr(body.maxTotalChars, 1_000_000, 2_000_000),
+          historyTimeoutMs: strictPositiveIntOr(body.historyTimeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_history_timeout_invalid'),
+          historyMaxIterations: strictPositiveIntOr(body.historyMaxIterations, MAX_CONVERSATION_HISTORY_ITERATIONS, MAX_CONVERSATION_HISTORY_ITERATIONS, 'conversation_history_iterations_invalid')
+        });
+        if (!result || typeof result.url !== 'string' || !Array.isArray(result.windows)
+          || !result.history || result.history.mode !== 'bounded-raw-windows') {
+          throw new Error('conversation_windows_controller_unavailable');
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          tabId: tab.id,
+          vendorId: 'chatgpt',
+          url: result.url,
+          windowOrder: result.history.windowOrder,
+          windows: result.windows,
+          history: result.history
+        });
+      }
+
       if (url.pathname === '/download-images' && req.method === 'POST') {
         const body = await parseBody(req);
         const maxImages = positiveIntOr(body.maxImages, 6, 50);

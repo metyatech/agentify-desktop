@@ -421,6 +421,31 @@ Markdown, JSON, and code blocks are preserved. The endpoint is intended for the
 ai-autopilot approval watcher and uses the existing loopback and bearer-token
 security boundary.
 
+For bounded recovery diagnostics that need the mounted history windows without
+merging them, use:
+
+```text
+POST /conversation/windows
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"tabId":"existing-chatgpt-tab","maxTurnsPerWindow":100,"maxCharsPerTurn":100000,"maxTotalChars":1000000,"historyTimeoutMs":60000,"historyMaxIterations":240}
+```
+
+This endpoint only resolves an existing ChatGPT tab. It never creates a tab,
+navigates, queries, sends, or changes the composer. It performs one bounded
+bottom-to-older traversal using the existing native-wheel, tail proof, URL and
+layout stability, timeout, iteration, and restoration machinery. The response
+contains raw snapshot windows in explicit `newest-to-oldest` order. Each window
+keeps its observed role, text, provider identities, identity provenance, and
+position hint; position hints are local observations and are not global indexes.
+The endpoint does not call the conversation snapshot merge and therefore keeps
+conflicting observations in their respective windows. It never labels this
+sequence as a complete transcript. Iteration and timeout stops retain acquired
+windows with bounded-stop metadata; URL changes, failed tail or restoration
+proofs, invalid scrollers, malformed observations, and response-size limits
+fail closed without silent truncation.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

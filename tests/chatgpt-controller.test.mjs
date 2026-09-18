@@ -889,7 +889,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -1127,6 +1127,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
     };
     page.restoreMinimizedForProbe = async () => {
       events.push('window-state:minimized');
+      if (!windowRestoreSucceeds) return;
       browserWindowState = 'minimized';
       adapterMinimized = true;
       visibilityState = 'hidden';
@@ -1655,6 +1656,7 @@ test('chatgpt-controller: bounded raw windows preserve proven newest-to-oldest t
   assert.equal(result.history.startReached, true);
   assert.equal(result.history.startPositionProof, true);
   assert.equal(result.history.scrollRestored, true);
+  assert.equal(result.history.windowRestored, true);
   assert.equal(result.history.windowCount, result.windows.length);
   assert.deepEqual(result.windows[0].turns.map((turn) => turn.positionHint), [20, 21, 22, 23, 24]);
   assert.deepEqual(result.windows.at(-1).turns.map((turn) => turn.positionHint), [0, 1, 2, 3, 4, 5, 6]);
@@ -1742,6 +1744,47 @@ test('chatgpt-controller: bounded raw windows fail closed when scroll restoratio
   });
   assert.equal(result.history.reason, 'scroll-restore-failed');
   assert.equal(result.history.scrollRestored, false);
+  assert.deepEqual(result.windows, []);
+});
+
+test('chatgpt-controller: bounded raw windows fail closed when browser window restore fails', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    backend: 'chrome-cdp',
+    initialBrowserWindowState: 'minimized',
+    windowRestoreSucceeds: false
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  assert.equal(result.history.windowRestored, false);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreVerified, false);
+  assert.equal(result.history.reason, 'history-window-restore-failed');
+  assert.deepEqual(result.windows, []);
+});
+
+test('chatgpt-controller: bounded stop plus browser window restore failure never returns raw windows', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    backend: 'chrome-cdp',
+    initialBrowserWindowState: 'minimized',
+    windowRestoreSucceeds: false
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 1
+  });
+  assert.equal(result.history.reason, 'history-iteration-limit');
+  assert.equal(result.history.stopReason, 'history-iteration-limit');
+  assert.equal(result.history.windowRestored, false);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreVerified, false);
   assert.deepEqual(result.windows, []);
 });
 

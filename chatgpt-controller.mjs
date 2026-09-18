@@ -5827,6 +5827,7 @@ export class ChatGPTController {
 
       const failClosed = result.tailProven !== true
         || result.scrollRestored !== true
+        || result.diagnostics?.windowLifecycle?.restoreVerified !== true
         || result.diagnostics?.urlStable !== true
         || result.diagnostics?.scroller?.candidateCount !== 1
         || result.reason === 'conversation_too_large'
@@ -5843,6 +5844,7 @@ export class ChatGPTController {
         snapshotStable: result.snapshotStable === true,
         iterations: result.iterations,
         scrollRestored: result.scrollRestored === true,
+        windowRestored: result.diagnostics?.windowLifecycle?.restoreVerified === true,
         reason,
         stopReason: reason || (result.startReached === true ? 'start-reached' : 'bounded-stop'),
         urlStable: result.diagnostics?.urlStable === true,

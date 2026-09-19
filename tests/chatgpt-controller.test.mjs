@@ -4140,6 +4140,8 @@ test('chatgpt-controller: one corrective native wheel restores a persistent newe
   let recoilInjected = false;
   let correctiveRestored = false;
   let correctiveWheelCalls = 0;
+  let olderRetryWheelCalls = 0;
+  let newerCorrectiveWheelCalls = 0;
   const harness = createNativeWheelHistoryPage({
     initialWindow: 2,
     windowRanges: [candidate, newer, Array.from({ length: 10 }, (_, index) => index + 8)],
@@ -4153,13 +4155,15 @@ test('chatgpt-controller: one corrective native wheel restores a persistent newe
     },
     mouseWheelPlan: ({ deltaY, windowIndex }) => {
       if (deltaY < 0 && windowIndex === 0) probeArmed = true;
-      if (deltaY > 0 && probeArmed && recoilInjected) {
+      if (probeArmed && recoilInjected && windowIndex === 1 && deltaY < 0) {
+        olderRetryWheelCalls += 1;
         correctiveWheelCalls += 1;
         if (!correctiveRestored) {
           correctiveRestored = true;
           return { windowIndex: 0 };
         }
       }
+      if (probeArmed && recoilInjected && windowIndex === 1 && deltaY > 0) newerCorrectiveWheelCalls += 1;
       return null;
     },
     restorePlan: () => ({ windowIndex: 2 }),
@@ -4181,6 +4185,8 @@ test('chatgpt-controller: one corrective native wheel restores a persistent newe
   assert.equal(probe.identityCorrectiveRestoreSuccessCount, 1);
   assert.equal(probe.identityCorrectiveRestoreWheelCount, 1);
   assert.equal(correctiveWheelCalls, 1);
+  assert.equal(olderRetryWheelCalls, 1);
+  assert.equal(newerCorrectiveWheelCalls, 0);
   assert.ok(probe.identityRecoilCount > 0);
   assert.ok(probe.identityRecoilRestoreCount > 0);
   assert.equal(probe.progressCount, 0);
@@ -4206,7 +4212,7 @@ test('chatgpt-controller: corrective recoil wheel compares its result to the ori
     turnIdentityPlan: currentDomUnitIdentity,
     mouseWheelPlan: ({ deltaY, windowIndex }) => {
       if (deltaY < 0 && windowIndex === 0) probeArmed = true;
-      if (deltaY > 0 && probeArmed && recoilInjected) {
+      if (deltaY < 0 && probeArmed && recoilInjected && windowIndex === 1) {
         correctiveWheelCalls += 1;
         return { windowIndex: 2 };
       }
@@ -4234,9 +4240,11 @@ test('chatgpt-controller: corrective recoil wheel compares its result to the ori
   assert.equal(recoilInjected, true);
   assert.equal(correctiveWheelCalls, 1);
   assert.equal(probe.identityCorrectiveRestoreAttemptCount, 1);
+  assert.equal(probe.identityCorrectiveRestoreWheelCount, 1);
   assert.equal(probe.identityCorrectiveRestoreOlderProgressCount, 1);
   assert.equal(probe.progressCount, 1);
   assert.equal(probe.materializationProgressCount, 1);
+  assert.equal(probe.identityCorrectiveRestoreUnresolvedCount, 0);
   assert.equal(result.turns.some((turn) => turn.messageId === 'origin-turn--4:0:user'), true);
 });
 
@@ -4258,7 +4266,7 @@ test('chatgpt-controller: corrective recoil that returns a contraction waits for
     turnIdentityPlan: currentDomUnitIdentity,
     mouseWheelPlan: ({ deltaY, windowIndex }) => {
       if (deltaY < 0 && windowIndex === 0) probeArmed = true;
-      if (deltaY > 0 && probeArmed && recoilInjected) {
+      if (deltaY < 0 && probeArmed && recoilInjected && windowIndex === 1) {
         correctiveWheelCalls += 1;
         correctiveReadPending = true;
         contractionRestorePending = true;
@@ -4314,7 +4322,7 @@ test('chatgpt-controller: corrective recoil with unrelated identity fails closed
     turnIdentityPlan: currentDomUnitIdentity,
     mouseWheelPlan: ({ deltaY, windowIndex }) => {
       if (deltaY < 0 && windowIndex === 0) probeArmed = true;
-      if (deltaY > 0 && probeArmed && recoilInjected) return { windowIndex: 2 };
+      if (deltaY < 0 && probeArmed && recoilInjected && windowIndex === 1) return { windowIndex: 2 };
       return null;
     },
     restorePlan: () => ({ windowIndex: 2 }),
@@ -4507,6 +4515,8 @@ test('chatgpt-controller: origin probe tolerates wheel-stage newer recoil but pr
   const newest = Array.from({ length: 10 }, (_, index) => index + 8);
   let probeArmed = false;
   let wheelRecoilPending = false;
+  let olderRetryWheelCalls = 0;
+  let newerCorrectiveWheelCalls = 0;
   const harness = createNativeWheelHistoryPage({
     initialWindow: 2,
     windowRanges: [candidate, newer, newest],
@@ -4520,6 +4530,11 @@ test('chatgpt-controller: origin probe tolerates wheel-stage newer recoil but pr
         wheelRecoilPending = true;
         return { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 };
       }
+      if (probeArmed && deltaY < 0 && windowIndex === 1) {
+        olderRetryWheelCalls += 1;
+        return { windowIndex: 0, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      if (probeArmed && deltaY > 0 && windowIndex === 1) newerCorrectiveWheelCalls += 1;
       return null;
     },
     restorePlan: () => {
@@ -4547,6 +4562,9 @@ test('chatgpt-controller: origin probe tolerates wheel-stage newer recoil but pr
   assert.ok(probe.identityRecoilRestoreCount > 0);
   assert.equal(probe.identityCorrectiveRestoreAttemptCount, 1);
   assert.equal(probe.identityCorrectiveRestoreWheelCount, 1);
+  assert.equal(probe.identityCorrectiveRestoreSuccessCount, 1);
+  assert.equal(olderRetryWheelCalls, 1);
+  assert.equal(newerCorrectiveWheelCalls, 0);
   assert.equal(probe.progressCount, 0);
   assert.equal(probe.materializationProgressCount, 0);
 });
@@ -4643,6 +4661,8 @@ test('chatgpt-controller: newer recoil without candidate restoration fails close
   assert.equal(probe.identityRecoilRestoreCount, 0);
   assert.equal(probe.identityCorrectiveRestoreAttemptCount, 1);
   assert.equal(probe.identityCorrectiveRestoreWheelCount, 1);
+  assert.equal(probe.identityCorrectiveRestoreOlderProgressCount, 0);
+  assert.equal(probe.identityCorrectiveRestoreUnresolvedCount, 0);
   assert.equal(probe.progressCount, 0);
   assert.equal(probe.materializationProgressCount, 0);
 });

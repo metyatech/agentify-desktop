@@ -5359,12 +5359,13 @@ export class ChatGPTController {
         identityContractionActive = true;
         latestIdentityTransient = { kind: 'contraction', stage, state };
       };
-      const attemptCorrectiveRestore = async (recoilState) => {
+      const attemptCorrectiveOlderRetry = async (recoilState) => {
         if (correctiveRestoreAttemptedThisEpisode) return { kind: 'already-attempted' };
         correctiveRestoreAttemptedThisEpisode = true;
         probe.identityCorrectiveRestoreAttemptCount += 1;
         probe.identityCorrectiveRestoreWheelCount += 1;
-        const corrective = await nativeWheel(1, recoilState, { collectChangedSnapshot: false });
+        // Retry the intended older/history-start movement after a newer recoil.
+        const corrective = await nativeWheel(-1, recoilState, { collectChangedSnapshot: false });
         if (!corrective.ok) {
           probe.identityCorrectiveRestoreUnresolvedCount += 1;
           failProbe('corrective-wheel-invalid', corrective.reason || 'wheel-failed', corrective.reason || 'history-virtualized-origin-unproven');
@@ -5498,7 +5499,7 @@ export class ChatGPTController {
             if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
               wheelIdentityTransientObserved = true;
               recordNewerIdentityRecoil('wheel', wheel.state);
-              const correction = await attemptCorrectiveRestore(wheel.state);
+              const correction = await attemptCorrectiveOlderRetry(wheel.state);
               if (correction.kind === 'failed') return { verified: false, progressed: false };
               if (correction.kind === 'older-progress') return { verified: false, progressed: true };
             } else if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
@@ -5565,7 +5566,7 @@ export class ChatGPTController {
             if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
               recordNewerIdentityRecoil('poll', state);
               if (!correctiveRestoreAttemptedThisEpisode) {
-                const correction = await attemptCorrectiveRestore(state);
+                const correction = await attemptCorrectiveOlderRetry(state);
                 if (correction.kind === 'failed') return { verified: false, progressed: false };
                 if (correction.kind === 'older-progress') return { verified: false, progressed: true };
                 if (correction.kind === 'exact-candidate') {

@@ -3377,7 +3377,39 @@ test('chatgpt-controller: virtualized-origin identity diagnostics identify curre
   assert.equal(diagnostic.unitIndexOnlyMismatchCount, 2);
   assert.equal(diagnostic.beforeCurrentUnitKeyShapeValid, true);
   assert.equal(diagnostic.afterCurrentUnitKeyShapeValid, true);
+  assert.equal(diagnostic.afterIsExactOrderedIdentitySubsetOfBefore, false);
   assert.equal(diagnostic.lengthChanged, false);
+});
+
+test('chatgpt-controller: virtualized-origin identity diagnostics prove only exact ordered subsets', () => {
+  const turn = (position) => {
+    const role = position % 2 ? 'assistant' : 'user';
+    const turnId = `unit-turn-${position}`;
+    return { turnId, role, messageId: `${turnId}:0:${role}` };
+  };
+  const before = Array.from({ length: 13 }, (_, position) => turn(position));
+  const nonContiguousSubset = [0, 2, 3, 5, 6, 8, 9, 11, 12].map((position) => turn(position));
+  const subsetDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(before, nonContiguousSubset);
+  assert.equal(subsetDiagnostic.turnRoleDirection, 'ambiguous');
+  assert.equal(subsetDiagnostic.afterIsExactOrderedIdentitySubsetOfBefore, true);
+  assert.equal(subsetDiagnostic.exactIdentitySubsetCount, 9);
+
+  const reordered = [0, 3, 2, 5, 6, 8, 9, 11, 12].map((position) => turn(position));
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, reordered).afterIsExactOrderedIdentitySubsetOfBefore, false);
+
+  const unknown = nonContiguousSubset.slice();
+  unknown[4] = turn(99);
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, unknown).afterIsExactOrderedIdentitySubsetOfBefore, false);
+
+  const changedMessageId = nonContiguousSubset.map((item, index) => index === 4
+    ? { ...item, messageId: `${item.turnId}:1:${item.role}` }
+    : item);
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, changedMessageId).afterIsExactOrderedIdentitySubsetOfBefore, false);
+
+  const unitChurn = nonContiguousSubset.map((item, index) => index === 4
+    ? { ...item, messageId: `${item.turnId}:1:${item.role}` }
+    : item);
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, unitChurn).unitIndexOnlyMismatchCount, 1);
 });
 
 test('chatgpt-controller: virtualized-origin identity diagnostics classify turn-role direction independently', () => {
@@ -3415,6 +3447,7 @@ test('chatgpt-controller: virtualized-origin identity diagnostics reject duplica
   assert.equal(duplicate.beforeTurnRoleUnique, false);
   assert.equal(duplicate.beforeDuplicateTurnRoleCount, 1);
   assert.equal(duplicate.turnRoleDirection, 'ambiguous');
+  assert.equal(duplicate.afterIsExactOrderedIdentitySubsetOfBefore, false);
 
   const malformed = diagnoseVirtualizedOriginIdentityMismatch(
     [turn('turn-A', 'user', 'sentinel-malformed-provider-unit-key')],
@@ -3422,6 +3455,7 @@ test('chatgpt-controller: virtualized-origin identity diagnostics reject duplica
   );
   assert.equal(malformed.beforeCurrentUnitKeyShapeValid, false);
   assert.equal(malformed.afterCurrentUnitKeyShapeValid, false);
+  assert.equal(malformed.afterIsExactOrderedIdentitySubsetOfBefore, false);
 });
 
 test('chatgpt-controller: structural origin diagnostics never expose provider identities or hashes', () => {
@@ -4097,6 +4131,170 @@ test('chatgpt-controller: bounded newer recoil restores the exact origin baselin
   assert.equal(probe.materializationProgressCount, 0);
   assert.equal(probe.lastFailureStage, null);
   assert.equal(probe.lastFailureReason, null);
+});
+
+test('chatgpt-controller: bounded exact identity contraction restores the 13-unit origin baseline without false progress', async () => {
+  const candidate = Array.from({ length: 13 }, (_, index) => index);
+  const subset = [0, 2, 3, 5, 6, 8, 9, 11, 12];
+  let contractionInjected = false;
+  let restoreWasObserved = false;
+  let contractionPollPending = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [candidate, subset, candidate],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: currentDomUnitIdentity,
+    restorePlan: () => ({ windowIndex: 2 }),
+    virtualizerTopOffsetPlan: ({ readCount, traversalRead }) => {
+      if (traversalRead) return null;
+      if (!contractionPollPending && !contractionInjected && readCount >= 18) {
+        contractionInjected = true;
+        contractionPollPending = true;
+        return { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      if (contractionPollPending) {
+        contractionPollPending = false;
+        restoreWasObserved = true;
+        return { windowIndex: 0, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 20_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 50
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(contractionInjected, true);
+  assert.equal(restoreWasObserved, true);
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(probe.verified, true);
+  assert.equal(probe.stablePasses, 3);
+  assert.ok(probe.identityContractionCount > 0, JSON.stringify(probe));
+  assert.ok(probe.identityContractionPollCount > 0);
+  assert.ok(probe.identityContractionRestoreCount > 0);
+  assert.equal(probe.progressCount, 0);
+  assert.equal(probe.materializationProgressCount, 0);
+  assert.equal(probe.lastFailureStage, null);
+  assert.equal(probe.lastFailureReason, null);
+});
+
+test('chatgpt-controller: exact identity contraction keeps the original baseline for actual older materialization', async () => {
+  const candidate = Array.from({ length: 13 }, (_, index) => index);
+  const subset = [0, 2, 3, 5, 6, 8, 9, 11, 12];
+  let pollStage = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [candidate, subset, candidate],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: currentDomUnitIdentity,
+    restorePlan: () => ({ windowIndex: 3 }),
+    virtualizerTopOffsetPlan: ({ readCount, traversalRead }) => {
+      if (traversalRead || readCount < 18) return null;
+      if (pollStage === 0) {
+        pollStage += 1;
+        return { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      if (pollStage === 1) {
+        pollStage += 1;
+        return {
+          prependRange: Array.from({ length: 13 }, (_, index) => index - 4),
+          scrollTop: 0,
+          virtualizerTopOffsetPx: 0
+        };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 20_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 50
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(pollStage, 2);
+  assert.equal(probe.progressCount, 1);
+  assert.equal(probe.materializationProgressCount, 1);
+  assert.ok(probe.identityContractionCount > 0);
+  assert.equal(result.windows.some((window) => window.turns.some((turn) => turn.turnId === 'origin-turn--4')),
+    true,
+    JSON.stringify({ startReached: result.history.startReached, reason: result.history.reason, windowTurnCounts: result.windows.map((window) => window.turns.length), olderIdentityObserved: result.windows.some((window) => window.turns.some((turn) => turn.turnId === 'origin-turn--4')) }));
+});
+
+test('chatgpt-controller: repeated exact contractions remain bounded and only prove after the original candidate returns', async () => {
+  const candidate = Array.from({ length: 13 }, (_, index) => index);
+  const subsetB = [0, 2, 3, 5, 6, 8, 9, 11, 12];
+  const subsetC = [0, 3, 5, 8, 9, 12];
+  const subsetD = [2, 5, 8, 11];
+  let pollStage = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 4,
+    windowRanges: [candidate, subsetB, subsetC, subsetD, candidate],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: currentDomUnitIdentity,
+    restorePlan: () => ({ windowIndex: 4 }),
+    virtualizerTopOffsetPlan: ({ readCount, traversalRead }) => {
+      if (traversalRead || readCount < 20) return null;
+      const sequence = [1, 2, 3, 0];
+      if (pollStage < sequence.length) return { windowIndex: sequence[pollStage++], scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 20_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 60
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(probe.verified, true);
+  assert.equal(probe.stablePasses, 3);
+  assert.equal(pollStage, 4);
+  assert.ok(probe.identityContractionCount >= 3);
+  assert.equal(probe.identityContractionRestoreCount, 1);
+  assert.equal(probe.progressCount, 0);
+  assert.equal(probe.materializationProgressCount, 0);
+});
+
+test('chatgpt-controller: exact identity contraction that never restores fails closed at its bounded deadline', async () => {
+  const candidate = Array.from({ length: 13 }, (_, index) => index);
+  const subset = [0, 2, 3, 5, 6, 8, 9, 11, 12];
+  let contractionObserved = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [candidate, subset, candidate],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: currentDomUnitIdentity,
+    restorePlan: () => ({ windowIndex: 2 }),
+    virtualizerTopOffsetPlan: ({ readCount, traversalRead }) => {
+      if (!contractionObserved && !traversalRead && readCount >= 18) {
+        contractionObserved = true;
+        return { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return contractionObserved ? { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 } : null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 20_000,
+    historyTimeoutMs: 10_000, historyMaxIterations: 50
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(probe.verified, false);
+  assert.ok(probe.stablePasses < 3);
+  assert.equal(probe.lastFailureStage, 'poll-identity-contraction-timeout');
+  assert.equal(probe.lastFailureReason, 'candidate-not-restored-after-contraction');
+  assert.ok(probe.identityContractionCount > 0);
+  assert.equal(probe.identityContractionRestoreCount, 0);
+  assert.equal(probe.progressCount, 0);
+  assert.equal(probe.materializationProgressCount, 0);
 });
 
 test('chatgpt-controller: origin probe tolerates wheel-stage newer recoil but proves only after the candidate returns', async () => {

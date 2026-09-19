@@ -1213,6 +1213,20 @@ export function diagnoseVirtualizedOriginIdentityMismatch(beforeTurns = [], afte
   }
   const beforeCurrentUnitKeyShapeValid = before.length > 0 && before.every((turn) => currentContentSearchUnitKey(turn) !== null);
   const afterCurrentUnitKeyShapeValid = after.length > 0 && after.every((turn) => currentContentSearchUnitKey(turn) !== null);
+  const afterBeforeIndexes = afterKeys.map((key) => beforeByKey.get(key));
+  const afterIsExactOrderedIdentitySubsetOfBefore = before.length > after.length
+    && after.length > 0
+    && beforeTurnRoleUnique
+    && afterTurnRoleUnique
+    && beforeDuplicateCount === 0
+    && afterDuplicateCount === 0
+    && beforeCurrentUnitKeyShapeValid
+    && afterCurrentUnitKeyShapeValid
+    && afterBeforeIndexes.every((index) => Number.isInteger(index))
+    && afterBeforeIndexes.every((index, position) => position === 0 || afterBeforeIndexes[position - 1] < index)
+    && alignedSameTurnRoleCount === after.length
+    && alignedSameTurnRoleDifferentMessageIdCount === 0
+    && unitIndexOnlyMismatchCount === 0;
   return {
     beforeCount: before.length,
     afterCount: after.length,
@@ -1228,12 +1242,26 @@ export function diagnoseVirtualizedOriginIdentityMismatch(beforeTurns = [], afte
     unitIndexOnlyMismatchCount,
     beforeCurrentUnitKeyShapeValid,
     afterCurrentUnitKeyShapeValid,
+    afterIsExactOrderedIdentitySubsetOfBefore,
+    exactIdentitySubsetCount: afterIsExactOrderedIdentitySubsetOfBefore ? after.length : 0,
     lengthChanged: before.length !== after.length
   };
 }
 
 function isSafeVirtualizedOriginNewerRecoil(diagnostic) {
   return diagnostic?.turnRoleDirection === 'newer'
+    && diagnostic.beforeTurnRoleUnique === true
+    && diagnostic.afterTurnRoleUnique === true
+    && diagnostic.beforeDuplicateTurnRoleCount === 0
+    && diagnostic.afterDuplicateTurnRoleCount === 0
+    && diagnostic.beforeCurrentUnitKeyShapeValid === true
+    && diagnostic.afterCurrentUnitKeyShapeValid === true;
+}
+
+function isSafeVirtualizedOriginIdentityContraction(diagnostic) {
+  return diagnostic?.afterIsExactOrderedIdentitySubsetOfBefore === true
+    && diagnostic.beforeCount > diagnostic.afterCount
+    && diagnostic.afterCount > 0
     && diagnostic.beforeTurnRoleUnique === true
     && diagnostic.afterTurnRoleUnique === true
     && diagnostic.beforeDuplicateTurnRoleCount === 0
@@ -4639,6 +4667,10 @@ export class ChatGPTController {
         identityRecoilRestoreCount: 0,
         identityRecoilWheelCount: 0,
         identityRecoilPollCount: 0,
+        identityContractionCount: 0,
+        identityContractionRestoreCount: 0,
+        identityContractionWheelCount: 0,
+        identityContractionPollCount: 0,
         identityMismatch: null,
         lastFailureStage: null,
         lastFailureReason: null,
@@ -5293,7 +5325,8 @@ export class ChatGPTController {
       const expectedIdentitySignature = conversationWindowDurableIdentitySignature(candidate?.turns);
       const progressBaselineState = candidate;
       let identityRecoilActive = false;
-      let latestIdentityRecoil = null;
+      let identityContractionActive = false;
+      let latestIdentityTransient = null;
       const failProbe = (stage, failureReason, traversalReason = 'history-virtualized-origin-unproven') => {
         probe.lastFailureStage = stage;
         probe.lastFailureReason = failureReason;
@@ -5311,7 +5344,14 @@ export class ChatGPTController {
         if (stage === 'wheel') probe.identityRecoilWheelCount += 1;
         else probe.identityRecoilPollCount += 1;
         identityRecoilActive = true;
-        latestIdentityRecoil = { stage, state };
+        latestIdentityTransient = { kind: 'recoil', stage, state };
+      };
+      const recordIdentityContraction = (stage, state) => {
+        probe.identityContractionCount += 1;
+        if (stage === 'wheel') probe.identityContractionWheelCount += 1;
+        else probe.identityContractionPollCount += 1;
+        identityContractionActive = true;
+        latestIdentityTransient = { kind: 'contraction', stage, state };
       };
       const recordTransientScrollState = (state) => {
         const topOffsetPx = conversationVirtualizerTopOffset(state);
@@ -5363,8 +5403,8 @@ export class ChatGPTController {
           return failProbe('wheel-scroller-invalid', 'scroller-invalid', scrollerReason);
         }
         if (!virtualizedOriginProbeSampleSignature(wheel.state)) return failProbe('wheel-sample-invalid', 'identity-invalid');
-        const wheelProgress = directionalProgressFor(before, wheel.state, -1);
-        const wheelPhysicalProgress = recordPhysicalOlderAdvance(before, wheel.state);
+        const wheelProgress = directionalProgressFor(progressBaselineState, wheel.state, -1);
+        const wheelPhysicalProgress = recordPhysicalOlderAdvance(progressBaselineState, wheel.state);
         if (wheelProgress.progress || wheelPhysicalProgress) {
           probe.progressCount += 1;
           probe.materializationProgressCount += 1;
@@ -5377,13 +5417,16 @@ export class ChatGPTController {
           recordOlderProgress(wheelProgress);
           if (conversationWindowDurableIdentitySignature(wheel.state?.turns) !== expectedIdentitySignature) {
             const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, wheel.state?.turns);
-            if (!isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+            if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+              recordNewerIdentityRecoil('wheel', wheel.state);
+            } else if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
+              recordIdentityContraction('wheel', wheel.state);
+            } else {
               recordIdentityMismatch('wheel', candidate, wheel.state);
               return failProbe('wheel-identity-changed', 'identity-sequence-changed');
             }
-            recordNewerIdentityRecoil('wheel', wheel.state);
           }
-          if (wheel.state?.loading !== true) {
+          if (!identityRecoilActive && !identityContractionActive && wheel.state?.loading !== true) {
             const wheelProof = conversationStartBoundaryProof(wheel.state, { physicalTopStable: true });
             if (!wheelProof.virtualizedOriginCandidate) {
               if (!recordTransientScrollState(wheel.state)) return failProbe('wheel-candidate-invalid', 'origin-candidate-invalid');
@@ -5421,7 +5464,7 @@ export class ChatGPTController {
           }
           const sampleSignature = virtualizedOriginProbeSampleSignature(state);
           if (!sampleSignature) return failProbe('poll-sample-invalid', 'identity-invalid');
-          const progressBefore = identityRecoilActive ? progressBaselineState : pollBefore;
+          const progressBefore = identityRecoilActive || identityContractionActive ? progressBaselineState : pollBefore;
           const pollProgress = directionalProgressFor(progressBefore, state, -1);
           const pollPhysicalProgress = recordPhysicalOlderAdvance(progressBefore, state);
           if (pollProgress.progress || pollPhysicalProgress) {
@@ -5436,19 +5479,24 @@ export class ChatGPTController {
           recordOlderProgress(pollProgress);
           if (conversationWindowDurableIdentitySignature(state?.turns) !== expectedIdentitySignature) {
             const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
-            if (!isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+            if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+              recordNewerIdentityRecoil('poll', state);
+            } else if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
+              recordIdentityContraction('poll', state);
+            } else {
               recordIdentityMismatch('poll', candidate, state);
               return failProbe('poll-identity-changed', 'identity-sequence-changed');
             }
-            recordNewerIdentityRecoil('poll', state);
             stableSamples = 0;
             previousStableSignature = null;
             current = state;
             continue;
           }
-          if (identityRecoilActive) {
+          if (identityRecoilActive || identityContractionActive) {
+            if (identityRecoilActive) probe.identityRecoilRestoreCount += 1;
+            if (identityContractionActive) probe.identityContractionRestoreCount += 1;
             identityRecoilActive = false;
-            probe.identityRecoilRestoreCount += 1;
+            identityContractionActive = false;
             stableSamples = 0;
             previousStableSignature = null;
           }
@@ -5483,8 +5531,11 @@ export class ChatGPTController {
           pollBefore = state;
         }
         if (stableSamples < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
-          if (identityRecoilActive) {
-            if (latestIdentityRecoil) recordIdentityMismatch(latestIdentityRecoil.stage, candidate, latestIdentityRecoil.state);
+          if (identityRecoilActive || identityContractionActive) {
+            if (latestIdentityTransient) recordIdentityMismatch(latestIdentityTransient.stage, candidate, latestIdentityTransient.state);
+            if (latestIdentityTransient?.kind === 'contraction') {
+              return failProbe('poll-identity-contraction-timeout', 'candidate-not-restored-after-contraction');
+            }
             return failProbe('poll-identity-recoil-timeout', 'newer-candidate-not-restored');
           }
           const budgetExpired = historyBudgetExpired();

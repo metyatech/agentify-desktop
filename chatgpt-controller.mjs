@@ -270,13 +270,23 @@ function rawConversationWindowTurn(turn) {
   const turnId = typeof turn?.turnId === 'string' ? turn.turnId.trim() : '';
   const positionHint = Number.isInteger(turn?.positionHint) ? turn.positionHint : null;
   if (!role || !text) return null;
+  const liveInnerText = turn?.domMode === 'content-search-unit' && typeof turn?.liveInnerText === 'string'
+    ? normalizeConversationText(turn.liveInnerText)
+    : null;
   return {
     role,
     text,
     messageId: messageId || null,
     turnId: turnId || null,
     ...(messageId ? { identityProvenance: 'provider-message-id' } : turnId ? { identityProvenance: 'provider-turn-id' } : {}),
-    positionHint
+    positionHint,
+    ...(liveInnerText !== null ? {
+      textObservation: {
+        liveInnerTextLength: liveInnerText.length,
+        liveInnerTextSha256: crypto.createHash('sha256').update(liveInnerText, 'utf8').digest('hex'),
+        canonicalMatchesLiveInnerText: text === liveInnerText
+      }
+    } : {})
   };
 }
 
@@ -359,6 +369,8 @@ export function buildChatGPTDomModelScript() {
           continue;
         }
         seenKeys.add(unitKey);
+        const canonicalText = visibleText(node);
+        const liveInnerText = normalize(node?.innerText || '');
         records.push({
           node,
           role: match[3],
@@ -368,7 +380,8 @@ export function buildChatGPTDomModelScript() {
           positionHint: null,
           domMode: 'content-search-unit',
           domIndex,
-          text: visibleText(node)
+          text: canonicalText,
+          liveInnerText
         });
       }
       return { nodes, records, malformedCount };
@@ -1647,7 +1660,16 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
         const { node, role, messageId, turnId, positionHint } = record;
         const text = record.text || visibleText(node);
         if (!text) return null;
-        return { role, text, messageId: messageId || null, turnId: turnId || null, positionHint, domMode: record.domMode, domIndex };
+        return {
+          role,
+          text,
+          messageId: messageId || null,
+          turnId: turnId || null,
+          positionHint,
+          domMode: record.domMode,
+          domIndex,
+          ...(record.domMode === 'content-search-unit' && typeof record.liveInnerText === 'string' ? { liveInnerText: record.liveInnerText } : {})
+        };
       }).filter(Boolean);
       return raw.map((turn, index) => ({
         ...turn,

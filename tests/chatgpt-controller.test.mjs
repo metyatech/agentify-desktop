@@ -889,7 +889,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   const windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -941,7 +941,8 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
         text: typeof turnText === 'function' ? turnText({ position, windowIndex }) : `turn-${position}`,
         messageId: `message-${position}`,
         turnId: null,
-        positionHint: positionHints ? position : null
+        positionHint: positionHints ? position : null,
+        ...(typeof turnLiveText === 'function' ? { domMode: 'content-search-unit', liveInnerText: turnLiveText({ position, windowIndex }) } : {})
       })),
       limitExceeded: false,
       limitKind: null,
@@ -1664,6 +1665,39 @@ test('chatgpt-controller: bounded raw windows preserve proven newest-to-oldest t
   assert.equal(Object.hasOwn(result, 'fullHistoryComplete'), false);
   assert.equal(Object.hasOwn(result.history, 'fullHistoryComplete'), false);
   assert.equal(result.windows[0].turns[0].identityProvenance, 'provider-message-id');
+});
+
+test('chatgpt-controller: bounded raw windows expose hashed live text without returning it', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    turnLiveText: ({ position }) => position === 12 ? 'turn-12' : `turn-${position} presentation`
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50,
+    maxCharsPerTurn: 1000,
+    maxTotalChars: 5000,
+    historyTimeoutMs: 20_000,
+    historyMaxIterations: 30
+  });
+  const turns = result.windows.flatMap((window) => window.turns);
+  const same = turns.find((candidate) => candidate.messageId === 'message-12');
+  const different = turns.find((candidate) => candidate.messageId === 'message-13');
+  assert.ok(same);
+  assert.ok(different);
+  assert.equal(same.text, 'turn-12');
+  assert.deepEqual(same.textObservation, {
+    liveInnerTextLength: 'turn-12'.length,
+    liveInnerTextSha256: crypto.createHash('sha256').update('turn-12', 'utf8').digest('hex'),
+    canonicalMatchesLiveInnerText: true
+  });
+  assert.equal(different.text, 'turn-13');
+  assert.deepEqual(different.textObservation, {
+    liveInnerTextLength: 'turn-13 presentation'.length,
+    liveInnerTextSha256: crypto.createHash('sha256').update('turn-13 presentation', 'utf8').digest('hex'),
+    canonicalMatchesLiveInnerText: false
+  });
+  assert.equal(Object.hasOwn(different, 'liveInnerText'), false);
+  assert.equal(JSON.stringify(different).includes('turn-13 presentation'), false);
 });
 
 test('chatgpt-controller: bounded raw windows retain conflicting durable observations without merging them', async () => {
@@ -4165,6 +4199,20 @@ test('chatgpt-controller: current content-search units normalize roles and stabl
     ['user', 'turn-b:0:user', 'turn-b', 'virtual-wrapper-b', null]
   ]);
   assert.equal(result.records[1].text, 'assistant answer');
+});
+
+test('chatgpt-controller: current units retain canonical text and live innerText diagnostics separately', () => {
+  const fixture = evaluateCurrentDomModel({ offsetPx: 4_800 });
+  const first = vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, fixture.context);
+  const second = vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, fixture.context);
+  assert.equal(first.records[0].text, 'user prompt');
+  assert.equal(first.records[0].liveInnerText, 'user prompt');
+  assert.equal(first.records[1].text, 'assistant answer');
+  assert.equal(first.records[1].liveInnerText, 'assistant answer Copy');
+  assert.deepEqual(
+    first.records.map((record) => [record.messageId, record.text, record.liveInnerText]),
+    second.records.map((record) => [record.messageId, record.text, record.liveInnerText])
+  );
 });
 
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {

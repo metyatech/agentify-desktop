@@ -4384,7 +4384,19 @@ test('http-api: conversation windows requires an existing ChatGPT tab and preser
         url: 'https://chatgpt.com/c/test',
         windows: [{
           windowIndex: 0,
-          turns: [{ role: 'user', text: 'hello', messageId: 'm1', turnId: null, identityProvenance: 'provider-message-id', positionHint: 31 }]
+          turns: [{
+            role: 'user',
+            text: 'hello',
+            messageId: 'm1',
+            turnId: null,
+            identityProvenance: 'provider-message-id',
+            positionHint: 31,
+            textObservation: {
+              liveInnerTextLength: 5,
+              liveInnerTextSha256: 'a'.repeat(64),
+              canonicalMatchesLiveInnerText: true
+            }
+          }]
         }],
         history: {
           mode: 'bounded-raw-windows',
@@ -4434,6 +4446,12 @@ test('http-api: conversation windows requires an existing ChatGPT tab and preser
   assert.equal(result.data.windowOrder, 'newest-to-oldest');
   assert.equal(result.data.history.mode, 'bounded-raw-windows');
   assert.equal(result.data.windows[0].turns[0].positionHint, 31);
+  assert.deepEqual(result.data.windows[0].turns[0].textObservation, {
+    liveInnerTextLength: 5,
+    liveInnerTextSha256: 'a'.repeat(64),
+    canonicalMatchesLiveInnerText: true
+  });
+  assert.equal(Object.hasOwn(result.data.windows[0].turns[0], 'liveInnerText'), false);
   assert.equal(reads, 1);
   assert.equal(creates, 0);
 

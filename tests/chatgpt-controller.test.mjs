@@ -1060,7 +1060,10 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       if (currentDom && typeof virtualizerTopOffsetPlan === 'function') {
         const planned = await virtualizerTopOffsetPlan({ readCount, traversalRead, windowIndex, currentOffset: virtualizerTopOffsetOverride });
         if (planned !== null && planned !== undefined && Number.isFinite(Number(planned))) virtualizerTopOffsetOverride = Number(planned);
-        if (planned && typeof planned === 'object' && Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
+        if (planned && typeof planned === 'object') {
+          if (Number.isFinite(Number(planned.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(planned.virtualizerTopOffsetPx);
+          if (Number.isFinite(Number(planned.scrollTop))) scrollTopOverride = Number(planned.scrollTop);
+        }
       }
       const state = snapshot();
       if (traversalRead && typeof onTraversalRead === 'function') await onTraversalRead({ readCount, windowIndex, state: structuredClone(state) });
@@ -3614,6 +3617,186 @@ test('chatgpt-controller: virtualized-origin probes keep A/B/A text variants on 
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
 });
 
+test('chatgpt-controller: virtualized-origin probe waits through transient atTop false state', async () => {
+  let transientArmed = false;
+  let transientPolls = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) {
+        if (attempt >= 3 && !transientArmed) transientArmed = true;
+        return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead }) => {
+      if (!transientArmed || traversalRead) return null;
+      transientPolls += 1;
+      return { scrollTop: transientPolls <= 2 ? 8 : 0, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(probe.verified, true);
+  assert.equal(probe.stablePasses, 3);
+  assert.ok(probe.transientAtTopFalseCount >= 2);
+  assert.ok(probe.transientResetCount >= 2);
+});
+
+test('chatgpt-controller: virtualized-origin probe waits through transient positive top offset', async () => {
+  let transientArmed = false;
+  let transientPolls = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) {
+        if (attempt >= 3 && !transientArmed) transientArmed = true;
+        return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead }) => {
+      if (!transientArmed || traversalRead) return null;
+      transientPolls += 1;
+      return { scrollTop: 0, virtualizerTopOffsetPx: transientPolls <= 2 ? 120 : 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(probe.verified, true);
+  assert.equal(probe.stablePasses, 3);
+  assert.ok(probe.transientPositiveTopOffsetCount >= 2);
+  assert.ok(probe.transientResetCount >= 2);
+});
+
+test('chatgpt-controller: virtualized-origin probe resets through combined transient scroll states', async () => {
+  let transientArmed = false;
+  let transientPolls = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) {
+        if (attempt >= 3 && !transientArmed) transientArmed = true;
+        return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead }) => {
+      if (!transientArmed || traversalRead) return null;
+      transientPolls += 1;
+      if (transientPolls === 1) return { scrollTop: 8, virtualizerTopOffsetPx: 120 };
+      if (transientPolls === 2) return { scrollTop: 0, virtualizerTopOffsetPx: 120 };
+      return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(probe.verified, true);
+  assert.equal(probe.stablePasses, 3);
+  assert.ok(probe.transientAtTopFalseCount >= 1);
+  assert.ok(probe.transientPositiveTopOffsetCount >= 2);
+  assert.ok(probe.transientResetCount >= 2);
+});
+
+test('chatgpt-controller: virtualized-origin probe fails closed on identity change during a transient', async () => {
+  let transientArmed = false;
+  let identityChanged = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: ({ position }) => position === 0 && identityChanged
+      ? { messageId: 'replacement-message-zero', turnId: null }
+      : null,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (attempt >= 3 && deltaY < 0 && windowIndex === 0) {
+        transientArmed = true;
+        return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead }) => {
+      if (!transientArmed || traversalRead) return null;
+      identityChanged = true;
+      return { scrollTop: 8, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(probe.verified, false);
+  assert.equal(probe.stablePasses, 0);
+  assert.equal(probe.lastFailureStage, 'poll-identity-changed');
+  assert.equal(probe.lastFailureReason, 'identity-sequence-changed');
+});
+
+test('chatgpt-controller: virtualized-origin probe fails boundedly if a transient candidate never returns', async () => {
+  let transientArmed = false;
+  let pollCount = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (attempt >= 3 && deltaY < 0 && windowIndex === 0) {
+        transientArmed = true;
+        return { scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    virtualizerTopOffsetPlan: ({ traversalRead }) => {
+      if (!transientArmed || traversalRead) return null;
+      pollCount += 1;
+      return { scrollTop: 8, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(probe.verified, false);
+  assert.ok(pollCount > 0);
+  assert.ok(probe.transientAtTopFalseCount > 0);
+  assert.equal(probe.lastFailureStage, 'poll-stability-timeout');
+  assert.equal(probe.lastFailureReason, 'candidate-not-restored');
+});
+
 test('chatgpt-controller: virtualized-origin identity kind changes reset boundary stability', async () => {
   let switchIdentityKind = false;
   const harness = createNativeWheelHistoryPage({
@@ -3642,7 +3825,9 @@ test('chatgpt-controller: virtualized-origin identity kind changes reset boundar
   assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 0);
-  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 2);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.lastFailureStage, 'wheel-identity-changed');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.lastFailureReason, 'identity-sequence-changed');
 });
 
 test('chatgpt-controller: virtualized-origin probe fails closed when a current turn has no durable identity', async () => {

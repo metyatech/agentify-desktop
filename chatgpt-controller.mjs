@@ -4667,6 +4667,11 @@ export class ChatGPTController {
         identityRecoilRestoreCount: 0,
         identityRecoilWheelCount: 0,
         identityRecoilPollCount: 0,
+        identityCorrectiveRestoreAttemptCount: 0,
+        identityCorrectiveRestoreSuccessCount: 0,
+        identityCorrectiveRestoreWheelCount: 0,
+        identityCorrectiveRestoreOlderProgressCount: 0,
+        identityCorrectiveRestoreUnresolvedCount: 0,
         identityContractionCount: 0,
         identityContractionRestoreCount: 0,
         identityContractionWheelCount: 0,
@@ -5327,6 +5332,7 @@ export class ChatGPTController {
       let identityRecoilActive = false;
       let identityContractionActive = false;
       let latestIdentityTransient = null;
+      let correctiveRestoreAttemptedThisEpisode = false;
       const failProbe = (stage, failureReason, traversalReason = 'history-virtualized-origin-unproven') => {
         probe.lastFailureStage = stage;
         probe.lastFailureReason = failureReason;
@@ -5342,16 +5348,87 @@ export class ChatGPTController {
       const recordNewerIdentityRecoil = (stage, state) => {
         probe.identityRecoilCount += 1;
         if (stage === 'wheel') probe.identityRecoilWheelCount += 1;
-        else probe.identityRecoilPollCount += 1;
+        else if (stage === 'poll') probe.identityRecoilPollCount += 1;
         identityRecoilActive = true;
         latestIdentityTransient = { kind: 'recoil', stage, state };
       };
       const recordIdentityContraction = (stage, state) => {
         probe.identityContractionCount += 1;
         if (stage === 'wheel') probe.identityContractionWheelCount += 1;
-        else probe.identityContractionPollCount += 1;
+        else if (stage === 'poll') probe.identityContractionPollCount += 1;
         identityContractionActive = true;
         latestIdentityTransient = { kind: 'contraction', stage, state };
+      };
+      const attemptCorrectiveRestore = async (recoilState) => {
+        if (correctiveRestoreAttemptedThisEpisode) return { kind: 'already-attempted' };
+        correctiveRestoreAttemptedThisEpisode = true;
+        probe.identityCorrectiveRestoreAttemptCount += 1;
+        probe.identityCorrectiveRestoreWheelCount += 1;
+        const corrective = await nativeWheel(1, recoilState, { collectChangedSnapshot: false });
+        if (!corrective.ok) {
+          probe.identityCorrectiveRestoreUnresolvedCount += 1;
+          failProbe('corrective-wheel-invalid', corrective.reason || 'wheel-failed', corrective.reason || 'history-virtualized-origin-unproven');
+          return { kind: 'failed' };
+        }
+        const state = corrective.state;
+        if (!currentUrlIsStable(state)) {
+          probe.identityCorrectiveRestoreUnresolvedCount += 1;
+          failProbe('corrective-url-changed', 'url-changed', 'conversation-changed');
+          return { kind: 'failed' };
+        }
+        if (state?.limitExceeded) {
+          probe.identityCorrectiveRestoreUnresolvedCount += 1;
+          const limitReason = state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+          failProbe('corrective-sample-invalid', 'size-limit', limitReason);
+          return { kind: 'failed' };
+        }
+        if (state?.scroller?.candidateCount !== 1 || !virtualizedOriginProbeSampleSignature(state)) {
+          probe.identityCorrectiveRestoreUnresolvedCount += 1;
+          failProbe('corrective-sample-invalid', 'identity-invalid');
+          return { kind: 'failed' };
+        }
+
+        const progress = directionalProgressFor(progressBaselineState, state, -1);
+        const physicalProgress = recordPhysicalOlderAdvance(progressBaselineState, state);
+        if (progress.progress || physicalProgress) {
+          probe.progressCount += 1;
+          probe.materializationProgressCount += 1;
+          probe.identityCorrectiveRestoreOlderProgressCount += 1;
+          resetBoundaryStability();
+          recordOlderProgress({ ...progress, progress: progress.progress || physicalProgress });
+          addSnapshot(state);
+          current = state;
+          return { kind: 'older-progress', state };
+        }
+        recordOlderProgress(progress);
+
+        if (conversationWindowDurableIdentitySignature(state?.turns) === expectedIdentitySignature) {
+          probe.identityCorrectiveRestoreSuccessCount += 1;
+          if (identityRecoilActive) probe.identityRecoilRestoreCount += 1;
+          if (identityContractionActive) probe.identityContractionRestoreCount += 1;
+          identityRecoilActive = false;
+          identityContractionActive = false;
+          latestIdentityTransient = null;
+          correctiveRestoreAttemptedThisEpisode = false;
+          current = state;
+          return { kind: 'exact-candidate', state };
+        }
+
+        const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
+        if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+          recordNewerIdentityRecoil('corrective', state);
+          current = state;
+          return { kind: 'newer-recoil', state };
+        }
+        if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
+          recordIdentityContraction('corrective', state);
+          current = state;
+          return { kind: 'identity-contraction', state };
+        }
+        probe.identityCorrectiveRestoreUnresolvedCount += 1;
+        recordIdentityMismatch('corrective', candidate, state);
+        failProbe('corrective-identity-invalid', 'identity-sequence-changed');
+        return { kind: 'failed' };
       };
       const recordTransientScrollState = (state) => {
         const topOffsetPx = conversationVirtualizerTopOffset(state);
@@ -5391,6 +5468,7 @@ export class ChatGPTController {
         probe.attempts += 1;
         let transientStateObserved = false;
         let candidateReturnedAfterTransient = false;
+        let wheelIdentityTransientObserved = false;
         const wheel = await nativeWheel(-1, before, { collectChangedSnapshot: false });
         if (!wheel.ok) return failProbe('wheel-sample-invalid', 'wheel-failed', wheel.reason || 'history-virtualized-origin-unproven');
         if (!currentUrlIsStable(wheel.state)) return failProbe('wheel-url-changed', 'url-changed', 'conversation-changed');
@@ -5418,15 +5496,20 @@ export class ChatGPTController {
           if (conversationWindowDurableIdentitySignature(wheel.state?.turns) !== expectedIdentitySignature) {
             const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, wheel.state?.turns);
             if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+              wheelIdentityTransientObserved = true;
               recordNewerIdentityRecoil('wheel', wheel.state);
+              const correction = await attemptCorrectiveRestore(wheel.state);
+              if (correction.kind === 'failed') return { verified: false, progressed: false };
+              if (correction.kind === 'older-progress') return { verified: false, progressed: true };
             } else if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
+              wheelIdentityTransientObserved = true;
               recordIdentityContraction('wheel', wheel.state);
             } else {
               recordIdentityMismatch('wheel', candidate, wheel.state);
               return failProbe('wheel-identity-changed', 'identity-sequence-changed');
             }
           }
-          if (!identityRecoilActive && !identityContractionActive && wheel.state?.loading !== true) {
+          if (!wheelIdentityTransientObserved && !identityRecoilActive && !identityContractionActive && wheel.state?.loading !== true) {
             const wheelProof = conversationStartBoundaryProof(wheel.state, { physicalTopStable: true });
             if (!wheelProof.virtualizedOriginCandidate) {
               if (!recordTransientScrollState(wheel.state)) return failProbe('wheel-candidate-invalid', 'origin-candidate-invalid');
@@ -5441,7 +5524,7 @@ export class ChatGPTController {
         );
         let stableSamples = 0;
         let previousStableSignature = null;
-        let pollBefore = wheel.state;
+        let pollBefore = current;
         while (Date.now() < pollDeadline && stableSamples < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
           await sleep(Math.min(CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS, Math.max(1, pollDeadline - Date.now())));
           if (historyBudgetExpired()) {
@@ -5481,6 +5564,24 @@ export class ChatGPTController {
             const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
             if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
               recordNewerIdentityRecoil('poll', state);
+              if (!correctiveRestoreAttemptedThisEpisode) {
+                const correction = await attemptCorrectiveRestore(state);
+                if (correction.kind === 'failed') return { verified: false, progressed: false };
+                if (correction.kind === 'older-progress') return { verified: false, progressed: true };
+                if (correction.kind === 'exact-candidate') {
+                  stableSamples = 0;
+                  previousStableSignature = null;
+                  pollBefore = correction.state;
+                  continue;
+                }
+                if (correction.kind === 'newer-recoil' || correction.kind === 'identity-contraction') {
+                  stableSamples = 0;
+                  previousStableSignature = null;
+                  current = correction.state;
+                  pollBefore = correction.state;
+                  continue;
+                }
+              }
             } else if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
               recordIdentityContraction('poll', state);
             } else {
@@ -5497,6 +5598,8 @@ export class ChatGPTController {
             if (identityContractionActive) probe.identityContractionRestoreCount += 1;
             identityRecoilActive = false;
             identityContractionActive = false;
+            latestIdentityTransient = null;
+            correctiveRestoreAttemptedThisEpisode = false;
             stableSamples = 0;
             previousStableSignature = null;
           }

@@ -17,6 +17,7 @@ import {
   buildConversationTraversalReadScript,
   buildConversationWindowReadScript,
   conversationDirectionalProgress,
+  diagnoseVirtualizedOriginIdentityMismatch,
   conversationStartBoundaryProof,
   verifyCompleteHistoryFixedPoint,
   mergeConversationSnapshots,
@@ -3348,6 +3349,86 @@ test('chatgpt-controller: stable IDs classify older, newer, same, and remount tr
   ]), 'same');
 });
 
+test('chatgpt-controller: virtualized-origin identity diagnostics identify current unit index churn', () => {
+  const before = [
+    { turnId: 'provider-turn-A', role: 'user', messageId: 'provider-turn-A:0:user' },
+    { turnId: 'provider-turn-A', role: 'assistant', messageId: 'provider-turn-A:2:assistant' }
+  ];
+  const after = [
+    { turnId: 'provider-turn-A', role: 'user', messageId: 'provider-turn-A:1:user' },
+    { turnId: 'provider-turn-A', role: 'assistant', messageId: 'provider-turn-A:3:assistant' }
+  ];
+  const diagnostic = diagnoseVirtualizedOriginIdentityMismatch(before, after);
+  assert.equal(diagnostic.beforeCount, 2);
+  assert.equal(diagnostic.afterCount, 2);
+  assert.equal(diagnostic.messageIdSequenceSame, false);
+  assert.equal(diagnostic.turnRoleSequenceSame, true);
+  assert.equal(diagnostic.turnRoleDirection, 'same');
+  assert.equal(diagnostic.beforeTurnRoleUnique, true);
+  assert.equal(diagnostic.afterTurnRoleUnique, true);
+  assert.equal(diagnostic.alignedSameTurnRoleCount, 2);
+  assert.equal(diagnostic.alignedSameTurnRoleDifferentMessageIdCount, 2);
+  assert.equal(diagnostic.unitIndexOnlyMismatchCount, 2);
+  assert.equal(diagnostic.beforeCurrentUnitKeyShapeValid, true);
+  assert.equal(diagnostic.afterCurrentUnitKeyShapeValid, true);
+  assert.equal(diagnostic.lengthChanged, false);
+});
+
+test('chatgpt-controller: virtualized-origin identity diagnostics classify turn-role direction independently', () => {
+  const makeTurns = (ids, prefix) => ids.map((id, index) => ({
+    turnId: id,
+    role: (id.charCodeAt(id.length - 1) - 'A'.charCodeAt(0)) % 2 === 0 ? 'user' : 'assistant',
+    messageId: `${prefix}-${index}`
+  }));
+  const before = makeTurns(['turn-B', 'turn-C', 'turn-D'], 'before-provider');
+  const older = makeTurns(['turn-A', 'turn-B', 'turn-C', 'turn-D'], 'after-provider');
+  const newer = makeTurns(['turn-B', 'turn-C', 'turn-D', 'turn-E'], 'newer-provider');
+  assert.equal(conversationDirectionalProgress(before, older), 'ambiguous');
+  const olderDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(before, older);
+  assert.equal(olderDiagnostic.turnRoleDirection, 'older');
+  assert.equal(olderDiagnostic.turnRoleSequenceSame, false);
+  assert.equal(olderDiagnostic.messageIdSequenceSame, false);
+  assert.equal(olderDiagnostic.alignedSameTurnRoleCount, 3);
+  assert.equal(olderDiagnostic.alignedSameTurnRoleDifferentMessageIdCount, 3);
+  assert.equal(olderDiagnostic.lengthChanged, true);
+  const newerDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(before, newer);
+  assert.equal(newerDiagnostic.turnRoleDirection, 'newer');
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, makeTurns(['turn-X', 'turn-Y'], 'unrelated')).turnRoleDirection, 'ambiguous');
+});
+
+test('chatgpt-controller: virtualized-origin identity diagnostics reject duplicate, reordered, and malformed identities', () => {
+  const turn = (turnId, role, messageId = `${turnId}:0:${role}`) => ({ turnId, role, messageId });
+  const before = [turn('turn-A', 'user'), turn('turn-B', 'assistant'), turn('turn-C', 'user')];
+  const reordered = [turn('turn-A', 'user'), turn('turn-C', 'user'), turn('turn-B', 'assistant')];
+  assert.equal(diagnoseVirtualizedOriginIdentityMismatch(before, reordered).turnRoleDirection, 'ambiguous');
+
+  const duplicate = diagnoseVirtualizedOriginIdentityMismatch(
+    [turn('turn-A', 'user'), turn('turn-A', 'user', 'turn-A:1:user')],
+    [turn('turn-A', 'user')]
+  );
+  assert.equal(duplicate.beforeTurnRoleUnique, false);
+  assert.equal(duplicate.beforeDuplicateTurnRoleCount, 1);
+  assert.equal(duplicate.turnRoleDirection, 'ambiguous');
+
+  const malformed = diagnoseVirtualizedOriginIdentityMismatch(
+    [turn('turn-A', 'user', 'sentinel-malformed-provider-unit-key')],
+    [turn('turn-A', 'user', 'turn-A:0:assistant')]
+  );
+  assert.equal(malformed.beforeCurrentUnitKeyShapeValid, false);
+  assert.equal(malformed.afterCurrentUnitKeyShapeValid, false);
+});
+
+test('chatgpt-controller: structural origin diagnostics never expose provider identities or hashes', () => {
+  const sentinel = 'PRIVATE_PROVIDER_ID_SENTINEL_62a47';
+  const diagnostic = diagnoseVirtualizedOriginIdentityMismatch(
+    [{ turnId: sentinel, role: 'user', messageId: `${sentinel}:0:user` }],
+    [{ turnId: sentinel, role: 'user', messageId: `${sentinel}:1:user` }]
+  );
+  const serialized = JSON.stringify(diagnostic);
+  assert.doesNotMatch(serialized, new RegExp(sentinel, 'u'));
+  assert.doesNotMatch(serialized, /[a-f0-9]{64}/iu);
+});
+
 test('chatgpt-controller: discontinuous current-DOM overlap is not semantic older progress', async () => {
   const harness = createNativeWheelHistoryPage({
     initialWindow: 2,
@@ -3841,6 +3922,11 @@ test('chatgpt-controller: virtualized-origin probe fails closed on identity chan
   assert.equal(probe.stablePasses, 0);
   assert.equal(probe.lastFailureStage, 'poll-identity-changed');
   assert.equal(probe.lastFailureReason, 'identity-sequence-changed');
+  assert.equal(probe.identityMismatch.stage, 'poll');
+  assert.equal(probe.identityMismatch.beforeCount, 8);
+  assert.equal(probe.identityMismatch.afterCount, 8);
+  assert.equal(probe.identityMismatch.turnRoleDirection, 'ambiguous');
+  assert.doesNotMatch(JSON.stringify(probe.identityMismatch), /replacement-message-zero/u);
 });
 
 test('chatgpt-controller: virtualized-origin probe fails boundedly if a transient candidate never returns', async () => {
@@ -3911,6 +3997,8 @@ test('chatgpt-controller: virtualized-origin identity kind changes reset boundar
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.lastFailureStage, 'wheel-identity-changed');
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.lastFailureReason, 'identity-sequence-changed');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.identityMismatch.stage, 'wheel');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.identityMismatch.turnRoleDirection, 'ambiguous');
 });
 
 test('chatgpt-controller: virtualized-origin probe fails closed when a current turn has no durable identity', async () => {

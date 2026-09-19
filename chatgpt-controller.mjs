@@ -1128,6 +1128,12 @@ export function conversationDirectionalProgress(beforeTurns = [], afterTurns = [
     if (!matching) continue;
     if (beforeByKey.get(key)?.role !== matching.role) return 'ambiguous';
   }
+  return directionalProgressFromUniqueKeys(beforeKeys, afterKeys);
+}
+
+function directionalProgressFromUniqueKeys(beforeKeys, afterKeys) {
+  const beforeByKey = new Map(beforeKeys.map((key) => [key, true]));
+  const afterByKey = new Map(afterKeys.map((key) => [key, true]));
   const sharedBefore = beforeKeys.filter((key) => afterByKey.has(key));
   const sharedAfter = afterKeys.filter((key) => beforeByKey.has(key));
   if (sharedBefore.length === 0 || JSON.stringify(sharedBefore) !== JSON.stringify(sharedAfter)) return 'ambiguous';
@@ -1144,6 +1150,86 @@ export function conversationDirectionalProgress(beforeTurns = [], afterTurns = [
   if (olderAnchored && !newerAnchored) return 'older';
   if (newerAnchored && !olderAnchored) return 'newer';
   return 'ambiguous';
+}
+
+function virtualizedOriginTurnRoleKey(turn) {
+  const turnId = typeof turn?.turnId === 'string' ? turn.turnId.trim() : '';
+  const role = turn?.role;
+  if (!turnId || !['user', 'assistant'].includes(role)) return null;
+  return JSON.stringify(['turnId', turnId, 'role', role]);
+}
+
+function currentContentSearchUnitKey(turn) {
+  const turnId = typeof turn?.turnId === 'string' ? turn.turnId.trim() : '';
+  const messageId = typeof turn?.messageId === 'string' ? turn.messageId.trim() : '';
+  const role = turn?.role;
+  if (!turnId || !messageId || !['user', 'assistant'].includes(role)) return null;
+  const match = /^(.*):([0-9]{1,3}):(user|assistant)$/u.exec(messageId);
+  if (!match || match[1] !== turnId || match[3] !== role) return null;
+  return { base: match[1], unitIndex: Number(match[2]), role: match[3] };
+}
+
+export function diagnoseVirtualizedOriginIdentityMismatch(beforeTurns = [], afterTurns = []) {
+  const before = Array.isArray(beforeTurns) ? beforeTurns : [];
+  const after = Array.isArray(afterTurns) ? afterTurns : [];
+  const beforeKeys = before.map(virtualizedOriginTurnRoleKey);
+  const afterKeys = after.map(virtualizedOriginTurnRoleKey);
+  const beforeDuplicateCount = beforeKeys.filter((key, index) => key && beforeKeys.indexOf(key) !== index).length;
+  const afterDuplicateCount = afterKeys.filter((key, index) => key && afterKeys.indexOf(key) !== index).length;
+  const beforeTurnRoleUnique = before.length > 0 && beforeKeys.every(Boolean) && beforeDuplicateCount === 0;
+  const afterTurnRoleUnique = after.length > 0 && afterKeys.every(Boolean) && afterDuplicateCount === 0;
+  const turnRoleSequenceSame = beforeTurnRoleUnique && afterTurnRoleUnique
+    && before.length === after.length
+    && JSON.stringify(beforeKeys) === JSON.stringify(afterKeys);
+  const turnRoleDirection = beforeTurnRoleUnique && afterTurnRoleUnique
+    ? directionalProgressFromUniqueKeys(beforeKeys, afterKeys)
+    : 'ambiguous';
+  const beforeMessageIds = before.map((turn) => typeof turn?.messageId === 'string' ? turn.messageId.trim() : null);
+  const afterMessageIds = after.map((turn) => typeof turn?.messageId === 'string' ? turn.messageId.trim() : null);
+  const messageIdSequenceSame = before.length === after.length
+    && JSON.stringify(beforeMessageIds) === JSON.stringify(afterMessageIds);
+  const beforeByKey = new Map();
+  const afterByKey = new Map();
+  beforeKeys.forEach((key, index) => { if (key && !beforeByKey.has(key)) beforeByKey.set(key, index); });
+  afterKeys.forEach((key, index) => { if (key && !afterByKey.has(key)) afterByKey.set(key, index); });
+  let alignedSameTurnRoleCount = 0;
+  let alignedSameTurnRoleDifferentMessageIdCount = 0;
+  let unitIndexOnlyMismatchCount = 0;
+  for (const [key, beforeIndex] of beforeByKey) {
+    const afterIndex = afterByKey.get(key);
+    if (afterIndex === undefined || beforeKeys.filter((item) => item === key).length !== 1
+      || afterKeys.filter((item) => item === key).length !== 1) continue;
+    alignedSameTurnRoleCount += 1;
+    if (beforeMessageIds[beforeIndex] === afterMessageIds[afterIndex]) continue;
+    alignedSameTurnRoleDifferentMessageIdCount += 1;
+    const beforeUnitKey = currentContentSearchUnitKey(before[beforeIndex]);
+    const afterUnitKey = currentContentSearchUnitKey(after[afterIndex]);
+    if (beforeUnitKey && afterUnitKey
+      && beforeUnitKey.base === afterUnitKey.base
+      && beforeUnitKey.role === afterUnitKey.role
+      && beforeUnitKey.unitIndex !== afterUnitKey.unitIndex) {
+      unitIndexOnlyMismatchCount += 1;
+    }
+  }
+  const beforeCurrentUnitKeyShapeValid = before.length > 0 && before.every((turn) => currentContentSearchUnitKey(turn) !== null);
+  const afterCurrentUnitKeyShapeValid = after.length > 0 && after.every((turn) => currentContentSearchUnitKey(turn) !== null);
+  return {
+    beforeCount: before.length,
+    afterCount: after.length,
+    messageIdSequenceSame,
+    turnRoleSequenceSame,
+    turnRoleDirection,
+    beforeTurnRoleUnique,
+    afterTurnRoleUnique,
+    beforeDuplicateTurnRoleCount: beforeDuplicateCount,
+    afterDuplicateTurnRoleCount: afterDuplicateCount,
+    alignedSameTurnRoleCount,
+    alignedSameTurnRoleDifferentMessageIdCount,
+    unitIndexOnlyMismatchCount,
+    beforeCurrentUnitKeyShapeValid,
+    afterCurrentUnitKeyShapeValid,
+    lengthChanged: before.length !== after.length
+  };
 }
 
 function conversationVirtualizerTopOffset(state) {
@@ -4539,6 +4625,7 @@ export class ChatGPTController {
         transientResetCount: 0,
         transientAtTopFalseCount: 0,
         transientPositiveTopOffsetCount: 0,
+        identityMismatch: null,
         lastFailureStage: null,
         lastFailureReason: null,
         verified: false
@@ -5196,6 +5283,12 @@ export class ChatGPTController {
         reason = traversalReason;
         return { verified: false, progressed: false };
       };
+      const recordIdentityMismatch = (stage, beforeState, afterState) => {
+        probe.identityMismatch = {
+          stage,
+          ...diagnoseVirtualizedOriginIdentityMismatch(beforeState?.turns, afterState?.turns)
+        };
+      };
       const recordTransientScrollState = (state) => {
         const topOffsetPx = conversationVirtualizerTopOffset(state);
         const atTopFalse = state?.scroller?.atTop === false;
@@ -5258,8 +5351,10 @@ export class ChatGPTController {
           return { verified: false, progressed: true };
         } else {
           recordOlderProgress(wheelProgress);
-          if (conversationWindowDurableIdentitySignature(wheel.state?.turns) !== expectedIdentitySignature)
+          if (conversationWindowDurableIdentitySignature(wheel.state?.turns) !== expectedIdentitySignature) {
+            recordIdentityMismatch('wheel', candidate, wheel.state);
             return failProbe('wheel-identity-changed', 'identity-sequence-changed');
+          }
           if (wheel.state?.loading !== true) {
             const wheelProof = conversationStartBoundaryProof(wheel.state, { physicalTopStable: true });
             if (!wheelProof.virtualizedOriginCandidate) {
@@ -5310,8 +5405,10 @@ export class ChatGPTController {
             return { verified: false, progressed: true };
           }
           recordOlderProgress(pollProgress);
-          if (conversationWindowDurableIdentitySignature(state?.turns) !== expectedIdentitySignature)
+          if (conversationWindowDurableIdentitySignature(state?.turns) !== expectedIdentitySignature) {
+            recordIdentityMismatch('poll', candidate, state);
             return failProbe('poll-identity-changed', 'identity-sequence-changed');
+          }
           const proof = conversationStartBoundaryProof(state, { physicalTopStable: true, virtualizedOriginProbeVerified: true });
           if (state.loading === true) {
             stableSamples = 0;

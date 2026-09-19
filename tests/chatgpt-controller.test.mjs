@@ -889,9 +889,9 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, olderMaterializationPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
-  const windows = Array.isArray(windowRanges)
+  let windows = Array.isArray(windowRanges)
     ? windowRanges
     : Number.isInteger(windowSize) && windowSize > 0
     ? Array.from({ length: windowCount }, (_, index) => Array.from({ length: windowSize }, (_, offset) => index * windowSize + offset))
@@ -993,6 +993,22 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       }
     };
   };
+  const applyOlderMaterialization = async (attempt) => {
+    if (typeof olderMaterializationPlan !== 'function') return false;
+    const materialized = await olderMaterializationPlan({ attempt, windowIndex, windows: windows.map((window) => window.slice()) });
+    if (!materialized || typeof materialized !== 'object') return false;
+    if (Array.isArray(materialized.prependRange)) {
+      windows = [materialized.prependRange.slice(), ...windows];
+      windowIndex = 0;
+    } else if (Number.isInteger(materialized.windowIndex)) {
+      windowIndex = Math.max(0, Math.min(windows.length - 1, materialized.windowIndex));
+    }
+    if (Number.isFinite(Number(materialized.virtualizerTopOffsetPx))) virtualizerTopOffsetOverride = Number(materialized.virtualizerTopOffsetPx);
+    if (typeof materialized.loading === 'boolean') loadingOverride = materialized.loading;
+    if (materialized.changeUrl === true) url = 'https://chatgpt.com/c/changed-during-origin-probe';
+    scrollTopOverride = Number.isFinite(Number(materialized.scrollTop)) ? Number(materialized.scrollTop) : null;
+    return true;
+  };
   const page = createPage({
     events,
     onEvaluate: async (js) => {
@@ -1074,8 +1090,9 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       if (changeUrlOnWheel && wheelCount === 1) url = 'https://chatgpt.com/c/changed';
       if (!windowChanges) return;
       const planned = typeof mouseWheelPlan === 'function'
-        ? await mouseWheelPlan({ attempt: wheelCount, deltaY, range: windows[windowIndex].slice(0), scrollTop: windowIndex * 250 })
+        ? await mouseWheelPlan({ attempt: wheelCount, deltaY, range: windows[windowIndex].slice(0), scrollTop: windowIndex * 250, windowIndex })
         : Array.isArray(mouseWheelPlan) ? mouseWheelPlan[wheelCount - 1] : null;
+      if (deltaY < 0 && await applyOlderMaterialization(wheelCount)) return;
       if (planned && typeof planned === 'object') {
         if (Number.isInteger(planned.windowIndex)) windowIndex = Math.max(0, Math.min(windows.length - 1, planned.windowIndex));
         if (planned.range) {
@@ -1096,6 +1113,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
       if (changeUrlOnWheel && wheelCount === 1) url = 'https://chatgpt.com/c/changed';
       if (scrollGestureSource && gestureSourceType !== scrollGestureSource) return;
       if (!windowChanges) return;
+      if (yDistance > 0 && await applyOlderMaterialization(wheelCount)) return;
       if (yDistance < 0) windowIndex = Math.min(windows.length - 1, windowIndex + 1);
       if (yDistance > 0) windowIndex = Math.max(0, windowIndex - 1);
     }
@@ -3360,6 +3378,8 @@ test('chatgpt-controller: physical jitter does not reset semantic older no-progr
 });
 
 test('chatgpt-controller: reverse current-DOM scrolling keeps monotonic physical older progress until virtualized windows materialize', async () => {
+  let scrollPlanStep = 0;
+  let finalOriginReached = false;
   const harness = createNativeWheelHistoryPage({
     initialWindow: 3,
     windowRanges: [
@@ -3373,15 +3393,21 @@ test('chatgpt-controller: reverse current-DOM scrolling keeps monotonic physical
     currentDom: true,
     reverseScroll: true,
     virtualizerTopOffsetPx: 18_000,
-    restorePlan: () => ({ virtualizerTopOffsetPx: 18_000 }),
+    restorePlan: () => {
+      scrollPlanStep = 0;
+      finalOriginReached = false;
+      return { virtualizerTopOffsetPx: 18_000 };
+    },
     directTopPlan: () => ({ windowIndex: 0, virtualizerTopOffsetPx: 0 }),
-    mouseWheelPlan: ({ attempt, deltaY }) => {
+    mouseWheelPlan: ({ deltaY, windowIndex }) => {
       if (deltaY > 0) return { windowIndex: 3, scrollTop: 0, virtualizerTopOffsetPx: 18_000 };
-      const step = ((attempt - 1) % 5) + 1;
+      if (finalOriginReached && windowIndex === 0) return { windowIndex: 0, scrollTop: -1_000, virtualizerTopOffsetPx: 0 };
+      const step = ++scrollPlanStep;
       if (step === 1) return { windowIndex: 3, scrollTop: -200, virtualizerTopOffsetPx: 18_000 };
       if (step === 2) return { windowIndex: 3, scrollTop: -400, virtualizerTopOffsetPx: 18_000 };
       if (step === 3) return { windowIndex: 2, scrollTop: -600, virtualizerTopOffsetPx: 12_000 };
       if (step === 4) return { windowIndex: 1, scrollTop: -800, virtualizerTopOffsetPx: 6_000 };
+      finalOriginReached = true;
       return { windowIndex: 0, scrollTop: -1_000, virtualizerTopOffsetPx: 0 };
     }
   });
@@ -3405,7 +3431,7 @@ test('chatgpt-controller: current DOM stable IDs and decreasing virtualizer offs
     currentDom: true,
     virtualizerTopOffsetPlan: ({ windowIndex }) => windowIndex * 1_600
   });
-  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 20_000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.reason, null);
   assert.ok(result.history.diagnostics.semanticOlderProgressCount >= 2);
@@ -3415,6 +3441,138 @@ test('chatgpt-controller: current DOM stable IDs and decreasing virtualizer offs
   assert.equal(result.history.diagnostics.finalVirtualizerTopOffsetPx, 3_200);
   assert.equal(result.history.diagnostics.progress.olderWindowObserved, true);
   assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
+});
+
+test('chatgpt-controller: false zero-offset origin probes and adds materialized older history', async () => {
+  let materialized = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7], [4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 13, 14, 15]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    olderMaterializationPlan: ({ attempt, windowIndex }) => {
+      if (windowIndex === 0 && attempt >= 5 && !materialized) {
+        materialized = true;
+        return { prependRange: [-4, -3, -2, -1, 0, 1, 2, 3], virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 10_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 40
+  });
+  assert.equal(result.history.startReached, true);
+  assert.equal(result.history.reason, null);
+  assert.equal(materialized, true);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, true);
+  assert.ok(result.history.diagnostics.virtualizedOriginProbe.boundaryCount >= 2, JSON.stringify(result.history.diagnostics.virtualizedOriginProbe));
+  assert.ok(result.history.diagnostics.virtualizedOriginProbe.progressCount >= 1);
+  assert.ok(result.history.diagnostics.virtualizedOriginProbe.materializationProgressCount >= 1);
+  const observedIds = new Set(result.windows.flatMap((window) => window.turns.map((turn) => turn.messageId)));
+  for (let position = -4; position <= 15; position += 1) assert.ok(observedIds.has(`message-${position}`));
+});
+
+test('chatgpt-controller: multi-stage zero-offset boundaries keep traversing until final stable origin', async () => {
+  const olderRanges = [
+    [-4, -3, -2, -1, 0, 1, 2, 3],
+    [-8, -7, -6, -5, -4, -3, -2, -1]
+  ];
+  let materializationIndex = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7], [4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 13, 14, 15]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    olderMaterializationPlan: ({ windowIndex }) => {
+      if (windowIndex !== 0 || materializationIndex >= olderRanges.length) return null;
+      return { prependRange: olderRanges[materializationIndex++], virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 10_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 50
+  });
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 3);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, true);
+  assert.ok(result.windows.length >= 5);
+  assert.ok(result.windows.every((window, index) => window.windowIndex === index));
+  const observedIds = new Set(result.windows.flatMap((window) => window.turns.map((turn) => turn.messageId)));
+  assert.deepEqual(Array.from({ length: 24 }, (_, index) => `message-${index - 8}`).filter((id) => observedIds.has(id)), Array.from({ length: 24 }, (_, index) => `message-${index - 8}`));
+  assert.deepEqual(result.windows.at(-1).turns.map((turn) => turn.messageId), Array.from({ length: 8 }, (_, index) => `message-${index - 8}`));
+});
+
+test('chatgpt-controller: prior older progress does not prove a later apparent zero origin', async () => {
+  let materialized = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7], [4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 13, 14, 15]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    olderMaterializationPlan: ({ windowIndex }) => {
+      if (windowIndex === 0 && !materialized) {
+        materialized = true;
+        return { prependRange: [-4, -3, -2, -1, 0, 1, 2, 3], virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 4
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-iteration-limit');
+  assert.ok(result.history.diagnostics.olderProgressCount > 0);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+});
+
+test('chatgpt-controller: true short current-DOM history passes bounded active origin probes', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, true, JSON.stringify(result.history));
+  assert.equal(result.turns.length, 8);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, true);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 3);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.attempts, 3);
+  assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
+});
+
+test('chatgpt-controller: unstable virtualized-origin probe fails closed', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    olderMaterializationPlan: ({ attempt }) => attempt >= 3 ? { loading: true, virtualizerTopOffsetPx: 0 } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+  assert.ok(result.history.diagnostics.virtualizedOriginProbe.attempts > 0);
+  assert.equal(result.history.scrollRestored, true);
+  assert.equal(result.history.diagnostics.windowLifecycle.restoreVerified, true);
 });
 
 test('chatgpt-controller: bounded top materialization wait accepts delayed current-DOM offset progress', async () => {
@@ -3442,7 +3600,7 @@ test('chatgpt-controller: bounded top materialization wait accepts delayed curre
       return null;
     }
   });
-  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 10_000, historyMaxIterations: 30 });
+  const result = await createController(harness.page).readConversationTurns({ maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000, historyMode: 'complete', historyTimeoutMs: 20_000, historyMaxIterations: 30 });
   assert.equal(result.history.complete, true);
   assert.equal(result.history.reason, null);
   assert.equal(result.history.diagnostics.topMaterialization.attempted, true);
@@ -3639,6 +3797,7 @@ test('chatgpt-controller: low range candidate establishes direct top without ano
   assert.equal(result.history.diagnostics.directTop.atTopVerified, true);
   assert.equal(result.history.diagnostics.directTop.triggeredAtIteration, 1);
   assert.equal(result.history.diagnostics.startProofMode, 'one-origin');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.attempted, false);
   assert.equal(harness.events.filter((event) => event.startsWith('mouse-wheel:')).length, 1);
 });
 
@@ -3651,6 +3810,7 @@ test('chatgpt-controller: zero-origin low range candidate also establishes direc
   assert.equal(result.history.diagnostics.startProven, true);
   assert.equal(result.history.diagnostics.directTop.candidateRangeMin, 0);
   assert.equal(result.history.diagnostics.wheelUpAttempts, 1);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.attempted, false);
 });
 
 test('chatgpt-controller: stalled native input uses direct top fallback for a live-like virtualized range', async () => {
@@ -4278,12 +4438,16 @@ test('chatgpt-controller: current virtualizer offset above zero cannot prove con
   assert.equal(proof.mode, null);
 });
 
-test('chatgpt-controller: current virtualizer origin proof requires an explicit zero offset', () => {
+test('chatgpt-controller: current virtualizer origin requires verified active older probes', () => {
   const fixture = evaluateCurrentDomModel({ offsetPx: 0 });
   const state = vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 10, maxCharsPerTurn: 1_000, maxTotalChars: 5_000 }), fixture.context);
   const proof = conversationStartBoundaryProof({ ...state, urlStable: true }, { physicalTopStable: true });
-  assert.equal(proof.proven, true);
-  assert.equal(proof.mode, 'virtualized-origin');
+  assert.equal(proof.proven, false);
+  assert.equal(proof.mode, null);
+  assert.equal(proof.virtualizedOriginCandidate, true);
+  const verified = conversationStartBoundaryProof({ ...state, urlStable: true }, { physicalTopStable: true, virtualizedOriginProbeVerified: true });
+  assert.equal(verified.proven, true);
+  assert.equal(verified.mode, 'virtualized-origin');
 });
 
 test('chatgpt-controller: current stable unit IDs merge overlapping virtualized windows', () => {

@@ -35,6 +35,7 @@ const CONVERSATION_HISTORY_TAIL_RECHECK_SAMPLES = 3;
 const CONVERSATION_HISTORY_TOP_MATERIALIZATION_WAIT_MS = 3_000;
 const CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS = 200;
 const CONVERSATION_HISTORY_TOP_MATERIALIZATION_MAX_ATTEMPTS = 2;
+const VIRTUALIZED_ORIGIN_REQUIRED_STABLE_PASSES = 3;
 const CONVERSATION_TAIL_TIMEOUT_MS = 5_000;
 const CONVERSATION_TAIL_MAX_ITERATIONS = 16;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -1153,7 +1154,7 @@ function conversationScrollerDistanceFromBottom(state) {
     : Math.max(0, maxDistance - scrollTop);
 }
 
-export function conversationStartBoundaryProof(state, { physicalTopStable = false } = {}) {
+export function conversationStartBoundaryProof(state, { physicalTopStable = false, virtualizedOriginProbeVerified = false } = {}) {
   const boundary = state?.startBoundary || {};
   const rangeMin = Number.isInteger(state?.range?.min) ? state.range.min : null;
   const firstMessagePosition = Number.isInteger(boundary.firstMessagePosition)
@@ -1192,7 +1193,7 @@ export function conversationStartBoundaryProof(state, { physicalTopStable = fals
     && positionZeroMessageNodeCount === 0
     && positionZeroMarkerInsideScrollerCount === 0;
   if (oneOrigin) return { proven: true, mode: 'one-origin', ...evidence };
-  const virtualizedOriginProven = virtualizedOrigin?.domMode === 'content-search-unit'
+  const virtualizedOriginCandidate = virtualizedOrigin?.domMode === 'content-search-unit'
     && virtualizedOrigin?.scrollerCandidateCount === 1
     && virtualizedOrigin?.turnHostCount === 1
     && virtualizedOrigin?.topOffsetPx === 0
@@ -1202,7 +1203,14 @@ export function conversationStartBoundaryProof(state, { physicalTopStable = fals
     && virtualizedOrigin?.loading === false
     && state?.scroller?.atTop === true
     && state?.urlStable !== false;
-  return { proven: virtualizedOriginProven, mode: virtualizedOriginProven ? 'virtualized-origin' : null, ...evidence, virtualizedOrigin };
+  const virtualizedOriginProven = virtualizedOriginCandidate && virtualizedOriginProbeVerified === true;
+  return {
+    proven: virtualizedOriginProven,
+    mode: virtualizedOriginProven ? 'virtualized-origin' : null,
+    ...evidence,
+    virtualizedOrigin,
+    virtualizedOriginCandidate
+  };
 }
 
 function probeWindowSummary(state) {
@@ -4501,6 +4509,15 @@ export class ChatGPTController {
         progressObserved: false,
         stalled: false
       },
+      virtualizedOriginProbe: {
+        attempted: false,
+        boundaryCount: 0,
+        attempts: 0,
+        stablePasses: 0,
+        progressCount: 0,
+        materializationProgressCount: 0,
+        verified: false
+      },
       tailProven: false,
       startProven: false,
       startProofMode: null,
@@ -4626,6 +4643,7 @@ export class ChatGPTController {
     let tailBaselineSignature = null;
     let iterations = 0;
     let furthestOlderDistanceFromBottom = null;
+    const virtualizedOriginBoundaries = new Map();
     const addSnapshot = (state) => {
       if (Array.isArray(state?.turns)) snapshots.push(state.turns);
       if (collectRawWindows && Array.isArray(state?.turns)) {
@@ -4813,7 +4831,7 @@ export class ChatGPTController {
         range: conversationTurnRange(after?.turns)
       };
     };
-    const nativeWheel = async (direction, state) => {
+    const nativeWheel = async (direction, state, { collectChangedSnapshot = true } = {}) => {
       if (historyBudgetExpired() || iterations >= historyMaxIterations) return { ok: false, reason: 'timeout' };
       if (isChromeCdp) {
         let runtime = null;
@@ -4918,7 +4936,7 @@ export class ChatGPTController {
       if (!currentUrlIsStable(next)) return { ok: false, reason: 'conversation-changed', state: next };
       if (next?.limitExceeded) return { ok: false, reason: next.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large', state: next };
       const result = recordWheelResult(beforeState, next, direction);
-      if (result.windowChanged) addSnapshot(next);
+      if (result.windowChanged && collectChangedSnapshot) addSnapshot(next);
       current = next;
       return { ok: true, state: next, ...result };
     };
@@ -5104,6 +5122,161 @@ export class ChatGPTController {
       }
       diagnostics.topMaterialization.stalled = true;
       return false;
+    };
+    const virtualizedOriginBoundaryKey = (state) => textDigest(JSON.stringify({
+      window: conversationWindowSignature(state?.turns),
+      range: conversationTurnRange(state?.turns),
+      topOffsetPx: conversationVirtualizerTopOffset(state),
+      atTop: state?.scroller?.atTop === true
+    }));
+    const verifyVirtualizedOriginBoundary = async (candidate) => {
+      const probe = diagnostics.virtualizedOriginProbe;
+      probe.attempted = true;
+      const initialProof = conversationStartBoundaryProof(candidate, { physicalTopStable: true });
+      if (!initialProof.virtualizedOriginCandidate) return { verified: false, progressed: false };
+      const trackBoundary = (state) => {
+        const key = virtualizedOriginBoundaryKey(state);
+        let tracked = virtualizedOriginBoundaries.get(key);
+        if (!tracked) {
+          tracked = { stablePasses: 0 };
+          virtualizedOriginBoundaries.set(key, tracked);
+          probe.boundaryCount += 1;
+        }
+        return { key, tracked };
+      };
+      let { key: boundaryKey, tracked: boundaryState } = trackBoundary(candidate);
+
+      for (let pass = 0; pass < VIRTUALIZED_ORIGIN_REQUIRED_STABLE_PASSES; pass += 1) {
+        if (historyBudgetExpired()) {
+          reason = 'timeout';
+          return { verified: false, progressed: false };
+        }
+        if (iterations >= historyMaxIterations) {
+          reason = 'history-iteration-limit';
+          return { verified: false, progressed: false };
+        }
+        const before = current;
+        probe.attempts += 1;
+        const wheel = await nativeWheel(-1, before, { collectChangedSnapshot: false });
+        if (!wheel.ok) {
+          reason = wheel.reason || 'history-virtualized-origin-unproven';
+          return { verified: false, progressed: false };
+        }
+        let progressed = false;
+        const wheelProgress = directionalProgressFor(before, wheel.state, -1);
+        const wheelPhysicalProgress = recordPhysicalOlderAdvance(before, wheel.state);
+        if (wheelProgress.progress || wheelPhysicalProgress) {
+          progressed = true;
+          probe.progressCount += 1;
+          probe.materializationProgressCount += 1;
+          boundaryState.stablePasses = 0;
+          recordOlderProgress({ ...wheelProgress, progress: wheelProgress.progress || wheelPhysicalProgress });
+          addSnapshot(wheel.state);
+          ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(wheel.state));
+        } else {
+          recordOlderProgress(wheelProgress);
+        }
+
+        const pollDeadline = Math.min(
+          Date.now() + CONVERSATION_HISTORY_TOP_MATERIALIZATION_WAIT_MS,
+          deadlineAt ?? Number.POSITIVE_INFINITY
+        );
+        let stableSamples = 0;
+        let previousStableSignature = null;
+        let pollBefore = wheel.state;
+        while (Date.now() < pollDeadline && stableSamples < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
+          await sleep(Math.min(CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS, Math.max(1, pollDeadline - Date.now())));
+          if (historyBudgetExpired()) {
+            reason = 'timeout';
+            return { verified: false, progressed };
+          }
+          let state;
+          try {
+            state = await readWindow();
+          } catch {
+            reason = 'history-virtualized-origin-unproven';
+            return { verified: false, progressed };
+          }
+          if (!currentUrlIsStable(state)) {
+            reason = 'conversation-changed';
+            return { verified: false, progressed };
+          }
+          if (state?.limitExceeded) {
+            reason = state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+            return { verified: false, progressed };
+          }
+          if (state?.scroller?.candidateCount !== 1) {
+            reason = state?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
+            return { verified: false, progressed };
+          }
+          const pollProgress = directionalProgressFor(pollBefore, state, -1);
+          const pollPhysicalProgress = recordPhysicalOlderAdvance(pollBefore, state);
+          if (pollProgress.progress || pollPhysicalProgress) {
+            progressed = true;
+            probe.progressCount += 1;
+            probe.materializationProgressCount += 1;
+            boundaryState.stablePasses = 0;
+            recordOlderProgress({ ...pollProgress, progress: pollProgress.progress || pollPhysicalProgress });
+            addSnapshot(state);
+            stableSamples = 0;
+            previousStableSignature = null;
+            pollBefore = state;
+            current = state;
+            ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(state));
+            continue;
+          }
+          recordOlderProgress(pollProgress);
+          const proof = conversationStartBoundaryProof(state, { physicalTopStable: true, virtualizedOriginProbeVerified: true });
+          const virtualizedOrigin = state?.startBoundary?.virtualizedOrigin;
+          const currentDomStateValid = virtualizedOrigin?.domMode === 'content-search-unit'
+            && virtualizedOrigin?.scrollerCandidateCount === 1
+            && virtualizedOrigin?.turnHostCount === 1
+            && Number(virtualizedOrigin?.validMessageCount) > 0
+            && Number(virtualizedOrigin?.malformedMessageCount) === 0;
+          if (!currentDomStateValid) {
+            reason = 'history-virtualized-origin-unproven';
+            return { verified: false, progressed };
+          }
+          if (state.loading === true) {
+            stableSamples = 0;
+            previousStableSignature = null;
+            pollBefore = state;
+            current = state;
+            continue;
+          }
+          const stateBoundaryKey = virtualizedOriginBoundaryKey(state);
+          if ((!progressed && !proof.proven) || stateBoundaryKey !== boundaryKey) {
+            if (stateBoundaryKey !== boundaryKey) {
+              ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(state));
+            }
+            reason = 'history-virtualized-origin-unproven';
+            return { verified: false, progressed };
+          }
+          const stableSignature = JSON.stringify({ boundary: stateBoundaryKey, window: conversationWindowSignature(state.turns) });
+          stableSamples = stableSignature === previousStableSignature ? stableSamples + 1 : 1;
+          previousStableSignature = stableSignature;
+          current = state;
+          pollBefore = state;
+        }
+        if (stableSamples < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
+          reason ||= historyBudgetExpired() ? 'timeout' : 'history-virtualized-origin-unproven';
+          return { verified: false, progressed };
+        }
+        if (progressed) {
+          boundaryState.stablePasses = 0;
+          return { verified: false, progressed: true };
+        }
+        boundaryState.stablePasses += 1;
+        probe.stablePasses += 1;
+        boundaryKey = virtualizedOriginBoundaryKey(current);
+        const currentProof = conversationStartBoundaryProof(current, { physicalTopStable: true, virtualizedOriginProbeVerified: true });
+        if (!currentProof.proven) {
+          reason = 'history-virtualized-origin-unproven';
+          return { verified: false, progressed: false };
+        }
+      }
+      probe.verified = true;
+      return { verified: true, progressed: false };
     };
     const restore = async () => {
       const restoreDiagnostics = diagnostics.conversationRestore;
@@ -5448,6 +5621,7 @@ export class ChatGPTController {
             diagnostics.iterationLimitReachedAtTop = diagnostics.iterationLimitReached;
             let stableTopCount = 0;
             let previousTop = null;
+            let originProbeProgress = false;
             for (let sample = 0; sample < CONVERSATION_HISTORY_TOP_STABLE_SAMPLES && !historyBudgetExpired(); sample += 1) {
               await sleep(CONVERSATION_HISTORY_TOP_SETTLE_WAIT_MS);
               const settled = await this.#eval(buildConversationWindowReadScript(limits));
@@ -5462,17 +5636,33 @@ export class ChatGPTController {
               previousTop = signature;
               current = settled;
               if (stableTopCount >= CONVERSATION_HISTORY_TOP_STABLE_SAMPLES) {
-                const proof = conversationStartBoundaryProof(settled, { physicalTopStable: true });
+                let proof = conversationStartBoundaryProof(settled, { physicalTopStable: true });
+                if (proof.virtualizedOriginCandidate) {
+                  const originProbe = await verifyVirtualizedOriginBoundary(settled);
+                  if (originProbe.progressed) {
+                    originProbeProgress = true;
+                    break;
+                  }
+                  if (!originProbe.verified) {
+                    reason ||= 'history-virtualized-origin-unproven';
+                    break;
+                  }
+                  proof = conversationStartBoundaryProof(current, {
+                    physicalTopStable: true,
+                    virtualizedOriginProbeVerified: true
+                  });
+                }
                 diagnostics.startBoundary = proof;
                 diagnostics.startProofMode = proof.mode;
                 diagnostics.startProven = proof.proven;
                 startReached = diagnostics.startProven;
-                snapshotStable = true;
+                snapshotStable = diagnostics.startProven;
                 reason = diagnostics.startProven ? null : 'history-start-unproven';
                 break;
               }
             }
             if (reason || startReached) break;
+            if (originProbeProgress) continue;
           }
           if (iterations >= historyMaxIterations) {
             diagnostics.iterationLimitReached = true;

@@ -889,7 +889,7 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, olderMaterializationPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, turnIdentityPlan = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, olderMaterializationPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   let windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -936,14 +936,17 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
     const distanceFromTop = reverseScroll ? Math.max(0, maxScrollDistance + rawScrollTop) : Math.max(0, rawScrollTop);
     return {
       url,
-      turns: positions.map((position) => ({
-        role: rawPositions[positions.indexOf(position)] % 2 ? 'assistant' : 'user',
-        text: typeof turnText === 'function' ? turnText({ position, windowIndex }) : `turn-${position}`,
-        messageId: `message-${position}`,
-        turnId: null,
-        positionHint: positionHints ? position : null,
-        ...(typeof turnLiveText === 'function' ? { domMode: 'content-search-unit', liveInnerText: turnLiveText({ position, windowIndex }) } : {})
-      })),
+      turns: positions.map((position) => {
+        const plannedIdentity = typeof turnIdentityPlan === 'function' ? turnIdentityPlan({ position, windowIndex, readCount }) : null;
+        return {
+          role: rawPositions[positions.indexOf(position)] % 2 ? 'assistant' : 'user',
+          text: typeof turnText === 'function' ? turnText({ position, windowIndex, readCount }) : `turn-${position}`,
+          messageId: plannedIdentity && Object.hasOwn(plannedIdentity, 'messageId') ? plannedIdentity.messageId : `message-${position}`,
+          turnId: plannedIdentity && Object.hasOwn(plannedIdentity, 'turnId') ? plannedIdentity.turnId : null,
+          positionHint: positionHints ? position : null,
+          ...(typeof turnLiveText === 'function' ? { domMode: 'content-search-unit', liveInnerText: turnLiveText({ position, windowIndex, readCount }) } : {})
+        };
+      }),
       limitExceeded: false,
       limitKind: null,
       loading: loadingOverride === null ? false : loadingOverride,
@@ -3551,6 +3554,162 @@ test('chatgpt-controller: true short current-DOM history passes bounded active o
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 3);
   assert.equal(result.history.diagnostics.virtualizedOriginProbe.attempts, 3);
   assert.equal(result.history.diagnostics.startProofMode, 'virtualized-origin');
+});
+
+test('chatgpt-controller: virtualized-origin stable passes ignore provider text variants', async () => {
+  let probePass = 0;
+  const variants = ['presentation-a', 'presentation-b', 'presentation-a'];
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnText: ({ position }) => position === 0 ? `turn-zero-${variants[Math.max(0, probePass - 1) % variants.length]}` : `turn-${position}`,
+    mouseWheelPlan: ({ deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) {
+        probePass += 1;
+        return { windowIndex: 0, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, true);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 3);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
+});
+
+test('chatgpt-controller: virtualized-origin probes keep A/B/A text variants on one logical boundary', async () => {
+  let probePass = 0;
+  const variants = ['historical-shape', 'dom-decoration', 'historical-shape'];
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnText: ({ position }) => position === 0 ? `turn-zero-${variants[Math.max(0, probePass - 1) % variants.length]}` : `turn-${position}`,
+    mouseWheelPlan: ({ deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) {
+        probePass += 1;
+        return { windowIndex: 0, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.startReached, true, JSON.stringify(result.history));
+  assert.equal(result.history.reason, null);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, true);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 3);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
+});
+
+test('chatgpt-controller: virtualized-origin identity kind changes reset boundary stability', async () => {
+  let switchIdentityKind = false;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: ({ position }) => position === 0 && switchIdentityKind
+      ? { messageId: null, turnId: 'message-0' }
+      : null,
+    mouseWheelPlan: ({ attempt, deltaY, windowIndex }) => {
+      if (attempt >= 2 && deltaY < 0 && windowIndex === 0) {
+        switchIdentityKind = true;
+        return { windowIndex: 0, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.stablePasses, 0);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 2);
+});
+
+test('chatgpt-controller: virtualized-origin probe fails closed when a current turn has no durable identity', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: ({ position }) => position === 3 ? { messageId: null, turnId: null } : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+});
+
+test('chatgpt-controller: virtualized-origin probe fails closed on duplicate provider identity', async () => {
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: ({ position }) => position === 0 || position === 1
+      ? { messageId: 'duplicate-message', turnId: null }
+      : null
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 5000,
+    historyMode: 'complete', historyTimeoutMs: 25_000, historyMaxIterations: 30
+  });
+  assert.equal(result.history.complete, false);
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-virtualized-origin-unproven');
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+});
+
+test('chatgpt-controller: materialization states are excluded from origin boundary count', async () => {
+  const olderRanges = [
+    [-3, -2, -1, 0, 1, 2, 3, 4],
+    [-8, -7, -6, -5, -4, -3, -2, -1]
+  ];
+  let materializationIndex = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7], [4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 13, 14, 15]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    olderMaterializationPlan: ({ windowIndex }) => {
+      if (windowIndex !== 0 || materializationIndex >= olderRanges.length) return null;
+      return { prependRange: olderRanges[materializationIndex++], virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1000, maxTotalChars: 10_000,
+    historyTimeoutMs: 25_000, historyMaxIterations: 3
+  });
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.verified, false);
+  assert.equal(result.history.diagnostics.virtualizedOriginProbe.boundaryCount, 1);
+  assert.ok(result.history.diagnostics.virtualizedOriginProbe.progressCount > 0);
 });
 
 test('chatgpt-controller: unstable virtualized-origin probe fails closed', async () => {

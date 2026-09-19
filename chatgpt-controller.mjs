@@ -1086,6 +1086,26 @@ function conversationWindowIdentitySignature(turns = []) {
   ]));
 }
 
+function conversationWindowDurableIdentitySignature(turns = []) {
+  if (!Array.isArray(turns) || turns.length === 0) return null;
+  const identities = [];
+  const seen = new Set();
+  for (const turn of turns) {
+    if (!['user', 'assistant'].includes(turn?.role)) return null;
+    if (turn?.messageId !== undefined && turn.messageId !== null && typeof turn.messageId !== 'string') return null;
+    if (turn?.turnId !== undefined && turn.turnId !== null && typeof turn.turnId !== 'string') return null;
+    const messageId = String(turn?.messageId || '').trim();
+    const turnId = String(turn?.turnId || '').trim();
+    const identity = messageId ? ['messageId', messageId] : turnId ? ['turnId', turnId] : null;
+    if (!identity) return null;
+    const identityKey = JSON.stringify(identity);
+    if (seen.has(identityKey)) return null;
+    seen.add(identityKey);
+    identities.push(identity);
+  }
+  return JSON.stringify({ window: conversationWindowIdentitySignature(turns), identities });
+}
+
 function conversationDirectionalIdentityKey(turn, index) {
   const messageId = String(turn?.messageId || '').trim();
   if (messageId) return `message:${messageId}`;
@@ -5123,12 +5143,42 @@ export class ChatGPTController {
       diagnostics.topMaterialization.stalled = true;
       return false;
     };
-    const virtualizedOriginBoundaryKey = (state) => textDigest(JSON.stringify({
-      window: conversationWindowSignature(state?.turns),
-      range: conversationTurnRange(state?.turns),
-      topOffsetPx: conversationVirtualizerTopOffset(state),
-      atTop: state?.scroller?.atTop === true
-    }));
+    const virtualizedOriginProbeSampleSignature = (state) => {
+      const virtualizedOrigin = state?.startBoundary?.virtualizedOrigin;
+      const topOffsetPx = conversationVirtualizerTopOffset(state);
+      const identitySignature = conversationWindowDurableIdentitySignature(state?.turns);
+      if (virtualizedOrigin?.domMode !== 'content-search-unit'
+        || virtualizedOrigin?.scrollerCandidateCount !== 1
+        || virtualizedOrigin?.turnHostCount !== 1
+        || !Number.isInteger(Number(virtualizedOrigin?.validMessageCount))
+        || Number(virtualizedOrigin?.validMessageCount) <= 0
+        || !Number.isInteger(Number(virtualizedOrigin?.malformedMessageCount))
+        || Number(virtualizedOrigin?.malformedMessageCount) !== 0
+        || state?.scroller?.candidateCount !== 1
+        || typeof state?.scroller?.atTop !== 'boolean'
+        || topOffsetPx === null
+        || typeof state?.loading !== 'boolean'
+        || !identitySignature) return null;
+      return JSON.stringify({
+        identity: identitySignature,
+        range: conversationTurnRange(state?.turns),
+        atTop: state.scroller.atTop,
+        topOffsetPx,
+        loading: state.loading,
+        scrollerCandidateCount: state.scroller.candidateCount,
+        turnHostCount: virtualizedOrigin.turnHostCount
+      });
+    };
+    const virtualizedOriginBoundaryKey = (state) => {
+      const identity = conversationWindowDurableIdentitySignature(state?.turns);
+      if (!identity) return null;
+      return textDigest(JSON.stringify({
+        identity,
+        range: conversationTurnRange(state?.turns),
+        topOffsetPx: conversationVirtualizerTopOffset(state),
+        atTop: state?.scroller?.atTop === true
+      }));
+    };
     const verifyVirtualizedOriginBoundary = async (candidate) => {
       const probe = diagnostics.virtualizedOriginProbe;
       probe.attempted = true;
@@ -5136,6 +5186,7 @@ export class ChatGPTController {
       if (!initialProof.virtualizedOriginCandidate) return { verified: false, progressed: false };
       const trackBoundary = (state) => {
         const key = virtualizedOriginBoundaryKey(state);
+        if (!key) return { key: null, tracked: null };
         let tracked = virtualizedOriginBoundaries.get(key);
         if (!tracked) {
           tracked = { stablePasses: 0 };
@@ -5145,6 +5196,13 @@ export class ChatGPTController {
         return { key, tracked };
       };
       let { key: boundaryKey, tracked: boundaryState } = trackBoundary(candidate);
+      if (!boundaryKey) {
+        reason = 'history-virtualized-origin-unproven';
+        return { verified: false, progressed: false };
+      }
+      const resetBoundaryStability = () => {
+        for (const tracked of virtualizedOriginBoundaries.values()) tracked.stablePasses = 0;
+      };
 
       for (let pass = 0; pass < VIRTUALIZED_ORIGIN_REQUIRED_STABLE_PASSES; pass += 1) {
         if (historyBudgetExpired()) {
@@ -5162,6 +5220,22 @@ export class ChatGPTController {
           reason = wheel.reason || 'history-virtualized-origin-unproven';
           return { verified: false, progressed: false };
         }
+        if (!currentUrlIsStable(wheel.state)) {
+          reason = 'conversation-changed';
+          return { verified: false, progressed: false };
+        }
+        if (wheel.state?.limitExceeded) {
+          reason = wheel.state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+          return { verified: false, progressed: false };
+        }
+        if (wheel.state?.scroller?.candidateCount !== 1) {
+          reason = wheel.state?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
+          return { verified: false, progressed: false };
+        }
+        if (!virtualizedOriginProbeSampleSignature(wheel.state)) {
+          reason = 'history-virtualized-origin-unproven';
+          return { verified: false, progressed: false };
+        }
         let progressed = false;
         const wheelProgress = directionalProgressFor(before, wheel.state, -1);
         const wheelPhysicalProgress = recordPhysicalOlderAdvance(before, wheel.state);
@@ -5169,10 +5243,9 @@ export class ChatGPTController {
           progressed = true;
           probe.progressCount += 1;
           probe.materializationProgressCount += 1;
-          boundaryState.stablePasses = 0;
+          resetBoundaryStability();
           recordOlderProgress({ ...wheelProgress, progress: wheelProgress.progress || wheelPhysicalProgress });
           addSnapshot(wheel.state);
-          ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(wheel.state));
         } else {
           recordOlderProgress(wheelProgress);
         }
@@ -5209,34 +5282,36 @@ export class ChatGPTController {
             reason = state?.scroller?.candidateCount > 1 ? 'scroll-container-ambiguous' : 'scroll-container-not-found';
             return { verified: false, progressed };
           }
+          const sampleSignature = virtualizedOriginProbeSampleSignature(state);
+          if (!sampleSignature) {
+            reason = 'history-virtualized-origin-unproven';
+            return { verified: false, progressed };
+          }
           const pollProgress = directionalProgressFor(pollBefore, state, -1);
           const pollPhysicalProgress = recordPhysicalOlderAdvance(pollBefore, state);
           if (pollProgress.progress || pollPhysicalProgress) {
             progressed = true;
             probe.progressCount += 1;
             probe.materializationProgressCount += 1;
-            boundaryState.stablePasses = 0;
+            resetBoundaryStability();
             recordOlderProgress({ ...pollProgress, progress: pollProgress.progress || pollPhysicalProgress });
             addSnapshot(state);
             stableSamples = 0;
             previousStableSignature = null;
             pollBefore = state;
             current = state;
-            ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(state));
+            const progressProof = conversationStartBoundaryProof(state, { physicalTopStable: true });
+            if (progressProof.virtualizedOriginCandidate) {
+              const tracked = trackBoundary(state);
+              if (!tracked.key) {
+                reason = 'history-virtualized-origin-unproven';
+                return { verified: false, progressed };
+              }
+            }
             continue;
           }
           recordOlderProgress(pollProgress);
           const proof = conversationStartBoundaryProof(state, { physicalTopStable: true, virtualizedOriginProbeVerified: true });
-          const virtualizedOrigin = state?.startBoundary?.virtualizedOrigin;
-          const currentDomStateValid = virtualizedOrigin?.domMode === 'content-search-unit'
-            && virtualizedOrigin?.scrollerCandidateCount === 1
-            && virtualizedOrigin?.turnHostCount === 1
-            && Number(virtualizedOrigin?.validMessageCount) > 0
-            && Number(virtualizedOrigin?.malformedMessageCount) === 0;
-          if (!currentDomStateValid) {
-            reason = 'history-virtualized-origin-unproven';
-            return { verified: false, progressed };
-          }
           if (state.loading === true) {
             stableSamples = 0;
             previousStableSignature = null;
@@ -5245,14 +5320,20 @@ export class ChatGPTController {
             continue;
           }
           const stateBoundaryKey = virtualizedOriginBoundaryKey(state);
-          if ((!progressed && !proof.proven) || stateBoundaryKey !== boundaryKey) {
-            if (stateBoundaryKey !== boundaryKey) {
-              ({ key: boundaryKey, tracked: boundaryState } = trackBoundary(state));
+          if (!progressed) {
+            if (!proof.proven || stateBoundaryKey !== boundaryKey) {
+              if (proof.virtualizedOriginCandidate && stateBoundaryKey !== boundaryKey) {
+                const tracked = trackBoundary(state);
+                if (!tracked.key) {
+                  reason = 'history-virtualized-origin-unproven';
+                  return { verified: false, progressed };
+                }
+              }
+              reason = 'history-virtualized-origin-unproven';
+              return { verified: false, progressed };
             }
-            reason = 'history-virtualized-origin-unproven';
-            return { verified: false, progressed };
           }
-          const stableSignature = JSON.stringify({ boundary: stateBoundaryKey, window: conversationWindowSignature(state.turns) });
+          const stableSignature = JSON.stringify({ boundary: progressed ? null : stateBoundaryKey, sample: sampleSignature });
           stableSamples = stableSignature === previousStableSignature ? stableSamples + 1 : 1;
           previousStableSignature = stableSignature;
           current = state;
@@ -5263,7 +5344,7 @@ export class ChatGPTController {
           return { verified: false, progressed };
         }
         if (progressed) {
-          boundaryState.stablePasses = 0;
+          resetBoundaryStability();
           return { verified: false, progressed: true };
         }
         boundaryState.stablePasses += 1;

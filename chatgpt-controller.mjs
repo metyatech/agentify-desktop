@@ -36,6 +36,7 @@ const CONVERSATION_HISTORY_TOP_MATERIALIZATION_WAIT_MS = 3_000;
 const CONVERSATION_HISTORY_TOP_MATERIALIZATION_POLL_MS = 200;
 const CONVERSATION_HISTORY_TOP_MATERIALIZATION_MAX_ATTEMPTS = 2;
 const VIRTUALIZED_ORIGIN_REQUIRED_STABLE_PASSES = 3;
+const VIRTUALIZED_ORIGIN_MAX_CORRECTIVE_OLDER_RETRIES = 3;
 const CONVERSATION_TAIL_TIMEOUT_MS = 5_000;
 const CONVERSATION_TAIL_MAX_ITERATIONS = 16;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
@@ -4672,6 +4673,10 @@ export class ChatGPTController {
         identityCorrectiveRestoreWheelCount: 0,
         identityCorrectiveRestoreOlderProgressCount: 0,
         identityCorrectiveRestoreUnresolvedCount: 0,
+        identityCorrectiveRestoreMaxRetries: VIRTUALIZED_ORIGIN_MAX_CORRECTIVE_OLDER_RETRIES,
+        identityCorrectiveRestoreRetryCount: 0,
+        identityCorrectiveRestoreEpisodeCount: 0,
+        identityCorrectiveRestoreBudgetExhaustedCount: 0,
         identityContractionCount: 0,
         identityContractionRestoreCount: 0,
         identityContractionWheelCount: 0,
@@ -5332,8 +5337,28 @@ export class ChatGPTController {
       let identityRecoilActive = false;
       let identityContractionActive = false;
       let latestIdentityTransient = null;
-      let correctiveRestoreAttemptedThisEpisode = false;
+      let correctiveRestoreEpisodeActive = false;
+      let correctiveRestoreRetriesThisEpisode = 0;
+      let correctiveRestoreBudgetExhaustedThisEpisode = false;
+      const beginCorrectiveRestoreEpisode = () => {
+        if (correctiveRestoreEpisodeActive || identityContractionActive) return;
+        correctiveRestoreEpisodeActive = true;
+        correctiveRestoreRetriesThisEpisode = 0;
+        correctiveRestoreBudgetExhaustedThisEpisode = false;
+        probe.identityCorrectiveRestoreEpisodeCount += 1;
+      };
+      const endCorrectiveRestoreEpisode = () => {
+        correctiveRestoreEpisodeActive = false;
+        correctiveRestoreRetriesThisEpisode = 0;
+        correctiveRestoreBudgetExhaustedThisEpisode = false;
+      };
+      const markCorrectiveRestoreBudgetExhausted = () => {
+        if (correctiveRestoreBudgetExhaustedThisEpisode) return;
+        correctiveRestoreBudgetExhaustedThisEpisode = true;
+        probe.identityCorrectiveRestoreBudgetExhaustedCount += 1;
+      };
       const failProbe = (stage, failureReason, traversalReason = 'history-virtualized-origin-unproven') => {
+        endCorrectiveRestoreEpisode();
         probe.lastFailureStage = stage;
         probe.lastFailureReason = failureReason;
         reason = traversalReason;
@@ -5350,86 +5375,111 @@ export class ChatGPTController {
         if (stage === 'wheel') probe.identityRecoilWheelCount += 1;
         else if (stage === 'poll') probe.identityRecoilPollCount += 1;
         identityRecoilActive = true;
-        latestIdentityTransient = { kind: 'recoil', stage, state };
+        if (!identityContractionActive) {
+          beginCorrectiveRestoreEpisode();
+          latestIdentityTransient = { kind: 'recoil', stage, state };
+        }
       };
       const recordIdentityContraction = (stage, state) => {
         probe.identityContractionCount += 1;
         if (stage === 'wheel') probe.identityContractionWheelCount += 1;
         else if (stage === 'poll') probe.identityContractionPollCount += 1;
+        endCorrectiveRestoreEpisode();
         identityContractionActive = true;
         latestIdentityTransient = { kind: 'contraction', stage, state };
       };
       const attemptCorrectiveOlderRetry = async (recoilState) => {
-        if (correctiveRestoreAttemptedThisEpisode) return { kind: 'already-attempted' };
-        correctiveRestoreAttemptedThisEpisode = true;
-        probe.identityCorrectiveRestoreAttemptCount += 1;
-        probe.identityCorrectiveRestoreWheelCount += 1;
-        // Retry the intended older/history-start movement after a newer recoil.
-        const corrective = await nativeWheel(-1, recoilState, { collectChangedSnapshot: false });
-        if (!corrective.ok) {
-          probe.identityCorrectiveRestoreUnresolvedCount += 1;
-          failProbe('corrective-wheel-invalid', corrective.reason || 'wheel-failed', corrective.reason || 'history-virtualized-origin-unproven');
-          return { kind: 'failed' };
-        }
-        const state = corrective.state;
-        if (!currentUrlIsStable(state)) {
-          probe.identityCorrectiveRestoreUnresolvedCount += 1;
-          failProbe('corrective-url-changed', 'url-changed', 'conversation-changed');
-          return { kind: 'failed' };
-        }
-        if (state?.limitExceeded) {
-          probe.identityCorrectiveRestoreUnresolvedCount += 1;
-          const limitReason = state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
-          failProbe('corrective-sample-invalid', 'size-limit', limitReason);
-          return { kind: 'failed' };
-        }
-        if (state?.scroller?.candidateCount !== 1 || !virtualizedOriginProbeSampleSignature(state)) {
-          probe.identityCorrectiveRestoreUnresolvedCount += 1;
-          failProbe('corrective-sample-invalid', 'identity-invalid');
-          return { kind: 'failed' };
-        }
+        if (!correctiveRestoreEpisodeActive) beginCorrectiveRestoreEpisode();
+        while (true) {
+          if (correctiveRestoreRetriesThisEpisode >= VIRTUALIZED_ORIGIN_MAX_CORRECTIVE_OLDER_RETRIES) {
+            markCorrectiveRestoreBudgetExhausted();
+            return { kind: 'budget-exhausted', state: recoilState };
+          }
+          if (historyBudgetExpired()) {
+            return failProbe('probe-budget-exhausted', 'history-budget-expired', 'timeout');
+          }
+          if (iterations >= historyMaxIterations) {
+            return failProbe('probe-budget-exhausted', 'iteration-limit', 'history-iteration-limit');
+          }
+          correctiveRestoreRetriesThisEpisode += 1;
+          probe.identityCorrectiveRestoreAttemptCount += 1;
+          probe.identityCorrectiveRestoreRetryCount += 1;
+          probe.identityCorrectiveRestoreWheelCount += 1;
+          // Retry the intended older/history-start movement after a newer recoil.
+          const corrective = await nativeWheel(-1, recoilState, { collectChangedSnapshot: false });
+          if (!corrective.ok) {
+            probe.identityCorrectiveRestoreUnresolvedCount += 1;
+            failProbe('corrective-wheel-invalid', corrective.reason || 'wheel-failed', corrective.reason || 'history-virtualized-origin-unproven');
+            return { kind: 'failed' };
+          }
+          const state = corrective.state;
+          if (!currentUrlIsStable(state)) {
+            probe.identityCorrectiveRestoreUnresolvedCount += 1;
+            failProbe('corrective-url-changed', 'url-changed', 'conversation-changed');
+            return { kind: 'failed' };
+          }
+          if (state?.limitExceeded) {
+            probe.identityCorrectiveRestoreUnresolvedCount += 1;
+            const limitReason = state.limitKind === 'per-turn' ? 'conversation_turn_too_large' : 'conversation_too_large';
+            failProbe('corrective-sample-invalid', 'size-limit', limitReason);
+            return { kind: 'failed' };
+          }
+          if (state?.scroller?.candidateCount !== 1 || !virtualizedOriginProbeSampleSignature(state)) {
+            probe.identityCorrectiveRestoreUnresolvedCount += 1;
+            failProbe('corrective-sample-invalid', 'identity-invalid');
+            return { kind: 'failed' };
+          }
 
-        const progress = directionalProgressFor(progressBaselineState, state, -1);
-        const physicalProgress = recordPhysicalOlderAdvance(progressBaselineState, state);
-        if (progress.progress || physicalProgress) {
-          probe.progressCount += 1;
-          probe.materializationProgressCount += 1;
-          probe.identityCorrectiveRestoreOlderProgressCount += 1;
-          resetBoundaryStability();
-          recordOlderProgress({ ...progress, progress: progress.progress || physicalProgress });
-          addSnapshot(state);
-          current = state;
-          return { kind: 'older-progress', state };
-        }
-        recordOlderProgress(progress);
+          // Every result is classified against the original candidate A, never
+          // the preceding recoil sample.
+          if (conversationWindowDurableIdentitySignature(state?.turns) === expectedIdentitySignature) {
+            probe.identityCorrectiveRestoreSuccessCount += 1;
+            if (identityRecoilActive) probe.identityRecoilRestoreCount += 1;
+            if (identityContractionActive) probe.identityContractionRestoreCount += 1;
+            identityRecoilActive = false;
+            identityContractionActive = false;
+            latestIdentityTransient = null;
+            endCorrectiveRestoreEpisode();
+            current = state;
+            return { kind: 'exact-candidate', state };
+          }
 
-        if (conversationWindowDurableIdentitySignature(state?.turns) === expectedIdentitySignature) {
-          probe.identityCorrectiveRestoreSuccessCount += 1;
-          if (identityRecoilActive) probe.identityRecoilRestoreCount += 1;
-          if (identityContractionActive) probe.identityContractionRestoreCount += 1;
-          identityRecoilActive = false;
-          identityContractionActive = false;
-          latestIdentityTransient = null;
-          correctiveRestoreAttemptedThisEpisode = false;
-          current = state;
-          return { kind: 'exact-candidate', state };
-        }
+          const progress = directionalProgressFor(progressBaselineState, state, -1);
+          const physicalProgress = recordPhysicalOlderAdvance(progressBaselineState, state);
+          if (progress.progress || physicalProgress) {
+            probe.progressCount += 1;
+            probe.materializationProgressCount += 1;
+            probe.identityCorrectiveRestoreOlderProgressCount += 1;
+            resetBoundaryStability();
+            recordOlderProgress({ ...progress, progress: progress.progress || physicalProgress });
+            addSnapshot(state);
+            current = state;
+            endCorrectiveRestoreEpisode();
+            return { kind: 'older-progress', state };
+          }
+          recordOlderProgress(progress);
 
-        const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
-        if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
-          recordNewerIdentityRecoil('corrective', state);
-          current = state;
-          return { kind: 'newer-recoil', state };
+          const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
+          if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
+            recordNewerIdentityRecoil('corrective', state);
+            current = state;
+            recoilState = state;
+            if (correctiveRestoreRetriesThisEpisode >= VIRTUALIZED_ORIGIN_MAX_CORRECTIVE_OLDER_RETRIES) {
+              markCorrectiveRestoreBudgetExhausted();
+              return { kind: 'budget-exhausted', state };
+            }
+            continue;
+          }
+          if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
+            recordIdentityContraction('corrective', state);
+            current = state;
+            return { kind: 'identity-contraction', state };
+          }
+          probe.identityCorrectiveRestoreUnresolvedCount += 1;
+          recordIdentityMismatch('corrective', candidate, state);
+          failProbe('corrective-identity-invalid', 'identity-sequence-changed');
+          return { kind: 'failed' };
         }
-        if (isSafeVirtualizedOriginIdentityContraction(identityDiagnostic)) {
-          recordIdentityContraction('corrective', state);
-          current = state;
-          return { kind: 'identity-contraction', state };
-        }
-        probe.identityCorrectiveRestoreUnresolvedCount += 1;
-        recordIdentityMismatch('corrective', candidate, state);
-        failProbe('corrective-identity-invalid', 'identity-sequence-changed');
-        return { kind: 'failed' };
       };
       const recordTransientScrollState = (state) => {
         const topOffsetPx = conversationVirtualizerTopOffset(state);
@@ -5548,9 +5598,15 @@ export class ChatGPTController {
           }
           const sampleSignature = virtualizedOriginProbeSampleSignature(state);
           if (!sampleSignature) return failProbe('poll-sample-invalid', 'identity-invalid');
+          const transientCandidateRestored = (identityRecoilActive || identityContractionActive)
+            && conversationWindowDurableIdentitySignature(state?.turns) === expectedIdentitySignature;
           const progressBefore = identityRecoilActive || identityContractionActive ? progressBaselineState : pollBefore;
-          const pollProgress = directionalProgressFor(progressBefore, state, -1);
-          const pollPhysicalProgress = recordPhysicalOlderAdvance(progressBefore, state);
+          const pollProgress = transientCandidateRestored
+            ? { semanticProgress: false, offsetProgress: false, progress: false }
+            : directionalProgressFor(progressBefore, state, -1);
+          const pollPhysicalProgress = transientCandidateRestored
+            ? false
+            : recordPhysicalOlderAdvance(progressBefore, state);
           if (pollProgress.progress || pollPhysicalProgress) {
             probe.progressCount += 1;
             probe.materializationProgressCount += 1;
@@ -5558,14 +5614,15 @@ export class ChatGPTController {
             recordOlderProgress({ ...pollProgress, progress: pollProgress.progress || pollPhysicalProgress });
             addSnapshot(state);
             current = state;
+            endCorrectiveRestoreEpisode();
             return { verified: false, progressed: true };
           }
-          recordOlderProgress(pollProgress);
+          if (!transientCandidateRestored) recordOlderProgress(pollProgress);
           if (conversationWindowDurableIdentitySignature(state?.turns) !== expectedIdentitySignature) {
             const identityDiagnostic = diagnoseVirtualizedOriginIdentityMismatch(candidate?.turns, state?.turns);
             if (isSafeVirtualizedOriginNewerRecoil(identityDiagnostic)) {
               recordNewerIdentityRecoil('poll', state);
-              if (!correctiveRestoreAttemptedThisEpisode) {
+              if (!identityContractionActive && !correctiveRestoreBudgetExhaustedThisEpisode) {
                 const correction = await attemptCorrectiveOlderRetry(state);
                 if (correction.kind === 'failed') return { verified: false, progressed: false };
                 if (correction.kind === 'older-progress') return { verified: false, progressed: true };
@@ -5575,7 +5632,7 @@ export class ChatGPTController {
                   pollBefore = correction.state;
                   continue;
                 }
-                if (correction.kind === 'newer-recoil' || correction.kind === 'identity-contraction') {
+                if (correction.kind === 'newer-recoil' || correction.kind === 'identity-contraction' || correction.kind === 'budget-exhausted') {
                   stableSamples = 0;
                   previousStableSignature = null;
                   current = correction.state;
@@ -5600,7 +5657,7 @@ export class ChatGPTController {
             identityRecoilActive = false;
             identityContractionActive = false;
             latestIdentityTransient = null;
-            correctiveRestoreAttemptedThisEpisode = false;
+            endCorrectiveRestoreEpisode();
             stableSamples = 0;
             previousStableSignature = null;
           }

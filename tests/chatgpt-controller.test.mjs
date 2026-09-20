@@ -217,6 +217,90 @@ function createController(page, options = {}) {
   return new ChatGPTController({ page, selectors, ...options });
 }
 
+function createBackendDiagnosticPage({
+  pathname = '/c/backend-diagnostic-test',
+  body = null,
+  status = 200,
+  contentType = 'application/json',
+  responseText = body === null ? '{}' : JSON.stringify(body),
+  contentLength = null,
+  fetchError = null,
+  fetchDelayMs = 0,
+  mountedDomTurnCount = 0
+} = {}) {
+  const calls = [];
+  const bytes = new TextEncoder().encode(responseText);
+  const page = {
+    async evaluate(js) {
+      const context = {
+        AbortController,
+        TextDecoder,
+        TextEncoder,
+        clearTimeout,
+        crypto: crypto.webcrypto,
+        document: { querySelectorAll: () => Array.from({ length: mountedDomTurnCount }, () => ({})) },
+        fetch: async (url, options) => {
+          calls.push({ url, options });
+          if (fetchError) throw fetchError;
+          if (fetchDelayMs > 0) {
+            await new Promise((resolve, reject) => {
+              const handle = setTimeout(resolve, fetchDelayMs);
+              options.signal.addEventListener('abort', () => {
+                clearTimeout(handle);
+                const error = new Error('aborted');
+                error.name = 'AbortError';
+                reject(error);
+              }, { once: true });
+            });
+          }
+          let consumed = false;
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            headers: { get: (name) => name.toLowerCase() === 'content-type' ? contentType : name.toLowerCase() === 'content-length' ? contentLength : null },
+            body: {
+              getReader() {
+                return {
+                  async read() {
+                    if (consumed) return { done: true, value: undefined };
+                    consumed = true;
+                    return { done: false, value: bytes };
+                  },
+                  async cancel() {}
+                };
+              }
+            },
+            async text() { return responseText; }
+          };
+        },
+        location: { pathname },
+        setTimeout,
+        clearTimeout
+      };
+      return await vm.runInNewContext(js, context);
+    },
+    async getUrl() { return `https://chatgpt.com${pathname}`; }
+  };
+  return { page, calls };
+}
+
+function backendMappingFixture({ currentNode = 'assistant-2', branching = false, brokenParent = false, cycle = false } = {}) {
+  const root = { id: 'root-sentinel', parent: null, children: ['user-1'] };
+  const user = { id: 'user-1', parent: 'root-sentinel', children: ['assistant-2'], message: { author: { role: 'user' }, content: { parts: ['synthetic user'] } } };
+  const assistant = { id: 'assistant-2', parent: brokenParent ? 'missing-parent-sentinel' : 'user-1', children: [], message: { author: { role: 'assistant' }, content: { parts: ['synthetic assistant'] } } };
+  if (cycle) {
+    root.parent = 'assistant-2';
+    assistant.children = ['root-sentinel'];
+  }
+  const mapping = { 'root-sentinel': root, 'user-1': user, 'assistant-2': assistant };
+  if (branching) {
+    mapping['user-branch'] = { id: 'user-branch', parent: 'root-sentinel', children: ['assistant-branch'], message: { author: { role: 'user' }, content: { parts: ['branch user'] } } };
+    mapping['assistant-branch'] = { id: 'assistant-branch', parent: 'user-branch', children: [], message: { author: { role: 'assistant' }, content: { parts: ['branch assistant'] } } };
+    root.children.push('user-branch');
+  }
+  return { mapping, current_node: currentNode, conversation_id: 'backend-diagnostic-test' };
+}
+
 function createStartMarkerDiagnosticPage({ snapshot, initialAtTop = true, wheelSnapshots = [], layoutSnapshots = [] } = {}) {
   const events = [];
   let phase = 'before';
@@ -6109,6 +6193,112 @@ test('chatgpt-controller: bounded origin probe diagnostics follow the last valid
   assert.ok(probe.persistentTurnShellObservationChangedCount >= 1);
   assert.equal(probe.persistentTurnShells.firstMountedShellIndex, 5);
   assert.equal(probe.persistentTurnShells.lastMountedShellIndex, 15);
+});
+
+test('chatgpt-controller: backend diagnostics validate a full mapping and current branch', async () => {
+  const fixture = createBackendDiagnosticPage({ body: backendMappingFixture({ branching: true, currentNode: 'assistant-branch' }), mountedDomTurnCount: 2 });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.jsonParsed, true);
+  assert.equal(result.mappingPresent, true);
+  assert.equal(result.mappingObject, true);
+  assert.equal(result.mappingNodeCount, 5);
+  assert.equal(result.currentBranchResolved, true);
+  assert.equal(result.currentBranchRootReached, true);
+  assert.equal(result.currentBranchNodeCount, 3);
+  assert.equal(result.currentBranchMessageCount, 2);
+  assert.equal(result.userMessageCount, 2);
+  assert.equal(result.assistantMessageCount, 2);
+  assert.equal(result.mappingGraphStructurallyValid, true);
+  assert.equal(result.cycleDetected, false);
+  assert.equal(result.responseConversationIdMatchesUrl, true);
+  assert.equal(result.backendBranchAtLeastAsLargeAsMountedDom, true);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.calls[0].options.method, 'GET');
+  assert.equal(fixture.calls[0].options.credentials, 'include');
+  assert.equal(fixture.calls[0].options.headers.Authorization, undefined);
+});
+
+test('chatgpt-controller: backend diagnostics resolve only the selected branch', async () => {
+  const fixture = createBackendDiagnosticPage({ body: backendMappingFixture({ branching: true, currentNode: 'assistant-2' }) });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.mappingNodeCount, 5);
+  assert.equal(result.currentBranchResolved, true);
+  assert.equal(result.currentBranchNodeCount, 3);
+  assert.equal(result.currentBranchMessageCount, 2);
+  assert.equal(result.currentBranchUserCount, 1);
+  assert.equal(result.currentBranchAssistantCount, 1);
+  assert.equal(result.currentBranchAnchor1ExactMatchCount, 0);
+  assert.equal(result.currentBranchAnchor2ExactMatchCount, 0);
+});
+
+test('chatgpt-controller: backend diagnostics fail closed for broken parents and cycles', async () => {
+  const broken = createBackendDiagnosticPage({ body: backendMappingFixture({ brokenParent: true }) });
+  const brokenResult = await createController(broken.page).readConversationBackendDiagnostics();
+  assert.equal(brokenResult.currentBranchResolved, false);
+  assert.equal(brokenResult.currentBranchBrokenParent, true);
+  assert.equal(brokenResult.missingParentReferenceCount, 1);
+  assert.equal(brokenResult.mappingGraphStructurallyValid, false);
+
+  const cyclic = createBackendDiagnosticPage({ body: backendMappingFixture({ cycle: true, currentNode: 'assistant-2' }) });
+  const cyclicResult = await createController(cyclic.page).readConversationBackendDiagnostics();
+  assert.equal(cyclicResult.cycleDetected, true);
+  assert.equal(cyclicResult.currentBranchCycleDetected, true);
+  assert.equal(cyclicResult.currentBranchResolved, false);
+});
+
+test('chatgpt-controller: backend diagnostics classify transport, content, and size failures', async () => {
+  const unauthorized = createBackendDiagnosticPage({ status: 401, contentType: 'application/json', body: { error: 'unauthorized-sentinel' } });
+  const unauthorizedResult = await createController(unauthorized.page).readConversationBackendDiagnostics();
+  assert.equal(unauthorizedResult.httpStatus, 401);
+  assert.equal(unauthorizedResult.httpOk, false);
+  assert.equal(unauthorizedResult.jsonParsed, false);
+
+  const forbidden = createBackendDiagnosticPage({ status: 403, contentType: 'application/json', body: { error: 'forbidden-sentinel' } });
+  const forbiddenResult = await createController(forbidden.page).readConversationBackendDiagnostics();
+  assert.equal(forbiddenResult.httpStatus, 403);
+  assert.equal(forbiddenResult.httpOk, false);
+  assert.equal(forbiddenResult.jsonParsed, false);
+
+  const html = createBackendDiagnosticPage({ contentType: 'text/html', responseText: '<html>login-sentinel</html>' });
+  const htmlResult = await createController(html.page).readConversationBackendDiagnostics();
+  assert.equal(htmlResult.httpOk, true);
+  assert.equal(htmlResult.contentTypeJson, false);
+  assert.equal(htmlResult.jsonParsed, false);
+
+  const oversized = createBackendDiagnosticPage({ contentType: 'application/json', contentLength: String(20 * 1024 * 1024 + 1), responseText: '{}' });
+  const oversizedResult = await createController(oversized.page).readConversationBackendDiagnostics();
+  assert.equal(oversizedResult.sizeLimitExceeded, true);
+  assert.equal(oversizedResult.jsonParsed, false);
+
+  const failed = createBackendDiagnosticPage({ fetchError: Object.assign(new Error('network-sentinel'), { name: 'TypeError' }) });
+  const failedResult = await createController(failed.page).readConversationBackendDiagnostics();
+  assert.equal(failedResult.fetchErrorKind, 'network');
+  assert.equal(failedResult.jsonParsed, false);
+
+  const timedOut = createBackendDiagnosticPage({ fetchDelayMs: 2_000 });
+  const timedOutResult = await createController(timedOut.page).readConversationBackendDiagnostics({ timeoutMs: 1_000 });
+  assert.equal(timedOutResult.fetchTimedOut, true);
+  assert.equal(timedOutResult.fetchErrorKind, 'timeout');
+});
+
+test('chatgpt-controller: backend diagnostics expose safe ID mismatch and no raw leakage', async () => {
+  const fixture = createBackendDiagnosticPage({ body: { ...backendMappingFixture(), conversation_id: 'different-conversation-sentinel' } });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.responseConversationIdMatchesUrl, false);
+  assert.equal(typeof result.backendAnchor1ExactMatchCount, 'number');
+  assert.equal(typeof result.backendAnchor2ExactMatchCount, 'number');
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /sentinel/u);
+  assert.doesNotMatch(serialized, /root-sentinel|assistant-2|user-1/u);
+  assert.doesNotMatch(serialized, /synthetic user|synthetic assistant/u);
+});
+
+test('chatgpt-controller: backend diagnostics reject invalid conversation paths without fetching', async () => {
+  const fixture = createBackendDiagnosticPage({ pathname: '/share/not-a-conversation', body: backendMappingFixture() });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.conversationPathRecognized, false);
+  assert.equal(result.conversationIdPresent, false);
+  assert.equal(fixture.calls.length, 0);
 });
 
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {

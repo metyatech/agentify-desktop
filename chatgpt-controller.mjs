@@ -23,6 +23,8 @@ export const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 180_000;
 export const MAX_CONVERSATION_HISTORY_ITERATIONS = 240;
 export const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
 export const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = MAX_CONVERSATION_HISTORY_ITERATIONS;
+export const DEFAULT_BACKEND_CONVERSATION_DIAGNOSTIC_TIMEOUT_MS = 15_000;
+export const MAX_BACKEND_CONVERSATION_BYTES = 20 * 1024 * 1024;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
 const CONVERSATION_HISTORY_SCROLL_POLL_MS = 50;
 const CONVERSATION_HISTORY_SCROLL_SETTLE_MAX_MS = 220;
@@ -165,6 +167,250 @@ function nativeInputErrorDetails(error) {
     backendErrorCode: sanitizeNativeInputCode(error?.data?.backendCode),
     backendErrorMessage
   };
+}
+
+function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
+  const anchorHashes = JSON.stringify([
+    '70a3a2301fc3acb64bdf29e79ee6a7fe15b81ebdfcd8ab3567d9c68387b7253a',
+    'a6fb7a19f6274b7f51cf2407a1f39cb412b478b33d34820eb6331acc55de24ad'
+  ]);
+  return String.raw`(async () => {
+    const timeoutMs = ${JSON.stringify(timeoutMs)};
+    const maxBytes = ${JSON.stringify(maxBytes)};
+    const anchorHashes = ${anchorHashes};
+    const result = {
+      attempted: true, conversationPathRecognized: false, conversationIdPresent: false,
+      httpStatus: null, httpOk: false, contentTypeJson: false, fetchTimedOut: false,
+      fetchErrorKind: null, responseByteLength: null, sizeLimitExceeded: false,
+      jsonParsed: false, rootObject: false, mappingPresent: false, mappingObject: false,
+      mappingNodeCount: 0, currentNodePresent: false, currentNodeExistsInMapping: false,
+      responseConversationIdPresent: false, responseConversationIdMatchesUrl: null,
+      nodesWithMessageCount: 0, nodesWithoutMessageCount: 0, rootNodeCount: 0, leafNodeCount: 0,
+      parentReferenceCount: 0, missingParentReferenceCount: 0, childReferenceCount: 0,
+      missingChildReferenceCount: 0, selfParentCount: 0, selfChildCount: 0,
+      duplicateChildReferenceCount: 0, mappingGraphStructurallyValid: false, cycleDetected: false,
+      userMessageCount: 0, assistantMessageCount: 0, systemMessageCount: 0,
+      toolMessageCount: 0, otherRoleMessageCount: 0,
+      currentBranchResolved: false, currentBranchNodeCount: 0, currentBranchMessageCount: 0,
+      currentBranchUserCount: 0, currentBranchAssistantCount: 0, currentBranchSystemCount: 0,
+      currentBranchToolCount: 0, currentBranchRootReached: false, currentBranchCycleDetected: false,
+      currentBranchBrokenParent: false, messagesWithTextualContentCount: 0,
+      messagesWithoutTextualContentCount: 0, currentBranchMessagesWithTextCount: 0,
+      backendAnchor1ExactMatchCount: 0, backendAnchor2ExactMatchCount: 0,
+      currentBranchAnchor1ExactMatchCount: 0, currentBranchAnchor2ExactMatchCount: 0,
+      mountedDomTurnCount: 0, backendCurrentBranchMessageCount: 0,
+      backendBranchAtLeastAsLargeAsMountedDom: null,
+      mountedDurableIdentityMatchCount: null, mountedDurableIdentityUnmatchedCount: null
+    };
+    const pathMatch = /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || ''));
+    result.conversationPathRecognized = !!pathMatch;
+    let conversationId = null;
+    if (pathMatch) {
+      try { conversationId = decodeURIComponent(pathMatch[1]); } catch { conversationId = null; }
+    }
+    result.conversationIdPresent = typeof conversationId === 'string' && conversationId.length > 0;
+    if (!result.conversationIdPresent) return result;
+
+    const abortController = new AbortController();
+    let timeoutHandle = null;
+    let response;
+    try {
+      timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+      response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
+        method: 'GET', credentials: 'include', cache: 'no-store',
+        headers: { Accept: 'application/json' }, signal: abortController.signal
+      });
+    } catch (error) {
+      result.fetchTimedOut = abortController.signal.aborted === true;
+      result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'network';
+      return result;
+    } finally {
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    }
+    result.httpStatus = Number.isSafeInteger(response?.status) ? response.status : null;
+    result.httpOk = response?.ok === true;
+    let contentType = '';
+    try { contentType = String(response?.headers?.get?.('content-type') || ''); } catch {}
+    result.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
+    if (!result.httpOk) return result;
+
+    const readBoundedText = async () => {
+      let declaredLength = null;
+      try {
+        const value = Number(response?.headers?.get?.('content-length'));
+        if (Number.isSafeInteger(value) && value >= 0) declaredLength = value;
+      } catch {}
+      if (declaredLength !== null && declaredLength > maxBytes) return { text: null, byteLength: declaredLength, sizeLimitExceeded: true };
+      const reader = response?.body?.getReader?.();
+      if (!reader) {
+        const text = await response.text();
+        const byteLength = new TextEncoder().encode(text).byteLength;
+        return byteLength > maxBytes ? { text: null, byteLength, sizeLimitExceeded: true } : { text, byteLength, sizeLimitExceeded: false };
+      }
+      const decoder = new TextDecoder();
+      const parts = [];
+      let byteLength = 0;
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+        byteLength += chunk.byteLength;
+        if (byteLength > maxBytes) {
+          try { await reader.cancel(); } catch {}
+          return { text: null, byteLength, sizeLimitExceeded: true };
+        }
+        parts.push(decoder.decode(chunk, { stream: true }));
+      }
+      parts.push(decoder.decode());
+      return { text: parts.join(''), byteLength, sizeLimitExceeded: false };
+    };
+    let bounded;
+    try { bounded = await readBoundedText(); } catch (error) {
+      result.fetchErrorKind = error?.name === 'AbortError' ? 'aborted' : 'response-read';
+      return result;
+    }
+    result.responseByteLength = bounded.byteLength;
+    result.sizeLimitExceeded = bounded.sizeLimitExceeded === true;
+    if (result.sizeLimitExceeded || !result.contentTypeJson || typeof bounded.text !== 'string') return result;
+    let body;
+    try { body = JSON.parse(bounded.text); } catch { return result; }
+    result.jsonParsed = true;
+    result.rootObject = !!body && typeof body === 'object' && !Array.isArray(body);
+    if (!result.rootObject) return result;
+
+    const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+    const mapping = body.mapping;
+    result.mappingPresent = hasOwn(body, 'mapping');
+    result.mappingObject = !!mapping && typeof mapping === 'object' && !Array.isArray(mapping);
+    result.currentNodePresent = typeof body.current_node === 'string' && body.current_node.length > 0;
+    result.responseConversationIdPresent = typeof body.conversation_id === 'string' && body.conversation_id.length > 0;
+    result.responseConversationIdMatchesUrl = result.responseConversationIdPresent ? body.conversation_id === conversationId : null;
+    if (!result.mappingObject) return result;
+
+    const ids = Object.keys(mapping);
+    const idSet = new Set(ids);
+    result.mappingNodeCount = ids.length;
+    result.currentNodeExistsInMapping = result.currentNodePresent && idSet.has(body.current_node);
+    const nodeInfo = new Map();
+    let reciprocal = true;
+    for (const id of ids) {
+      const node = mapping[id];
+      const objectNode = !!node && typeof node === 'object' && !Array.isArray(node);
+      const message = objectNode && node.message && typeof node.message === 'object' && !Array.isArray(node.message) ? node.message : null;
+      if (message) result.nodesWithMessageCount += 1; else result.nodesWithoutMessageCount += 1;
+      const parent = objectNode && typeof node.parent === 'string' && node.parent.length > 0 ? node.parent : null;
+      if (parent === null) result.rootNodeCount += 1;
+      else {
+        result.parentReferenceCount += 1;
+        if (!idSet.has(parent)) result.missingParentReferenceCount += 1;
+        if (parent === id) result.selfParentCount += 1;
+        if (idSet.has(parent) && !(Array.isArray(mapping[parent]?.children) && mapping[parent].children.includes(id))) reciprocal = false;
+      }
+      const children = objectNode && Array.isArray(node.children) ? node.children : [];
+      if (children.length === 0) result.leafNodeCount += 1;
+      const seenChildren = new Set();
+      for (const child of children) {
+        result.childReferenceCount += 1;
+        if (seenChildren.has(child)) result.duplicateChildReferenceCount += 1;
+        seenChildren.add(child);
+        if (child === id) result.selfChildCount += 1;
+        if (typeof child !== 'string' || !idSet.has(child)) {
+          result.missingChildReferenceCount += 1;
+          reciprocal = false;
+        } else if (mapping[child]?.parent !== id) reciprocal = false;
+      }
+      nodeInfo.set(id, { message });
+    }
+    const parentCycleDetected = (start) => {
+      const seen = new Set();
+      let current = start;
+      while (idSet.has(current)) {
+        if (seen.has(current)) return true;
+        seen.add(current);
+        const parent = mapping[current]?.parent;
+        if (typeof parent !== 'string' || parent.length === 0) return false;
+        current = parent;
+      }
+      return false;
+    };
+    result.cycleDetected = ids.some(parentCycleDetected);
+    result.mappingGraphStructurallyValid = ids.length > 0 && result.rootNodeCount === 1
+      && result.missingParentReferenceCount === 0 && result.missingChildReferenceCount === 0
+      && result.selfParentCount === 0 && result.selfChildCount === 0
+      && result.duplicateChildReferenceCount === 0 && !result.cycleDetected && reciprocal;
+
+    const roleFor = (info) => {
+      const role = info?.message?.author?.role;
+      return role === 'user' || role === 'assistant' || role === 'system' || role === 'tool' ? role : 'other';
+    };
+    for (const info of nodeInfo.values()) {
+      if (!info.message) continue;
+      const role = roleFor(info);
+      if (role === 'user') result.userMessageCount += 1;
+      else if (role === 'assistant') result.assistantMessageCount += 1;
+      else if (role === 'system') result.systemMessageCount += 1;
+      else if (role === 'tool') result.toolMessageCount += 1;
+      else result.otherRoleMessageCount += 1;
+    }
+
+    const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
+    const textInfo = async (message) => {
+      const content = message?.content;
+      const parts = Array.isArray(content?.parts) ? content.parts.filter((part) => typeof part === 'string') : [];
+      const projections = parts.length ? [...parts, parts.join('\n')] : typeof content?.text === 'string' ? [content.text] : [];
+      const normalized = normalizeText(projections.length ? projections[projections.length - 1] : '');
+      const hashes = new Set();
+      for (const projection of projections) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalizeText(projection)));
+        hashes.add(Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(''));
+      }
+      return { hasTextualContent: normalized.length > 0, hashes };
+    };
+    const textById = new Map();
+    for (const [id, info] of nodeInfo) {
+      const text = info.message ? await textInfo(info.message) : { hasTextualContent: false, hashes: new Set() };
+      textById.set(id, text);
+      if (info.message && text.hasTextualContent) result.messagesWithTextualContentCount += 1;
+      else if (info.message) result.messagesWithoutTextualContentCount += 1;
+    }
+
+    const branchIds = [];
+    const branchSeen = new Set();
+    let current = result.currentNodeExistsInMapping ? body.current_node : null;
+    while (current !== null) {
+      if (branchSeen.has(current)) { result.currentBranchCycleDetected = true; result.cycleDetected = true; break; }
+      branchSeen.add(current);
+      branchIds.push(current);
+      const parent = typeof mapping[current]?.parent === 'string' && mapping[current].parent.length > 0 ? mapping[current].parent : null;
+      if (parent === null) { result.currentBranchRootReached = true; break; }
+      if (!idSet.has(parent)) { result.currentBranchBrokenParent = true; break; }
+      current = parent;
+    }
+    result.currentBranchNodeCount = branchIds.length;
+    result.currentBranchResolved = branchIds.length > 0 && result.currentBranchRootReached && !result.currentBranchCycleDetected && !result.currentBranchBrokenParent;
+    for (const id of branchIds) {
+      const info = nodeInfo.get(id);
+      if (!info?.message) continue;
+      result.currentBranchMessageCount += 1;
+      const role = roleFor(info);
+      if (role === 'user') result.currentBranchUserCount += 1;
+      else if (role === 'assistant') result.currentBranchAssistantCount += 1;
+      else if (role === 'system') result.currentBranchSystemCount += 1;
+      else if (role === 'tool') result.currentBranchToolCount += 1;
+      if (textById.get(id)?.hasTextualContent) result.currentBranchMessagesWithTextCount += 1;
+      if (textById.get(id)?.hashes?.has(anchorHashes[0])) result.currentBranchAnchor1ExactMatchCount += 1;
+      if (textById.get(id)?.hashes?.has(anchorHashes[1])) result.currentBranchAnchor2ExactMatchCount += 1;
+    }
+    for (const text of textById.values()) {
+      if (text.hashes.has(anchorHashes[0])) result.backendAnchor1ExactMatchCount += 1;
+      if (text.hashes.has(anchorHashes[1])) result.backendAnchor2ExactMatchCount += 1;
+    }
+    try { result.mountedDomTurnCount = document.querySelectorAll('[data-content-search-unit-key]').length; } catch {}
+    result.backendCurrentBranchMessageCount = result.currentBranchMessageCount;
+    result.backendBranchAtLeastAsLargeAsMountedDom = result.currentBranchResolved
+      ? result.currentBranchMessageCount >= result.mountedDomTurnCount : null;
+    return result;
+  })()`;
 }
 
 function normalizeUserTurnText(value) {
@@ -6673,6 +6919,19 @@ export class ChatGPTController {
       };
       return { url: result.url || String(await this.getUrl()), windows, history };
     });
+  }
+
+  async readConversationBackendDiagnostics({
+    timeoutMs = DEFAULT_BACKEND_CONVERSATION_DIAGNOSTIC_TIMEOUT_MS
+  } = {}) {
+    const boundedTimeoutMs = Number(timeoutMs);
+    if (!Number.isInteger(boundedTimeoutMs) || boundedTimeoutMs < 1_000 || boundedTimeoutMs > 20_000) {
+      throw new Error('conversation_backend_diagnostic_timeout_invalid');
+    }
+    return await this.runExclusive(async () => await this.#eval(buildBackendConversationDiagnosticsScript({
+      timeoutMs: boundedTimeoutMs,
+      maxBytes: MAX_BACKEND_CONVERSATION_BYTES
+    })));
   }
 
   async detectChallenge() {

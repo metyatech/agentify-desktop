@@ -4496,6 +4496,49 @@ test('http-api: conversation windows allows responses below 10MiB and rejects la
   assert.equal(aboveLimit.data.error, 'response_too_large');
 });
 
+test('http-api: backend conversation diagnostics is a bounded read-only controller route', async (t) => {
+  const calls = [];
+  const controller = {
+    readConversationBackendDiagnostics: async (options) => {
+      calls.push(options);
+      return {
+        attempted: true,
+        jsonParsed: true,
+        conversationPathRecognized: true,
+        conversationIdPresent: true,
+        responseConversationIdMatchesUrl: true,
+        mappingNodeCount: 3,
+        currentBranchResolved: true,
+        backendAnchor1ExactMatchCount: 0,
+        backendAnchor2ExactMatchCount: 0
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const result = await req({ port, token: 'secret', method: 'POST', pth: '/conversation/backend-diagnostics', body: { key: 'review', timeoutMs: 10_000 } });
+  assert.equal(result.res.status, 200);
+  assert.equal(result.data.diagnostics.mappingNodeCount, 3);
+  assert.deepEqual(calls, [{ timeoutMs: 10_000 }]);
+
+  const unauthorized = await req({ port, method: 'POST', pth: '/conversation/backend-diagnostics', body: { key: 'review' } });
+  assert.equal(unauthorized.res.status, 401);
+});
+
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {
   const calls = [];
   const controller = {

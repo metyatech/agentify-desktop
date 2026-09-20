@@ -446,6 +446,26 @@ windows with bounded-stop metadata; URL changes, failed tail or restoration
 proofs, invalid scrollers, malformed observations, and response-size limits
 fail closed without silent truncation.
 
+For a separate read-only diagnostic of the currently open ChatGPT conversation's
+same-origin backend mapping, use:
+
+```text
+POST /conversation/backend-diagnostics
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"tabId":"existing-chatgpt-tab","timeoutMs":15000}
+```
+
+The controller evaluates a page-context `GET` to the current page's
+`/backend-api/conversation/{conversation_id}` endpoint with browser-managed
+credentials and no custom authorization header. The response is capped at
+20 MiB before parsing and returns only bounded transport, mapping-graph,
+current-branch, role, text-length, anchor-match-count, and mounted-DOM
+aggregate diagnostics. It never returns conversation text, mapping IDs,
+cookies, tokens, or headers, and it does not alter history proof or traversal
+state.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

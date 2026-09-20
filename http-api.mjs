@@ -2099,6 +2099,34 @@ export function startHttpApi({
         }, { maxBytes: MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES });
       }
 
+      if (url.pathname === '/conversation/backend-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readConversationBackendDiagnostics !== 'function') {
+          throw new Error('conversation_backend_diagnostics_controller_unavailable');
+        }
+        const timeoutMs = strictPositiveIntOr(body.timeoutMs, 15_000, 20_000, 'conversation_backend_diagnostic_timeout_invalid');
+        if (timeoutMs < 1_000) throw new Error('conversation_backend_diagnostic_timeout_invalid');
+        const diagnostics = await controller.readConversationBackendDiagnostics({ timeoutMs });
+        if (!diagnostics || diagnostics.attempted !== true || typeof diagnostics.jsonParsed !== 'boolean') {
+          throw new Error('conversation_backend_diagnostics_controller_unavailable');
+        }
+        return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics }, { maxBytes: 512 * 1024 });
+      }
+
       if (url.pathname === '/download-images' && req.method === 'POST') {
         const body = await parseBody(req);
         const maxImages = positiveIntOr(body.maxImages, 6, 50);

@@ -956,7 +956,7 @@ function evaluatePersistentTurnShells({
     const wrapper = wrappers[position] || wrappers[0];
     const unit = {
       tagName: 'DIV', parentElement: null, innerText: `turn ${position}`, textContent: `turn ${position}`,
-      getAttribute(name) { return name === 'data-content-search-unit-key' ? `${sentinel}-turn-${position}:0:${role}` : null; },
+      getAttribute(name) { return name === 'data-content-search-unit-key' ? `${sentinel}-turn-${position}:${index}:${role}` : null; },
       closest(selector) { return selector === '[data-content-search-turn-key]' ? contentTurn : selector === '[data-turn-key]' ? wrapper : null; },
       contains(child) { return child === this || contains(this, child); },
       cloneNode() { return { innerText: `turn ${position}`, textContent: `turn ${position}`, matches: () => false, querySelectorAll: () => [] }; }
@@ -1029,6 +1029,9 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
   const snapshot = () => {
     const rawPositions = windows[windowIndex];
     const positions = rawPositions.map((position) => position + positionOffset);
+    const persistentShellDiagnostics = typeof persistentTurnShells === 'function'
+      ? persistentTurnShells({ readCount, windowIndex })
+      : persistentTurnShells;
     const defaultScrollTop = reverseScroll
       ? -(windows.length - 1 - windowIndex) * 250
       : windowIndex * 250;
@@ -1068,7 +1071,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
             topOffsetPx: virtualizerTopOffsetOverride,
             validMessageCount: positions.length,
             malformedMessageCount: 0,
-            persistentTurnShells,
+            persistentTurnShells: persistentShellDiagnostics,
             firstMessageRole: rawPositions[0] % 2 ? 'assistant' : 'user',
             loading: loadingOverride === true
           }
@@ -1096,7 +1099,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
           virtualizerHostCount: 1,
           validCurrentMessageUnitCount: positions.length,
           malformedCurrentMessageUnitCount: 0,
-          persistentTurnShells
+          persistentTurnShells: persistentShellDiagnostics
         } : {})
       }
     };
@@ -5916,7 +5919,7 @@ test('chatgpt-controller: persistent turn shell inventory distinguishes full his
   assert.equal(inventory.outsideConversationScrollerCount, 0);
   assert.equal(inventory.validRoleCount, 45);
   assert.equal(inventory.invalidRoleCount, 0);
-  assert.equal(inventory.zeroShellRole, 0);
+  assert.equal(inventory.zeroShellRole, 'user');
   assert.equal(inventory.mountedShellIndexOrderStrictlyIncreasing, true);
   assert.equal(inventory.mountedShellIndexesUnique, true);
   assert.equal(inventory.zeroShellHasMountedContent, false);
@@ -5958,13 +5961,40 @@ test('chatgpt-controller: persistent turn shell diagnostics track role validity 
   assert.equal(inventory.invalidRoleCount, 0);
 });
 
+test('chatgpt-controller: multiple content units in one shell use unique shell order metrics', () => {
+  const fixture = evaluatePersistentTurnShells({
+    shellTestIds: ['conversation-turn-0', 'conversation-turn-1', 'conversation-turn-2', 'conversation-turn-3'],
+    mountedIndices: [2, 2, 3]
+  });
+  const inventory = fixture.result.diagnostics.persistentTurnShells;
+  assert.equal(inventory.mountedContentUnitCount, 3);
+  assert.equal(inventory.mountedContentUnitWithShellCount, 3);
+  assert.equal(inventory.mountedContentUnitWithoutShellCount, 0);
+  assert.equal(inventory.mountedUniqueShellCount, 2);
+  assert.equal(inventory.firstMountedShellIndex, 2);
+  assert.equal(inventory.lastMountedShellIndex, 3);
+  assert.equal(inventory.mountedShellIndexesUnique, true);
+  assert.equal(inventory.mountedShellIndexOrderStrictlyIncreasing, true);
+});
+
 test('chatgpt-controller: persistent turn shell role conflicts are diagnostic-only and fail the role count', () => {
   const fixture = evaluatePersistentTurnShells({ shellRoles: new Map([[0, 'system'], [1, null]]) });
   const inventory = fixture.result.diagnostics.persistentTurnShells;
   assert.equal(inventory.validRoleCount, 43);
   assert.equal(inventory.invalidRoleCount, 1);
-  assert.equal(inventory.zeroShellRole, 1);
+  assert.equal(inventory.unknownRoleCount, 1);
+  assert.equal(inventory.zeroShellRole, null);
   assert.equal(fixture.result.valid, true);
+});
+
+test('chatgpt-controller: zero shell role is a role value and unknown roles have a separate count', () => {
+  const userInventory = evaluatePersistentTurnShells({ shellRoles: new Map([[0, 'user']]) }).result.diagnostics.persistentTurnShells;
+  const assistantInventory = evaluatePersistentTurnShells({ shellRoles: new Map([[0, 'assistant']]) }).result.diagnostics.persistentTurnShells;
+  const unresolvedInventory = evaluatePersistentTurnShells({ shellRoles: new Map([[0, null]]) }).result.diagnostics.persistentTurnShells;
+  assert.equal(userInventory.zeroShellRole, 'user');
+  assert.equal(assistantInventory.zeroShellRole, 'assistant');
+  assert.equal(unresolvedInventory.zeroShellRole, null);
+  assert.equal(unresolvedInventory.unknownRoleCount, 1);
 });
 
 test('chatgpt-controller: persistent shell diagnostics surface in window state and contain no identity leakage', () => {
@@ -6021,6 +6051,64 @@ test('chatgpt-controller: persistent shell inventory is retained on bounded orig
   });
   assert.deepEqual(result.history.diagnostics.virtualizedOriginProbe.persistentTurnShells, persistentTurnShells);
   assert.equal(result.history.startReached, true);
+});
+
+test('chatgpt-controller: bounded origin probe diagnostics follow the last valid candidate observation', async () => {
+  const candidateA = {
+    observed: true,
+    shellCount: 45,
+    parseableShellCount: 45,
+    malformedShellCount: 0,
+    duplicateIndexCount: 0,
+    minIndex: 0,
+    maxIndex: 44,
+    zeroIndexCount: 1,
+    domOrderStrictlyIncreasing: true,
+    contiguousFromZero: true,
+    validRoleCount: 45,
+    invalidRoleCount: 0,
+    unknownRoleCount: 0,
+    zeroShellRole: 'user',
+    insideConversationScrollerCount: 45,
+    outsideConversationScrollerCount: 0,
+    mountedContentUnitCount: 8,
+    mountedContentUnitWithShellCount: 8,
+    mountedContentUnitWithoutShellCount: 0,
+    mountedUniqueShellCount: 8,
+    firstMountedShellIndex: 20,
+    lastMountedShellIndex: 30,
+    mountedShellIndexOrderStrictlyIncreasing: true,
+    mountedShellIndexesUnique: true,
+    zeroShellHasMountedContent: false,
+    nonzeroHeightShellCount: 8,
+    zeroHeightShellCount: 37
+  };
+  const candidateB = { ...candidateA, firstMountedShellIndex: 5, lastMountedShellIndex: 15 };
+  let phase = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7], [4, 5, 6, 7, 8, 9, 10, 11], [8, 9, 10, 11, 12, 13, 14, 15]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    persistentTurnShells: () => phase === 0 ? candidateA : candidateB,
+    olderMaterializationPlan: ({ windowIndex }) => {
+      if (windowIndex === 0 && phase === 0) {
+        phase = 1;
+        return { prependRange: [-4, -3, -2, -1, 0, 1, 2, 3], virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    }
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1_000, maxTotalChars: 10_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 40
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.ok(probe.persistentTurnShellObservationCount >= 2);
+  assert.ok(probe.persistentTurnShellObservationChangedCount >= 1);
+  assert.equal(probe.persistentTurnShells.firstMountedShellIndex, 5);
+  assert.equal(probe.persistentTurnShells.lastMountedShellIndex, 15);
 });
 
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {

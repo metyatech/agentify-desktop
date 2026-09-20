@@ -470,13 +470,16 @@ export function buildChatGPTDomModelScript() {
       };
       let validRoleCount = 0;
       let invalidRoleCount = 0;
-      let zeroShellRole = 0;
+      let unknownRoleCount = 0;
+      const zeroShellRoles = [];
       for (const entry of parseable) {
         const role = roleForShell(entry.node);
         if (role.role) validRoleCount += 1;
         else if (role.invalid) invalidRoleCount += 1;
-        else zeroShellRole += 1;
+        else unknownRoleCount += 1;
+        if (entry.index === 0) zeroShellRoles.push(role.role);
       }
+      const zeroShellRole = zeroShellRoles.length === 1 ? zeroShellRoles[0] : null;
       const resolvedScroller = resolveDiagnosticConversationScroller(currentNodes);
       let insideConversationScrollerCount = 0;
       let outsideConversationScrollerCount = 0;
@@ -492,14 +495,15 @@ export function buildChatGPTDomModelScript() {
         }
         return null;
       };
-      const mountedShellIndexes = [];
+      const mountedShellNodes = [];
       let mountedContentUnitWithShellCount = 0;
       for (const node of currentNodes) {
         const shell = closestShell(node);
         if (!shell) continue;
         mountedContentUnitWithShellCount += 1;
-        mountedShellIndexes.push(shellByNode.get(shell));
+        if (!mountedShellNodes.includes(shell)) mountedShellNodes.push(shell);
       }
+      const mountedShellIndexes = mountedShellNodes.map((shell) => shellByNode.get(shell));
       const mountedContentUnitCount = currentNodes.length;
       const mountedShellIndexesUnique = new Set(mountedShellIndexes).size === mountedShellIndexes.length;
       const mountedShellIndexOrderStrictlyIncreasing = mountedShellIndexes.every((index, position) => position === 0 || index > mountedShellIndexes[position - 1]);
@@ -519,6 +523,7 @@ export function buildChatGPTDomModelScript() {
         contiguousFromZero,
         validRoleCount,
         invalidRoleCount,
+        unknownRoleCount,
         zeroShellRole,
         insideConversationScrollerCount,
         outsideConversationScrollerCount,
@@ -4833,6 +4838,8 @@ export class ChatGPTController {
         identityContractionWheelCount: 0,
         identityContractionPollCount: 0,
         persistentTurnShells: null,
+        persistentTurnShellObservationCount: 0,
+        persistentTurnShellObservationChangedCount: 0,
         identityMismatch: null,
         lastFailureStage: null,
         lastFailureReason: null,
@@ -5482,11 +5489,17 @@ export class ChatGPTController {
     const verifyVirtualizedOriginBoundary = async (candidate) => {
       const probe = diagnostics.virtualizedOriginProbe;
       probe.attempted = true;
-      if (probe.persistentTurnShells === null && candidate?.scroller?.persistentTurnShells) {
-        probe.persistentTurnShells = candidate.scroller.persistentTurnShells;
-      }
       const initialProof = conversationStartBoundaryProof(candidate, { physicalTopStable: true });
       if (!initialProof.virtualizedOriginCandidate) return { verified: false, progressed: false };
+      const candidateShells = candidate?.scroller?.persistentTurnShells;
+      if (candidateShells && typeof candidateShells === 'object') {
+        if (probe.persistentTurnShells !== null
+          && JSON.stringify(probe.persistentTurnShells) !== JSON.stringify(candidateShells)) {
+          probe.persistentTurnShellObservationChangedCount += 1;
+        }
+        probe.persistentTurnShellObservationCount += 1;
+        probe.persistentTurnShells = candidateShells;
+      }
       const expectedIdentitySignature = conversationWindowDurableIdentitySignature(candidate?.turns);
       const progressBaselineState = candidate;
       let identityRecoilActive = false;

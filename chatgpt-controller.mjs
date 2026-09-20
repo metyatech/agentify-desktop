@@ -388,6 +388,153 @@ export function buildChatGPTDomModelScript() {
       }
       return { nodes, records, malformedCount };
     };
+    const persistentTurnShellSelector = 'section[data-testid^="conversation-turn-"], article[data-testid^="conversation-turn-"]';
+    const parsePersistentTurnShellIndex = (node) => {
+      const value = String(node?.getAttribute?.('data-testid') || '').trim();
+      const match = /^conversation-turn-([0-9]+)$/u.exec(value);
+      if (!match) return null;
+      const index = Number(match[1]);
+      return Number.isSafeInteger(index) && index >= 0 ? index : null;
+    };
+    const isNavigationRegion = (node) => node?.matches?.('nav, aside, [role="navigation"], [data-testid*="sidebar" i], [aria-label*="sidebar" i]') === true;
+    const isScrollable = (node) => {
+      if (!node) return false;
+      if (!(Number(node.scrollHeight) > Number(node.clientHeight))) return false;
+      if (node === document.scrollingElement) return true;
+      const overflowY = String(globalThis.getComputedStyle?.(node)?.overflowY || '');
+      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+    };
+    const resolveDiagnosticConversationScroller = (nodes) => {
+      const chains = nodes.map((node) => {
+        const chain = [];
+        let current = node?.parentElement || null;
+        while (current) {
+          chain.push(current);
+          current = current.parentElement;
+        }
+        if (document.scrollingElement && !chain.includes(document.scrollingElement)) chain.push(document.scrollingElement);
+        return chain;
+      });
+      const common = chains.length ? chains[0].filter((node) => chains.every((chain) => chain.includes(node))) : [];
+      const candidates = common
+        .filter((node) => !isNavigationRegion(node) && isScrollable(node))
+        .map((node) => ({
+          node,
+          distance: Math.max(...chains.map((chain) => chain.indexOf(node))),
+          descendants: nodes.filter((message) => node.contains?.(message)).length
+        }))
+        .filter((candidate) => candidate.descendants > 0);
+      candidates.sort((left, right) => left.distance - right.distance);
+      const nearestDistance = candidates[0]?.distance;
+      const nearest = candidates.filter((candidate) => candidate.distance === nearestDistance);
+      return { selected: nearest.length === 1 ? nearest[0].node : null, candidates, nearest };
+    };
+    const persistentTurnShellDiagnostics = (currentNodes, currentRecords) => {
+      const main = document.querySelector?.('main') || null;
+      const scope = main || document;
+      const shells = Array.from(scope.querySelectorAll?.(persistentTurnShellSelector) || []);
+      const entries = shells.map((node, domIndex) => ({ node, domIndex, index: parsePersistentTurnShellIndex(node) }));
+      const parseable = entries.filter((entry) => entry.index !== null);
+      const malformedShellCount = entries.length - parseable.length;
+      const seenIndexes = new Set();
+      let duplicateIndexCount = 0;
+      for (const entry of parseable) {
+        if (seenIndexes.has(entry.index)) duplicateIndexCount += 1;
+        else seenIndexes.add(entry.index);
+      }
+      const indices = parseable.map((entry) => entry.index);
+      const uniqueSortedIndices = [...seenIndexes].sort((left, right) => left - right);
+      const minIndex = uniqueSortedIndices.length ? uniqueSortedIndices[0] : null;
+      const maxIndex = uniqueSortedIndices.length ? uniqueSortedIndices.at(-1) : null;
+      const domOrderStrictlyIncreasing = parseable.every((entry, index) => index === 0 || entry.index > parseable[index - 1].index);
+      const contiguousFromZero = malformedShellCount === 0
+        && duplicateIndexCount === 0
+        && uniqueSortedIndices.length > 0
+        && minIndex === 0
+        && uniqueSortedIndices.every((value, index) => value === index);
+      const shellByNode = new Map(parseable.map((entry) => [entry.node, entry.index]));
+      const roleForShell = (shell) => {
+        const roles = [];
+        const declaredRole = String(shell.getAttribute?.('data-turn') || '').trim();
+        if (declaredRole) roles.push(declaredRole);
+        for (const roleNode of Array.from(shell.querySelectorAll?.('[data-message-author-role="user"], [data-message-author-role="assistant"]') || [])) {
+          const role = String(roleNode.getAttribute?.('data-message-author-role') || '').trim();
+          if (role) roles.push(role);
+        }
+        for (const record of currentRecords) {
+          if (shell.contains?.(record.node)) roles.push(record.role);
+        }
+        const uniqueRoles = [...new Set(roles)];
+        const valid = uniqueRoles.length === 1 && (uniqueRoles[0] === 'user' || uniqueRoles[0] === 'assistant');
+        return { role: valid ? uniqueRoles[0] : null, invalid: uniqueRoles.some((role) => role !== 'user' && role !== 'assistant') || uniqueRoles.length > 1 };
+      };
+      let validRoleCount = 0;
+      let invalidRoleCount = 0;
+      let zeroShellRole = 0;
+      for (const entry of parseable) {
+        const role = roleForShell(entry.node);
+        if (role.role) validRoleCount += 1;
+        else if (role.invalid) invalidRoleCount += 1;
+        else zeroShellRole += 1;
+      }
+      const resolvedScroller = resolveDiagnosticConversationScroller(currentNodes);
+      let insideConversationScrollerCount = 0;
+      let outsideConversationScrollerCount = 0;
+      for (const entry of entries) {
+        if (resolvedScroller.selected?.contains?.(entry.node)) insideConversationScrollerCount += 1;
+        else outsideConversationScrollerCount += 1;
+      }
+      const closestShell = (node) => {
+        let current = node;
+        while (current) {
+          if (shellByNode.has(current)) return current;
+          current = current.parentElement || null;
+        }
+        return null;
+      };
+      const mountedShellIndexes = [];
+      let mountedContentUnitWithShellCount = 0;
+      for (const node of currentNodes) {
+        const shell = closestShell(node);
+        if (!shell) continue;
+        mountedContentUnitWithShellCount += 1;
+        mountedShellIndexes.push(shellByNode.get(shell));
+      }
+      const mountedContentUnitCount = currentNodes.length;
+      const mountedShellIndexesUnique = new Set(mountedShellIndexes).size === mountedShellIndexes.length;
+      const mountedShellIndexOrderStrictlyIncreasing = mountedShellIndexes.every((index, position) => position === 0 || index > mountedShellIndexes[position - 1]);
+      const zeroShellHasMountedContent = mountedShellIndexes.includes(0);
+      const heights = entries.map((entry) => Number(entry.node.getBoundingClientRect?.()?.height));
+      const nonzeroHeightShellCount = heights.filter((height) => Number.isFinite(height) && height > 0.5).length;
+      return {
+        observed: true,
+        shellCount: shells.length,
+        parseableShellCount: parseable.length,
+        malformedShellCount,
+        duplicateIndexCount,
+        minIndex,
+        maxIndex,
+        zeroIndexCount: indices.filter((index) => index === 0).length,
+        domOrderStrictlyIncreasing,
+        contiguousFromZero,
+        validRoleCount,
+        invalidRoleCount,
+        zeroShellRole,
+        insideConversationScrollerCount,
+        outsideConversationScrollerCount,
+        mountedContentUnitCount,
+        mountedContentUnitWithShellCount,
+        mountedContentUnitWithoutShellCount: mountedContentUnitCount - mountedContentUnitWithShellCount,
+        mountedUniqueShellCount: new Set(mountedShellIndexes).size,
+        firstMountedShellIndex: mountedShellIndexes.length ? mountedShellIndexes[0] : null,
+        lastMountedShellIndex: mountedShellIndexes.length ? mountedShellIndexes.at(-1) : null,
+        mountedShellIndexOrderStrictlyIncreasing,
+        mountedShellIndexesUnique,
+        zeroShellHasMountedContent,
+        nonzeroHeightShellCount,
+        zeroHeightShellCount: entries.length - nonzeroHeightShellCount
+      };
+    };
     const legacyRecords = () => {
       const entries = [
         ...Array.from(document.querySelectorAll?.('[data-message-author-role="user"], article[data-turn="user"]') || []).map((node) => ({ node, roleHint: 'user' })),
@@ -486,6 +633,7 @@ export function buildChatGPTDomModelScript() {
       });
       const records = [...currentRecords, ...legacyWithoutDuplicates].sort(compareNodes);
       const virtualizer = virtualizerTopOffset(currentRecords);
+      const persistentTurnShells = persistentTurnShellDiagnostics(current.nodes, currentRecords);
       const mode = currentRecords.length && legacy.length
         ? 'mixed'
         : currentRecords.length
@@ -509,7 +657,8 @@ export function buildChatGPTDomModelScript() {
           renderedTurnWrapperCount: document.querySelectorAll('[data-turn-key]').length,
           virtualizerTopOffsetPx: virtualizer.offsetPx,
           virtualizerHostCount: virtualizer.hostCount,
-          mixedRepresentationConflict: conflicts.length > 0
+          mixedRepresentationConflict: conflicts.length > 0,
+          persistentTurnShells
         }
       };
     };
@@ -1951,6 +2100,7 @@ export function buildConversationWindowReadScript({ maxTurns, maxCharsPerTurn, m
           topOffsetPx: model.diagnostics.virtualizerTopOffsetPx,
           validMessageCount: model.diagnostics.validCurrentMessageUnitCount,
           malformedMessageCount: model.diagnostics.malformedCurrentMessageUnitCount,
+          persistentTurnShells: model.diagnostics.persistentTurnShells,
           firstMessageRole: firstMessage?.role === 'user' || firstMessage?.role === 'assistant' ? firstMessage.role : null,
           loading
         }
@@ -2082,6 +2232,7 @@ export function buildConversationTraversalReadScript({ maxTurns, maxCharsPerTurn
           topOffsetPx: model.diagnostics.virtualizerTopOffsetPx,
           validMessageCount: model.diagnostics.validCurrentMessageUnitCount,
           malformedMessageCount: model.diagnostics.malformedCurrentMessageUnitCount,
+          persistentTurnShells: model.diagnostics.persistentTurnShells,
           firstMessageRole: first?.role === 'user' || first?.role === 'assistant' ? first.role : null,
           loading
         }
@@ -4681,6 +4832,7 @@ export class ChatGPTController {
         identityContractionRestoreCount: 0,
         identityContractionWheelCount: 0,
         identityContractionPollCount: 0,
+        persistentTurnShells: null,
         identityMismatch: null,
         lastFailureStage: null,
         lastFailureReason: null,
@@ -5330,6 +5482,9 @@ export class ChatGPTController {
     const verifyVirtualizedOriginBoundary = async (candidate) => {
       const probe = diagnostics.virtualizedOriginProbe;
       probe.attempted = true;
+      if (probe.persistentTurnShells === null && candidate?.scroller?.persistentTurnShells) {
+        probe.persistentTurnShells = candidate.scroller.persistentTurnShells;
+      }
       const initialProof = conversationStartBoundaryProof(candidate, { physicalTopStable: true });
       if (!initialProof.virtualizedOriginCandidate) return { verified: false, progressed: false };
       const expectedIdentitySignature = conversationWindowDurableIdentitySignature(candidate?.turns);

@@ -890,7 +890,109 @@ function evaluateCurrentDomModel({ offsetPx = 4_800, malformed = false, legacy =
   return { context, result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context) };
 }
 
-function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, turnIdentityPlan = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, olderMaterializationPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
+function evaluatePersistentTurnShells({
+  shellTestIds = Array.from({ length: 45 }, (_, index) => `conversation-turn-${index}`),
+  mountedIndices = Array.from({ length: 18 }, (_, index) => index + 27),
+  shellOrder = null,
+  shellRoles = new Map(),
+  shellHeights = new Map(),
+  unitOutsideShell = false,
+  sentinel = 'provider-sentinel-should-not-leak'
+} = {}) {
+  const body = { tagName: 'BODY', parentElement: null, scrollHeight: 3_000, clientHeight: 800, scrollTop: 0, matches: () => false, getAttribute: () => null };
+  const main = { tagName: 'MAIN', parentElement: body, matches: () => false, getAttribute: () => null };
+  const scroller = { tagName: 'DIV', parentElement: main, scrollHeight: 4_000, clientHeight: 800, scrollTop: 0, matches: () => false, getAttribute: () => null };
+  const host = { tagName: 'DIV', parentElement: scroller, style: { marginTop: '0px' }, matches: () => false, getAttribute: () => null };
+  const contains = (root, child) => {
+    let current = child;
+    while (current) {
+      if (current === root) return true;
+      current = current.parentElement;
+    }
+    return false;
+  };
+  body.contains = (child) => child === body || contains(body, child);
+  main.contains = (child) => child === main || contains(main, child);
+  scroller.contains = (child) => child === scroller || contains(scroller, child);
+  host.contains = (child) => child === host || contains(host, child);
+  const shells = [];
+  const wrappers = [];
+  const units = [];
+  const shellByIndex = new Map();
+  const roleNode = (role) => ({ getAttribute: (name) => name === 'data-message-author-role' ? role : null });
+  const makeShell = (testId, position) => {
+    const role = shellRoles.has(position) ? shellRoles.get(position) : position % 2 === 0 ? 'user' : 'assistant';
+    const shell = {
+      tagName: position % 2 === 0 ? 'SECTION' : 'ARTICLE',
+      parentElement: host,
+      style: {},
+      matches: () => false,
+      getAttribute(name) {
+        if (name === 'data-testid') return testId;
+        if (name === 'data-turn') return role;
+        return null;
+      },
+      querySelectorAll: () => [],
+      contains(child) { return child === this || contains(this, child); },
+      getBoundingClientRect: () => ({ height: shellHeights.get(testId) ?? 120 })
+    };
+    const wrapper = {
+      tagName: 'DIV', parentElement: shell, style: {}, matches: () => false,
+      getAttribute(name) { return name === 'data-turn-key' ? `virtual-${sentinel}-${position}` : null; },
+      contains(child) { return child === this || contains(this, child); }
+    };
+    shellByIndex.set(position, shell);
+    shells.push(shell);
+    wrappers.push(wrapper);
+    return { shell, wrapper, role };
+  };
+  for (const [position, testId] of (shellOrder || shellTestIds.map((value, index) => ({ value, index }))).entries()) {
+    const spec = typeof testId === 'object' ? testId : { value: testId, index: position };
+    makeShell(spec.value, spec.index);
+  }
+  const makeUnit = (position, index) => {
+    const role = position % 2 === 0 ? 'user' : 'assistant';
+    const contentTurn = { parentElement: shellByIndex.get(position), getAttribute: (name) => name === 'data-content-search-turn-key' ? `${sentinel}-turn-${position}` : null, closest: (selector) => selector === '[data-content-search-turn-key]' ? contentTurn : selector === '[data-turn-key]' ? wrappers[position] : null, contains: (child) => child === contentTurn || contains(contentTurn, child), matches: () => false };
+    const wrapper = wrappers[position] || wrappers[0];
+    const unit = {
+      tagName: 'DIV', parentElement: null, innerText: `turn ${position}`, textContent: `turn ${position}`,
+      getAttribute(name) { return name === 'data-content-search-unit-key' ? `${sentinel}-turn-${position}:0:${role}` : null; },
+      closest(selector) { return selector === '[data-content-search-turn-key]' ? contentTurn : selector === '[data-turn-key]' ? wrapper : null; },
+      contains(child) { return child === this || contains(this, child); },
+      cloneNode() { return { innerText: `turn ${position}`, textContent: `turn ${position}`, matches: () => false, querySelectorAll: () => [] }; }
+    };
+    unit.parentElement = unitOutsideShell && index === 0 ? host : contentTurn;
+    units.push(unit);
+  };
+  mountedIndices.forEach((position, index) => makeUnit(position, index));
+  const document = {
+    scrollingElement: body,
+    documentElement: body,
+    querySelector(selector) { return selector === 'main' ? main : null; },
+    querySelectorAll(selector) {
+      if (selector === '[data-content-search-unit-key]') return units;
+      if (selector === '[data-turn-key]') return wrappers;
+      if (selector === '[data-message-author-role="user"], [data-message-author-role="assistant"], article[data-turn="user"], article[data-turn="assistant"]') return [];
+      return [];
+    }
+  };
+  main.querySelectorAll = (selector) => selector === 'section[data-testid^="conversation-turn-"], article[data-testid^="conversation-turn-"]' ? shells : [];
+  const context = {
+    document,
+    location: { href: 'https://chatgpt.com/c/persistent-shell-test' },
+    innerWidth: 1_000,
+    innerHeight: 800,
+    getComputedStyle(node) { return { overflowY: node === scroller ? 'auto' : 'visible' }; }
+  };
+  context.globalThis = context;
+  return {
+    context,
+    result: vm.runInNewContext(`${buildChatGPTDomModelScript()}.read()`, context),
+    readWindow: () => vm.runInNewContext(buildConversationWindowReadScript({ maxTurns: 100, maxCharsPerTurn: 1_000, maxTotalChars: 20_000 }), context)
+  };
+}
+
+function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, windowSize = null, windowRanges = null, positionHints = true, positionOffset = 0, turnText = null, turnLiveText = null, turnIdentityPlan = null, changeUrlOnWheel = false, changeUrlOnReadAt = null, nativeWheel = true, windowChanges = true, scrollGesture = false, scrollGestureSource = null, backend = 'test', initialBrowserWindowState = null, initialVisibilityState = null, initialDocumentHidden = null, initialDocumentHasFocus = null, initialPageClosed = false, windowRestoreSucceeds = true, nativeDiagnosticsPlan = null, mouseWheelPlan = null, olderMaterializationPlan = null, directTopPlan = null, normalizeReady = true, limitExceededAtRead = null, limitKind = 'total', restorePlan = null, layoutSnapshots = null, onTraversalRead = null, currentDom = false, persistentTurnShells = null, virtualizerTopOffsetPx = null, virtualizerTopOffsetPlan = null, reverseScroll = false } = {}) {
   const events = [];
   let windows = Array.isArray(windowRanges)
     ? windowRanges
@@ -966,6 +1068,7 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
             topOffsetPx: virtualizerTopOffsetOverride,
             validMessageCount: positions.length,
             malformedMessageCount: 0,
+            persistentTurnShells,
             firstMessageRole: rawPositions[0] % 2 ? 'assistant' : 'user',
             loading: loadingOverride === true
           }
@@ -992,7 +1095,8 @@ function createNativeWheelHistoryPage({ initialWindow = 2, windowCount = 5, wind
           virtualizerTopOffsetPx: virtualizerTopOffsetOverride,
           virtualizerHostCount: 1,
           validCurrentMessageUnitCount: positions.length,
-          malformedCurrentMessageUnitCount: 0
+          malformedCurrentMessageUnitCount: 0,
+          persistentTurnShells
         } : {})
       }
     };
@@ -5771,6 +5875,152 @@ test('chatgpt-controller: current units retain canonical text and live innerText
     first.records.map((record) => [record.messageId, record.text, record.liveInnerText]),
     second.records.map((record) => [record.messageId, record.text, record.liveInnerText])
   );
+});
+
+test('chatgpt-controller: persistent turn shell inventory distinguishes full history from partial mounted content', () => {
+  const fixture = evaluatePersistentTurnShells();
+  const inventory = fixture.result.diagnostics.persistentTurnShells;
+  assert.deepEqual({
+    shellCount: inventory.shellCount,
+    parseableShellCount: inventory.parseableShellCount,
+    malformedShellCount: inventory.malformedShellCount,
+    minIndex: inventory.minIndex,
+    maxIndex: inventory.maxIndex,
+    zeroIndexCount: inventory.zeroIndexCount,
+    duplicateIndexCount: inventory.duplicateIndexCount,
+    domOrderStrictlyIncreasing: inventory.domOrderStrictlyIncreasing,
+    contiguousFromZero: inventory.contiguousFromZero,
+    firstMountedShellIndex: inventory.firstMountedShellIndex,
+    lastMountedShellIndex: inventory.lastMountedShellIndex,
+    mountedContentUnitCount: inventory.mountedContentUnitCount,
+    mountedContentUnitWithShellCount: inventory.mountedContentUnitWithShellCount,
+    mountedContentUnitWithoutShellCount: inventory.mountedContentUnitWithoutShellCount
+  }, {
+    shellCount: 45,
+    parseableShellCount: 45,
+    malformedShellCount: 0,
+    minIndex: 0,
+    maxIndex: 44,
+    zeroIndexCount: 1,
+    duplicateIndexCount: 0,
+    domOrderStrictlyIncreasing: true,
+    contiguousFromZero: true,
+    firstMountedShellIndex: 27,
+    lastMountedShellIndex: 44,
+    mountedContentUnitCount: 18,
+    mountedContentUnitWithShellCount: 18,
+    mountedContentUnitWithoutShellCount: 0
+  });
+  assert.equal(inventory.mountedUniqueShellCount, 18);
+  assert.equal(inventory.insideConversationScrollerCount, 45);
+  assert.equal(inventory.outsideConversationScrollerCount, 0);
+  assert.equal(inventory.validRoleCount, 45);
+  assert.equal(inventory.invalidRoleCount, 0);
+  assert.equal(inventory.zeroShellRole, 0);
+  assert.equal(inventory.mountedShellIndexOrderStrictlyIncreasing, true);
+  assert.equal(inventory.mountedShellIndexesUnique, true);
+  assert.equal(inventory.zeroShellHasMountedContent, false);
+});
+
+test('chatgpt-controller: persistent turn shell diagnostics report zero-height unmounted shells without mutating layout', () => {
+  const shellHeights = new Map(Array.from({ length: 27 }, (_, index) => [`conversation-turn-${index}`, 0]));
+  const fixture = evaluatePersistentTurnShells({ shellHeights });
+  const inventory = fixture.result.diagnostics.persistentTurnShells;
+  assert.ok(inventory.zeroHeightShellCount > 0);
+  assert.ok(inventory.nonzeroHeightShellCount > 0);
+  assert.equal(inventory.zeroShellHasMountedContent, false);
+  assert.equal(inventory.contiguousFromZero, true);
+});
+
+test('chatgpt-controller: persistent turn shell continuity rejects gaps, missing zero, duplicates, reorder, and malformed IDs', () => {
+  for (const [name, shellTestIds, expected] of [
+    ['gap', ['conversation-turn-0', 'conversation-turn-1', 'conversation-turn-2', 'conversation-turn-4', 'conversation-turn-5'], { contiguousFromZero: false, domOrderStrictlyIncreasing: true, duplicateIndexCount: 0, malformedShellCount: 0 }],
+    ['missing-zero', ['conversation-turn-3', 'conversation-turn-4'], { contiguousFromZero: false, domOrderStrictlyIncreasing: true, duplicateIndexCount: 0, malformedShellCount: 0 }],
+    ['duplicate', ['conversation-turn-0', 'conversation-turn-1', 'conversation-turn-7', 'conversation-turn-7'], { contiguousFromZero: false, domOrderStrictlyIncreasing: false, duplicateIndexCount: 1, malformedShellCount: 0 }],
+    ['reorder', ['conversation-turn-0', 'conversation-turn-1', 'conversation-turn-3', 'conversation-turn-2', 'conversation-turn-4'], { contiguousFromZero: true, domOrderStrictlyIncreasing: false, duplicateIndexCount: 0, malformedShellCount: 0 }],
+    ['malformed', ['conversation-turn-0', 'conversation-turn-x', 'conversation-turn--1', 'conversation-turn-2-extra'], { contiguousFromZero: false, domOrderStrictlyIncreasing: true, duplicateIndexCount: 0, malformedShellCount: 3 }]
+  ]) {
+    const inventory = evaluatePersistentTurnShells({ shellTestIds }).result.diagnostics.persistentTurnShells;
+    assert.deepEqual({ contiguousFromZero: inventory.contiguousFromZero, domOrderStrictlyIncreasing: inventory.domOrderStrictlyIncreasing, duplicateIndexCount: inventory.duplicateIndexCount, malformedShellCount: inventory.malformedShellCount }, expected, name);
+  }
+});
+
+test('chatgpt-controller: persistent turn shell diagnostics track role validity and mounted shell association', () => {
+  const fixture = evaluatePersistentTurnShells({ mountedIndices: [27, 28, 29], unitOutsideShell: true });
+  const inventory = fixture.result.diagnostics.persistentTurnShells;
+  assert.equal(inventory.mountedContentUnitCount, 3);
+  assert.equal(inventory.mountedContentUnitWithShellCount, 2);
+  assert.equal(inventory.mountedContentUnitWithoutShellCount, 1);
+  assert.equal(inventory.mountedUniqueShellCount, 2);
+  assert.equal(inventory.firstMountedShellIndex, 28);
+  assert.equal(inventory.lastMountedShellIndex, 29);
+  assert.equal(inventory.validRoleCount, 45);
+  assert.equal(inventory.invalidRoleCount, 0);
+});
+
+test('chatgpt-controller: persistent turn shell role conflicts are diagnostic-only and fail the role count', () => {
+  const fixture = evaluatePersistentTurnShells({ shellRoles: new Map([[0, 'system'], [1, null]]) });
+  const inventory = fixture.result.diagnostics.persistentTurnShells;
+  assert.equal(inventory.validRoleCount, 43);
+  assert.equal(inventory.invalidRoleCount, 1);
+  assert.equal(inventory.zeroShellRole, 1);
+  assert.equal(fixture.result.valid, true);
+});
+
+test('chatgpt-controller: persistent shell diagnostics surface in window state and contain no identity leakage', () => {
+  const fixture = evaluatePersistentTurnShells();
+  const state = fixture.readWindow();
+  assert.deepEqual(state.startBoundary.virtualizedOrigin.persistentTurnShells, fixture.result.diagnostics.persistentTurnShells);
+  const serialized = JSON.stringify(state.startBoundary.virtualizedOrigin.persistentTurnShells);
+  assert.equal(serialized.includes('provider-sentinel-should-not-leak'), false);
+  assert.equal(serialized.includes('data-content-search-unit-key'), false);
+  assert.equal(serialized.includes('virtualizer'), false);
+  assert.equal(serialized.includes('['), false);
+});
+
+test('chatgpt-controller: persistent shell inventory is retained on bounded origin probe diagnostics', async () => {
+  const persistentTurnShells = {
+    observed: true,
+    shellCount: 45,
+    parseableShellCount: 45,
+    malformedShellCount: 0,
+    duplicateIndexCount: 0,
+    minIndex: 0,
+    maxIndex: 44,
+    zeroIndexCount: 1,
+    domOrderStrictlyIncreasing: true,
+    contiguousFromZero: true,
+    validRoleCount: 45,
+    invalidRoleCount: 0,
+    zeroShellRole: 0,
+    insideConversationScrollerCount: 45,
+    outsideConversationScrollerCount: 0,
+    mountedContentUnitCount: 8,
+    mountedContentUnitWithShellCount: 8,
+    mountedContentUnitWithoutShellCount: 0,
+    mountedUniqueShellCount: 8,
+    firstMountedShellIndex: 37,
+    lastMountedShellIndex: 44,
+    mountedShellIndexOrderStrictlyIncreasing: true,
+    mountedShellIndexesUnique: true,
+    zeroShellHasMountedContent: false,
+    nonzeroHeightShellCount: 8,
+    zeroHeightShellCount: 37
+  };
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 0,
+    windowRanges: [[0, 1, 2, 3, 4, 5, 6, 7]],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    persistentTurnShells
+  });
+  const result = await createController(harness.page).readConversationWindows({
+    maxTurnsPerWindow: 50, maxCharsPerTurn: 1_000, maxTotalChars: 10_000,
+    historyTimeoutMs: 20_000, historyMaxIterations: 30
+  });
+  assert.deepEqual(result.history.diagnostics.virtualizedOriginProbe.persistentTurnShells, persistentTurnShells);
+  assert.equal(result.history.startReached, true);
 });
 
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {

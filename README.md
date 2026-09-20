@@ -447,7 +447,7 @@ proofs, invalid scrollers, malformed observations, and response-size limits
 fail closed without silent truncation.
 
 For a separate read-only diagnostic of the currently open ChatGPT conversation's
-same-origin backend mapping, use:
+same-origin paginated conversation API, use:
 
 ```text
 POST /conversation/backend-diagnostics
@@ -457,15 +457,19 @@ Content-Type: application/json
 {"tabId":"existing-chatgpt-tab","timeoutMs":15000}
 ```
 
-The controller evaluates a page-context `GET` to the current page's
-`/backend-api/conversation/{conversation_id}` endpoint with browser-managed
-credentials and no custom authorization header. The response is capped at
-20 MiB before parsing and returns only bounded transport, mapping-graph,
-current-branch, role, text-length, anchor-match-count, and mounted-DOM
-aggregate diagnostics. The mounted-DOM count is a content-unit comparison
-convenience only (not a turn count and never a full-history proof). It never
-returns conversation text, mapping IDs, cookies, tokens, or headers, and it
-does not alter history proof or traversal state.
+The controller makes one page-context `GET` to
+`/backend-api/conversations/{conversation_id}?include_has_versions=true&num_turns=100`
+with browser-managed credentials and no custom authorization header. It reads
+only this first page; it does not follow pagination cursors, and these
+diagnostics are not a full-history proof. If the response contains a mapping,
+the existing bounded mapping and current-branch analysis is retained. If it
+contains paginated `messages` instead, the controller returns only first-page
+role, text-presence, and anchor-match aggregates; it does not synthesize a
+mapping or resolve a branch. The response is capped at 20 MiB before parsing
+and returns only the existing bounded diagnostic schema. The mounted-DOM count
+is a content-unit comparison convenience only (not a turn count and never a
+full-history proof). It never returns conversation text, mapping IDs, cookies,
+tokens, or headers, and it does not alter history proof or traversal state.
 
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:

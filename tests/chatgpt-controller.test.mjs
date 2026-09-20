@@ -229,7 +229,8 @@ function createBackendDiagnosticPage({
   mountedDomTurnCount = 0,
   streamChunks = null,
   stallAfterReadIndex = null,
-  omitReader = false
+  omitReader = false,
+  digestOverrides = {}
 } = {}) {
   const calls = [];
   const state = { readCount: 0, cancelCount: 0, responseTextCalled: false };
@@ -243,7 +244,16 @@ function createBackendDiagnosticPage({
         TextDecoder,
         TextEncoder,
         clearTimeout,
-        crypto: crypto.webcrypto,
+        crypto: {
+          subtle: {
+            async digest(algorithm, value) {
+              const text = new TextDecoder().decode(value);
+              const digest = digestOverrides[text];
+              if (typeof digest !== 'string') return await crypto.webcrypto.subtle.digest(algorithm, value);
+              return Uint8Array.from(digest.match(/.{2}/gu), (byte) => Number.parseInt(byte, 16)).buffer;
+            }
+          }
+        },
         document: { querySelectorAll: () => Array.from({ length: mountedDomTurnCount }, () => ({})) },
         fetch: async (url, options) => {
           calls.push({ url, options });
@@ -6230,9 +6240,135 @@ test('chatgpt-controller: backend diagnostics validate a full mapping and curren
   assert.equal(result.responseConversationIdMatchesUrl, true);
   assert.equal(result.backendBranchAtLeastAsLargeAsMountedDom, true);
   assert.equal(fixture.calls.length, 1);
+  const requestUrl = new URL(fixture.calls[0].url, 'https://chatgpt.com');
+  assert.equal(requestUrl.pathname, '/backend-api/conversations/backend-diagnostic-test');
+  assert.equal(requestUrl.searchParams.get('include_has_versions'), 'true');
+  assert.equal(requestUrl.searchParams.get('num_turns'), '100');
+  assert.equal(requestUrl.searchParams.has('before'), false);
   assert.equal(fixture.calls[0].options.method, 'GET');
   assert.equal(fixture.calls[0].options.credentials, 'include');
+  assert.equal(fixture.calls[0].options.cache, 'no-store');
+  assert.equal(fixture.calls[0].options.headers.Accept, 'application/json');
   assert.equal(fixture.calls[0].options.headers.Authorization, undefined);
+});
+
+test('chatgpt-controller: paginated backend diagnostics aggregate only the first page without changing the response schema', async () => {
+  const anchor1 = '70a3a2301fc3acb64bdf29e79ee6a7fe15b81ebdfcd8ab3567d9c68387b7253a';
+  const anchor2 = 'a6fb7a19f6274b7f51cf2407a1f39cb412b478b33d34820eb6331acc55de24ad';
+  const fixture = createBackendDiagnosticPage({
+    body: {
+      conversation_id: 'backend-diagnostic-test',
+      current_node: 'current-node-secret-sentinel',
+      messages: [
+        { id: 'message-user-id-secret', author: { role: 'user' }, content: { parts: ['anchor-one-projection'] } },
+        { id: 'message-assistant-id-secret', author: { role: 'assistant' }, content: { text: 'anchor-two-projection' } },
+        { id: 'message-system-id-secret', author: { role: 'system' }, content: { parts: ['  \n '] } },
+        { id: 'message-tool-id-secret', author: { role: 'tool' }, content: { parts: [{ image: 'not-text' }] } },
+        { id: 'message-other-id-secret', author: { role: 'developer' }, content: { parts: ['other-role-text-secret'] }, future_field: 'unknown-field-secret' },
+        { id: 'message-empty-id-secret', author: { role: 'assistant' }, content: { parts: [null] } }
+      ],
+      page_info: { next_cursor: 'cursor-secret-sentinel' },
+      future_response_field: 'future-response-secret'
+    },
+    digestOverrides: {
+      'anchor-one-projection': anchor1,
+      'anchor-two-projection': anchor2
+    }
+  });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+
+  assert.equal(fixture.calls.length, 1);
+  const request = fixture.calls[0];
+  const requestUrl = new URL(request.url, 'https://chatgpt.com');
+  assert.equal(requestUrl.pathname, '/backend-api/conversations/backend-diagnostic-test');
+  assert.equal(requestUrl.searchParams.get('include_has_versions'), 'true');
+  assert.equal(requestUrl.searchParams.get('num_turns'), '100');
+  assert.equal(requestUrl.searchParams.has('before'), false);
+  assert.equal(request.options.method, 'GET');
+  assert.equal(request.options.credentials, 'include');
+  assert.equal(request.options.cache, 'no-store');
+  assert.equal(request.options.headers.Accept, 'application/json');
+  assert.equal(request.options.headers.Authorization, undefined);
+
+  assert.equal(result.jsonParsed, true);
+  assert.equal(result.rootObject, true);
+  assert.equal(result.responseConversationIdMatchesUrl, true);
+  assert.equal(result.mappingPresent, false);
+  assert.equal(result.mappingObject, false);
+  assert.equal(result.mappingNodeCount, 0);
+  assert.equal(result.currentNodePresent, true);
+  assert.equal(result.currentNodeExistsInMapping, false);
+  assert.deepEqual({
+    user: result.userMessageCount,
+    assistant: result.assistantMessageCount,
+    system: result.systemMessageCount,
+    tool: result.toolMessageCount,
+    other: result.otherRoleMessageCount,
+    withText: result.messagesWithTextualContentCount,
+    withoutText: result.messagesWithoutTextualContentCount,
+    anchor1: result.backendAnchor1ExactMatchCount,
+    anchor2: result.backendAnchor2ExactMatchCount
+  }, { user: 1, assistant: 2, system: 1, tool: 1, other: 1, withText: 3, withoutText: 3, anchor1: 1, anchor2: 1 });
+
+  assert.equal(result.currentBranchResolved, false);
+  assert.equal(result.currentBranchNodeCount, 0);
+  assert.equal(result.currentBranchMessageCount, 0);
+  assert.equal(result.currentBranchUserCount, 0);
+  assert.equal(result.currentBranchAssistantCount, 0);
+  assert.equal(result.currentBranchSystemCount, 0);
+  assert.equal(result.currentBranchToolCount, 0);
+  assert.equal(result.currentBranchRootReached, false);
+  assert.equal(result.currentBranchCycleDetected, false);
+  assert.equal(result.currentBranchBrokenParent, false);
+  assert.equal(result.currentBranchMessagesWithTextCount, 0);
+  assert.equal(result.currentBranchAnchor1ExactMatchCount, 0);
+  assert.equal(result.currentBranchAnchor2ExactMatchCount, 0);
+  assert.equal(result.backendCurrentBranchMessageCount, 0);
+  assert.equal(result.backendBranchAtLeastAsLargeAsMountedDom, null);
+
+  assert.deepEqual(Object.keys(result).sort(), [
+    'attempted', 'conversationPathRecognized', 'conversationIdPresent', 'httpStatus', 'httpOk', 'contentTypeJson',
+    'fetchTimedOut', 'fetchErrorKind', 'responseByteLength', 'sizeLimitExceeded', 'boundedBodyReadSupported',
+    'jsonParsed', 'rootObject', 'mappingPresent', 'mappingObject', 'mappingNodeCount', 'currentNodePresent',
+    'currentNodeExistsInMapping', 'responseConversationIdPresent', 'responseConversationIdMatchesUrl',
+    'nodesWithMessageCount', 'nodesWithoutMessageCount', 'rootNodeCount', 'leafNodeCount', 'parentReferenceCount',
+    'missingParentReferenceCount', 'childReferenceCount', 'missingChildReferenceCount', 'selfParentCount',
+    'selfChildCount', 'duplicateChildReferenceCount', 'mappingGraphStructurallyValid', 'cycleDetected',
+    'userMessageCount', 'assistantMessageCount', 'systemMessageCount', 'toolMessageCount', 'otherRoleMessageCount',
+    'currentBranchResolved', 'currentBranchNodeCount', 'currentBranchMessageCount', 'currentBranchUserCount',
+    'currentBranchAssistantCount', 'currentBranchSystemCount', 'currentBranchToolCount', 'currentBranchRootReached',
+    'currentBranchCycleDetected', 'currentBranchBrokenParent', 'messagesWithTextualContentCount',
+    'messagesWithoutTextualContentCount', 'currentBranchMessagesWithTextCount', 'backendAnchor1ExactMatchCount',
+    'backendAnchor2ExactMatchCount', 'currentBranchAnchor1ExactMatchCount', 'currentBranchAnchor2ExactMatchCount',
+    'mountedDomTurnCount', 'backendCurrentBranchMessageCount', 'backendBranchAtLeastAsLargeAsMountedDom',
+    'mountedDurableIdentityMatchCount', 'mountedDurableIdentityUnmatchedCount'
+  ].sort());
+  const serialized = JSON.stringify(result);
+  for (const secret of [
+    'current-node-secret-sentinel', 'message-user-id-secret', 'message-assistant-id-secret', 'message-system-id-secret',
+    'message-tool-id-secret', 'message-other-id-secret', 'message-empty-id-secret', 'anchor-one-projection',
+    'anchor-two-projection', 'other-role-text-secret', 'unknown-field-secret', 'future-response-secret',
+    'cursor-secret-sentinel', 'Authorization', 'cookie', 'token'
+  ]) assert.equal(serialized.includes(secret), false, `unexpected diagnostic leakage: ${secret}`);
+});
+
+test('chatgpt-controller: malformed paginated backend messages fail closed without leaking unknown data', async () => {
+  for (const messages of [null, {}, 'messages-secret-sentinel', [{ id: 'message-id-secret' }, null]]) {
+    const fixture = createBackendDiagnosticPage({
+      body: { conversation_id: 'backend-diagnostic-test', messages, page_info: { next_cursor: 'cursor-secret-sentinel' } }
+    });
+    const result = await createController(fixture.page).readConversationBackendDiagnostics();
+    assert.equal(fixture.calls.length, 1);
+    assert.equal(result.mappingPresent, false);
+    assert.equal(result.mappingObject, false);
+    assert.equal(result.mappingNodeCount, 0);
+    assert.equal(result.userMessageCount, 0);
+    assert.equal(result.assistantMessageCount, 0);
+    assert.equal(result.currentBranchResolved, false);
+    assert.equal(result.backendCurrentBranchMessageCount, 0);
+    assert.equal(result.backendBranchAtLeastAsLargeAsMountedDom, null);
+    assert.doesNotMatch(JSON.stringify(result), /messages-secret-sentinel|message-id-secret|cursor-secret-sentinel/u);
+  }
 });
 
 test('chatgpt-controller: backend diagnostics resolve only the selected branch', async () => {
@@ -6264,17 +6400,15 @@ test('chatgpt-controller: backend diagnostics fail closed for broken parents and
 });
 
 test('chatgpt-controller: backend diagnostics classify transport, content, and size failures', async () => {
-  const unauthorized = createBackendDiagnosticPage({ status: 401, contentType: 'application/json', body: { error: 'unauthorized-sentinel' } });
-  const unauthorizedResult = await createController(unauthorized.page).readConversationBackendDiagnostics();
-  assert.equal(unauthorizedResult.httpStatus, 401);
-  assert.equal(unauthorizedResult.httpOk, false);
-  assert.equal(unauthorizedResult.jsonParsed, false);
-
-  const forbidden = createBackendDiagnosticPage({ status: 403, contentType: 'application/json', body: { error: 'forbidden-sentinel' } });
-  const forbiddenResult = await createController(forbidden.page).readConversationBackendDiagnostics();
-  assert.equal(forbiddenResult.httpStatus, 403);
-  assert.equal(forbiddenResult.httpOk, false);
-  assert.equal(forbiddenResult.jsonParsed, false);
+  for (const status of [401, 403, 404]) {
+    const failed = createBackendDiagnosticPage({ status, contentType: 'application/json', body: { error: `http-${status}-sentinel` } });
+    const failedResult = await createController(failed.page).readConversationBackendDiagnostics();
+    assert.equal(failedResult.httpStatus, status);
+    assert.equal(failedResult.httpOk, false);
+    assert.equal(failedResult.jsonParsed, false);
+    assert.equal(failed.calls.length, 1);
+    assert.doesNotMatch(JSON.stringify(failedResult), /sentinel/u);
+  }
 
   const html = createBackendDiagnosticPage({ contentType: 'text/html', responseText: '<html>login-sentinel</html>' });
   const htmlResult = await createController(html.page).readConversationBackendDiagnostics();

@@ -217,7 +217,8 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
     try {
       let response;
       try {
-        response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
+        response = await fetch('/backend-api/conversations/' + encodeURIComponent(conversationId)
+          + '?include_has_versions=true&num_turns=100', {
           method: 'GET', credentials: 'include', cache: 'no-store',
           headers: { Accept: 'application/json' }, signal: abortController.signal
         });
@@ -315,7 +316,43 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       result.currentNodePresent = typeof body.current_node === 'string' && body.current_node.length > 0;
       result.responseConversationIdPresent = typeof body.conversation_id === 'string' && body.conversation_id.length > 0;
       result.responseConversationIdMatchesUrl = result.responseConversationIdPresent ? body.conversation_id === conversationId : null;
-      if (!result.mappingObject) return result;
+      const roleFor = (message) => {
+        const role = message?.author?.role;
+        return role === 'user' || role === 'assistant' || role === 'system' || role === 'tool' ? role : 'other';
+      };
+      const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
+      const textInfo = async (message) => {
+        const content = message?.content;
+        const parts = Array.isArray(content?.parts) ? content.parts.filter((part) => typeof part === 'string') : [];
+        const projections = parts.length ? [...parts, parts.join('\n')] : typeof content?.text === 'string' ? [content.text] : [];
+        const normalized = normalizeText(projections.length ? projections[projections.length - 1] : '');
+        const hashes = new Set();
+        for (const projection of projections) {
+          const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalizeText(projection)));
+          hashes.add(Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(''));
+        }
+        return { hasTextualContent: normalized.length > 0, hashes };
+      };
+      if (!result.mappingObject) {
+        if (!result.mappingPresent && Array.isArray(body.messages)) {
+          if (!body.messages.every((message) => !!message && typeof message === 'object' && !Array.isArray(message))) return result;
+          for (const message of body.messages) {
+            const role = roleFor(message);
+            if (role === 'user') result.userMessageCount += 1;
+            else if (role === 'assistant') result.assistantMessageCount += 1;
+            else if (role === 'system') result.systemMessageCount += 1;
+            else if (role === 'tool') result.toolMessageCount += 1;
+            else result.otherRoleMessageCount += 1;
+
+            const text = await textInfo(message);
+            if (text.hasTextualContent) result.messagesWithTextualContentCount += 1;
+            else result.messagesWithoutTextualContentCount += 1;
+            if (text.hashes.has(anchorHashes[0])) result.backendAnchor1ExactMatchCount += 1;
+            if (text.hashes.has(anchorHashes[1])) result.backendAnchor2ExactMatchCount += 1;
+          }
+        }
+        return result;
+      }
 
       const ids = Object.keys(mapping);
       const idSet = new Set(ids);
@@ -369,13 +406,9 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       && result.selfParentCount === 0 && result.selfChildCount === 0
       && result.duplicateChildReferenceCount === 0 && !result.cycleDetected && reciprocal;
 
-    const roleFor = (info) => {
-      const role = info?.message?.author?.role;
-      return role === 'user' || role === 'assistant' || role === 'system' || role === 'tool' ? role : 'other';
-    };
     for (const info of nodeInfo.values()) {
       if (!info.message) continue;
-      const role = roleFor(info);
+      const role = roleFor(info.message);
       if (role === 'user') result.userMessageCount += 1;
       else if (role === 'assistant') result.assistantMessageCount += 1;
       else if (role === 'system') result.systemMessageCount += 1;
@@ -383,19 +416,6 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       else result.otherRoleMessageCount += 1;
     }
 
-    const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
-    const textInfo = async (message) => {
-      const content = message?.content;
-      const parts = Array.isArray(content?.parts) ? content.parts.filter((part) => typeof part === 'string') : [];
-      const projections = parts.length ? [...parts, parts.join('\n')] : typeof content?.text === 'string' ? [content.text] : [];
-      const normalized = normalizeText(projections.length ? projections[projections.length - 1] : '');
-      const hashes = new Set();
-      for (const projection of projections) {
-        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalizeText(projection)));
-        hashes.add(Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(''));
-      }
-      return { hasTextualContent: normalized.length > 0, hashes };
-    };
     const textById = new Map();
     for (const [id, info] of nodeInfo) {
       const text = info.message ? await textInfo(info.message) : { hasTextualContent: false, hashes: new Set() };
@@ -422,7 +442,7 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       const info = nodeInfo.get(id);
       if (!info?.message) continue;
       result.currentBranchMessageCount += 1;
-      const role = roleFor(info);
+      const role = roleFor(info.message);
       if (role === 'user') result.currentBranchUserCount += 1;
       else if (role === 'assistant') result.currentBranchAssistantCount += 1;
       else if (role === 'system') result.currentBranchSystemCount += 1;

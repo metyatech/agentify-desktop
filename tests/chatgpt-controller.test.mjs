@@ -226,10 +226,16 @@ function createBackendDiagnosticPage({
   contentLength = null,
   fetchError = null,
   fetchDelayMs = 0,
-  mountedDomTurnCount = 0
+  mountedDomTurnCount = 0,
+  streamChunks = null,
+  stallAfterReadIndex = null,
+  omitReader = false
 } = {}) {
   const calls = [];
-  const bytes = new TextEncoder().encode(responseText);
+  const state = { readCount: 0, cancelCount: 0, responseTextCalled: false };
+  const chunks = (streamChunks || [responseText]).map((chunk) => chunk instanceof Uint8Array
+    ? chunk
+    : new TextEncoder().encode(String(chunk)));
   const page = {
     async evaluate(js) {
       const context = {
@@ -253,24 +259,35 @@ function createBackendDiagnosticPage({
               }, { once: true });
             });
           }
-          let consumed = false;
           return {
             ok: status >= 200 && status < 300,
             status,
             headers: { get: (name) => name.toLowerCase() === 'content-type' ? contentType : name.toLowerCase() === 'content-length' ? contentLength : null },
-            body: {
+            body: omitReader ? {} : {
               getReader() {
+                let chunkIndex = 0;
                 return {
                   async read() {
-                    if (consumed) return { done: true, value: undefined };
-                    consumed = true;
-                    return { done: false, value: bytes };
+                    state.readCount += 1;
+                    if (stallAfterReadIndex !== null && chunkIndex >= stallAfterReadIndex) {
+                      await new Promise((resolve, reject) => {
+                        const onAbort = () => {
+                          const error = new Error('aborted');
+                          error.name = 'AbortError';
+                          reject(error);
+                        };
+                        if (options.signal.aborted) onAbort();
+                        else options.signal.addEventListener('abort', onAbort, { once: true });
+                      });
+                    }
+                    if (chunkIndex >= chunks.length) return { done: true, value: undefined };
+                    return { done: false, value: chunks[chunkIndex++] };
                   },
-                  async cancel() {}
+                  async cancel() { state.cancelCount += 1; }
                 };
               }
             },
-            async text() { return responseText; }
+            async text() { state.responseTextCalled = true; return responseText; }
           };
         },
         location: { pathname },
@@ -281,7 +298,7 @@ function createBackendDiagnosticPage({
     },
     async getUrl() { return `https://chatgpt.com${pathname}`; }
   };
-  return { page, calls };
+  return { page, calls, state };
 }
 
 function backendMappingFixture({ currentNode = 'assistant-2', branching = false, brokenParent = false, cycle = false } = {}) {
@@ -6279,6 +6296,63 @@ test('chatgpt-controller: backend diagnostics classify transport, content, and s
   const timedOutResult = await createController(timedOut.page).readConversationBackendDiagnostics({ timeoutMs: 1_000 });
   assert.equal(timedOutResult.fetchTimedOut, true);
   assert.equal(timedOutResult.fetchErrorKind, 'timeout');
+});
+
+test('chatgpt-controller: backend diagnostic timeout covers a stalled response body', async () => {
+  const fixture = createBackendDiagnosticPage({ stallAfterReadIndex: 0 });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics({ timeoutMs: 1_000 });
+  assert.equal(result.attempted, true);
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.httpOk, true);
+  assert.equal(result.fetchTimedOut, true);
+  assert.equal(result.fetchErrorKind, 'timeout');
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.calls[0].options.method, 'GET');
+  assert.equal(fixture.state.readCount, 1);
+  assert.equal(fixture.state.cancelCount, 1);
+  assert.equal(JSON.stringify(result).includes('backend-diagnostic-test'), false);
+});
+
+test('chatgpt-controller: backend diagnostic timeout covers a partial response body stall', async () => {
+  const fixture = createBackendDiagnosticPage({ streamChunks: ['{"mapping":'], stallAfterReadIndex: 1 });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics({ timeoutMs: 1_000 });
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.fetchTimedOut, true);
+  assert.equal(result.fetchErrorKind, 'timeout');
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.readCount, 2);
+  assert.equal(fixture.state.cancelCount, 1);
+});
+
+test('chatgpt-controller: backend diagnostic streaming cap cancels before another read', async () => {
+  const fixture = createBackendDiagnosticPage({
+    streamChunks: [new Uint8Array(20 * 1024 * 1024), new Uint8Array([123])]
+  });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.sizeLimitExceeded, true);
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.readCount, 2);
+  assert.equal(fixture.state.cancelCount, 1);
+});
+
+test('chatgpt-controller: backend diagnostic declared oversize skips the body reader', async () => {
+  const fixture = createBackendDiagnosticPage({ contentLength: String(20 * 1024 * 1024 + 1) });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.sizeLimitExceeded, true);
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.readCount, 0);
+  assert.equal(fixture.state.cancelCount, 0);
+});
+
+test('chatgpt-controller: backend diagnostic fails closed without a bounded stream reader', async () => {
+  const fixture = createBackendDiagnosticPage({ omitReader: true, responseText: '{"mapping":{}}' });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(result.boundedBodyReadSupported, false);
+  assert.equal(result.fetchErrorKind, 'stream-unavailable');
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.responseTextCalled, false);
+  assert.doesNotMatch(JSON.stringify(result), /"mapping"\s*:/u);
 });
 
 test('chatgpt-controller: backend diagnostics expose safe ID mismatch and no raw leakage', async () => {

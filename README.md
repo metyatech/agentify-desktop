@@ -462,9 +462,10 @@ The controller evaluates a page-context `GET` to the current page's
 credentials and no custom authorization header. The response is capped at
 20 MiB before parsing and returns only bounded transport, mapping-graph,
 current-branch, role, text-length, anchor-match-count, and mounted-DOM
-aggregate diagnostics. It never returns conversation text, mapping IDs,
-cookies, tokens, or headers, and it does not alter history proof or traversal
-state.
+aggregate diagnostics. The mounted-DOM count is a content-unit comparison
+convenience only (not a turn count and never a full-history proof). It never
+returns conversation text, mapping IDs, cookies, tokens, or headers, and it
+does not alter history proof or traversal state.
 
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:

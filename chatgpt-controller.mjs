@@ -182,6 +182,7 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       attempted: true, conversationPathRecognized: false, conversationIdPresent: false,
       httpStatus: null, httpOk: false, contentTypeJson: false, fetchTimedOut: false,
       fetchErrorKind: null, responseByteLength: null, sizeLimitExceeded: false,
+      boundedBodyReadSupported: null,
       jsonParsed: false, rootObject: false, mappingPresent: false, mappingObject: false,
       mappingNodeCount: 0, currentNodePresent: false, currentNodeExistsInMapping: false,
       responseConversationIdPresent: false, responseConversationIdMatchesUrl: null,
@@ -212,87 +213,116 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
     if (!result.conversationIdPresent) return result;
 
     const abortController = new AbortController();
-    let timeoutHandle = null;
-    let response;
+    const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
     try {
-      timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
-      response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
-        method: 'GET', credentials: 'include', cache: 'no-store',
-        headers: { Accept: 'application/json' }, signal: abortController.signal
-      });
-    } catch (error) {
-      result.fetchTimedOut = abortController.signal.aborted === true;
-      result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'network';
-      return result;
-    } finally {
-      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
-    }
-    result.httpStatus = Number.isSafeInteger(response?.status) ? response.status : null;
-    result.httpOk = response?.ok === true;
-    let contentType = '';
-    try { contentType = String(response?.headers?.get?.('content-type') || ''); } catch {}
-    result.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
-    if (!result.httpOk) return result;
-
-    const readBoundedText = async () => {
-      let declaredLength = null;
+      let response;
       try {
-        const value = Number(response?.headers?.get?.('content-length'));
-        if (Number.isSafeInteger(value) && value >= 0) declaredLength = value;
-      } catch {}
-      if (declaredLength !== null && declaredLength > maxBytes) return { text: null, byteLength: declaredLength, sizeLimitExceeded: true };
-      const reader = response?.body?.getReader?.();
-      if (!reader) {
-        const text = await response.text();
-        const byteLength = new TextEncoder().encode(text).byteLength;
-        return byteLength > maxBytes ? { text: null, byteLength, sizeLimitExceeded: true } : { text, byteLength, sizeLimitExceeded: false };
+        response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
+          method: 'GET', credentials: 'include', cache: 'no-store',
+          headers: { Accept: 'application/json' }, signal: abortController.signal
+        });
+      } catch (error) {
+        result.fetchTimedOut = abortController.signal.aborted === true;
+        result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'network';
+        return result;
       }
-      const decoder = new TextDecoder();
-      const parts = [];
-      let byteLength = 0;
-      while (true) {
-        const next = await reader.read();
-        if (next.done) break;
-        const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
-        byteLength += chunk.byteLength;
-        if (byteLength > maxBytes) {
-          try { await reader.cancel(); } catch {}
-          return { text: null, byteLength, sizeLimitExceeded: true };
+      result.httpStatus = Number.isSafeInteger(response?.status) ? response.status : null;
+      result.httpOk = response?.ok === true;
+      let contentType = '';
+      try { contentType = String(response?.headers?.get?.('content-type') || ''); } catch {}
+      result.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
+      if (!result.httpOk) return result;
+
+      let activeReader = null;
+      const readBoundedText = async () => {
+        let declaredLength = null;
+        try {
+          const value = Number(response?.headers?.get?.('content-length'));
+          if (Number.isSafeInteger(value) && value >= 0) declaredLength = value;
+        } catch {}
+        if (declaredLength !== null && declaredLength > maxBytes) return { text: null, byteLength: declaredLength, sizeLimitExceeded: true };
+        const reader = response?.body?.getReader?.();
+        if (!reader) return { text: null, byteLength: null, sizeLimitExceeded: false, bodyReadSupported: false };
+        activeReader = reader;
+        result.boundedBodyReadSupported = true;
+        const readWithAbort = async () => {
+          if (abortController.signal.aborted) {
+            const error = new Error('aborted');
+            error.name = 'AbortError';
+            throw error;
+          }
+          let abortHandler;
+          const abortPromise = new Promise((_, reject) => {
+            abortHandler = () => {
+              const error = new Error('aborted');
+              error.name = 'AbortError';
+              reject(error);
+            };
+            abortController.signal.addEventListener('abort', abortHandler, { once: true });
+          });
+          try {
+            return await Promise.race([reader.read(), abortPromise]);
+          } finally {
+            abortController.signal.removeEventListener('abort', abortHandler);
+          }
+        };
+        const decoder = new TextDecoder();
+        const parts = [];
+        let byteLength = 0;
+        while (true) {
+          const next = await readWithAbort();
+          if (next.done) break;
+          const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+          byteLength += chunk.byteLength;
+          if (byteLength > maxBytes) {
+            try { await reader.cancel(); } catch {}
+            return { text: null, byteLength, sizeLimitExceeded: true, bodyReadSupported: true };
+          }
+          parts.push(decoder.decode(chunk, { stream: true }));
         }
-        parts.push(decoder.decode(chunk, { stream: true }));
+        parts.push(decoder.decode());
+        return { text: parts.join(''), byteLength, sizeLimitExceeded: false, bodyReadSupported: true };
+      };
+      let bounded;
+      try { bounded = await readBoundedText(); } catch (error) {
+        try { await activeReader?.cancel(); } catch {}
+        result.fetchTimedOut = abortController.signal.aborted === true;
+        result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'response-read';
+        return result;
       }
-      parts.push(decoder.decode());
-      return { text: parts.join(''), byteLength, sizeLimitExceeded: false };
-    };
-    let bounded;
-    try { bounded = await readBoundedText(); } catch (error) {
-      result.fetchErrorKind = error?.name === 'AbortError' ? 'aborted' : 'response-read';
-      return result;
-    }
-    result.responseByteLength = bounded.byteLength;
-    result.sizeLimitExceeded = bounded.sizeLimitExceeded === true;
-    if (result.sizeLimitExceeded || !result.contentTypeJson || typeof bounded.text !== 'string') return result;
-    let body;
-    try { body = JSON.parse(bounded.text); } catch { return result; }
-    result.jsonParsed = true;
-    result.rootObject = !!body && typeof body === 'object' && !Array.isArray(body);
-    if (!result.rootObject) return result;
+      if (abortController.signal.aborted) {
+        result.fetchTimedOut = true;
+        result.fetchErrorKind = 'timeout';
+        return result;
+      }
+      result.boundedBodyReadSupported = bounded.bodyReadSupported === false ? false : result.boundedBodyReadSupported;
+      result.responseByteLength = bounded.byteLength;
+      result.sizeLimitExceeded = bounded.sizeLimitExceeded === true;
+      if (result.sizeLimitExceeded || !result.contentTypeJson || typeof bounded.text !== 'string') {
+        if (bounded.bodyReadSupported === false) result.fetchErrorKind = 'stream-unavailable';
+        return result;
+      }
+      let body;
+      try { body = JSON.parse(bounded.text); } catch { return result; }
+      result.jsonParsed = true;
+      result.rootObject = !!body && typeof body === 'object' && !Array.isArray(body);
+      if (!result.rootObject) return result;
 
-    const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
-    const mapping = body.mapping;
-    result.mappingPresent = hasOwn(body, 'mapping');
-    result.mappingObject = !!mapping && typeof mapping === 'object' && !Array.isArray(mapping);
-    result.currentNodePresent = typeof body.current_node === 'string' && body.current_node.length > 0;
-    result.responseConversationIdPresent = typeof body.conversation_id === 'string' && body.conversation_id.length > 0;
-    result.responseConversationIdMatchesUrl = result.responseConversationIdPresent ? body.conversation_id === conversationId : null;
-    if (!result.mappingObject) return result;
+      const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+      const mapping = body.mapping;
+      result.mappingPresent = hasOwn(body, 'mapping');
+      result.mappingObject = !!mapping && typeof mapping === 'object' && !Array.isArray(mapping);
+      result.currentNodePresent = typeof body.current_node === 'string' && body.current_node.length > 0;
+      result.responseConversationIdPresent = typeof body.conversation_id === 'string' && body.conversation_id.length > 0;
+      result.responseConversationIdMatchesUrl = result.responseConversationIdPresent ? body.conversation_id === conversationId : null;
+      if (!result.mappingObject) return result;
 
-    const ids = Object.keys(mapping);
-    const idSet = new Set(ids);
-    result.mappingNodeCount = ids.length;
-    result.currentNodeExistsInMapping = result.currentNodePresent && idSet.has(body.current_node);
-    const nodeInfo = new Map();
-    let reciprocal = true;
+      const ids = Object.keys(mapping);
+      const idSet = new Set(ids);
+      result.mappingNodeCount = ids.length;
+      result.currentNodeExistsInMapping = result.currentNodePresent && idSet.has(body.current_node);
+      const nodeInfo = new Map();
+      let reciprocal = true;
     for (const id of ids) {
       const node = mapping[id];
       const objectNode = !!node && typeof node === 'object' && !Array.isArray(node);
@@ -410,6 +440,9 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
     result.backendBranchAtLeastAsLargeAsMountedDom = result.currentBranchResolved
       ? result.currentBranchMessageCount >= result.mountedDomTurnCount : null;
     return result;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   })()`;
 }
 

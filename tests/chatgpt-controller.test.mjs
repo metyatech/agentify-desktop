@@ -4209,6 +4209,51 @@ test('chatgpt-controller: a second bounded older retry restores a persistent new
   assert.equal(JSON.stringify(probe).includes('provider-secret'), false);
 });
 
+test('chatgpt-controller: corrective retry fails closed immediately when the global iteration budget is reached', async () => {
+  const candidate = Array.from({ length: 13 }, (_, index) => index);
+  const newer = Array.from({ length: 10 }, (_, index) => index + 4);
+  const newerAgain = Array.from({ length: 10 }, (_, index) => index + 6);
+  let probeArmed = false;
+  let recoilInjected = false;
+  let correctiveWheelCalls = 0;
+  const harness = createNativeWheelHistoryPage({
+    initialWindow: 2,
+    windowRanges: [candidate, newer, newerAgain],
+    positionHints: false,
+    currentDom: true,
+    virtualizerTopOffsetPx: 0,
+    turnIdentityPlan: currentDomUnitIdentity,
+    mouseWheelPlan: ({ deltaY, windowIndex }) => {
+      if (deltaY < 0 && windowIndex === 0) probeArmed = true;
+      if (probeArmed && recoilInjected && deltaY < 0 && windowIndex === 1) {
+        correctiveWheelCalls += 1;
+        return { windowIndex: 2, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+      }
+      return null;
+    },
+    restorePlan: () => ({ windowIndex: 2 }),
+    virtualizerTopOffsetPlan: ({ readCount, traversalRead }) => {
+      if (traversalRead || !probeArmed || recoilInjected || readCount < 18) return null;
+      recoilInjected = true;
+      return { windowIndex: 1, scrollTop: 0, virtualizerTopOffsetPx: 0 };
+    }
+  });
+  const result = await createController(harness.page).readConversationTurns({
+    maxTurns: 50, maxCharsPerTurn: 1000, maxTotalChars: 20_000,
+    historyMode: 'complete', historyTimeoutMs: 20_000, historyMaxIterations: 5
+  });
+  const probe = result.history.diagnostics.virtualizedOriginProbe;
+  assert.equal(result.history.startReached, false);
+  assert.equal(result.history.reason, 'history-iteration-limit');
+  assert.equal(probe.verified, false);
+  assert.equal(probe.lastFailureStage, 'probe-budget-exhausted');
+  assert.equal(probe.lastFailureReason, 'iteration-limit');
+  assert.equal(correctiveWheelCalls, 1);
+  assert.equal(probe.identityCorrectiveRestoreAttemptCount, 1);
+  assert.equal(probe.identityCorrectiveRestoreWheelCount, 1);
+  assert.equal(probe.stablePasses, 1);
+});
+
 test('chatgpt-controller: the third bounded older retry can restore the original candidate without a fourth wheel', async () => {
   const candidate = Array.from({ length: 13 }, (_, index) => index);
   const newerA = Array.from({ length: 10 }, (_, index) => index + 4);

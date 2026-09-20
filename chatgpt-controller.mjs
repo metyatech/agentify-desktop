@@ -5396,10 +5396,12 @@ export class ChatGPTController {
             return { kind: 'budget-exhausted', state: recoilState };
           }
           if (historyBudgetExpired()) {
-            return failProbe('probe-budget-exhausted', 'history-budget-expired', 'timeout');
+            failProbe('probe-budget-exhausted', 'history-budget-expired', 'timeout');
+            return { kind: 'failed' };
           }
           if (iterations >= historyMaxIterations) {
-            return failProbe('probe-budget-exhausted', 'iteration-limit', 'history-iteration-limit');
+            failProbe('probe-budget-exhausted', 'iteration-limit', 'history-iteration-limit');
+            return { kind: 'failed' };
           }
           correctiveRestoreRetriesThisEpisode += 1;
           probe.identityCorrectiveRestoreAttemptCount += 1;

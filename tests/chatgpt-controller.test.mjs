@@ -28,6 +28,7 @@ import {
 } from '../chatgpt-controller.mjs';
 import { createDraftLease, describeAttachmentFiles, DraftOwnershipStore, textDigest } from '../chatgpt-draft-ownership.mjs';
 import { classifyProposalResponse, parseValidateProposalResponse } from '../autopilot-proposal.mjs';
+import { validateAndSanitizeBackendHistoryDiagnostics } from '../http-api.mjs';
 
 const selectors = {
   promptTextarea: '#prompt-textarea',
@@ -6905,6 +6906,79 @@ test('chatgpt-controller: backend history visibility diagnostics compares adjace
   assert.equal(result.groupedModels.TEXT_ONLY_NL.noMerge.orderedExactMatchCount, 2);
   assert.equal(result.groupedModels.TEXT_ONLY_NL.assistantMergeNewline.orderedExactMatchCount, 2);
   assert.equal(result.groupedModels.TEXT_ONLY_NL.assistantMergeBlankline.orderedExactMatchCount, 1);
+});
+
+test('chatgpt-controller: actual visibility diagnostics satisfy the server grouped schema with and without anchors', async () => {
+  const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  const turns = [
+    { role: 'assistant', text: 'review response' },
+    { role: 'user', text: 'answer' }
+  ];
+  const probe = {
+    reviewResponseIndex: 0,
+    reviewResponseDigest: digest(turns[0].text),
+    selectedUserTurns: [{ index: 1, digest: digest(JSON.stringify({ index: 1, role: 'user', text: turns[1].text })) }],
+    answerFirstIndex: 1,
+    answerLastIndex: 1,
+    answerLatestTurnDigest: digest(JSON.stringify({ index: 1, role: 'user', text: turns[1].text })),
+    answerTranscriptSha256: digest(JSON.stringify([{ index: 1, role: 'user', text: turns[1].text }]))
+  };
+  const expectedGroupKeys = [
+    'backendTurnCount',
+    'domGroupedTurnCount',
+    'orderedExactMatchCount',
+    'exactCommonSuffixLength',
+    'domUnmatchedCount',
+    'backendUnmatchedCount'
+  ].sort();
+
+  for (const legacyAnchorProbe of [undefined, probe]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{
+        responseText: JSON.stringify({
+          messages: turns.map((turn, index) => ({
+            id: `grouped-schema-${index}`,
+            author: { role: turn.role },
+            content: { content_type: 'text', parts: [turn.text] }
+          })),
+          page_info: { has_previous_page: false }
+        })
+      }]
+    });
+    const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ legacyAnchorProbe });
+    assert.deepEqual(Object.keys(result).sort(), [
+      'attempted',
+      'backend',
+      'backendBuckets',
+      'dom',
+      'exclusionCounts',
+      'groupedModels',
+      'models'
+    ]);
+    for (const model of Object.values(result.models)) {
+      assert.equal(Object.prototype.hasOwnProperty.call(model, 'legacyAnchorProbe'), Boolean(legacyAnchorProbe));
+    }
+    assert.deepEqual(Object.keys(result.backend).sort(), ['complete', 'pageCount', 'terminalOldestReached', 'totalBackendMessageCount'].sort());
+    assert.deepEqual(Object.keys(result.dom).sort(), ['groupedTurnCountBlankline', 'groupedTurnCountNewline', 'multiUnitGroupCount', 'tailTurnCount'].sort());
+    assert.deepEqual(Object.keys(result.exclusionCounts).sort(), ['aggregateResult', 'command', 'isCompleteFalse', 'recipientNonAll', 'toolCall', 'toolCalls', 'visuallyHidden'].sort());
+    for (const bucketCounts of Object.values(result.backendBuckets)) {
+      assert.deepEqual(Object.keys(bucketCounts).sort(), ['code', 'missing', 'multimodal_text', 'other_known_nonvisible', 'text', 'thought_or_reasoning', 'tool_or_execution', 'unknown', 'user_editable_context'].sort());
+    }
+    for (const model of Object.values(result.groupedModels)) {
+      for (const group of Object.values(model)) {
+        assert.deepEqual(Object.keys(group).sort(), expectedGroupKeys);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'backendCandidateTurnCount'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'extraBackendUserCount'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'extraBackendAssistantCount'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'extraDomUserCount'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'extraDomAssistantCount'), false);
+        assert.equal(Object.prototype.hasOwnProperty.call(group, 'legacyAnchorProbe'), false);
+      }
+    }
+    const serializedProducerResult = JSON.parse(JSON.stringify(result));
+    const sanitized = validateAndSanitizeBackendHistoryDiagnostics(serializedProducerResult);
+    assert.deepEqual(sanitized, serializedProducerResult);
+  }
 });
 
 test('chatgpt-controller: backend history visibility diagnostics follows bounded older pages once and fails closed on cursor cycles', async () => {

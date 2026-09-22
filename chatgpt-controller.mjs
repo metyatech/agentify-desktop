@@ -977,6 +977,17 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         const orderedExactMatchCount = lcs(backend, domTurns);
         return { backendCandidateTurnCount: backend.length, exactCommonSuffixLength: suffix(backend, domTurns), orderedExactMatchCount, domUnmatchedCount: domTurns.length - orderedExactMatchCount, backendUnmatchedCount: backend.length - orderedExactMatchCount, extraBackendUserCount: roleCounts(backend.filter((turn) => !domTurns.some((dom) => key(dom) === key(turn))), 'user'), extraBackendAssistantCount: roleCounts(backend.filter((turn) => !domTurns.some((dom) => key(dom) === key(turn))), 'assistant'), extraDomUserCount: roleCounts(domTurns.filter((turn) => !backend.some((item) => key(item) === key(turn))), 'user'), extraDomAssistantCount: roleCounts(domTurns.filter((turn) => !backend.some((item) => key(item) === key(turn))), 'assistant') };
       };
+      const groupedAlignment = (backendTurns, domTurns) => {
+        const base = alignment(backendTurns, domTurns);
+        return {
+          backendTurnCount: backendTurns.length,
+          domGroupedTurnCount: domTurns.length,
+          orderedExactMatchCount: base.orderedExactMatchCount,
+          exactCommonSuffixLength: base.exactCommonSuffixLength,
+          domUnmatchedCount: base.domUnmatchedCount,
+          backendUnmatchedCount: base.backendUnmatchedCount
+        };
+      };
       const digest = async (value) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value)))), (byte) => byte.toString(16).padStart(2, '0')).join('');
       const anchorCheck = async (turns) => {
         if (!anchorProbe) return undefined;
@@ -1013,7 +1024,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         const turns = allModelTurns(model).map((turn, index) => ({ ...turn, index }));
         result.models[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}) };
         const merge = (separator) => { const merged = []; for (const turn of turns) { const previous = merged.at(-1); if (previous && previous.role === 'assistant' && turn.role === 'assistant') previous.text = normalizeText(previous.text + separator + turn.text); else merged.push({ ...turn }); } return merged; };
-        result.groupedModels[model] = { noMerge: { ...alignment(turns, domGroupedNl), backendTurnCount: turns.length, domGroupedTurnCount: domGroupedNl.length }, assistantMergeNewline: { ...alignment(merge('\n'), domGroupedNl), backendTurnCount: merge('\n').length, domGroupedTurnCount: domGroupedNl.length }, assistantMergeBlankline: { ...alignment(merge('\n\n'), domGroupedBlank), backendTurnCount: merge('\n\n').length, domGroupedTurnCount: domGroupedBlank.length } };
+        result.groupedModels[model] = { noMerge: groupedAlignment(turns, domGroupedNl), assistantMergeNewline: groupedAlignment(merge('\n'), domGroupedNl), assistantMergeBlankline: groupedAlignment(merge('\n\n'), domGroupedBlank) };
       }
       result.backend.complete = hasPreviousPage === false;
       result.backend.pageCount = pageCount;

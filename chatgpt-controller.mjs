@@ -170,6 +170,7 @@ function nativeInputErrorDetails(error) {
 }
 
 function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
+  const sessionMaxBytes = 64 * 1024;
   const anchorHashes = JSON.stringify([
     '70a3a2301fc3acb64bdf29e79ee6a7fe15b81ebdfcd8ab3567d9c68387b7253a',
     'a6fb7a19f6274b7f51cf2407a1f39cb412b478b33d34820eb6331acc55de24ad'
@@ -203,7 +204,10 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       backendBranchAtLeastAsLargeAsMountedDom: null,
       mountedDurableIdentityMatchCount: null, mountedDurableIdentityUnmatchedCount: null
     };
-    const pathMatch = /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || ''));
+    const pageOrigin = String(location?.origin || '');
+    const pathMatch = pageOrigin === 'https://chatgpt.com'
+      ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || ''))
+      : null;
     result.conversationPathRecognized = !!pathMatch;
     let conversationId = null;
     if (pathMatch) {
@@ -214,38 +218,17 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
 
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+    let accessToken = null;
     try {
-      let response;
-      try {
-        response = await fetch('/backend-api/conversations/' + encodeURIComponent(conversationId)
-          + '?include_has_versions=true&num_turns=100', {
-          method: 'GET', credentials: 'include', cache: 'no-store',
-          headers: { Accept: 'application/json' }, signal: abortController.signal
-        });
-      } catch (error) {
-        result.fetchTimedOut = abortController.signal.aborted === true;
-        result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'network';
-        return result;
-      }
-      result.httpStatus = Number.isSafeInteger(response?.status) ? response.status : null;
-      result.httpOk = response?.ok === true;
-      let contentType = '';
-      try { contentType = String(response?.headers?.get?.('content-type') || ''); } catch {}
-      result.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
-      if (!result.httpOk) return result;
-
-      let activeReader = null;
-      const readBoundedText = async () => {
+      const readBoundedText = async (response, limit) => {
         let declaredLength = null;
         try {
           const value = Number(response?.headers?.get?.('content-length'));
           if (Number.isSafeInteger(value) && value >= 0) declaredLength = value;
         } catch {}
-        if (declaredLength !== null && declaredLength > maxBytes) return { text: null, byteLength: declaredLength, sizeLimitExceeded: true };
+        if (declaredLength !== null && declaredLength > limit) return { text: null, byteLength: declaredLength, sizeLimitExceeded: true, bodyReadSupported: null };
         const reader = response?.body?.getReader?.();
         if (!reader) return { text: null, byteLength: null, sizeLimitExceeded: false, bodyReadSupported: false };
-        activeReader = reader;
-        result.boundedBodyReadSupported = true;
         const readWithAbort = async () => {
           if (abortController.signal.aborted) {
             const error = new Error('aborted');
@@ -270,41 +253,105 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
         const decoder = new TextDecoder();
         const parts = [];
         let byteLength = 0;
-        while (true) {
-          const next = await readWithAbort();
-          if (next.done) break;
-          const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
-          byteLength += chunk.byteLength;
-          if (byteLength > maxBytes) {
-            try { await reader.cancel(); } catch {}
-            return { text: null, byteLength, sizeLimitExceeded: true, bodyReadSupported: true };
+        try {
+          while (true) {
+            const next = await readWithAbort();
+            if (next.done) break;
+            const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+            byteLength += chunk.byteLength;
+            if (byteLength > limit) {
+              try { await reader.cancel(); } catch {}
+              return { text: null, byteLength, sizeLimitExceeded: true, bodyReadSupported: true };
+            }
+            parts.push(decoder.decode(chunk, { stream: true }));
           }
-          parts.push(decoder.decode(chunk, { stream: true }));
+          parts.push(decoder.decode());
+          return { text: parts.join(''), byteLength, sizeLimitExceeded: false, bodyReadSupported: true };
+        } catch (error) {
+          try { await reader.cancel(); } catch {}
+          throw error;
         }
-        parts.push(decoder.decode());
-        return { text: parts.join(''), byteLength, sizeLimitExceeded: false, bodyReadSupported: true };
       };
-      let bounded;
-      try { bounded = await readBoundedText(); } catch (error) {
-        try { await activeReader?.cancel(); } catch {}
-        result.fetchTimedOut = abortController.signal.aborted === true;
-        result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'response-read';
-        return result;
-      }
-      if (abortController.signal.aborted) {
-        result.fetchTimedOut = true;
-        result.fetchErrorKind = 'timeout';
-        return result;
-      }
-      result.boundedBodyReadSupported = bounded.bodyReadSupported === false ? false : result.boundedBodyReadSupported;
-      result.responseByteLength = bounded.byteLength;
-      result.sizeLimitExceeded = bounded.sizeLimitExceeded === true;
-      if (result.sizeLimitExceeded || !result.contentTypeJson || typeof bounded.text !== 'string') {
+      const applyResponseHeaders = (response) => {
+        result.httpStatus = Number.isSafeInteger(response?.status) ? response.status : null;
+        result.httpOk = response?.ok === true;
+        let contentType = '';
+        try { contentType = String(response?.headers?.get?.('content-type') || ''); } catch {}
+        result.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
+      };
+      const applyResponseTransport = (response, bounded) => {
+        applyResponseHeaders(response);
+        result.boundedBodyReadSupported = bounded.bodyReadSupported === false ? false : result.boundedBodyReadSupported;
+        result.responseByteLength = bounded.byteLength;
+        result.sizeLimitExceeded = bounded.sizeLimitExceeded === true;
         if (bounded.bodyReadSupported === false) result.fetchErrorKind = 'stream-unavailable';
+      };
+      const readResponseBody = async (response, limit) => {
+        let bounded;
+        try { bounded = await readBoundedText(response, limit); } catch (error) {
+          result.fetchTimedOut = abortController.signal.aborted === true;
+          result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'response-read';
+          return null;
+        }
+        if (abortController.signal.aborted) {
+          result.fetchTimedOut = true;
+          result.fetchErrorKind = 'timeout';
+          return null;
+        }
+        applyResponseTransport(response, bounded);
+        return bounded;
+      };
+      const fetchResponse = async (url, options) => {
+        try { return await fetch(url, options); } catch (error) {
+          result.fetchTimedOut = abortController.signal.aborted === true;
+          result.fetchErrorKind = result.fetchTimedOut ? 'timeout' : error?.name === 'AbortError' ? 'aborted' : 'network';
+          return null;
+        }
+      };
+
+      const sessionResponse = await fetchResponse('/api/auth/session', {
+        method: 'GET', redirect: 'error', credentials: 'include', cache: 'no-store',
+        headers: { Accept: 'application/json' }, signal: abortController.signal
+      });
+      if (sessionResponse) applyResponseHeaders(sessionResponse);
+      if (!sessionResponse || !sessionResponse.ok) return result;
+      const sessionBounded = await readResponseBody(sessionResponse, ${JSON.stringify(sessionMaxBytes)});
+      if (!sessionBounded || result.sizeLimitExceeded || !result.contentTypeJson || typeof sessionBounded.text !== 'string') return result;
+      let sessionBody;
+      try { sessionBody = JSON.parse(sessionBounded.text); } catch { return result; }
+      result.jsonParsed = true;
+      result.rootObject = !!sessionBody && typeof sessionBody === 'object' && !Array.isArray(sessionBody);
+      if (!result.rootObject || typeof sessionBody.accessToken !== 'string' || sessionBody.accessToken.trim().length === 0 || sessionBody.accessToken.length > 16 * 1024) return result;
+      accessToken = sessionBody.accessToken;
+      sessionBody = null;
+
+      result.httpStatus = null;
+      result.httpOk = false;
+      result.contentTypeJson = false;
+      result.fetchTimedOut = false;
+      result.fetchErrorKind = null;
+      result.responseByteLength = null;
+      result.sizeLimitExceeded = false;
+      result.boundedBodyReadSupported = null;
+      result.jsonParsed = false;
+      result.rootObject = false;
+
+      const backendResponse = await fetchResponse('/backend-api/conversations/' + encodeURIComponent(conversationId)
+        + '?include_has_versions=true&num_turns=100', {
+        method: 'GET', redirect: 'error', credentials: 'include', cache: 'no-store',
+        headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken }, signal: abortController.signal
+      });
+      accessToken = null;
+      if (backendResponse) applyResponseHeaders(backendResponse);
+      if (!backendResponse || !backendResponse.ok) return result;
+      const bounded = await readResponseBody(backendResponse, maxBytes);
+      if (!bounded || result.sizeLimitExceeded || !result.contentTypeJson || typeof bounded.text !== 'string') return result;
+      let body;
+      try { body = JSON.parse(bounded.text); } catch {
+        result.jsonParsed = false;
+        result.rootObject = false;
         return result;
       }
-      let body;
-      try { body = JSON.parse(bounded.text); } catch { return result; }
       result.jsonParsed = true;
       result.rootObject = !!body && typeof body === 'object' && !Array.isArray(body);
       if (!result.rootObject) return result;
@@ -461,6 +508,7 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
       ? result.currentBranchMessageCount >= result.mountedDomTurnCount : null;
     return result;
     } finally {
+      accessToken = null;
       clearTimeout(timeoutHandle);
     }
   })()`;

@@ -220,21 +220,35 @@ function createController(page, options = {}) {
 function createBackendDiagnosticPage({
   pathname = '/c/backend-diagnostic-test',
   body = null,
+  sessionBody = { accessToken: 'session-access-token-sentinel' },
   status = 200,
+  sessionStatus = 200,
   contentType = 'application/json',
+  sessionContentType = 'application/json',
   responseText = body === null ? '{}' : JSON.stringify(body),
+  sessionResponseText = sessionBody === null ? '{}' : JSON.stringify(sessionBody),
   contentLength = null,
+  sessionContentLength = null,
   fetchError = null,
+  sessionFetchError = null,
   fetchDelayMs = 0,
+  sessionFetchDelayMs = 0,
   mountedDomTurnCount = 0,
   streamChunks = null,
+  sessionStreamChunks = null,
   stallAfterReadIndex = null,
+  sessionStallAfterReadIndex = null,
   omitReader = false,
+  sessionOmitReader = false,
   digestOverrides = {}
 } = {}) {
   const calls = [];
-  const state = { readCount: 0, cancelCount: 0, responseTextCalled: false };
+  const allCalls = [];
+  const state = { readCount: 0, sessionReadCount: 0, cancelCount: 0, sessionCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false };
   const chunks = (streamChunks || [responseText]).map((chunk) => chunk instanceof Uint8Array
+    ? chunk
+    : new TextEncoder().encode(String(chunk)));
+  const sessionChunks = (sessionStreamChunks || [sessionResponseText]).map((chunk) => chunk instanceof Uint8Array
     ? chunk
     : new TextEncoder().encode(String(chunk)));
   const page = {
@@ -256,11 +270,23 @@ function createBackendDiagnosticPage({
         },
         document: { querySelectorAll: () => Array.from({ length: mountedDomTurnCount }, () => ({})) },
         fetch: async (url, options) => {
-          calls.push({ url, options });
-          if (fetchError) throw fetchError;
-          if (fetchDelayMs > 0) {
+          const isSession = String(url) === '/api/auth/session';
+          const call = { url, options };
+          allCalls.push(call);
+          if (!isSession) calls.push(call);
+          const responseStatus = isSession ? sessionStatus : status;
+          const responseContentType = isSession ? sessionContentType : contentType;
+          const responseTextValue = isSession ? sessionResponseText : responseText;
+          const responseContentLength = isSession ? sessionContentLength : contentLength;
+          const responseChunks = isSession ? sessionChunks : chunks;
+          const responseFetchError = isSession ? sessionFetchError : fetchError;
+          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : fetchDelayMs;
+          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : stallAfterReadIndex;
+          const responseOmitReader = isSession ? sessionOmitReader : omitReader;
+          if (responseFetchError) throw responseFetchError;
+          if (responseFetchDelayMs > 0) {
             await new Promise((resolve, reject) => {
-              const handle = setTimeout(resolve, fetchDelayMs);
+              const handle = setTimeout(resolve, responseFetchDelayMs);
               options.signal.addEventListener('abort', () => {
                 clearTimeout(handle);
                 const error = new Error('aborted');
@@ -270,16 +296,17 @@ function createBackendDiagnosticPage({
             });
           }
           return {
-            ok: status >= 200 && status < 300,
-            status,
-            headers: { get: (name) => name.toLowerCase() === 'content-type' ? contentType : name.toLowerCase() === 'content-length' ? contentLength : null },
-            body: omitReader ? {} : {
-              getReader() {
+            ok: responseStatus >= 200 && responseStatus < 300,
+            status: responseStatus,
+            headers: { get: (name) => name.toLowerCase() === 'content-type' ? responseContentType : name.toLowerCase() === 'content-length' ? responseContentLength : null },
+            body: responseOmitReader ? {} : {
+                getReader() {
                 let chunkIndex = 0;
                 return {
                   async read() {
-                    state.readCount += 1;
-                    if (stallAfterReadIndex !== null && chunkIndex >= stallAfterReadIndex) {
+                    if (isSession) state.sessionReadCount += 1;
+                    else state.readCount += 1;
+                    if (responseStallAfterReadIndex !== null && chunkIndex >= responseStallAfterReadIndex) {
                       await new Promise((resolve, reject) => {
                         const onAbort = () => {
                           const error = new Error('aborted');
@@ -290,17 +317,17 @@ function createBackendDiagnosticPage({
                         else options.signal.addEventListener('abort', onAbort, { once: true });
                       });
                     }
-                    if (chunkIndex >= chunks.length) return { done: true, value: undefined };
-                    return { done: false, value: chunks[chunkIndex++] };
+                    if (chunkIndex >= responseChunks.length) return { done: true, value: undefined };
+                    return { done: false, value: responseChunks[chunkIndex++] };
                   },
-                  async cancel() { state.cancelCount += 1; }
+                  async cancel() { if (isSession) state.sessionCancelCount += 1; else state.cancelCount += 1; }
                 };
               }
             },
-            async text() { state.responseTextCalled = true; return responseText; }
+            async text() { if (isSession) state.sessionResponseTextCalled = true; else state.responseTextCalled = true; return responseTextValue; }
           };
         },
-        location: { pathname },
+        location: { origin: 'https://chatgpt.com', pathname },
         setTimeout,
         clearTimeout
       };
@@ -308,7 +335,7 @@ function createBackendDiagnosticPage({
     },
     async getUrl() { return `https://chatgpt.com${pathname}`; }
   };
-  return { page, calls, state };
+  return { page, calls, allCalls, state };
 }
 
 function backendMappingFixture({ currentNode = 'assistant-2', branching = false, brokenParent = false, cycle = false } = {}) {
@@ -6222,6 +6249,117 @@ test('chatgpt-controller: bounded origin probe diagnostics follow the last valid
   assert.equal(probe.persistentTurnShells.lastMountedShellIndex, 15);
 });
 
+test('chatgpt-controller: backend diagnostics authenticate through one bounded session request before the backend page', async () => {
+  const token = 'session-token-secret-sentinel';
+  const fixture = createBackendDiagnosticPage({
+    sessionBody: { accessToken: token, user: { email: 'account-secret-sentinel' } },
+    body: {
+      conversation_id: 'backend-diagnostic-test',
+      messages: [{ author: { role: 'assistant' }, content: { parts: ['backend-text-secret-sentinel'] } }],
+      page_info: { next_cursor: 'cursor-secret-sentinel' }
+    }
+  });
+
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(fixture.allCalls.length, 2);
+  const sessionCall = fixture.allCalls[0];
+  const backendCall = fixture.allCalls[1];
+  assert.equal(sessionCall.url, '/api/auth/session');
+  assert.equal(sessionCall.options.method, 'GET');
+  assert.equal(sessionCall.options.credentials, 'include');
+  assert.equal(sessionCall.options.cache, 'no-store');
+  assert.equal(sessionCall.options.headers.Accept, 'application/json');
+  assert.equal(sessionCall.options.headers.Authorization, undefined);
+
+  const backendUrl = new URL(backendCall.url, 'https://chatgpt.com');
+  assert.equal(backendUrl.pathname, '/backend-api/conversations/backend-diagnostic-test');
+  assert.equal(backendUrl.searchParams.get('include_has_versions'), 'true');
+  assert.equal(backendUrl.searchParams.get('num_turns'), '100');
+  assert.equal(backendUrl.searchParams.has('before'), false);
+  assert.equal(backendCall.options.method, 'GET');
+  assert.equal(backendCall.options.credentials, 'include');
+  assert.equal(backendCall.options.cache, 'no-store');
+  assert.equal(backendCall.options.headers.Accept, 'application/json');
+  assert.equal(backendCall.options.headers.Authorization, `Bearer ${token}`);
+  assert.equal(result.httpOk, true);
+  assert.equal(result.jsonParsed, true);
+  assert.equal(result.mappingPresent, false);
+  assert.equal(result.currentBranchResolved, false);
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /session-token-secret-sentinel|account-secret-sentinel|backend-text-secret-sentinel|cursor-secret-sentinel/u);
+});
+
+test('chatgpt-controller: backend diagnostics fail closed before backend fetch for session failures', async () => {
+  const cases = [
+    { name: '401', options: { sessionStatus: 401 }, expectedStatus: 401 },
+    { name: '403', options: { sessionStatus: 403 }, expectedStatus: 403 },
+    { name: 'non-json', options: { sessionContentType: 'text/html', sessionResponseText: '<html>session-secret</html>' }, expectedContentType: false },
+    { name: 'missing-token', options: { sessionBody: { user: { id: 'account-secret' } } }, expectedRoot: true },
+    { name: 'blank-token', options: { sessionBody: { accessToken: '   ' } }, expectedRoot: true },
+    { name: 'oversized', options: { sessionContentLength: String(64 * 1024 + 1) }, expectedOversize: true },
+    { name: 'network', options: { sessionFetchError: Object.assign(new Error('session-network-secret'), { name: 'TypeError' }) }, expectedError: 'network' }
+  ];
+  for (const item of cases) {
+    const fixture = createBackendDiagnosticPage(item.options);
+    const result = await createController(fixture.page).readConversationBackendDiagnostics();
+    assert.equal(fixture.allCalls.length, 1, `${item.name}: ${fixture.allCalls.map((call) => String(call.url)).join('|')}`);
+    assert.equal(fixture.calls.length, 0, item.name);
+    if (item.expectedStatus !== undefined) assert.equal(result.httpStatus, item.expectedStatus, item.name);
+    if (item.expectedContentType !== undefined) assert.equal(result.contentTypeJson, item.expectedContentType, item.name);
+    if (item.expectedRoot !== undefined) assert.equal(result.rootObject, item.expectedRoot, item.name);
+    if (item.expectedOversize) assert.equal(result.sizeLimitExceeded, true, item.name);
+    if (item.expectedError) assert.equal(result.fetchErrorKind, item.expectedError, item.name);
+    assert.equal(result.jsonParsed && result.mappingNodeCount > 0, false, item.name);
+    assert.doesNotMatch(JSON.stringify(result), /session-network-secret|session-secret|account-secret/u, item.name);
+  }
+});
+
+test('chatgpt-controller: backend diagnostics session body timeout is bounded and does not reach backend', async () => {
+  const fixture = createBackendDiagnosticPage({ sessionStallAfterReadIndex: 0 });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics({ timeoutMs: 1_000 });
+  assert.equal(fixture.allCalls.length, 1, fixture.allCalls.map((call) => String(call.url)).join('|'));
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.fetchTimedOut, true);
+  assert.equal(result.fetchErrorKind, 'timeout');
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.sessionReadCount, 1);
+  assert.equal(fixture.state.sessionCancelCount, 1);
+});
+
+test('chatgpt-controller: backend diagnostics session cap cancels before parsing or backend fetch', async () => {
+  const fixture = createBackendDiagnosticPage({ sessionStreamChunks: [new Uint8Array(64 * 1024), new Uint8Array([123])] });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.equal(fixture.allCalls.length, 1, fixture.allCalls.map((call) => String(call.url)).join('|'));
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(result.sizeLimitExceeded, true);
+  assert.equal(result.jsonParsed, false);
+  assert.equal(fixture.state.sessionReadCount, 2);
+  assert.equal(fixture.state.sessionCancelCount, 1);
+});
+
+test('chatgpt-controller: backend diagnostics retain the existing schema after session authentication', async () => {
+  const fixture = createBackendDiagnosticPage({ body: backendMappingFixture() });
+  const result = await createController(fixture.page).readConversationBackendDiagnostics();
+  assert.deepEqual(Object.keys(result).sort(), [
+    'attempted', 'conversationPathRecognized', 'conversationIdPresent', 'httpStatus', 'httpOk', 'contentTypeJson',
+    'fetchTimedOut', 'fetchErrorKind', 'responseByteLength', 'sizeLimitExceeded', 'boundedBodyReadSupported',
+    'jsonParsed', 'rootObject', 'mappingPresent', 'mappingObject', 'mappingNodeCount', 'currentNodePresent',
+    'currentNodeExistsInMapping', 'responseConversationIdPresent', 'responseConversationIdMatchesUrl',
+    'nodesWithMessageCount', 'nodesWithoutMessageCount', 'rootNodeCount', 'leafNodeCount', 'parentReferenceCount',
+    'missingParentReferenceCount', 'childReferenceCount', 'missingChildReferenceCount', 'selfParentCount',
+    'selfChildCount', 'duplicateChildReferenceCount', 'mappingGraphStructurallyValid', 'cycleDetected',
+    'userMessageCount', 'assistantMessageCount', 'systemMessageCount', 'toolMessageCount', 'otherRoleMessageCount',
+    'currentBranchResolved', 'currentBranchNodeCount', 'currentBranchMessageCount', 'currentBranchUserCount',
+    'currentBranchAssistantCount', 'currentBranchSystemCount', 'currentBranchToolCount', 'currentBranchRootReached',
+    'currentBranchCycleDetected', 'currentBranchBrokenParent', 'messagesWithTextualContentCount',
+    'messagesWithoutTextualContentCount', 'currentBranchMessagesWithTextCount', 'backendAnchor1ExactMatchCount',
+    'backendAnchor2ExactMatchCount', 'currentBranchAnchor1ExactMatchCount', 'currentBranchAnchor2ExactMatchCount',
+    'mountedDomTurnCount', 'backendCurrentBranchMessageCount', 'backendBranchAtLeastAsLargeAsMountedDom',
+    'mountedDurableIdentityMatchCount', 'mountedDurableIdentityUnmatchedCount'
+  ].sort());
+});
+
 test('chatgpt-controller: backend diagnostics validate a full mapping and current branch', async () => {
   const fixture = createBackendDiagnosticPage({ body: backendMappingFixture({ branching: true, currentNode: 'assistant-branch' }), mountedDomTurnCount: 2 });
   const result = await createController(fixture.page).readConversationBackendDiagnostics();
@@ -6249,7 +6387,7 @@ test('chatgpt-controller: backend diagnostics validate a full mapping and curren
   assert.equal(fixture.calls[0].options.credentials, 'include');
   assert.equal(fixture.calls[0].options.cache, 'no-store');
   assert.equal(fixture.calls[0].options.headers.Accept, 'application/json');
-  assert.equal(fixture.calls[0].options.headers.Authorization, undefined);
+  assert.equal(fixture.calls[0].options.headers.Authorization, 'Bearer session-access-token-sentinel');
 });
 
 test('chatgpt-controller: paginated backend diagnostics aggregate only the first page without changing the response schema', async () => {
@@ -6288,7 +6426,7 @@ test('chatgpt-controller: paginated backend diagnostics aggregate only the first
   assert.equal(request.options.credentials, 'include');
   assert.equal(request.options.cache, 'no-store');
   assert.equal(request.options.headers.Accept, 'application/json');
-  assert.equal(request.options.headers.Authorization, undefined);
+  assert.equal(request.options.headers.Authorization, 'Bearer session-access-token-sentinel');
 
   assert.equal(result.jsonParsed, true);
   assert.equal(result.rootObject, true);

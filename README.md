@@ -457,11 +457,14 @@ Content-Type: application/json
 {"tabId":"existing-chatgpt-tab","timeoutMs":15000}
 ```
 
-The controller makes one page-context `GET` to
+The controller first makes one bounded page-context `GET` to
+`/api/auth/session` with browser-managed credentials, keeps only the returned
+short-lived access token in memory, and then makes one page-context `GET` to
 `/backend-api/conversations/{conversation_id}?include_has_versions=true&num_turns=100`
-with browser-managed credentials and no custom authorization header. It reads
-only this first page; it does not follow pagination cursors, and these
-diagnostics are not a full-history proof. If the response contains a mapping,
+with `credentials: "include"` and an in-page bearer authorization header. The
+session response and token are never returned. It reads only this first page;
+it does not follow pagination cursors, and these diagnostics are not a
+full-history proof. If the response contains a mapping,
 the existing bounded mapping and current-branch analysis is retained. If it
 contains paginated `messages` instead, the controller returns only first-page
 role, text-presence, and anchor-match aggregates; it does not synthesize a

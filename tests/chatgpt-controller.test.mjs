@@ -6730,6 +6730,36 @@ test('chatgpt-controller: backend history rejects cursor cycles and incomplete p
   }
 });
 
+test('chatgpt-controller: backend history rejects contradictory pagination aliases and accepts equivalent aliases', async () => {
+  for (const pageInfo of [
+    { has_previous_page: false, hasPreviousPage: true },
+    { has_previous_page: true, hasPreviousPage: false, start_cursor: 'cursor-a' },
+    { has_previous_page: true, hasPreviousPage: true, start_cursor: 'cursor-a', startCursor: 'cursor-b' },
+  ]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: pageInfo }) }],
+    });
+    await assert.rejects(
+      () => createController(fixture.page).readConversationBackendHistory(),
+      /conversation_backend_history_(page_info|cursor)_conflict/u,
+    );
+    assert.equal(fixture.calls.length, 1);
+  }
+
+  for (const pageInfo of [
+    { has_previous_page: false, hasPreviousPage: false, start_cursor: 'same-cursor', startCursor: 'same-cursor' },
+    { hasPreviousPage: false },
+  ]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: pageInfo }) }],
+    });
+    const result = await createController(fixture.page).readConversationBackendHistory();
+    assert.equal(result.history.complete, true);
+    assert.equal(fixture.calls.length, 1);
+    assert.doesNotMatch(JSON.stringify(result), /same-cursor|session-access-token-sentinel/u);
+  }
+});
+
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {
   const { result } = evaluateCurrentDomModel({ offsetPx: 0 });
   assert.equal(result.valid, true);

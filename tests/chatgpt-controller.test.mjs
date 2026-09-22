@@ -6760,6 +6760,84 @@ test('chatgpt-controller: backend history rejects contradictory pagination alias
   }
 });
 
+test('chatgpt-controller: backend history validates both outer page-info aliases independently', async () => {
+  for (const { pageInfo, expected } of [
+    {
+      pageInfo: {
+        page_info: { has_previous_page: false },
+        pageInfo: { hasPreviousPage: true, startCursor: 'older' },
+      },
+      expected: /conversation_backend_history_page_info_conflict/u,
+    },
+    {
+      pageInfo: {
+        page_info: { has_previous_page: true, start_cursor: 'a' },
+        pageInfo: { hasPreviousPage: true, startCursor: 'b' },
+      },
+      expected: /conversation_backend_history_cursor_conflict/u,
+    },
+    {
+      pageInfo: {
+        page_info: { has_previous_page: false },
+        pageInfo: { hasPreviousPage: 'false' },
+      },
+      expected: /conversation_backend_history_page_info_invalid/u,
+    },
+  ]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], ...pageInfo }) }],
+    });
+    await assert.rejects(
+      () => createController(fixture.page).readConversationBackendHistory(),
+      expected,
+    );
+    assert.equal(fixture.calls.length, 1);
+  }
+
+  for (const pageInfo of [
+    { has_previous_page: false, start_cursor: 'abc', startCursor: null },
+    { has_previous_page: false, start_cursor: null, startCursor: 'abc' },
+  ]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: pageInfo }) }],
+    });
+    await assert.rejects(
+      () => createController(fixture.page).readConversationBackendHistory(),
+      /conversation_backend_history_cursor_conflict/u,
+    );
+    assert.equal(fixture.calls.length, 1);
+  }
+
+  const equivalentOuter = createBackendDiagnosticPage({
+    backendResponses: [
+      {
+        responseText: JSON.stringify({
+          messages: [],
+          page_info: { has_previous_page: true, start_cursor: ' same ' },
+          pageInfo: { hasPreviousPage: true, startCursor: 'same' },
+        }),
+      },
+      { responseText: JSON.stringify({ messages: [], pageInfo: { hasPreviousPage: false } }) },
+    ],
+  });
+  const paginated = await createController(equivalentOuter.page).readConversationBackendHistory();
+  assert.equal(equivalentOuter.calls.length, 2);
+  assert.equal(paginated.history.pageCount, 2);
+
+  for (const pageInfo of [
+    { page_info: { has_previous_page: false }, pageInfo: { hasPreviousPage: false } },
+    { page_info: { has_previous_page: false, start_cursor: null, startCursor: null } },
+    { page_info: { has_previous_page: false, start_cursor: ' abc ', startCursor: 'abc' } },
+  ]) {
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], ...pageInfo }) }],
+    });
+    const result = await createController(fixture.page).readConversationBackendHistory();
+    assert.equal(result.history.complete, true);
+    assert.equal(fixture.calls.length, 1);
+  }
+});
+
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {
   const { result } = evaluateCurrentDomModel({ offsetPx: 0 });
   assert.equal(result.valid, true);

@@ -597,29 +597,42 @@ function buildBackendConversationHistoryScript({ timeoutMs, maxTurns, maxCharsPe
         let body;
         try { body = JSON.parse(bounded.text); } catch { throw new Error('conversation_backend_history_json_invalid'); }
         if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) throw new Error('conversation_backend_history_page_invalid');
-        const pageInfo = body.page_info && typeof body.page_info === 'object' && !Array.isArray(body.page_info)
-          ? body.page_info
-          : body.pageInfo && typeof body.pageInfo === 'object' && !Array.isArray(body.pageInfo) ? body.pageInfo : null;
-        if (!pageInfo) throw new Error('conversation_backend_history_page_info_invalid');
-        const hasPreviousSnake = Object.prototype.hasOwnProperty.call(pageInfo, 'has_previous_page');
-        const hasPreviousCamel = Object.prototype.hasOwnProperty.call(pageInfo, 'hasPreviousPage');
-        if ((hasPreviousSnake && typeof pageInfo.has_previous_page !== 'boolean') ||
-            (hasPreviousCamel && typeof pageInfo.hasPreviousPage !== 'boolean') ||
-            (!hasPreviousSnake && !hasPreviousCamel)) throw new Error('conversation_backend_history_page_info_invalid');
-        if (hasPreviousSnake && hasPreviousCamel && pageInfo.has_previous_page !== pageInfo.hasPreviousPage)
+        const normalizePageInfo = (candidate) => {
+          if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('conversation_backend_history_page_info_invalid');
+          const hasPreviousSnake = Object.prototype.hasOwnProperty.call(candidate, 'has_previous_page');
+          const hasPreviousCamel = Object.prototype.hasOwnProperty.call(candidate, 'hasPreviousPage');
+          if ((hasPreviousSnake && typeof candidate.has_previous_page !== 'boolean') ||
+              (hasPreviousCamel && typeof candidate.hasPreviousPage !== 'boolean') ||
+              (!hasPreviousSnake && !hasPreviousCamel)) throw new Error('conversation_backend_history_page_info_invalid');
+          if (hasPreviousSnake && hasPreviousCamel && candidate.has_previous_page !== candidate.hasPreviousPage)
+            throw new Error('conversation_backend_history_page_info_conflict');
+          const hasPreviousPage = hasPreviousSnake ? candidate.has_previous_page : candidate.hasPreviousPage;
+          const cursorSnake = Object.prototype.hasOwnProperty.call(candidate, 'start_cursor');
+          const cursorCamel = Object.prototype.hasOwnProperty.call(candidate, 'startCursor');
+          const normalizeCursor = (value) => {
+            if (value === null) return null;
+            if (typeof value !== 'string') throw new Error('conversation_backend_history_page_info_invalid');
+            return value.trim();
+          };
+          const snakeCursor = cursorSnake ? normalizeCursor(candidate.start_cursor) : null;
+          const camelCursor = cursorCamel ? normalizeCursor(candidate.startCursor) : null;
+          if (cursorSnake && cursorCamel && snakeCursor !== camelCursor)
+            throw new Error('conversation_backend_history_cursor_conflict');
+          const startCursor = cursorSnake ? snakeCursor : camelCursor;
+          if (hasPreviousPage && (!startCursor || !startCursor.trim())) throw new Error('conversation_backend_history_cursor_missing');
+          return { hasPreviousPage, startCursor: startCursor || null };
+        };
+        const hasPageInfoSnake = Object.prototype.hasOwnProperty.call(body, 'page_info');
+        const hasPageInfoCamel = Object.prototype.hasOwnProperty.call(body, 'pageInfo');
+        if (!hasPageInfoSnake && !hasPageInfoCamel) throw new Error('conversation_backend_history_page_info_invalid');
+        const snakePageInfo = hasPageInfoSnake ? normalizePageInfo(body.page_info) : null;
+        const camelPageInfo = hasPageInfoCamel ? normalizePageInfo(body.pageInfo) : null;
+        if (snakePageInfo && camelPageInfo && snakePageInfo.hasPreviousPage !== camelPageInfo.hasPreviousPage)
           throw new Error('conversation_backend_history_page_info_conflict');
-        const hasPreviousPage = hasPreviousSnake ? pageInfo.has_previous_page : pageInfo.hasPreviousPage;
-        const cursorSnake = Object.prototype.hasOwnProperty.call(pageInfo, 'start_cursor');
-        const cursorCamel = Object.prototype.hasOwnProperty.call(pageInfo, 'startCursor');
-        if ((cursorSnake && pageInfo.start_cursor !== null && typeof pageInfo.start_cursor !== 'string') ||
-            (cursorCamel && pageInfo.startCursor !== null && typeof pageInfo.startCursor !== 'string')) throw new Error('conversation_backend_history_page_info_invalid');
-        const snakeCursor = cursorSnake && typeof pageInfo.start_cursor === 'string' ? pageInfo.start_cursor.trim() : null;
-        const camelCursor = cursorCamel && typeof pageInfo.startCursor === 'string' ? pageInfo.startCursor.trim() : null;
-        if (cursorSnake && cursorCamel && snakeCursor !== null && camelCursor !== null && snakeCursor !== camelCursor)
+        if (snakePageInfo && camelPageInfo && snakePageInfo.startCursor !== camelPageInfo.startCursor)
           throw new Error('conversation_backend_history_cursor_conflict');
-        const startCursor = cursorSnake ? snakeCursor : camelCursor;
-        if (hasPreviousPage && (!startCursor || !startCursor.trim())) throw new Error('conversation_backend_history_cursor_missing');
-        return { body, hasPreviousPage, startCursor: startCursor || null, bytes: bounded.bytes };
+        const pageInfo = snakePageInfo || camelPageInfo;
+        return { body, hasPreviousPage: pageInfo.hasPreviousPage, startCursor: pageInfo.startCursor, bytes: bounded.bytes };
       };
       const fetchJson = async (url) => await readJson(await fetch(url, {
         method: 'GET',

@@ -25,6 +25,8 @@ export const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
 export const DEFAULT_CONVERSATION_HISTORY_ITERATIONS = MAX_CONVERSATION_HISTORY_ITERATIONS;
 export const DEFAULT_BACKEND_CONVERSATION_DIAGNOSTIC_TIMEOUT_MS = 15_000;
 export const MAX_BACKEND_CONVERSATION_BYTES = 20 * 1024 * 1024;
+export const MAX_BACKEND_CONVERSATION_HISTORY_PAGES = 100;
+export const MAX_BACKEND_CONVERSATION_HISTORY_TOTAL_BYTES = 64 * 1024 * 1024;
 const CONVERSATION_HISTORY_SCROLL_WAIT_MS = 180;
 const CONVERSATION_HISTORY_SCROLL_POLL_MS = 50;
 const CONVERSATION_HISTORY_SCROLL_SETTLE_MAX_MS = 220;
@@ -507,6 +509,216 @@ function buildBackendConversationDiagnosticsScript({ timeoutMs, maxBytes }) {
     result.backendBranchAtLeastAsLargeAsMountedDom = result.currentBranchResolved
       ? result.currentBranchMessageCount >= result.mountedDomTurnCount : null;
     return result;
+    } finally {
+      accessToken = null;
+      clearTimeout(timeoutHandle);
+    }
+  })()`;
+}
+
+function buildBackendConversationHistoryScript({ timeoutMs, maxTurns, maxCharsPerTurn, maxTotalChars }) {
+  const sessionMaxBytes = 64 * 1024;
+  const pageMaxBytes = 20 * 1024 * 1024;
+  const totalMaxBytes = 64 * 1024 * 1024;
+  return String.raw`(async () => {
+    const timeoutMs = ${JSON.stringify(timeoutMs)};
+    const maxTurns = ${JSON.stringify(maxTurns)};
+    const maxCharsPerTurn = ${JSON.stringify(maxCharsPerTurn)};
+    const maxTotalChars = ${JSON.stringify(maxTotalChars)};
+    const sessionMaxBytes = ${JSON.stringify(sessionMaxBytes)};
+    const pageMaxBytes = ${JSON.stringify(pageMaxBytes)};
+    const totalMaxBytes = ${JSON.stringify(totalMaxBytes)};
+    const pageOrigin = String(location?.origin || '');
+    const pathMatch = pageOrigin === 'https://chatgpt.com'
+      ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || ''))
+      : null;
+    let conversationId = null;
+    if (pathMatch) {
+      try { conversationId = decodeURIComponent(pathMatch[1]); } catch { conversationId = null; }
+    }
+    if (typeof conversationId !== 'string' || !conversationId) throw new Error('conversation_backend_history_path_invalid');
+
+    const abortController = new AbortController();
+    const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+    let accessToken = null;
+    try {
+      const normalizeText = (value) => String(value || '')
+        .replace(/\u0000/g, '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map((line) => line.replace(/[ \t]+$/u, ''))
+        .join('\n')
+        .trim();
+      const readBoundedText = async (response, limit) => {
+        let declaredLength = null;
+        try {
+          const value = Number(response?.headers?.get?.('content-length'));
+          if (Number.isSafeInteger(value) && value >= 0) declaredLength = value;
+        } catch {}
+        if (declaredLength !== null && declaredLength > limit) throw new Error('conversation_backend_history_page_too_large');
+        const reader = response?.body?.getReader?.();
+        if (!reader) throw new Error('conversation_backend_history_stream_unavailable');
+        const decoder = new TextDecoder();
+        const parts = [];
+        let bytes = 0;
+        const readWithAbort = async () => {
+          if (abortController.signal.aborted) throw new Error('conversation_backend_history_timeout');
+          let abortHandler;
+          const abortPromise = new Promise((_, reject) => {
+            abortHandler = () => reject(new Error('conversation_backend_history_timeout'));
+            abortController.signal.addEventListener('abort', abortHandler, { once: true });
+          });
+          try { return await Promise.race([reader.read(), abortPromise]); }
+          finally { abortController.signal.removeEventListener('abort', abortHandler); }
+        };
+        try {
+          while (true) {
+            const next = await readWithAbort();
+            if (next.done) break;
+            const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+            bytes += chunk.byteLength;
+            if (bytes > limit) throw new Error('conversation_backend_history_page_too_large');
+            parts.push(decoder.decode(chunk, { stream: true }));
+          }
+          parts.push(decoder.decode());
+          return { text: parts.join(''), bytes };
+        } catch (error) {
+          try { await reader.cancel(); } catch {}
+          throw error;
+        }
+      };
+      const readJson = async (response) => {
+        if (!response || !response.ok) throw new Error('conversation_backend_history_http_failed');
+        let contentType = '';
+        try { contentType = String(response.headers?.get?.('content-type') || ''); } catch {}
+        if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType)) throw new Error('conversation_backend_history_non_json');
+        const bounded = await readBoundedText(response, pageMaxBytes);
+        if (abortController.signal.aborted) throw new Error('conversation_backend_history_timeout');
+        let body;
+        try { body = JSON.parse(bounded.text); } catch { throw new Error('conversation_backend_history_json_invalid'); }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) throw new Error('conversation_backend_history_page_invalid');
+        const pageInfo = body.page_info && typeof body.page_info === 'object' && !Array.isArray(body.page_info)
+          ? body.page_info
+          : body.pageInfo && typeof body.pageInfo === 'object' && !Array.isArray(body.pageInfo) ? body.pageInfo : null;
+        if (!pageInfo || typeof pageInfo.has_previous_page !== 'boolean' && typeof pageInfo.hasPreviousPage !== 'boolean') throw new Error('conversation_backend_history_page_info_invalid');
+        const hasPreviousPage = typeof pageInfo.has_previous_page === 'boolean' ? pageInfo.has_previous_page : pageInfo.hasPreviousPage;
+        const startCursor = typeof pageInfo.start_cursor === 'string' ? pageInfo.start_cursor : typeof pageInfo.startCursor === 'string' ? pageInfo.startCursor : null;
+        if (hasPreviousPage && (!startCursor || !startCursor.trim())) throw new Error('conversation_backend_history_cursor_missing');
+        return { body, hasPreviousPage, startCursor: startCursor?.trim() || null, bytes: bounded.bytes };
+      };
+      const fetchJson = async (url) => await readJson(await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        redirect: 'error',
+        headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken },
+        signal: abortController.signal
+      }));
+      const sessionResponse = await fetch('/api/auth/session', {
+        method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
+        headers: { Accept: 'application/json' }, signal: abortController.signal
+      });
+      if (!sessionResponse || !sessionResponse.ok) throw new Error('conversation_backend_history_session_failed');
+      let sessionContentType = '';
+      try { sessionContentType = String(sessionResponse.headers?.get?.('content-type') || ''); } catch {}
+      if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(sessionContentType)) throw new Error('conversation_backend_history_session_non_json');
+      const sessionBody = JSON.parse((await readBoundedText(sessionResponse, sessionMaxBytes)).text);
+      if (!sessionBody || typeof sessionBody !== 'object' || Array.isArray(sessionBody) || typeof sessionBody.accessToken !== 'string' || !sessionBody.accessToken.trim() || sessionBody.accessToken.length > 16 * 1024) throw new Error('conversation_backend_history_session_invalid');
+      accessToken = sessionBody.accessToken;
+
+      const seenCursors = new Set();
+      const seenMessages = new Map();
+      const orderedVisible = [];
+      let totalResponseBytes = 0;
+      let pageCount = 0;
+      let hasPreviousPage = true;
+      let cursor = null;
+      const roleOf = (message) => {
+        const role = message?.author?.role;
+        return role === 'user' || role === 'assistant' ? role : null;
+      };
+      const textParts = (value, depth = 0) => {
+        if (depth > 20 || value === null || value === undefined) return [];
+        if (typeof value === 'string') return [value];
+        if (Array.isArray(value)) return value.flatMap((item) => textParts(item, depth + 1));
+        if (typeof value !== 'object') return [];
+        const output = [];
+        if (typeof value.text === 'string') output.push(value.text);
+        if (typeof value.content === 'string') output.push(value.content);
+        if (typeof value.value === 'string') output.push(value.value);
+        if (Array.isArray(value.parts)) output.push(...textParts(value.parts, depth + 1));
+        if (Array.isArray(value.content)) output.push(...textParts(value.content, depth + 1));
+        return output;
+      };
+      const messageText = (message) => normalizeText(textParts(message?.content).join('\n') || textParts(message).join('\n'));
+      const isVisible = (message, role) => {
+        if (!role) return false;
+        if (Object.prototype.hasOwnProperty.call(message, 'recipient') && message.recipient !== null && message.recipient !== 'all') return false;
+        const metadata = message?.metadata;
+        if (!metadata || typeof metadata !== 'object') return true;
+        return !metadata.is_visually_hidden_from_conversation && metadata.is_complete !== false
+          && !metadata.aggregate_result && !metadata.command && !metadata.tool_call && !metadata.tool_calls;
+      };
+      const providerId = (message) => {
+        const value = message?.id ?? message?.message_id;
+        return typeof value === 'string' && value.trim() ? value.trim() : null;
+      };
+      const semantic = (message, role, text) => JSON.stringify({ role, text, recipient: message?.recipient ?? null });
+      while (hasPreviousPage) {
+        if (pageCount >= ${JSON.stringify(MAX_BACKEND_CONVERSATION_HISTORY_PAGES)}) throw new Error('conversation_backend_history_page_limit');
+        if (cursor !== null) {
+          if (seenCursors.has(cursor)) throw new Error('conversation_backend_history_cursor_cycle');
+          seenCursors.add(cursor);
+        }
+        const pageUrl = '/backend-api/conversations/' + encodeURIComponent(conversationId) + (cursor === null ? '?include_has_versions=true&num_turns=100' : '/messages?before=' + encodeURIComponent(cursor) + '&include_has_versions=true&num_turns=100');
+        const page = await fetchJson(pageUrl);
+        const responseConversationId = page.body.conversation_id ?? page.body.conversationId;
+        if (responseConversationId !== undefined && responseConversationId !== conversationId) throw new Error('conversation_backend_history_conversation_mismatch');
+        pageCount += 1;
+        totalResponseBytes += page.bytes;
+        if (totalResponseBytes > totalMaxBytes) throw new Error('conversation_backend_history_total_too_large');
+        const pageVisible = [];
+        for (const message of page.body.messages) {
+          if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('conversation_backend_history_message_invalid');
+          const role = roleOf(message);
+          const text = messageText(message);
+          const id = providerId(message);
+          if (id) {
+            const signature = semantic(message, role, text);
+            const previous = seenMessages.get(id);
+            if (previous && previous.signature !== signature) throw new Error('conversation_backend_history_duplicate_conflict');
+            if (previous) continue;
+            seenMessages.set(id, { signature });
+          }
+          if (!isVisible(message, role)) continue;
+          if (!id) throw new Error('conversation_backend_history_visible_message_id_missing');
+          pageVisible.push({ id, role, text });
+        }
+        orderedVisible.unshift(...pageVisible);
+        hasPreviousPage = page.hasPreviousPage;
+        if (hasPreviousPage) {
+          cursor = page.startCursor;
+          if (!cursor) throw new Error('conversation_backend_history_cursor_missing');
+        }
+      }
+      const turns = orderedVisible.map((item, index) => ({ index, role: item.role, text: item.text, messageId: null, turnId: null }));
+      if (turns.length > maxTurns) throw new Error('conversation_backend_history_turn_limit');
+      let totalChars = 0;
+      for (const turn of turns) {
+        if (turn.text.length > maxCharsPerTurn) throw new Error('conversation_backend_history_turn_too_large');
+        totalChars += turn.text.length;
+        if (totalChars > maxTotalChars) throw new Error('conversation_backend_history_total_chars_too_large');
+      }
+      return {
+        url: String(location.href || ''),
+        turns,
+        history: {
+          mode: 'complete', source: 'backend-pagination', complete: true, scopeComplete: true,
+          fullHistoryComplete: true, pageCount, terminalOldestReached: true, paginationLimitReached: false,
+          cursorCycleDetected: false, conflictingDuplicateMessageCount: 0, totalBackendMessageCount: seenMessages.size,
+          normalizedTurnCount: turns.length, totalResponseBytes
+        }
+      };
     } finally {
       accessToken = null;
       clearTimeout(timeoutHandle);
@@ -7032,6 +7244,29 @@ export class ChatGPTController {
     return await this.runExclusive(async () => await this.#eval(buildBackendConversationDiagnosticsScript({
       timeoutMs: boundedTimeoutMs,
       maxBytes: MAX_BACKEND_CONVERSATION_BYTES
+    })));
+  }
+
+  async readConversationBackendHistory({
+    timeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
+    maxTurns = MAX_CONVERSATION_TURNS,
+    maxCharsPerTurn = MAX_CONVERSATION_TURN_CHARS,
+    maxTotalChars = MAX_CONVERSATION_TOTAL_CHARS
+  } = {}) {
+    const boundedTimeoutMs = Number(timeoutMs);
+    if (!Number.isInteger(boundedTimeoutMs) || boundedTimeoutMs < 1_000 || boundedTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS) {
+      throw new Error('conversation_backend_history_timeout_invalid');
+    }
+    if (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > MAX_CONVERSATION_TURNS ||
+        !Number.isSafeInteger(maxCharsPerTurn) || maxCharsPerTurn < 1 || maxCharsPerTurn > MAX_CONVERSATION_TURN_CHARS ||
+        !Number.isSafeInteger(maxTotalChars) || maxTotalChars < 1 || maxTotalChars > MAX_CONVERSATION_TOTAL_CHARS) {
+      throw new Error('conversation_backend_history_limits_invalid');
+    }
+    return await this.runExclusive(async () => await this.#eval(buildBackendConversationHistoryScript({
+      timeoutMs: boundedTimeoutMs,
+      maxTurns,
+      maxCharsPerTurn,
+      maxTotalChars
     })));
   }
 

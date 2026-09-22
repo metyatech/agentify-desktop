@@ -4539,6 +4539,47 @@ test('http-api: backend conversation diagnostics is a bounded read-only controll
   assert.equal(unauthorized.res.status, 401);
 });
 
+test('http-api: backend conversation history is authenticated, bounded, and exposes only complete pagination output', async (t) => {
+  const calls = [];
+  const controller = {
+    readConversationBackendHistory: async (options) => {
+      calls.push(options);
+      return {
+        url: 'https://chatgpt.com/c/backend-history-test',
+        turns: [
+          { index: 0, role: 'user', text: 'first', messageId: null, turnId: null },
+          { index: 1, role: 'assistant', text: 'second', messageId: null, turnId: null }
+        ],
+        history: {
+          mode: 'complete', source: 'backend-pagination', complete: true, scopeComplete: true,
+          fullHistoryComplete: true, pageCount: 2, terminalOldestReached: true,
+          paginationLimitReached: false, cursorCycleDetected: false, conflictingDuplicateMessageCount: 0,
+          totalBackendMessageCount: 2, normalizedTurnCount: 2, totalResponseBytes: 128
+        }
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history', body: { key: 'review', timeoutMs: 1_000, maxTurns: 2 } });
+  assert.equal(result.res.status, 200);
+  assert.equal(result.data.history.fullHistoryComplete, true);
+  assert.equal(result.data.turns[0].messageId, null);
+  assert.deepEqual(calls, [{ timeoutMs: 1_000, maxTurns: 2, maxCharsPerTurn: 200_000, maxTotalChars: 2_000_000 }]);
+});
+
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {
   const calls = [];
   const controller = {

@@ -240,11 +240,12 @@ function createBackendDiagnosticPage({
   sessionStallAfterReadIndex = null,
   omitReader = false,
   sessionOmitReader = false,
+  backendResponses = null,
   digestOverrides = {}
 } = {}) {
   const calls = [];
   const allCalls = [];
-  const state = { readCount: 0, sessionReadCount: 0, cancelCount: 0, sessionCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false };
+  const state = { readCount: 0, sessionReadCount: 0, backendRequestCount: 0, cancelCount: 0, sessionCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false };
   const chunks = (streamChunks || [responseText]).map((chunk) => chunk instanceof Uint8Array
     ? chunk
     : new TextEncoder().encode(String(chunk)));
@@ -274,15 +275,21 @@ function createBackendDiagnosticPage({
           const call = { url, options };
           allCalls.push(call);
           if (!isSession) calls.push(call);
-          const responseStatus = isSession ? sessionStatus : status;
-          const responseContentType = isSession ? sessionContentType : contentType;
-          const responseTextValue = isSession ? sessionResponseText : responseText;
-          const responseContentLength = isSession ? sessionContentLength : contentLength;
-          const responseChunks = isSession ? sessionChunks : chunks;
-          const responseFetchError = isSession ? sessionFetchError : fetchError;
-          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : fetchDelayMs;
-          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : stallAfterReadIndex;
-          const responseOmitReader = isSession ? sessionOmitReader : omitReader;
+          const backendResponse = !isSession && Array.isArray(backendResponses) ? backendResponses[state.backendRequestCount] || null : null;
+          if (!isSession) state.backendRequestCount += 1;
+          const responseStatus = isSession ? sessionStatus : backendResponse?.status ?? status;
+          const responseContentType = isSession ? sessionContentType : backendResponse?.contentType ?? contentType;
+          const responseTextValue = isSession ? sessionResponseText : backendResponse?.responseText ?? responseText;
+          const responseContentLength = isSession ? sessionContentLength : backendResponse?.contentLength ?? contentLength;
+          const responseChunks = isSession
+            ? sessionChunks
+            : (backendResponse
+              ? (backendResponse.streamChunks || [responseTextValue])
+              : chunks).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)));
+          const responseFetchError = isSession ? sessionFetchError : backendResponse?.fetchError ?? fetchError;
+          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : backendResponse?.fetchDelayMs ?? fetchDelayMs;
+          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : backendResponse?.stallAfterReadIndex ?? stallAfterReadIndex;
+          const responseOmitReader = isSession ? sessionOmitReader : backendResponse?.omitReader ?? omitReader;
           if (responseFetchError) throw responseFetchError;
           if (responseFetchDelayMs > 0) {
             await new Promise((resolve, reject) => {
@@ -6645,6 +6652,82 @@ test('chatgpt-controller: backend diagnostics reject invalid conversation paths 
   assert.equal(result.conversationPathRecognized, false);
   assert.equal(result.conversationIdPresent, false);
   assert.equal(fixture.calls.length, 0);
+});
+
+test('chatgpt-controller: backend history reads one terminal first page and returns normalized visible turns', async () => {
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{
+      responseText: JSON.stringify({
+        conversation_id: 'backend-diagnostic-test',
+        messages: [
+          { id: 'tool-hidden', author: { role: 'assistant' }, recipient: 'python', content: { parts: ['hidden tool'] } },
+          { id: 'system-hidden', author: { role: 'system' }, content: { parts: ['system'] } },
+          { id: 'user-1', author: { role: 'user' }, content: { parts: ['first user'] } },
+          { id: 'assistant-1', author: { role: 'assistant' }, content: { parts: [{ text: 'first assistant' }] } },
+          { id: 'user-2', author: { role: 'user' }, content: { parts: [{ content: ['second ', { value: 'user' }] }] } }
+        ],
+        page_info: { has_previous_page: false }
+      })
+    }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistory();
+  assert.equal(fixture.calls.length, 1);
+  const requestUrl = new URL(fixture.calls[0].url, 'https://chatgpt.com');
+  assert.equal(requestUrl.pathname, '/backend-api/conversations/backend-diagnostic-test');
+  assert.equal(requestUrl.searchParams.get('include_has_versions'), 'true');
+  assert.equal(requestUrl.searchParams.get('num_turns'), '100');
+  assert.equal(requestUrl.searchParams.has('before'), false);
+  assert.equal(fixture.calls[0].options.credentials, 'include');
+  assert.equal(fixture.calls[0].options.headers.Authorization, 'Bearer session-access-token-sentinel');
+  assert.equal(result.history.complete, true);
+  assert.equal(result.history.fullHistoryComplete, true);
+  assert.equal(result.history.pageCount, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.turns)), [
+    { index: 0, role: 'user', text: 'first user', messageId: null, turnId: null },
+    { index: 1, role: 'assistant', text: 'first assistant', messageId: null, turnId: null },
+    { index: 2, role: 'user', text: 'second\nuser', messageId: null, turnId: null }
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /tool-hidden|system-hidden|user-1|assistant-1|session-access-token-sentinel|hidden tool/u);
+});
+
+test('chatgpt-controller: backend history prepends older pages, deduplicates identical overlap, and requires terminal pagination', async () => {
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [
+      { responseText: JSON.stringify({ messages: [{ id: 'u2', author: { role: 'user' }, content: { parts: ['new'] } }, { id: 'a2', author: { role: 'assistant' }, content: { parts: ['new answer'] } }], page_info: { has_previous_page: true, start_cursor: 'cursor-newer' } }) },
+      { responseText: JSON.stringify({ messages: [{ id: 'u1', author: { role: 'user' }, content: { parts: ['old'] } }, { id: 'u2', author: { role: 'user' }, content: { parts: ['new'] } }], page_info: { has_previous_page: false, start_cursor: null } }) }
+    ]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistory();
+  assert.equal(fixture.calls.length, 2);
+  const olderUrl = new URL(fixture.calls[1].url, 'https://chatgpt.com');
+  assert.equal(olderUrl.pathname, '/backend-api/conversations/backend-diagnostic-test/messages');
+  assert.equal(olderUrl.searchParams.get('before'), 'cursor-newer');
+  assert.deepEqual(JSON.parse(JSON.stringify(result.turns)), [
+    { index: 0, role: 'user', text: 'old', messageId: null, turnId: null },
+    { index: 1, role: 'user', text: 'new', messageId: null, turnId: null },
+    { index: 2, role: 'assistant', text: 'new answer', messageId: null, turnId: null }
+  ]);
+  assert.equal(result.history.pageCount, 2);
+  assert.equal(result.history.totalBackendMessageCount, 3);
+});
+
+test('chatgpt-controller: backend history rejects cursor cycles and incomplete page metadata without retry or fallback', async () => {
+  for (const [name, responses] of [
+    ['cursor-cycle', [
+      { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'same-cursor' } }) },
+      { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'same-cursor' } }) }
+    ]],
+    ['missing-cursor', [
+      { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true } }) }
+    ]],
+    ['missing-page-info', [
+      { responseText: JSON.stringify({ messages: [] }) }
+    ]]
+  ]) {
+    const fixture = createBackendDiagnosticPage({ backendResponses: responses });
+    await assert.rejects(() => createController(fixture.page).readConversationBackendHistory(), /conversation_backend_history_/u, name);
+    assert.equal(fixture.calls.length, responses.length, name);
+  }
 });
 
 test('chatgpt-controller: current logical content-turn identity is independent of the outer virtualizer key', () => {

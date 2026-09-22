@@ -474,6 +474,29 @@ is a content-unit comparison convenience only (not a turn count and never a
 full-history proof). It never returns conversation text, mapping IDs, cookies,
 tokens, or headers, and it does not alter history proof or traversal state.
 
+For a bounded complete-history source that does not use DOM scrolling, use the
+separate backend-pagination endpoint:
+
+```text
+POST /conversation/backend-history
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"tabId":"existing-chatgpt-tab","timeoutMs":180000,"maxTurns":200,"maxCharsPerTurn":200000,"maxTotalChars":2000000}
+```
+
+The controller authenticates in the ChatGPT page context, reads the first
+conversation page, and follows only the bounded older-message cursor protocol
+until the backend explicitly reports `has_previous_page: false`. Repeated
+cursors, missing page metadata, response/page/turn limits, conflicting
+duplicates, missing provider message identities, timeouts, and transport
+failures fail closed. The returned turns are a linear normalized
+`user`/`assistant` sequence with `messageId: null` and `turnId: null`; backend
+IDs and cursors are never returned, and no synthetic mapping is built. This is
+a complete backend-pagination source only after the caller independently
+aligns its bounded DOM tail with the returned suffix; it is not used by the
+ordinary DOM conversation endpoint.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

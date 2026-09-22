@@ -15,6 +15,7 @@ import { AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES, validateAutopilotProposalTicket } 
 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES = 10 * 1024 * 1024;
+const MAX_CONVERSATION_BACKEND_HISTORY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -2125,6 +2126,46 @@ export function startHttpApi({
           throw new Error('conversation_backend_diagnostics_controller_unavailable');
         }
         return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics }, { maxBytes: 512 * 1024 });
+      }
+
+      if (url.pathname === '/conversation/backend-history' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readConversationBackendHistory !== 'function') {
+          throw new Error('conversation_backend_history_controller_unavailable');
+        }
+        const history = await controller.readConversationBackendHistory({
+          timeoutMs: strictPositiveIntOr(body.timeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_backend_history_timeout_invalid'),
+          maxTurns: positiveIntOr(body.maxTurns, 200, 200),
+          maxCharsPerTurn: positiveIntOr(body.maxCharsPerTurn, 200_000, 200_000),
+          maxTotalChars: positiveIntOr(body.maxTotalChars, 2_000_000, 2_000_000)
+        });
+        if (!history || typeof history.url !== 'string' || !Array.isArray(history.turns) ||
+            !history.history || history.history.mode !== 'complete' ||
+            history.history.complete !== true || history.history.fullHistoryComplete !== true) {
+          throw new Error('conversation_backend_history_incomplete');
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          tabId: tab.id,
+          vendorId: 'chatgpt',
+          url: history.url,
+          turns: history.turns,
+          history: history.history
+        }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_RESPONSE_BYTES });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

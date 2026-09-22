@@ -16,6 +16,7 @@ import { AUTOPILOT_PROPOSAL_TICKET_MAX_BYTES, validateAutopilotProposalTicket } 
 const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_CONVERSATION_BACKEND_HISTORY_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES = 256 * 1024;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -323,6 +324,8 @@ export function mapErrorToHttp(error) {
   if (msg === 'conversation_history_mode_invalid') return { code: 400, body: { error: 'conversation_history_mode_invalid' } };
   if (msg === 'conversation_history_timeout_invalid') return { code: 400, body: { error: 'conversation_history_timeout_invalid' } };
   if (msg === 'conversation_history_iterations_invalid') return { code: 400, body: { error: 'conversation_history_iterations_invalid' } };
+  if (msg === 'conversation_backend_history_diagnostics_limits_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_limits_invalid' } };
+  if (msg === 'conversation_backend_history_diagnostics_probe_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_probe_invalid' } };
   if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
   if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
@@ -372,6 +375,47 @@ function strictPositiveIntOr(value, fallback, max, errorCode) {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1 || n > max) throw new Error(errorCode);
   return n;
+}
+
+function validateBackendHistoryDiagnosticsProbe(value) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  const probeKeys = new Set(['reviewResponseIndex', 'reviewResponseDigest', 'selectedUserTurns', 'answerFirstIndex', 'answerLastIndex', 'answerLatestTurnDigest', 'answerTranscriptSha256']);
+  if (Object.keys(value).some((key) => !probeKeys.has(key))) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  const hash = (field) => {
+    const text = String(value[field] ?? '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/u.test(text)) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+    return text;
+  };
+  const reviewResponseIndex = value.reviewResponseIndex;
+  const answerFirstIndex = value.answerFirstIndex;
+  const answerLastIndex = value.answerLastIndex;
+  if (![reviewResponseIndex, answerFirstIndex, answerLastIndex].every((item) => Number.isSafeInteger(item) && item >= 0)) {
+    throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  }
+  const selectedUserTurns = value.selectedUserTurns;
+  if (!Array.isArray(selectedUserTurns) || selectedUserTurns.length === 0 || selectedUserTurns.length > 200) {
+    throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  }
+  let previous = -1;
+  const selected = selectedUserTurns.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item) || !Number.isSafeInteger(item.index) || item.index < 0 || item.index <= previous) {
+      throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+    }
+    if (Object.keys(item).some((key) => key !== 'index' && key !== 'digest')) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+    previous = item.index;
+    return { index: item.index, digest: String(item.digest ?? '').trim().toLowerCase() };
+  });
+  if (selected.some((item) => !/^[0-9a-f]{64}$/u.test(item.digest))) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  return {
+    reviewResponseIndex,
+    reviewResponseDigest: hash('reviewResponseDigest'),
+    selectedUserTurns: selected,
+    answerFirstIndex,
+    answerLastIndex,
+    answerLatestTurnDigest: hash('answerLatestTurnDigest'),
+    answerTranscriptSha256: hash('answerTranscriptSha256')
+  };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -2166,6 +2210,38 @@ export function startHttpApi({
           turns: history.turns,
           history: history.history
         }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_RESPONSE_BYTES });
+      }
+
+      if (url.pathname === '/conversation/backend-history-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 32_768 });
+        const requestKeys = new Set(['tabId', 'key', 'timeoutMs', 'historyTimeoutMs', 'tailMaxTurns', 'legacyAnchorProbe']);
+        if (body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).some((key) => !requestKeys.has(key))) {
+          throw new Error('conversation_backend_history_diagnostics_limits_invalid');
+        }
+        const requestedTabId = String(body?.tabId || '').trim();
+        const requestedKey = String(body?.key || '').trim();
+        if (!requestedTabId && !requestedKey) throw new Error('missing_conversation_tab');
+        if (requestedTabId && requestedKey) throw new Error('ambiguous_conversation_tab');
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId
+          ? listed.filter((tab) => tab?.id === requestedTabId)
+          : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readConversationBackendHistoryDiagnostics !== 'function') {
+          throw new Error('conversation_backend_history_diagnostics_controller_unavailable');
+        }
+        const timeoutMs = strictPositiveIntOr(body.timeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_backend_history_diagnostics_limits_invalid');
+        const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_backend_history_diagnostics_limits_invalid');
+        const tailMaxTurns = strictPositiveIntOr(body.tailMaxTurns, 100, 100, 'conversation_backend_history_diagnostics_limits_invalid');
+        const legacyAnchorProbe = validateBackendHistoryDiagnosticsProbe(body.legacyAnchorProbe);
+        const diagnostics = await controller.readConversationBackendHistoryDiagnostics({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe });
+        if (!diagnostics || diagnostics.attempted !== true || !diagnostics.backend || !diagnostics.dom || !diagnostics.models || !diagnostics.groupedModels) {
+          throw new Error('conversation_backend_history_diagnostics_controller_unavailable');
+        }
+        return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

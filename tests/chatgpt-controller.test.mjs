@@ -241,7 +241,8 @@ function createBackendDiagnosticPage({
   omitReader = false,
   sessionOmitReader = false,
   backendResponses = null,
-  digestOverrides = {}
+  digestOverrides = {},
+  domRecords = []
 } = {}) {
   const calls = [];
   const allCalls = [];
@@ -252,6 +253,38 @@ function createBackendDiagnosticPage({
   const sessionChunks = (sessionStreamChunks || [sessionResponseText]).map((chunk) => chunk instanceof Uint8Array
     ? chunk
     : new TextEncoder().encode(String(chunk)));
+  const domNodes = domRecords.map((record, index) => {
+    const turnId = String(record.turnId || `dom-turn-${index}`).trim();
+    const role = record.role === 'assistant' ? 'assistant' : 'user';
+    const text = String(record.text || '');
+    const contentTurn = {
+      parentElement: null,
+      getAttribute(name) { return name === 'data-content-search-turn-key' ? turnId : null; }
+    };
+    const wrapper = {
+      parentElement: null,
+      getAttribute(name) { return name === 'data-turn-key' ? `wrapper-${turnId}` : null; },
+      contains(node) { return node === domNode; }
+    };
+    const domNode = {
+      parentElement: contentTurn,
+      innerText: text,
+      textContent: text,
+      cloneNode() { return { innerText: text, textContent: text, matches: () => false, querySelectorAll: () => [] }; },
+      getAttribute(name) {
+        if (name === 'data-content-search-unit-key') return `${turnId}:${index}:${role}`;
+        return null;
+      },
+      closest(selector) {
+        if (selector === '[data-content-search-turn-key]') return contentTurn;
+        if (selector === '[data-turn-key]') return wrapper;
+        return null;
+      }
+    };
+    contentTurn.parentElement = wrapper;
+    wrapper.parentElement = null;
+    return domNode;
+  });
   const page = {
     async evaluate(js) {
       const context = {
@@ -269,7 +302,7 @@ function createBackendDiagnosticPage({
             }
           }
         },
-        document: { querySelectorAll: () => Array.from({ length: mountedDomTurnCount }, () => ({})) },
+        document: { querySelectorAll: (selector) => selector === '[data-content-search-unit-key]' ? domNodes : Array.from({ length: mountedDomTurnCount }, () => ({})) },
         fetch: async (url, options) => {
           const isSession = String(url) === '/api/auth/session';
           const call = { url, options };
@@ -6728,6 +6761,137 @@ test('chatgpt-controller: backend history rejects cursor cycles and incomplete p
     await assert.rejects(() => createController(fixture.page).readConversationBackendHistory(), /conversation_backend_history_/u, name);
     assert.equal(fixture.calls.length, responses.length, name);
   }
+});
+
+test('chatgpt-controller: backend history visibility diagnostics keep raw metadata in page context', async () => {
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{
+      responseText: JSON.stringify({
+        conversation_id: 'backend-diagnostic-test',
+        messages: [
+          { id: 'user-visible-sentinel', author: { role: 'user' }, content: { content_type: 'text', parts: ['visible user sentinel'] } },
+          { id: 'assistant-visible-sentinel', author: { role: 'assistant' }, content: { content_type: 'multimodal_text', parts: ['visible assistant sentinel'] } },
+          { id: 'thought-sentinel', author: { role: 'assistant' }, content: { content_type: 'thought', parts: ['hidden thought sentinel'] } },
+          { id: 'tool-sentinel', author: { role: 'assistant' }, recipient: 'python', content: { content_type: 'execution_output', parts: ['hidden tool sentinel'] } },
+          { id: 'unknown-sentinel', author: { role: 'user' }, content: { content_type: 'vendor-secret-content-type', parts: ['unknown sentinel'] } },
+          { id: 'metadata-sentinel', author: { role: 'assistant' }, metadata: { command: 'metadata secret sentinel' }, content: { content_type: 'text', parts: ['command sentinel'] } }
+        ],
+        page_info: { has_previous_page: false }
+      })
+    }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.allCalls.length, 2);
+  assert.equal(result.attempted, true);
+  assert.equal(result.backend.complete, true);
+  assert.equal(result.backend.pageCount, 1);
+  assert.equal(result.backendBuckets.user.text, 1);
+  assert.equal(result.backendBuckets.assistant.multimodal_text, 1);
+  assert.equal(result.backendBuckets.assistant.thought_or_reasoning, 1);
+  assert.equal(result.backendBuckets.assistant.tool_or_execution, 1);
+  assert.equal(result.backendBuckets.user.unknown, 1);
+  assert.equal(result.exclusionCounts.recipientNonAll, 1);
+  assert.equal(result.exclusionCounts.command, 1);
+  assert.equal(result.models.CURRENT.backendCandidateTurnCount, 4);
+  assert.equal(result.models.VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 2);
+  assert.equal(result.models.VISIBLE_TEXT_CODE_BLANKLINE.backendCandidateTurnCount, 2);
+  assert.equal(result.models.END_TURN_VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 2);
+  assert.equal(result.dom.tailTurnCount, 0);
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /visible user sentinel|hidden thought sentinel|user-visible-sentinel|unknown-sentinel|vendor-secret-content-type|metadata secret sentinel|session-access-token-sentinel/u);
+});
+
+test('chatgpt-controller: backend history visibility diagnostics compare grouped DOM units and legacy anchors', async () => {
+  const turns = [
+    { role: 'assistant', text: 'review response' },
+    { role: 'user', text: 'answer one' },
+    { role: 'user', text: 'answer two' }
+  ];
+  const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  const digestTurn = (turn, index) => digest(JSON.stringify({ index, role: turn.role, text: turn.text }));
+  const probe = {
+    reviewResponseIndex: 0,
+    reviewResponseDigest: digest(turns[0].text),
+    selectedUserTurns: [
+      { index: 1, digest: digestTurn(turns[1], 1) },
+      { index: 2, digest: digestTurn(turns[2], 2) }
+    ],
+    answerFirstIndex: 1,
+    answerLastIndex: 2,
+    answerLatestTurnDigest: digestTurn(turns[2], 2),
+    answerTranscriptSha256: digest(JSON.stringify(turns.slice(1).map((turn, index) => ({ index: index + 1, role: turn.role, text: turn.text }))))
+  };
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{
+      responseText: JSON.stringify({
+        messages: turns.map((turn, index) => ({ id: `anchor-${index}`, author: { role: turn.role }, content: { content_type: 'text', parts: [turn.text] } })),
+        page_info: { has_previous_page: false }
+      })
+    }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ legacyAnchorProbe: probe });
+  for (const model of Object.values(result.models)) {
+    assert.equal(model.legacyAnchorProbe.reviewResponseMatches, true);
+    assert.equal(model.legacyAnchorProbe.selectedTurnsMatch, true);
+    assert.equal(model.legacyAnchorProbe.answerBoundaryMatches, true);
+    assert.equal(model.legacyAnchorProbe.latestTurnDigestMatches, true);
+    assert.equal(model.legacyAnchorProbe.transcriptMatches, true);
+    assert.equal(model.legacyAnchorProbe.allMatch, true);
+  }
+  assert.equal(result.groupedModels.CURRENT.noMerge.domGroupedTurnCount, 0);
+  assert.equal(result.groupedModels.CURRENT.assistantMergeNewline.backendTurnCount, 3);
+  assert.doesNotMatch(JSON.stringify(result), /review response|answer one|anchor-0|session-access-token-sentinel/u);
+});
+
+test('chatgpt-controller: backend history visibility diagnostics compares adjacent DOM units without exposing identities', async () => {
+  const fixture = createBackendDiagnosticPage({
+    domRecords: [
+      { role: 'assistant', turnId: 'dom-review', text: 'review response' },
+      { role: 'assistant', turnId: 'dom-review', text: 'continued' },
+      { role: 'user', turnId: 'dom-answer', text: 'answer one' }
+    ],
+    backendResponses: [{
+      responseText: JSON.stringify({
+        messages: [
+          { id: 'backend-review', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['review response', 'continued'] } },
+          { id: 'backend-answer', author: { role: 'user' }, content: { content_type: 'text', parts: ['answer one'] } }
+        ],
+        page_info: { has_previous_page: false }
+      })
+    }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(result.dom.tailTurnCount, 3);
+  assert.equal(result.dom.groupedTurnCountNewline, 2);
+  assert.equal(result.dom.multiUnitGroupCount, 1);
+  assert.equal(result.models.TEXT_ONLY_NL.orderedExactMatchCount, 1);
+  assert.equal(result.groupedModels.TEXT_ONLY_NL.noMerge.orderedExactMatchCount, 2);
+  assert.equal(result.groupedModels.TEXT_ONLY_NL.assistantMergeNewline.orderedExactMatchCount, 2);
+  assert.equal(result.groupedModels.TEXT_ONLY_NL.assistantMergeBlankline.orderedExactMatchCount, 1);
+});
+
+test('chatgpt-controller: backend history visibility diagnostics follows bounded older pages once and fails closed on cursor cycles', async () => {
+  const paginated = createBackendDiagnosticPage({
+    backendResponses: [
+      { responseText: JSON.stringify({ messages: [{ id: 'newer', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['newer'] } }], page_info: { has_previous_page: true, start_cursor: 'cursor-sentinel' } }) },
+      { responseText: JSON.stringify({ messages: [{ id: 'older', author: { role: 'user' }, content: { content_type: 'text', parts: ['older'] } }], page_info: { has_previous_page: false } }) }
+    ]
+  });
+  const result = await createController(paginated.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(result.backend.complete, true);
+  assert.equal(result.backend.pageCount, 2);
+  assert.equal(paginated.calls.length, 2);
+  assert.equal(new URL(paginated.calls[0].url, 'https://chatgpt.com').searchParams.has('before'), false);
+  assert.equal(new URL(paginated.calls[1].url, 'https://chatgpt.com').searchParams.get('before'), 'cursor-sentinel');
+  assert.doesNotMatch(JSON.stringify(result), /cursor-sentinel|newer|older|session-access-token-sentinel/u);
+
+  const cycle = createBackendDiagnosticPage({ backendResponses: [
+    { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'cycle-sentinel' } }) },
+    { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'cycle-sentinel' } }) }
+  ] });
+  await assert.rejects(() => createController(cycle.page).readConversationBackendHistoryDiagnostics(), /conversation_backend_history_diagnostics_cursor_cycle/u);
+  assert.equal(cycle.calls.length, 2);
 });
 
 test('chatgpt-controller: backend history rejects contradictory pagination aliases and accepts equivalent aliases', async () => {

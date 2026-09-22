@@ -4580,6 +4580,55 @@ test('http-api: backend conversation history is authenticated, bounded, and expo
   assert.deepEqual(calls, [{ timeoutMs: 1_000, maxTurns: 2, maxCharsPerTurn: 200_000, maxTotalChars: 2_000_000 }]);
 });
 
+test('http-api: backend history visibility diagnostics is authenticated and strictly bounded', async (t) => {
+  const calls = [];
+  const controller = {
+    readConversationBackendHistoryDiagnostics: async (options) => {
+      calls.push(options);
+      return {
+        attempted: true,
+        backend: { complete: true, pageCount: 1, totalBackendMessageCount: 2, terminalOldestReached: true },
+        dom: { tailTurnCount: 2, groupedTurnCountNewline: 2, groupedTurnCountBlankline: 2, multiUnitGroupCount: 0 },
+        models: {},
+        groupedModels: {}
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const probe = {
+    reviewResponseIndex: 0,
+    reviewResponseDigest: 'a'.repeat(64),
+    selectedUserTurns: [{ index: 1, digest: 'b'.repeat(64) }],
+    answerFirstIndex: 1,
+    answerLastIndex: 1,
+    answerLatestTurnDigest: 'c'.repeat(64),
+    answerTranscriptSha256: 'd'.repeat(64)
+  };
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe } });
+  assert.equal(result.res.status, 200);
+  assert.equal(result.data.diagnostics.backend.complete, true);
+  assert.deepEqual(calls, [{ timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe }]);
+
+  const unauthorized = await req({ port: server.address().port, method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review' } });
+  assert.equal(unauthorized.res.status, 401);
+  const invalid = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', legacyAnchorProbe: { ...probe, reviewResponseDigest: 'not-a-hash' } } });
+  assert.equal(invalid.res.status, 400);
+  assert.equal(calls.length, 1);
+});
+
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {
   const calls = [];
   const controller = {

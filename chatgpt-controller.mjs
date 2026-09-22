@@ -754,6 +754,276 @@ function buildBackendConversationHistoryScript({ timeoutMs, maxTurns, maxCharsPe
   })()`;
 }
 
+function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe }) {
+  const sessionMaxBytes = 64 * 1024;
+  const pageMaxBytes = 20 * 1024 * 1024;
+  const totalMaxBytes = 64 * 1024 * 1024;
+  const probe = legacyAnchorProbe || null;
+  return String.raw`(async () => {
+    const timeoutMs = ${JSON.stringify(timeoutMs)};
+    const historyTimeoutMs = ${JSON.stringify(historyTimeoutMs)};
+    const tailMaxTurns = ${JSON.stringify(tailMaxTurns)};
+    const anchorProbe = ${JSON.stringify(probe)};
+    const sessionMaxBytes = ${JSON.stringify(sessionMaxBytes)};
+    const pageMaxBytes = ${JSON.stringify(pageMaxBytes)};
+    const totalMaxBytes = ${JSON.stringify(totalMaxBytes)};
+    const buckets = ['text', 'multimodal_text', 'code', 'thought_or_reasoning', 'user_editable_context', 'tool_or_execution', 'other_known_nonvisible', 'unknown', 'missing'];
+    const modelNames = ['CURRENT', 'TEXT_ONLY_NL', 'TEXT_ONLY_BLANKLINE', 'VISIBLE_TEXT_NL', 'VISIBLE_TEXT_BLANKLINE', 'VISIBLE_TEXT_CODE_BLANKLINE', 'END_TURN_VISIBLE_TEXT_BLANKLINE'];
+    const emptyAlignment = () => ({ backendCandidateTurnCount: 0, exactCommonSuffixLength: 0, orderedExactMatchCount: 0, domUnmatchedCount: 0, backendUnmatchedCount: 0, extraBackendUserCount: 0, extraBackendAssistantCount: 0, extraDomUserCount: 0, extraDomAssistantCount: 0 });
+    const emptyGroupAlignment = () => ({ backendTurnCount: 0, domGroupedTurnCount: 0, orderedExactMatchCount: 0, exactCommonSuffixLength: 0, domUnmatchedCount: 0, backendUnmatchedCount: 0 });
+    const makeModel = () => ({ ...emptyAlignment(), legacyAnchorProbe: anchorProbe ? { reviewResponseMatches: false, selectedTurnsMatch: false, answerBoundaryMatches: false, latestTurnDigestMatches: false, transcriptMatches: false, allMatch: false } : undefined });
+    const result = {
+      attempted: true,
+      backend: { complete: false, pageCount: 0, totalBackendMessageCount: 0, terminalOldestReached: false },
+      dom: { tailTurnCount: 0, groupedTurnCountNewline: 0, groupedTurnCountBlankline: 0, multiUnitGroupCount: 0 },
+      backendBuckets: { user: Object.fromEntries(buckets.map((bucket) => [bucket, 0])), assistant: Object.fromEntries(buckets.map((bucket) => [bucket, 0])) },
+      exclusionCounts: { recipientNonAll: 0, visuallyHidden: 0, isCompleteFalse: 0, aggregateResult: 0, command: 0, toolCall: 0, toolCalls: 0 },
+      models: Object.fromEntries(modelNames.map((name) => [name, makeModel()])),
+      groupedModels: Object.fromEntries(modelNames.map((name) => [name, { noMerge: emptyGroupAlignment(), assistantMergeNewline: emptyGroupAlignment(), assistantMergeBlankline: emptyGroupAlignment() }]))
+    };
+    const pageOrigin = String(location?.origin || '');
+    const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
+    let conversationId = null;
+    if (pathMatch) { try { conversationId = decodeURIComponent(pathMatch[1]); } catch { conversationId = null; } }
+    if (typeof conversationId !== 'string' || !conversationId) throw new Error('conversation_backend_history_diagnostics_path_invalid');
+    const startedAt = Date.now();
+    const deadline = () => Date.now() - startedAt <= historyTimeoutMs && Date.now() - startedAt <= timeoutMs;
+    const abortController = new AbortController();
+    const timeoutHandle = setTimeout(() => abortController.abort(), Math.min(timeoutMs, historyTimeoutMs));
+    let accessToken = null;
+    try {
+      const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
+      const readBoundedText = async (response, limit) => {
+        let declared = null;
+        try { const value = Number(response?.headers?.get?.('content-length')); if (Number.isSafeInteger(value) && value >= 0) declared = value; } catch {}
+        if (declared !== null && declared > limit) throw new Error('conversation_backend_history_diagnostics_page_too_large');
+        const reader = response?.body?.getReader?.();
+        if (!reader) throw new Error('conversation_backend_history_diagnostics_stream_unavailable');
+        const decoder = new TextDecoder();
+        const parts = [];
+        let bytes = 0;
+        const readWithAbort = async () => {
+          if (abortController.signal.aborted || !deadline()) throw new Error('conversation_backend_history_diagnostics_timeout');
+          let handler;
+          const abortPromise = new Promise((_, reject) => { handler = () => reject(new Error('conversation_backend_history_diagnostics_timeout')); abortController.signal.addEventListener('abort', handler, { once: true }); });
+          try { return await Promise.race([reader.read(), abortPromise]); } finally { abortController.signal.removeEventListener('abort', handler); }
+        };
+        try {
+          while (true) {
+            const next = await readWithAbort();
+            if (next.done) break;
+            const chunk = next.value instanceof Uint8Array ? next.value : new Uint8Array(next.value);
+            bytes += chunk.byteLength;
+            if (bytes > limit) throw new Error('conversation_backend_history_diagnostics_page_too_large');
+            parts.push(decoder.decode(chunk, { stream: true }));
+          }
+          parts.push(decoder.decode());
+          return { text: parts.join(''), bytes };
+        } catch (error) { try { await reader.cancel(); } catch {} throw error; }
+      };
+      const fetchJson = async (url) => {
+        const response = await fetch(url, { method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken }, signal: abortController.signal });
+        if (!response?.ok) throw new Error('conversation_backend_history_diagnostics_http_failed');
+        let contentType = '';
+        try { contentType = String(response.headers?.get?.('content-type') || ''); } catch {}
+        if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType)) throw new Error('conversation_backend_history_diagnostics_non_json');
+        const bounded = await readBoundedText(response, pageMaxBytes);
+        let body;
+        try { body = JSON.parse(bounded.text); } catch { throw new Error('conversation_backend_history_diagnostics_json_invalid'); }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) throw new Error('conversation_backend_history_diagnostics_page_invalid');
+        const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+        const normalizePageInfo = (candidate) => {
+          if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('conversation_backend_history_diagnostics_page_info_invalid');
+          const snake = hasOwn(candidate, 'has_previous_page');
+          const camel = hasOwn(candidate, 'hasPreviousPage');
+          if (!snake && !camel) throw new Error('conversation_backend_history_diagnostics_page_info_invalid');
+          if ((snake && typeof candidate.has_previous_page !== 'boolean') || (camel && typeof candidate.hasPreviousPage !== 'boolean')) throw new Error('conversation_backend_history_diagnostics_page_info_invalid');
+          if (snake && camel && candidate.has_previous_page !== candidate.hasPreviousPage) throw new Error('conversation_backend_history_diagnostics_page_info_conflict');
+          const hasPreviousPage = snake ? candidate.has_previous_page : candidate.hasPreviousPage;
+          const hasCursorSnake = hasOwn(candidate, 'start_cursor');
+          const hasCursorCamel = hasOwn(candidate, 'startCursor');
+          const normCursor = (value) => { if (value === null) return null; if (typeof value !== 'string') throw new Error('conversation_backend_history_diagnostics_page_info_invalid'); return value.trim(); };
+          const cursorSnake = hasCursorSnake ? normCursor(candidate.start_cursor) : null;
+          const cursorCamel = hasCursorCamel ? normCursor(candidate.startCursor) : null;
+          if (hasCursorSnake && hasCursorCamel && cursorSnake !== cursorCamel) throw new Error('conversation_backend_history_diagnostics_cursor_conflict');
+          const startCursor = hasCursorSnake ? cursorSnake : cursorCamel;
+          if (hasPreviousPage && !startCursor) throw new Error('conversation_backend_history_diagnostics_cursor_missing');
+          return { hasPreviousPage, startCursor };
+        };
+        const hasSnake = hasOwn(body, 'page_info');
+        const hasCamel = hasOwn(body, 'pageInfo');
+        if (!hasSnake && !hasCamel) throw new Error('conversation_backend_history_diagnostics_page_info_invalid');
+        const snakeInfo = hasSnake ? normalizePageInfo(body.page_info) : null;
+        const camelInfo = hasCamel ? normalizePageInfo(body.pageInfo) : null;
+        if (snakeInfo && camelInfo && (snakeInfo.hasPreviousPage !== camelInfo.hasPreviousPage || snakeInfo.startCursor !== camelInfo.startCursor)) throw new Error('conversation_backend_history_diagnostics_page_info_conflict');
+        const pageInfo = snakeInfo || camelInfo;
+        return { body, bytes: bounded.bytes, ...pageInfo };
+      };
+      const sessionResponse = await fetch('/api/auth/session', { method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' }, signal: abortController.signal });
+      if (!sessionResponse?.ok) throw new Error('conversation_backend_history_diagnostics_session_failed');
+      let sessionType = '';
+      try { sessionType = String(sessionResponse.headers?.get?.('content-type') || ''); } catch {}
+      if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(sessionType)) throw new Error('conversation_backend_history_diagnostics_session_non_json');
+      const session = JSON.parse((await readBoundedText(sessionResponse, sessionMaxBytes)).text);
+      if (!session || typeof session !== 'object' || Array.isArray(session) || typeof session.accessToken !== 'string' || !session.accessToken.trim() || session.accessToken.length > 16 * 1024) throw new Error('conversation_backend_history_diagnostics_session_invalid');
+      accessToken = session.accessToken;
+      const seenCursors = new Set();
+      const seenMessages = new Map();
+      const orderedMessages = [];
+      let cursor = null;
+      let hasPreviousPage = true;
+      let totalBytes = 0;
+      let pageCount = 0;
+      while (hasPreviousPage) {
+        if (pageCount >= ${JSON.stringify(MAX_BACKEND_CONVERSATION_HISTORY_PAGES)}) throw new Error('conversation_backend_history_diagnostics_page_limit');
+        if (cursor !== null) { if (seenCursors.has(cursor)) throw new Error('conversation_backend_history_diagnostics_cursor_cycle'); seenCursors.add(cursor); }
+        const pageUrl = '/backend-api/conversations/' + encodeURIComponent(conversationId) + (cursor === null ? '?include_has_versions=true&num_turns=100' : '/messages?before=' + encodeURIComponent(cursor) + '&include_has_versions=true&num_turns=100');
+        const page = await fetchJson(pageUrl);
+        const responseConversationId = page.body.conversation_id ?? page.body.conversationId;
+        if (responseConversationId !== undefined && responseConversationId !== conversationId) throw new Error('conversation_backend_history_diagnostics_conversation_mismatch');
+        pageCount += 1;
+        totalBytes += page.bytes;
+        if (totalBytes > totalMaxBytes) throw new Error('conversation_backend_history_diagnostics_total_too_large');
+        const pageItems = [];
+        for (const message of page.body.messages) {
+          if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error('conversation_backend_history_diagnostics_message_invalid');
+          const idValue = message.id ?? message.message_id;
+          const id = typeof idValue === 'string' && idValue.trim() ? idValue.trim() : null;
+          const role = message?.author?.role;
+          const signature = JSON.stringify({ role: typeof role === 'string' ? role : null, message });
+          if (id) { const prior = seenMessages.get(id); if (prior && prior.signature !== signature) throw new Error('conversation_backend_history_diagnostics_duplicate_conflict'); if (prior) continue; seenMessages.set(id, { signature }); }
+          pageItems.push(message);
+        }
+        orderedMessages.unshift(...pageItems);
+        hasPreviousPage = page.hasPreviousPage;
+        cursor = hasPreviousPage ? page.startCursor : null;
+      }
+      accessToken = null;
+      const roleOf = (message) => message?.author?.role === 'user' || message?.author?.role === 'assistant' ? message.author.role : null;
+      const contentTypeBucket = (message) => {
+        const value = message?.content?.content_type;
+        if (typeof value !== 'string' || !value.trim()) return 'missing';
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'text') return 'text';
+        if (normalized === 'multimodal_text') return 'multimodal_text';
+        if (normalized === 'code') return 'code';
+        if (/thought|reasoning/u.test(normalized)) return 'thought_or_reasoning';
+        if (/user.*editable.*context|editable.*context/u.test(normalized)) return 'user_editable_context';
+        if (/tool|execution|function|computer/u.test(normalized)) return 'tool_or_execution';
+        if (/system|tether|error|result|browser|search/u.test(normalized)) return 'other_known_nonvisible';
+        return 'unknown';
+      };
+      const recursiveParts = (value, depth = 0) => {
+        if (depth > 20 || value === null || value === undefined) return [];
+        if (typeof value === 'string') return [value];
+        if (Array.isArray(value)) return value.flatMap((item) => recursiveParts(item, depth + 1));
+        if (typeof value !== 'object') return [];
+        const out = [];
+        if (typeof value.text === 'string') out.push(value.text);
+        if (typeof value.content === 'string') out.push(value.content);
+        if (typeof value.value === 'string') out.push(value.value);
+        if (Array.isArray(value.parts)) out.push(...recursiveParts(value.parts, depth + 1));
+        if (Array.isArray(value.content)) out.push(...recursiveParts(value.content, depth + 1));
+        return out;
+      };
+      const stringParts = (message) => Array.isArray(message?.content?.parts) ? message.content.parts.filter((part) => typeof part === 'string') : [];
+      const isVisible = (message, role) => {
+        if (!role) return false;
+        if (Object.prototype.hasOwnProperty.call(message, 'recipient') && message.recipient !== null && message.recipient !== 'all') return false;
+        const metadata = message?.metadata;
+        return !metadata || typeof metadata !== 'object' || (!metadata.is_visually_hidden_from_conversation && metadata.is_complete !== false && !metadata.aggregate_result && !metadata.command && !metadata.tool_call && !metadata.tool_calls);
+      };
+      const exclusion = (message) => {
+        const metadata = message?.metadata;
+        if (Object.prototype.hasOwnProperty.call(message, 'recipient') && message.recipient !== null && message.recipient !== 'all') result.exclusionCounts.recipientNonAll += 1;
+        if (metadata && typeof metadata === 'object') {
+          if (metadata.is_visually_hidden_from_conversation === true) result.exclusionCounts.visuallyHidden += 1;
+          if (metadata.is_complete === false) result.exclusionCounts.isCompleteFalse += 1;
+          if (metadata.aggregate_result) result.exclusionCounts.aggregateResult += 1;
+          if (metadata.command) result.exclusionCounts.command += 1;
+          if (metadata.tool_call) result.exclusionCounts.toolCall += 1;
+          if (metadata.tool_calls) result.exclusionCounts.toolCalls += 1;
+        }
+      };
+      const textFor = (message, model) => {
+        const bucket = contentTypeBucket(message);
+        const separator = model.endsWith('BLANKLINE') ? '\n\n' : '\n';
+        let parts = [];
+        if (model === 'CURRENT') parts = recursiveParts(message?.content).length ? recursiveParts(message.content) : recursiveParts(message);
+        else if (model.startsWith('TEXT_ONLY')) parts = bucket === 'text' ? stringParts(message) : [];
+        else if (model.startsWith('VISIBLE_TEXT')) parts = (bucket === 'text' || bucket === 'multimodal_text' || (model === 'VISIBLE_TEXT_CODE_BLANKLINE' && bucket === 'code')) ? stringParts(message) : [];
+        else if (model.startsWith('END_TURN')) parts = (bucket === 'text' || bucket === 'multimodal_text') ? stringParts(message) : [];
+        if (model === 'VISIBLE_TEXT_CODE_BLANKLINE' && bucket === 'code' && typeof message?.content?.text === 'string' && message.content.text) parts = [message.content.text];
+        return normalizeText(parts.join(separator));
+      };
+      const allowed = (message, model) => {
+        const role = roleOf(message);
+        if (!isVisible(message, role)) return false;
+        const bucket = contentTypeBucket(message);
+        if (model === 'CURRENT') return true;
+        if (model === 'TEXT_ONLY_NL' || model === 'TEXT_ONLY_BLANKLINE') return bucket === 'text';
+        if (model === 'VISIBLE_TEXT_NL' || model === 'VISIBLE_TEXT_BLANKLINE') return bucket === 'text' || bucket === 'multimodal_text';
+        if (model === 'VISIBLE_TEXT_CODE_BLANKLINE') return bucket === 'text' || bucket === 'multimodal_text' || bucket === 'code';
+        if (model === 'END_TURN_VISIBLE_TEXT_BLANKLINE') return (bucket === 'text' || bucket === 'multimodal_text') && message.end_turn !== false;
+        return false;
+      };
+      const allModelTurns = (model) => orderedMessages.filter((message) => allowed(message, model)).map((message) => ({ role: roleOf(message), text: textFor(message, model) }));
+      const key = (turn) => JSON.stringify([turn.role, turn.text]);
+      const lcs = (left, right) => { const dp = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0)); for (let i = 1; i <= left.length; i += 1) for (let j = 1; j <= right.length; j += 1) dp[i][j] = key(left[i - 1]) === key(right[j - 1]) ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]); return dp[left.length][right.length]; };
+      const suffix = (left, right) => { let count = 0; for (let i = 1; i <= Math.min(left.length, right.length); i += 1) { if (key(left.at(-i)) !== key(right.at(-i))) break; count += 1; } return count; };
+      const roleCounts = (turns, role) => turns.filter((turn) => turn.role === role).length;
+      const alignment = (backendTurns, domTurns) => {
+        const backend = backendTurns.slice(-40);
+        const orderedExactMatchCount = lcs(backend, domTurns);
+        return { backendCandidateTurnCount: backend.length, exactCommonSuffixLength: suffix(backend, domTurns), orderedExactMatchCount, domUnmatchedCount: domTurns.length - orderedExactMatchCount, backendUnmatchedCount: backend.length - orderedExactMatchCount, extraBackendUserCount: roleCounts(backend.filter((turn) => !domTurns.some((dom) => key(dom) === key(turn))), 'user'), extraBackendAssistantCount: roleCounts(backend.filter((turn) => !domTurns.some((dom) => key(dom) === key(turn))), 'assistant'), extraDomUserCount: roleCounts(domTurns.filter((turn) => !backend.some((item) => key(item) === key(turn))), 'user'), extraDomAssistantCount: roleCounts(domTurns.filter((turn) => !backend.some((item) => key(item) === key(turn))), 'assistant') };
+      };
+      const digest = async (value) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value)))), (byte) => byte.toString(16).padStart(2, '0')).join('');
+      const anchorCheck = async (turns) => {
+        if (!anchorProbe) return undefined;
+        const review = turns.filter((turn) => turn.index === anchorProbe.reviewResponseIndex);
+        const reviewResponseMatches = review.length === 1 && review[0].role === 'assistant' && await digest(review[0].text) === anchorProbe.reviewResponseDigest;
+        const digestTurn = async (turn) => digest(JSON.stringify({ index: turn.index, role: turn.role, text: turn.text }));
+        const selectedTurnsMatch = (await Promise.all(anchorProbe.selectedUserTurns.map(async (expected) => {
+          const turn = turns.find((candidate) => candidate.index === expected.index);
+          return !!turn && turn.role === 'user' && expected.digest === await digestTurn(turn);
+        }))).every(Boolean);
+        const selected = anchorProbe.selectedUserTurns.map((expected) => turns.find((turn) => turn.index === expected.index)).filter(Boolean);
+        const answerBoundaryMatches = selected.length === anchorProbe.selectedUserTurns.length && selected.length > 0 && reviewResponseMatches && anchorProbe.reviewResponseIndex < selected[0].index && selected[0].index === anchorProbe.answerFirstIndex && selected.at(-1).index === anchorProbe.answerLastIndex;
+        const latestTurnDigestMatches = selected.length > 0 && anchorProbe.answerLatestTurnDigest === await digestTurn(selected.at(-1));
+        const transcriptMatches = selected.length === anchorProbe.selectedUserTurns.length
+          && anchorProbe.answerTranscriptSha256 === await digest(JSON.stringify(selected.map((turn) => ({ index: turn.index, role: turn.role, text: turn.text }))));
+        return { reviewResponseMatches, selectedTurnsMatch, answerBoundaryMatches, latestTurnDigestMatches, transcriptMatches, allMatch: reviewResponseMatches && selectedTurnsMatch && answerBoundaryMatches && latestTurnDigestMatches && transcriptMatches };
+      };
+      const domModel = ${buildChatGPTDomModelScript()};
+      const domRead = domModel.read();
+      const domUnits = domRead.valid ? domRead.records.filter((record) => (record.role === 'user' || record.role === 'assistant') && record.text).slice(-tailMaxTurns).map((record) => ({ role: record.role, text: normalizeText(record.text), turnId: record.turnId || null })) : [];
+      const groupTurns = (separator) => { const groups = []; for (const unit of domUnits) { const previous = groups.at(-1); if (previous && previous.turnId !== null && unit.turnId !== null && previous.turnId === unit.turnId) previous.units.push(unit); else groups.push({ turnId: unit.turnId, units: [unit] }); } return groups.map((group) => ({ role: group.units[0].role, text: normalizeText(group.units.map((unit) => unit.text).join(separator)), unitCount: group.units.length })); };
+      const domGroupedNl = groupTurns('\n');
+      const domGroupedBlank = groupTurns('\n\n');
+      result.dom.tailTurnCount = domUnits.length;
+      result.dom.groupedTurnCountNewline = domGroupedNl.length;
+      result.dom.groupedTurnCountBlankline = domGroupedBlank.length;
+      result.dom.multiUnitGroupCount = groupTurns('\n').filter((group) => group.unitCount > 1).length;
+      for (const message of orderedMessages.slice(-40)) {
+        const role = roleOf(message);
+        if (role) result.backendBuckets[role][contentTypeBucket(message)] += 1;
+        exclusion(message);
+      }
+      for (const model of modelNames) {
+        const turns = allModelTurns(model).map((turn, index) => ({ ...turn, index }));
+        result.models[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}) };
+        const merge = (separator) => { const merged = []; for (const turn of turns) { const previous = merged.at(-1); if (previous && previous.role === 'assistant' && turn.role === 'assistant') previous.text = normalizeText(previous.text + separator + turn.text); else merged.push({ ...turn }); } return merged; };
+        result.groupedModels[model] = { noMerge: { ...alignment(turns, domGroupedNl), backendTurnCount: turns.length, domGroupedTurnCount: domGroupedNl.length }, assistantMergeNewline: { ...alignment(merge('\n'), domGroupedNl), backendTurnCount: merge('\n').length, domGroupedTurnCount: domGroupedNl.length }, assistantMergeBlankline: { ...alignment(merge('\n\n'), domGroupedBlank), backendTurnCount: merge('\n\n').length, domGroupedTurnCount: domGroupedBlank.length } };
+      }
+      result.backend.complete = hasPreviousPage === false;
+      result.backend.pageCount = pageCount;
+      result.backend.totalBackendMessageCount = seenMessages.size || orderedMessages.length;
+      result.backend.terminalOldestReached = hasPreviousPage === false;
+      return result;
+    } finally { accessToken = null; clearTimeout(timeoutHandle); }
+  })()`;
+}
+
 function normalizeUserTurnText(value) {
   return String(value || '')
     .replace(/\u0000/g, '')
@@ -7295,6 +7565,28 @@ export class ChatGPTController {
       maxTurns,
       maxCharsPerTurn,
       maxTotalChars
+    })));
+  }
+
+  async readConversationBackendHistoryDiagnostics({
+    timeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
+    historyTimeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
+    tailMaxTurns = 100,
+    legacyAnchorProbe = null
+  } = {}) {
+    const boundedTimeoutMs = Number(timeoutMs);
+    const boundedHistoryTimeoutMs = Number(historyTimeoutMs);
+    const boundedTailMaxTurns = Number(tailMaxTurns);
+    if (!Number.isSafeInteger(boundedTimeoutMs) || boundedTimeoutMs < 1_000 || boundedTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS ||
+        !Number.isSafeInteger(boundedHistoryTimeoutMs) || boundedHistoryTimeoutMs < 1_000 || boundedHistoryTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS ||
+        !Number.isSafeInteger(boundedTailMaxTurns) || boundedTailMaxTurns < 1 || boundedTailMaxTurns > MAX_CONVERSATION_TURNS) {
+      throw new Error('conversation_backend_history_diagnostics_limits_invalid');
+    }
+    return await this.runExclusive(async () => await this.#eval(buildBackendConversationHistoryDiagnosticsScript({
+      timeoutMs: boundedTimeoutMs,
+      historyTimeoutMs: boundedHistoryTimeoutMs,
+      tailMaxTurns: boundedTailMaxTurns,
+      legacyAnchorProbe
     })));
   }
 

@@ -497,6 +497,23 @@ a complete backend-pagination source only after the caller independently
 aligns its bounded DOM tail with the returned suffix; it is not used by the
 ordinary DOM conversation endpoint.
 
+For a page-context-only comparison of safe backend visibility candidates, use:
+
+```text
+POST /conversation/backend-history-diagnostics
+Authorization: Bearer <local-token>
+Content-Type: application/json
+
+{"tabId":"existing-chatgpt-tab","timeoutMs":180000,"historyTimeoutMs":180000,"tailMaxTurns":100}
+```
+
+This diagnostic follows the same authenticated, bounded pagination route but
+keeps raw messages, metadata, cursors, IDs, and text inside the ChatGPT page
+context. It compares fixed visibility models and adjacent DOM-unit grouping,
+returning only bounded counts, booleans, fixed bucket names, and optional
+legacy-anchor booleans. It does not change backend-history behavior, synthesize
+a mapping, scroll the DOM, or establish recovery/full-history proof.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

@@ -25,6 +25,46 @@ const MAX_BROWSER_EVALUATION_DIAGNOSTIC_LENGTH = 256;
 const DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS = 60_000;
 const MAX_CONVERSATION_HISTORY_TIMEOUT_MS = 180_000;
 const MAX_CONVERSATION_HISTORY_ITERATIONS = 240;
+const BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES = Object.freeze([
+  'CURRENT',
+  'TEXT_ONLY_NL',
+  'TEXT_ONLY_BLANKLINE',
+  'VISIBLE_TEXT_NL',
+  'VISIBLE_TEXT_BLANKLINE',
+  'VISIBLE_TEXT_CODE_BLANKLINE',
+  'END_TURN_VISIBLE_TEXT_BLANKLINE'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_BUCKET_NAMES = Object.freeze([
+  'text',
+  'multimodal_text',
+  'code',
+  'thought_or_reasoning',
+  'user_editable_context',
+  'tool_or_execution',
+  'other_known_nonvisible',
+  'unknown',
+  'missing'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS = Object.freeze([
+  'backendCandidateTurnCount',
+  'exactCommonSuffixLength',
+  'orderedExactMatchCount',
+  'domUnmatchedCount',
+  'backendUnmatchedCount',
+  'extraBackendUserCount',
+  'extraBackendAssistantCount',
+  'extraDomUserCount',
+  'extraDomAssistantCount'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_GROUP_KEYS = Object.freeze([
+  'backendTurnCount',
+  'domGroupedTurnCount',
+  'orderedExactMatchCount',
+  'exactCommonSuffixLength',
+  'domUnmatchedCount',
+  'backendUnmatchedCount'
+]);
+const MAX_BACKEND_HISTORY_DIAGNOSTIC_COUNT = 1_000_000_000;
 
 function conversationUrlHash(url) {
   return crypto.createHash('sha256').update(String(url || ''), 'utf8').digest('hex');
@@ -326,6 +366,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'conversation_history_iterations_invalid') return { code: 400, body: { error: 'conversation_history_iterations_invalid' } };
   if (msg === 'conversation_backend_history_diagnostics_limits_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_limits_invalid' } };
   if (msg === 'conversation_backend_history_diagnostics_probe_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_probe_invalid' } };
+  if (msg === 'conversation_backend_history_diagnostics_response_invalid') return { code: 500, body: { error: 'conversation_backend_history_diagnostics_response_invalid' } };
   if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
   if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
@@ -416,6 +457,115 @@ function validateBackendHistoryDiagnosticsProbe(value) {
     answerLatestTurnDigest: hash('answerLatestTurnDigest'),
     answerTranscriptSha256: hash('answerTranscriptSha256')
   };
+}
+
+function isPlainBackendHistoryDiagnosticsObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function validateBackendHistoryDiagnosticsKeys(value, keys) {
+  if (!isPlainBackendHistoryDiagnosticsObject(value)) throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  const allowed = new Set(keys);
+  const actual = Object.keys(value);
+  if (actual.length !== allowed.size || actual.some((key) => !allowed.has(key))) {
+    throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  }
+}
+
+function validateBackendHistoryDiagnosticsBoolean(value) {
+  if (typeof value !== 'boolean') throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  return value;
+}
+
+function validateBackendHistoryDiagnosticsCount(value) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_BACKEND_HISTORY_DIAGNOSTIC_COUNT) {
+    throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  }
+  return value;
+}
+
+export function validateAndSanitizeBackendHistoryDiagnostics(value) {
+  const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels']);
+  if (value.attempted !== true) invalid();
+
+  validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
+  const backend = {
+    complete: validateBackendHistoryDiagnosticsBoolean(value.backend.complete),
+    pageCount: validateBackendHistoryDiagnosticsCount(value.backend.pageCount),
+    totalBackendMessageCount: validateBackendHistoryDiagnosticsCount(value.backend.totalBackendMessageCount),
+    terminalOldestReached: validateBackendHistoryDiagnosticsBoolean(value.backend.terminalOldestReached)
+  };
+
+  validateBackendHistoryDiagnosticsKeys(value.dom, ['tailTurnCount', 'groupedTurnCountNewline', 'groupedTurnCountBlankline', 'multiUnitGroupCount']);
+  const dom = {
+    tailTurnCount: validateBackendHistoryDiagnosticsCount(value.dom.tailTurnCount),
+    groupedTurnCountNewline: validateBackendHistoryDiagnosticsCount(value.dom.groupedTurnCountNewline),
+    groupedTurnCountBlankline: validateBackendHistoryDiagnosticsCount(value.dom.groupedTurnCountBlankline),
+    multiUnitGroupCount: validateBackendHistoryDiagnosticsCount(value.dom.multiUnitGroupCount)
+  };
+
+  validateBackendHistoryDiagnosticsKeys(value.backendBuckets, ['user', 'assistant']);
+  const backendBuckets = {};
+  for (const role of ['user', 'assistant']) {
+    validateBackendHistoryDiagnosticsKeys(value.backendBuckets[role], BACKEND_HISTORY_DIAGNOSTIC_BUCKET_NAMES);
+    backendBuckets[role] = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_BUCKET_NAMES.map((bucket) => [
+      bucket,
+      validateBackendHistoryDiagnosticsCount(value.backendBuckets[role][bucket])
+    ]));
+  }
+
+  const exclusionKeys = ['recipientNonAll', 'visuallyHidden', 'isCompleteFalse', 'aggregateResult', 'command', 'toolCall', 'toolCalls'];
+  validateBackendHistoryDiagnosticsKeys(value.exclusionCounts, exclusionKeys);
+  const exclusionCounts = Object.fromEntries(exclusionKeys.map((key) => [
+    key,
+    validateBackendHistoryDiagnosticsCount(value.exclusionCounts[key])
+  ]));
+
+  const validateAlignment = (alignment) => {
+    const keys = alignment && Object.prototype.hasOwnProperty.call(alignment, 'legacyAnchorProbe')
+      ? [...BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS, 'legacyAnchorProbe']
+      : [...BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS];
+    validateBackendHistoryDiagnosticsKeys(alignment, keys);
+    const sanitized = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS.map((key) => [
+      key,
+      validateBackendHistoryDiagnosticsCount(alignment[key])
+    ]));
+    if (keys.includes('legacyAnchorProbe')) {
+      const probeKeys = ['reviewResponseMatches', 'selectedTurnsMatch', 'answerBoundaryMatches', 'latestTurnDigestMatches', 'transcriptMatches', 'allMatch'];
+      validateBackendHistoryDiagnosticsKeys(alignment.legacyAnchorProbe, probeKeys);
+      sanitized.legacyAnchorProbe = Object.fromEntries(probeKeys.map((key) => [
+        key,
+        validateBackendHistoryDiagnosticsBoolean(alignment.legacyAnchorProbe[key])
+      ]));
+    }
+    return sanitized;
+  };
+
+  validateBackendHistoryDiagnosticsKeys(value.models, BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES);
+  const models = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => [name, validateAlignment(value.models[name])]));
+
+  const validateGroup = (group) => {
+    validateBackendHistoryDiagnosticsKeys(group, BACKEND_HISTORY_DIAGNOSTIC_GROUP_KEYS);
+    return Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_GROUP_KEYS.map((key) => [
+      key,
+      validateBackendHistoryDiagnosticsCount(group[key])
+    ]));
+  };
+  validateBackendHistoryDiagnosticsKeys(value.groupedModels, BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES);
+  const groupedModels = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => {
+    const grouped = value.groupedModels[name];
+    validateBackendHistoryDiagnosticsKeys(grouped, ['noMerge', 'assistantMergeNewline', 'assistantMergeBlankline']);
+    return [name, {
+      noMerge: validateGroup(grouped.noMerge),
+      assistantMergeNewline: validateGroup(grouped.assistantMergeNewline),
+      assistantMergeBlankline: validateGroup(grouped.assistantMergeBlankline)
+    }];
+  }));
+
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -2238,10 +2388,8 @@ export function startHttpApi({
         const tailMaxTurns = strictPositiveIntOr(body.tailMaxTurns, 100, 100, 'conversation_backend_history_diagnostics_limits_invalid');
         const legacyAnchorProbe = validateBackendHistoryDiagnosticsProbe(body.legacyAnchorProbe);
         const diagnostics = await controller.readConversationBackendHistoryDiagnostics({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe });
-        if (!diagnostics || diagnostics.attempted !== true || !diagnostics.backend || !diagnostics.dom || !diagnostics.models || !diagnostics.groupedModels) {
-          throw new Error('conversation_backend_history_diagnostics_controller_unavailable');
-        }
-        return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES });
+        const safeDiagnostics = validateAndSanitizeBackendHistoryDiagnostics(diagnostics);
+        return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

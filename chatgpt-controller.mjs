@@ -904,14 +904,14 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         const value = message?.content?.content_type;
         if (typeof value !== 'string' || !value.trim()) return 'missing';
         const normalized = value.trim().toLowerCase();
-        if (normalized === 'text') return 'text';
-        if (normalized === 'multimodal_text') return 'multimodal_text';
-        if (normalized === 'code') return 'code';
-        if (/thought|reasoning/u.test(normalized)) return 'thought_or_reasoning';
-        if (/user.*editable.*context|editable.*context/u.test(normalized)) return 'user_editable_context';
-        if (/tool|execution|function|computer/u.test(normalized)) return 'tool_or_execution';
-        if (/system|tether|error|result|browser|search/u.test(normalized)) return 'other_known_nonvisible';
-        return 'unknown';
+        const exactBuckets = new Map([
+          ['text', 'text'],
+          ['multimodal_text', 'multimodal_text'],
+          ['code', 'code'],
+          ['thought', 'thought_or_reasoning'],
+          ['execution_output', 'tool_or_execution']
+        ]);
+        return exactBuckets.get(normalized) || 'unknown';
       };
       const recursiveParts = (value, depth = 0) => {
         if (depth > 20 || value === null || value === undefined) return [];

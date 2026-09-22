@@ -5,7 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi, validateAndSanitizeBackendHistoryDiagnostics } from '../http-api.mjs';
 import { ChatGPTController } from '../chatgpt-controller.mjs';
 import { ChromeCdpBrowserBackend } from '../chrome-cdp-backend.mjs';
 
@@ -22,6 +22,119 @@ async function req({ port, token, method, pth, body, headers = {} }) {
   const data = await res.json().catch(() => ({}));
   return { res, data };
 }
+
+const backendHistoryDiagnosticModels = [
+  'CURRENT',
+  'TEXT_ONLY_NL',
+  'TEXT_ONLY_BLANKLINE',
+  'VISIBLE_TEXT_NL',
+  'VISIBLE_TEXT_BLANKLINE',
+  'VISIBLE_TEXT_CODE_BLANKLINE',
+  'END_TURN_VISIBLE_TEXT_BLANKLINE'
+];
+const backendHistoryDiagnosticBuckets = [
+  'text',
+  'multimodal_text',
+  'code',
+  'thought_or_reasoning',
+  'user_editable_context',
+  'tool_or_execution',
+  'other_known_nonvisible',
+  'unknown',
+  'missing'
+];
+
+function validBackendHistoryDiagnostics({ withProbe = false } = {}) {
+  const alignment = () => ({
+    backendCandidateTurnCount: 0,
+    exactCommonSuffixLength: 0,
+    orderedExactMatchCount: 0,
+    domUnmatchedCount: 0,
+    backendUnmatchedCount: 0,
+    extraBackendUserCount: 0,
+    extraBackendAssistantCount: 0,
+    extraDomUserCount: 0,
+    extraDomAssistantCount: 0,
+    ...(withProbe ? { legacyAnchorProbe: {
+      reviewResponseMatches: true,
+      selectedTurnsMatch: true,
+      answerBoundaryMatches: true,
+      latestTurnDigestMatches: true,
+      transcriptMatches: true,
+      allMatch: true
+    } } : {})
+  });
+  const grouped = () => ({
+    backendTurnCount: 0,
+    domGroupedTurnCount: 0,
+    orderedExactMatchCount: 0,
+    exactCommonSuffixLength: 0,
+    domUnmatchedCount: 0,
+    backendUnmatchedCount: 0
+  });
+  return {
+    attempted: true,
+    backend: { complete: true, pageCount: 1, totalBackendMessageCount: 0, terminalOldestReached: true },
+    dom: { tailTurnCount: 0, groupedTurnCountNewline: 0, groupedTurnCountBlankline: 0, multiUnitGroupCount: 0 },
+    backendBuckets: {
+      user: Object.fromEntries(backendHistoryDiagnosticBuckets.map((bucket) => [bucket, 0])),
+      assistant: Object.fromEntries(backendHistoryDiagnosticBuckets.map((bucket) => [bucket, 0]))
+    },
+    exclusionCounts: { recipientNonAll: 0, visuallyHidden: 0, isCompleteFalse: 0, aggregateResult: 0, command: 0, toolCall: 0, toolCalls: 0 },
+    models: Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, alignment()])),
+    groupedModels: Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, {
+      noMerge: grouped(),
+      assistantMergeNewline: grouped(),
+      assistantMergeBlankline: grouped()
+    }]))
+  };
+}
+
+test('http-api: backend history diagnostics validator reconstructs the exact safe schema', () => {
+  const source = validBackendHistoryDiagnostics({ withProbe: true });
+  const sanitized = validateAndSanitizeBackendHistoryDiagnostics(source);
+  assert.deepEqual(sanitized, source);
+  assert.notStrictEqual(sanitized, source);
+  assert.notStrictEqual(sanitized.models.CURRENT, source.models.CURRENT);
+  assert.equal(Object.prototype.hasOwnProperty.call(sanitized.models.CURRENT, 'legacyAnchorProbe'), true);
+});
+
+test('http-api: backend history diagnostics validator rejects unknown nested fields and never serializes sentinels', () => {
+  const cases = [
+    ['top-level', (value) => { value.rawMessages = [{ text: 'raw-text-sentinel' }]; }],
+    ['backend', (value) => { value.backend.providerId = 'provider-id-sentinel'; }],
+    ['model', (value) => { value.models.CURRENT.secret = 'secret-sentinel'; }],
+    ['legacy probe', (value) => { value.models.CURRENT.legacyAnchorProbe = { ...value.models.CURRENT.legacyAnchorProbe, digest: 'hash-sentinel' }; }],
+    ['grouped model', (value) => { value.groupedModels.CURRENT.noMerge.cursor = 'cursor-sentinel'; }]
+  ];
+  for (const [name, mutate] of cases) {
+    const value = validBackendHistoryDiagnostics({ withProbe: true });
+    mutate(value);
+    assert.throws(
+      () => validateAndSanitizeBackendHistoryDiagnostics(value),
+      (error) => error?.message === 'conversation_backend_history_diagnostics_response_invalid' && !JSON.stringify(error).includes('sentinel'),
+      name,
+    );
+  }
+});
+
+test('http-api: backend history diagnostics validator enforces fixed models, buckets, and count types', () => {
+  const mutations = [
+    ['extra model', (value) => { value.models.EXTRA = value.models.CURRENT; }],
+    ['missing model', (value) => { delete value.models.CURRENT; }],
+    ['extra bucket', (value) => { value.backendBuckets.user.EXTRA = 0; }],
+    ['missing bucket', (value) => { delete value.backendBuckets.user.text; }],
+    ['negative count', (value) => { value.backend.pageCount = -1; }],
+    ['fractional count', (value) => { value.dom.tailTurnCount = 1.5; }],
+    ['NaN count', (value) => { value.models.CURRENT.orderedExactMatchCount = Number.NaN; }],
+    ['wrong primitive', (value) => { value.backend.complete = 'true'; }]
+  ];
+  for (const [name, mutate] of mutations) {
+    const value = validBackendHistoryDiagnostics();
+    mutate(value);
+    assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), /conversation_backend_history_diagnostics_response_invalid/u, name);
+  }
+});
 
 test('http-api: health is public and returns serverId', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
@@ -4585,13 +4698,7 @@ test('http-api: backend history visibility diagnostics is authenticated and stri
   const controller = {
     readConversationBackendHistoryDiagnostics: async (options) => {
       calls.push(options);
-      return {
-        attempted: true,
-        backend: { complete: true, pageCount: 1, totalBackendMessageCount: 2, terminalOldestReached: true },
-        dom: { tailTurnCount: 2, groupedTurnCountNewline: 2, groupedTurnCountBlankline: 2, multiUnitGroupCount: 0 },
-        models: {},
-        groupedModels: {}
-      };
+      return validBackendHistoryDiagnostics();
     }
   };
   const tabs = {
@@ -4627,6 +4734,30 @@ test('http-api: backend history visibility diagnostics is authenticated and stri
   const invalid = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', legacyAnchorProbe: { ...probe, reviewResponseDigest: 'not-a-hash' } } });
   assert.equal(invalid.res.status, 400);
   assert.equal(calls.length, 1);
+});
+
+test('http-api: backend history visibility diagnostics rejects page-context schema pollution', async (t) => {
+  const polluted = validBackendHistoryDiagnostics();
+  polluted.models.CURRENT.rawMessages = [{ id: 'provider-id-sentinel', text: 'raw-text-sentinel', cursor: 'cursor-sentinel', token: 'token-sentinel' }];
+  const controller = { readConversationBackendHistoryDiagnostics: async () => polluted };
+  const tabs = {
+    listTabs: () => [{ id: 'chat-1', key: 'review', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'chat-1',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review' } });
+  assert.equal(result.res.status, 500);
+  assert.deepEqual(result.data, { error: 'conversation_backend_history_diagnostics_response_invalid' });
+  assert.doesNotMatch(JSON.stringify(result), /provider-id-sentinel|raw-text-sentinel|cursor-sentinel|token-sentinel/u);
 });
 
 test('http-api: conversation turns complete mode returns bounded history metadata and rejects invalid history options', async (t) => {

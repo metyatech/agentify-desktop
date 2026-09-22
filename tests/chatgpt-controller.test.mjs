@@ -6802,6 +6802,42 @@ test('chatgpt-controller: backend history visibility diagnostics keep raw metada
   assert.doesNotMatch(serialized, /visible user sentinel|hidden thought sentinel|user-visible-sentinel|unknown-sentinel|vendor-secret-content-type|metadata secret sentinel|session-access-token-sentinel/u);
 });
 
+test('chatgpt-controller: backend visibility buckets use exact content types and redact fabricated values', async () => {
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{
+      responseText: JSON.stringify({
+        messages: [
+          { id: 'known-text', author: { role: 'user' }, content: { content_type: 'text', parts: ['text'] } },
+          { id: 'known-multimodal', author: { role: 'assistant' }, content: { content_type: 'multimodal_text', parts: ['multimodal'] } },
+          { id: 'known-code', author: { role: 'assistant' }, content: { content_type: 'code', text: 'code' } },
+          { id: 'known-thought', author: { role: 'assistant' }, content: { content_type: 'thought', parts: ['thought'] } },
+          { id: 'known-tool', author: { role: 'assistant' }, content: { content_type: 'execution_output', parts: ['tool'] } },
+          { id: 'unknown-reasoning', author: { role: 'assistant' }, content: { content_type: 'secret_reasoning_unknown_xyz', parts: ['unknown reasoning'] } },
+          { id: 'unknown-tool', author: { role: 'assistant' }, content: { content_type: 'tool_private_unknown_xyz', parts: ['unknown tool'] } },
+          { id: 'unknown-browser', author: { role: 'user' }, content: { content_type: 'browser_result_unknown_xyz', parts: ['unknown browser'] } },
+          { id: 'missing-type', author: { role: 'user' }, content: { parts: ['missing type'] } }
+        ],
+        page_info: { has_previous_page: false }
+      })
+    }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(result.backendBuckets.user.text, 1);
+  assert.equal(result.backendBuckets.assistant.multimodal_text, 1);
+  assert.equal(result.backendBuckets.assistant.code, 1);
+  assert.equal(result.backendBuckets.assistant.thought_or_reasoning, 1);
+  assert.equal(result.backendBuckets.assistant.tool_or_execution, 1);
+  assert.equal(result.backendBuckets.assistant.unknown, 2);
+  assert.equal(result.backendBuckets.user.unknown, 1);
+  assert.equal(result.backendBuckets.user.missing, 1);
+  assert.equal(result.models.CURRENT.backendCandidateTurnCount, 9);
+  assert.equal(result.models.VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 2);
+  assert.equal(result.models.VISIBLE_TEXT_CODE_BLANKLINE.backendCandidateTurnCount, 3);
+  assert.equal(result.models.END_TURN_VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 2);
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /secret_reasoning_unknown_xyz|tool_private_unknown_xyz|browser_result_unknown_xyz|known-text|unknown reasoning|missing type/u);
+});
+
 test('chatgpt-controller: backend history visibility diagnostics compare grouped DOM units and legacy anchors', async () => {
   const turns = [
     { role: 'assistant', text: 'review response' },

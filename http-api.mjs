@@ -110,6 +110,34 @@ const BACKEND_HISTORY_DIAGNOSTIC_SINGULAR_FAILURES = Object.freeze([
   'current-node-missing', 'current-node-not-found', 'cycle', 'missing-node', 'invalid-parent',
   'timeout', 'too-large', 'stream', 'other-safe'
 ]);
+const BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCES = Object.freeze([
+  'direct-part',
+  'recursive-leaf',
+  'direct-contiguous-newline',
+  'direct-contiguous-blankline',
+  'recursive-contiguous-newline',
+  'recursive-contiguous-blankline'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_LOCATION_KEYS = Object.freeze([
+  'directPartMatchNodeCount', 'directPartMatchCandidateCount',
+  'recursiveLeafMatchNodeCount', 'recursiveLeafMatchCandidateCount',
+  'directContiguousNewlineMatchNodeCount', 'directContiguousNewlineMatchCandidateCount',
+  'directContiguousBlanklineMatchNodeCount', 'directContiguousBlanklineMatchCandidateCount',
+  'recursiveContiguousNewlineMatchNodeCount', 'recursiveContiguousNewlineMatchCandidateCount',
+  'recursiveContiguousBlanklineMatchNodeCount', 'recursiveContiguousBlanklineMatchCandidateCount'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCE_FIELDS = Object.freeze({
+  'direct-part': ['directPartMatchNodeCount', 'directPartMatchCandidateCount'],
+  'recursive-leaf': ['recursiveLeafMatchNodeCount', 'recursiveLeafMatchCandidateCount'],
+  'direct-contiguous-newline': ['directContiguousNewlineMatchNodeCount', 'directContiguousNewlineMatchCandidateCount'],
+  'direct-contiguous-blankline': ['directContiguousBlanklineMatchNodeCount', 'directContiguousBlanklineMatchCandidateCount'],
+  'recursive-contiguous-newline': ['recursiveContiguousNewlineMatchNodeCount', 'recursiveContiguousNewlineMatchCandidateCount'],
+  'recursive-contiguous-blankline': ['recursiveContiguousBlanklineMatchNodeCount', 'recursiveContiguousBlanklineMatchCandidateCount']
+});
+const BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_METADATA_KEYS = Object.freeze([
+  'contentTypeBucket', 'visibleByCurrentFilter', 'recipientNonAll', 'visuallyHidden', 'isCompleteFalse',
+  'aggregateResult', 'command', 'toolCall', 'toolCalls', 'endTurn'
+]);
 const MAX_BACKEND_HISTORY_DIAGNOSTIC_COUNT = 1_000_000_000;
 
 function conversationUrlHash(url) {
@@ -568,7 +596,7 @@ function validateBackendHistoryDiagnosticsSignedInteger(value) {
 
 export function validateAndSanitizeBackendHistoryDiagnostics(value) {
   const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
-  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels', 'singularAnchorTopology']);
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels', 'singularAnchorTopology', 'singularAnchorFragments']);
   if (value.attempted !== true) invalid();
 
   validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
@@ -832,7 +860,83 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
     if (!expected || expected.length !== selectedUserTurns.length || expected.some((match, index) => match.expectedIndex !== selectedUserTurns[index].expectedIndex)) invalid();
     singularAnchorTopology = { mappingNodeCount, currentPathNodeCount, offPathNodeCount, selectedUserTurns };
   }
-  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology };
+
+  let singularAnchorFragments = null;
+  const contentProbeMatches = models.CURRENT.contentAnchorProbe?.matches;
+  if (value.singularAnchorFragments !== null) {
+    const fragments = value.singularAnchorFragments;
+    validateBackendHistoryDiagnosticsKeys(fragments, ['mappingNodeCount', 'currentPathNodeCount', 'offPathNodeCount', 'selectedUserTurns']);
+    const mappingNodeCount = validateBackendHistoryDiagnosticsCount(fragments.mappingNodeCount);
+    const currentPathNodeCount = validateBackendHistoryDiagnosticsCount(fragments.currentPathNodeCount);
+    const offPathNodeCount = validateBackendHistoryDiagnosticsCount(fragments.offPathNodeCount);
+    if (!singularMapping.currentPathResolved || !contentProbeMatches || mappingNodeCount !== singularMapping.mappingNodeCount ||
+        currentPathNodeCount !== singularMapping.currentPathNodeCount || currentPathNodeCount > mappingNodeCount ||
+        offPathNodeCount !== mappingNodeCount - currentPathNodeCount || !Array.isArray(fragments.selectedUserTurns) ||
+        fragments.selectedUserTurns.length !== contentProbeMatches.length) invalid();
+    const selectedUserTurns = fragments.selectedUserTurns.map((item, index) => {
+      validateBackendHistoryDiagnosticsKeys(item, ['expectedIndex', 'currentPath', 'offPath', 'allMapping', 'uniqueMatchingNode']);
+      const expectedIndex = validateBackendHistoryDiagnosticsIndex(item.expectedIndex);
+      if (expectedIndex !== contentProbeMatches[index].expectedIndex || (index > 0 && expectedIndex <= fragments.selectedUserTurns[index - 1].expectedIndex)) invalid();
+      const validateLocation = (location, nodeCount) => {
+        validateBackendHistoryDiagnosticsKeys(location, BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_LOCATION_KEYS);
+        const safe = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_LOCATION_KEYS.map((key) => [key, validateBackendHistoryDiagnosticsCount(location[key])]));
+        for (const [nodeKey, candidateKey] of Object.values(BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCE_FIELDS)) {
+          if (safe[nodeKey] > nodeCount || safe[candidateKey] < safe[nodeKey]) invalid();
+        }
+        return safe;
+      };
+      const currentPath = validateLocation(item.currentPath, currentPathNodeCount);
+      const offPath = validateLocation(item.offPath, offPathNodeCount);
+      const allMapping = validateLocation(item.allMapping, mappingNodeCount);
+      for (const [nodeKey, candidateKey] of Object.values(BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCE_FIELDS)) {
+        if (currentPath[nodeKey] + offPath[nodeKey] !== allMapping[nodeKey] ||
+            currentPath[candidateKey] + offPath[candidateKey] !== allMapping[candidateKey]) invalid();
+      }
+      const match = item.uniqueMatchingNode;
+      if (match?.found === false) {
+        validateBackendHistoryDiagnosticsKeys(match, ['found']);
+        return { expectedIndex, currentPath, offPath, allMapping, uniqueMatchingNode: { found: false } };
+      }
+      validateBackendHistoryDiagnosticsKeys(match, ['found', 'location', 'matchedSources', ...BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_METADATA_KEYS]);
+      if (match.found !== true || !['current-path', 'off-path'].includes(match.location) ||
+          !Array.isArray(match.matchedSources) || match.matchedSources.length < 1 ||
+          match.matchedSources.some((source, sourceIndex) => !BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCES.includes(source) ||
+            sourceIndex > 0 && BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCES.indexOf(source) <= BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCES.indexOf(match.matchedSources[sourceIndex - 1]))) invalid();
+      const safeMatch = {
+        found: true,
+        location: match.location,
+        matchedSources: [...match.matchedSources],
+        contentTypeBucket: match.contentTypeBucket,
+        visibleByCurrentFilter: validateBackendHistoryDiagnosticsBoolean(match.visibleByCurrentFilter),
+        recipientNonAll: validateBackendHistoryDiagnosticsBoolean(match.recipientNonAll),
+        visuallyHidden: validateBackendHistoryDiagnosticsBoolean(match.visuallyHidden),
+        isCompleteFalse: validateBackendHistoryDiagnosticsBoolean(match.isCompleteFalse),
+        aggregateResult: validateBackendHistoryDiagnosticsBoolean(match.aggregateResult),
+        command: validateBackendHistoryDiagnosticsBoolean(match.command),
+        toolCall: validateBackendHistoryDiagnosticsBoolean(match.toolCall),
+        toolCalls: validateBackendHistoryDiagnosticsBoolean(match.toolCalls),
+        endTurn: match.endTurn
+      };
+      const nodeCounts = safeMatch.location === 'current-path' ? currentPath : offPath;
+      const otherNodeCounts = safeMatch.location === 'current-path' ? offPath : currentPath;
+      const visible = !safeMatch.recipientNonAll && !safeMatch.visuallyHidden && !safeMatch.isCompleteFalse &&
+        !safeMatch.aggregateResult && !safeMatch.command && !safeMatch.toolCall && !safeMatch.toolCalls;
+      if (!BACKEND_HISTORY_DIAGNOSTIC_BUCKET_NAMES.includes(safeMatch.contentTypeBucket) ||
+          !['true', 'false', 'missing'].includes(safeMatch.endTurn) || safeMatch.visibleByCurrentFilter !== visible ||
+          match.matchedSources.some((source) => {
+            const [nodeKey] = BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCE_FIELDS[source];
+            return nodeCounts[nodeKey] !== 1 || otherNodeCounts[nodeKey] !== 0;
+          }) || BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCES.some((source) => {
+            const [nodeKey] = BACKEND_HISTORY_DIAGNOSTIC_FRAGMENT_SOURCE_FIELDS[source];
+            return (nodeCounts[nodeKey] === 1) !== match.matchedSources.includes(source) || otherNodeCounts[nodeKey] !== 0;
+          })) invalid();
+      return { expectedIndex, currentPath, offPath, allMapping, uniqueMatchingNode: safeMatch };
+    });
+    singularAnchorFragments = { mappingNodeCount, currentPathNodeCount, offPathNodeCount, selectedUserTurns };
+  }
+  const fragmentEvidenceRequired = !!contentProbeMatches && singularMapping.currentPathResolved;
+  if (fragmentEvidenceRequired !== (singularAnchorTopology !== null) || fragmentEvidenceRequired !== (singularAnchorFragments !== null)) invalid();
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology, singularAnchorFragments };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {

@@ -135,7 +135,8 @@ function validBackendHistoryDiagnostics({ withProbe = false, withContentProbe = 
       failure: 'http'
     },
     singularBranchModels: null,
-    singularAnchorTopology: null
+    singularAnchorTopology: null,
+    singularAnchorFragments: null
   };
 }
 
@@ -204,6 +205,20 @@ test('http-api: backend history diagnostics validator accepts bounded singular m
       uniqueOffPathMatch: { found: true, role: 'user', contentTypeBucket: 'text', visibleByCurrentFilter: true, recipientNonAll: false, visuallyHidden: false, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'missing', parentOnCurrentPath: true, childOnCurrentPathCount: 0, siblingOnCurrentPathCount: 1 }
     }]
   };
+  const fragmentZero = {
+    directPartMatchNodeCount: 0, directPartMatchCandidateCount: 0,
+    recursiveLeafMatchNodeCount: 0, recursiveLeafMatchCandidateCount: 0,
+    directContiguousNewlineMatchNodeCount: 0, directContiguousNewlineMatchCandidateCount: 0,
+    directContiguousBlanklineMatchNodeCount: 0, directContiguousBlanklineMatchCandidateCount: 0,
+    recursiveContiguousNewlineMatchNodeCount: 0, recursiveContiguousNewlineMatchCandidateCount: 0,
+    recursiveContiguousBlanklineMatchNodeCount: 0, recursiveContiguousBlanklineMatchCandidateCount: 0
+  };
+  const fragmentOne = { ...fragmentZero, directPartMatchNodeCount: 1, directPartMatchCandidateCount: 1 };
+  resolved.singularAnchorFragments = {
+    mappingNodeCount: 3, currentPathNodeCount: 2, offPathNodeCount: 1,
+    selectedUserTurns: [{ expectedIndex: 2, currentPath: fragmentZero, offPath: fragmentOne, allMapping: fragmentOne,
+      uniqueMatchingNode: { found: true, location: 'off-path', matchedSources: ['direct-part'], contentTypeBucket: 'text', visibleByCurrentFilter: true, recipientNonAll: false, visuallyHidden: false, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'missing' } }]
+  };
   const sanitized = validateAndSanitizeBackendHistoryDiagnostics(resolved);
   assert.deepEqual(sanitized, resolved);
   assert.notStrictEqual(sanitized.singularMapping, resolved.singularMapping);
@@ -219,7 +234,30 @@ test('http-api: backend history diagnostics sanitizer validates and reconstructs
   const current = { currentExtractorMatchCount: 0, stringPartsNewlineMatchCount: 0, stringPartsBlanklineMatchCount: 0, recursivePartsNewlineMatchCount: 0, recursivePartsBlanklineMatchCount: 0 };
   const off = { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 };
   valid.singularAnchorTopology = { mappingNodeCount: 3, currentPathNodeCount: 2, offPathNodeCount: 1, selectedUserTurns: [{ expectedIndex: 2, currentPath: current, offPath: off, allMapping: off, uniqueOffPathMatch: { found: true, role: 'user', contentTypeBucket: 'unknown', visibleByCurrentFilter: false, recipientNonAll: true, visuallyHidden: true, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'false', parentOnCurrentPath: true, childOnCurrentPathCount: 1, siblingOnCurrentPathCount: 1 } }] };
+  const fragmentLocation = {
+    directPartMatchNodeCount: 0, directPartMatchCandidateCount: 0,
+    recursiveLeafMatchNodeCount: 0, recursiveLeafMatchCandidateCount: 0,
+    directContiguousNewlineMatchNodeCount: 0, directContiguousNewlineMatchCandidateCount: 0,
+    directContiguousBlanklineMatchNodeCount: 0, directContiguousBlanklineMatchCandidateCount: 0,
+    recursiveContiguousNewlineMatchNodeCount: 0, recursiveContiguousNewlineMatchCandidateCount: 0,
+    recursiveContiguousBlanklineMatchNodeCount: 0, recursiveContiguousBlanklineMatchCandidateCount: 0
+  };
+  const fragmentOff = { ...fragmentLocation, directPartMatchNodeCount: 1, directPartMatchCandidateCount: 1 };
+  valid.singularAnchorFragments = { mappingNodeCount: 3, currentPathNodeCount: 2, offPathNodeCount: 1, selectedUserTurns: [{ expectedIndex: 2, currentPath: fragmentLocation, offPath: fragmentOff, allMapping: fragmentOff, uniqueMatchingNode: { found: true, location: 'off-path', matchedSources: ['direct-part'], contentTypeBucket: 'text', visibleByCurrentFilter: true, recipientNonAll: false, visuallyHidden: false, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'missing' } }] };
   assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(valid), valid);
+
+  const invalidFragments = [
+    ['extra nested field', (value) => { value.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode.secret = 'raw-text-sentinel'; }],
+    ['partition mismatch', (value) => { value.singularAnchorFragments.offPathNodeCount = 2; }],
+    ['impossible candidate count', (value) => { value.singularAnchorFragments.selectedUserTurns[0].offPath.directPartMatchCandidateCount = 0; }],
+    ['unknown source', (value) => { value.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode.matchedSources = ['raw-part-source']; }],
+    ['required fragments missing', (value) => { value.singularAnchorFragments = null; }]
+  ];
+  for (const [name, mutate] of invalidFragments) {
+    const value = structuredClone(valid);
+    mutate(value);
+    assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), /conversation_backend_history_diagnostics_response_invalid/u, name);
+  }
 
   const cases = [
     ['extra nested topology field', (value) => { value.singularAnchorTopology.selectedUserTurns[0].uniqueOffPathMatch.secret = 'text-secret-sentinel'; }],

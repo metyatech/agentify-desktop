@@ -6965,6 +6965,7 @@ test('chatgpt-controller: actual visibility diagnostics satisfy the server group
       'exclusionCounts',
       'groupedModels',
       'models',
+      'singularAnchorFragments',
       'singularAnchorTopology',
       'singularBranchModels',
       'singularMapping'
@@ -7326,6 +7327,124 @@ test('chatgpt-controller: singular anchor topology localizes selected content to
   const absentLocation = absent.result.singularAnchorTopology.selectedUserTurns[0];
   assert.equal(absentLocation.offPath.currentExtractorMatchCount, 0);
   assert.equal(absentLocation.uniqueOffPathMatch.found, false);
+});
+
+test('chatgpt-controller: singular fragment anchors are node-aware, bounded, and sanitized', async () => {
+  const target = 'fragment-selected-user-secret-sentinel';
+  const contentDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: target }), 'utf8').digest('hex');
+  const read = async ({ parts, location = 'off-path', contentType = 'text', probeText = target, duplicateOff = false, recipient = 'all', metadata, endTurn = true }) => {
+    const currentMessage = { id: 'fragment-current-message-id-secret', author: { role: location === 'current-path' ? 'user' : 'assistant' }, content: { content_type: 'text', parts: ['unrelated current text'] } };
+    const offMessage = { id: 'fragment-off-message-id-secret', author: { role: 'user' }, recipient, end_turn: endTurn, content: { content_type: contentType, parts }, ...(metadata ? { metadata } : {}) };
+    const mapping = {
+      'fragment-root-node-id-secret': { id: 'fragment-root-node-id-secret', parent: null, children: ['fragment-current-node-id-secret', 'fragment-off-node-id-secret'], message: null },
+      'fragment-current-node-id-secret': { id: 'fragment-current-node-id-secret', parent: 'fragment-root-node-id-secret', children: [], message: location === 'current-path' ? offMessage : currentMessage },
+      'fragment-off-node-id-secret': { id: 'fragment-off-node-id-secret', parent: 'fragment-root-node-id-secret', children: [], message: location === 'current-path' ? { ...currentMessage, id: 'fragment-other-message-secret' } : offMessage }
+    };
+    if (duplicateOff) mapping['fragment-duplicate-off-node-id-secret'] = { id: 'fragment-duplicate-off-node-id-secret', parent: 'fragment-root-node-id-secret', children: [], message: { ...offMessage, id: 'fragment-duplicate-off-message-secret' } };
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+      singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'fragment-current-node-id-secret', mapping }) }
+    });
+    const probeDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: probeText }), 'utf8').digest('hex');
+    const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 33, contentDigest: probeDigest }] } });
+    return { result, fixture };
+  };
+
+  const direct = await read({ parts: ['prefix-private', target] });
+  assert.equal(direct.result.singularAnchorTopology.selectedUserTurns[0].allMapping.currentExtractorMatchCount, 0);
+  const directMatch = direct.result.singularAnchorFragments.selectedUserTurns[0];
+  assert.equal(directMatch.offPath.directPartMatchNodeCount, 1);
+  assert.equal(directMatch.offPath.directPartMatchCandidateCount, 1);
+  assert.equal(directMatch.offPath.recursiveLeafMatchNodeCount, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(directMatch.uniqueMatchingNode)), {
+    found: true, location: 'off-path', matchedSources: ['direct-part', 'recursive-leaf'], contentTypeBucket: 'text',
+    visibleByCurrentFilter: true, recipientNonAll: false, visuallyHidden: false, isCompleteFalse: false,
+    aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'true'
+  });
+  const directJson = JSON.parse(JSON.stringify(direct.result));
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(directJson), directJson);
+  const safe = JSON.stringify(direct.result);
+  for (const secret of [target, contentDigest, 'fragment-', 'prefix-private', 'fragment-selected-user-secret-sentinel', 'partIndex', 'rangeStart', 'rangeEnd']) assert.equal(safe.includes(secret), false, secret);
+
+  const recursiveOnly = await read({ parts: [{ text: target }] });
+  assert.equal(recursiveOnly.result.singularAnchorFragments.selectedUserTurns[0].offPath.directPartMatchNodeCount, 0);
+  assert.equal(recursiveOnly.result.singularAnchorFragments.selectedUserTurns[0].offPath.recursiveLeafMatchNodeCount, 1);
+
+  const hidden = await read({ parts: [target], contentType: 'secret_reasoning_unknown_xyz', recipient: 'python', metadata: { is_visually_hidden_from_conversation: true, is_complete: false }, endTurn: false });
+  assert.deepEqual(JSON.parse(JSON.stringify(hidden.result.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode)), {
+    found: true, location: 'off-path', matchedSources: ['direct-part', 'recursive-leaf'], contentTypeBucket: 'unknown',
+    visibleByCurrentFilter: false, recipientNonAll: true, visuallyHidden: true, isCompleteFalse: true,
+    aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'false'
+  });
+  assert.equal(JSON.stringify(hidden.result).includes('secret_reasoning_unknown_xyz'), false);
+
+  const newlineDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: 'fragment-left\nfragment-right' }), 'utf8').digest('hex');
+  const newlineFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'current', mapping: {
+      root: { id: 'root', parent: null, message: null }, current: { id: 'current', parent: 'root', message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['fragment-left', 'fragment-right'] } } }
+    } }) }
+  });
+  const newlineResult = await createController(newlineFixture.page).readConversationBackendHistoryDiagnostics({ contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 3, contentDigest: newlineDigest }] } });
+  assert.equal(newlineResult.singularAnchorFragments.selectedUserTurns[0].currentPath.directContiguousNewlineMatchNodeCount, 1);
+  assert.equal(newlineResult.singularAnchorFragments.selectedUserTurns[0].currentPath.recursiveContiguousNewlineMatchNodeCount, 1);
+
+  const blanklineDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: 'fragment-left\n\nfragment-right' }), 'utf8').digest('hex');
+  const blanklineFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'current', mapping: {
+      root: { id: 'root', parent: null, message: null }, current: { id: 'current', parent: 'root', message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['fragment-left', 'fragment-right'] } } }
+    } }) }
+  });
+  const blanklineResult = await createController(blanklineFixture.page).readConversationBackendHistoryDiagnostics({ contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 3, contentDigest: blanklineDigest }] } });
+  assert.equal(blanklineResult.singularAnchorFragments.selectedUserTurns[0].currentPath.directContiguousBlanklineMatchNodeCount, 1);
+  assert.equal(blanklineResult.singularAnchorFragments.selectedUserTurns[0].currentPath.recursiveContiguousBlanklineMatchNodeCount, 1);
+
+  const spanParts = Array.from({ length: 9 }, (_, index) => `span-${index}`);
+  const spanText = spanParts.join('\n');
+  const spanDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: spanText }), 'utf8').digest('hex');
+  const tooWide = await read({ parts: spanParts, probeText: spanText });
+  assert.equal(tooWide.result.singularAnchorFragments.selectedUserTurns[0].allMapping.directContiguousNewlineMatchCandidateCount, 0);
+  assert.notEqual(spanDigest, contentDigest);
+
+  const currentPathMatch = await read({ parts: [target], location: 'current-path' });
+  assert.equal(currentPathMatch.result.singularAnchorFragments.selectedUserTurns[0].currentPath.directPartMatchNodeCount, 1);
+  assert.equal(currentPathMatch.result.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode.location, 'current-path');
+  const ambiguous = await read({ parts: [target], duplicateOff: true });
+  assert.equal(ambiguous.result.singularAnchorFragments.selectedUserTurns[0].offPath.directPartMatchNodeCount, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(ambiguous.result.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode)), { found: false });
+
+  const historical31 = 'historical-whole-user-turn-31-private';
+  const twoAnchorDigests = [historical31, target].map((text) => crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text }), 'utf8').digest('hex'));
+  const productionShapeFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'user31', mapping: {
+      root: { id: 'root', parent: null, message: null },
+      user31: { id: 'user31', parent: 'root', message: { author: { role: 'user' }, content: { content_type: 'text', parts: [historical31] } } },
+      user33: { id: 'user33', parent: 'root', message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['part-prefix', target] } } }
+    } }) }
+  });
+  const productionShape = await createController(productionShapeFixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 31, contentDigest: twoAnchorDigests[0] }, { expectedIndex: 33, contentDigest: twoAnchorDigests[1] }] }
+  });
+  const whole31 = productionShape.singularAnchorTopology.selectedUserTurns[0];
+  const fragment33 = productionShape.singularAnchorTopology.selectedUserTurns[1];
+  assert.equal(whole31.currentPath.currentExtractorMatchCount, 1);
+  assert.equal(fragment33.currentPath.currentExtractorMatchCount + fragment33.offPath.currentExtractorMatchCount + fragment33.allMapping.currentExtractorMatchCount, 0);
+  assert.equal(productionShape.singularAnchorFragments.selectedUserTurns[0].uniqueMatchingNode.location, 'current-path');
+  assert.equal(productionShape.singularAnchorFragments.selectedUserTurns[1].uniqueMatchingNode.location, 'off-path');
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(JSON.parse(JSON.stringify(productionShape))), JSON.parse(JSON.stringify(productionShape)));
+  const productionSafe = JSON.stringify(productionShape);
+  for (const secret of [historical31, target, ...twoAnchorDigests, 'user31', 'user33', 'part-prefix']) assert.equal(productionSafe.includes(secret), false, secret);
+
+  const manyParts = Array.from({ length: 40 }, (_, index) => `candidate-${index}`);
+  const cappedFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'current', mapping: {
+      root: { id: 'root', parent: null, message: null }, current: { id: 'current', parent: 'root', message: { author: { role: 'user' }, content: { content_type: 'text', parts: manyParts } } }
+    } }) }
+  });
+  await assert.rejects(() => createController(cappedFixture.page).readConversationBackendHistoryDiagnostics({ contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 1, contentDigest }] } }), /fragment_candidate_limit/u);
 });
 
 test('chatgpt-controller: singular mapping diagnostic reduces transport and graph failures to fixed safe values', async () => {

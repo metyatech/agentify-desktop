@@ -527,6 +527,12 @@ mapping/path status, and the same safe model/anchor aggregates under
 `singularMapping` and `singularBranchModels`; the raw mapping never leaves page
 context. A failed singular request is reported with a fixed safe failure enum
 without changing the existing plural pagination result.
+When a content anchor probe and resolved singular path are both available, the
+diagnostic also reports bounded node/candidate counts for six fixed fragment
+extractors (direct string parts, recursive text leaves, and contiguous joins
+of at most eight fragments). Each message is capped at 512 generated
+candidates; reaching that cap fails the diagnostic instead of returning a
+partial search. Fragment text, positions, IDs, and digests remain private.
 
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:

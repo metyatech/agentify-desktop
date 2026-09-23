@@ -793,7 +793,8 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       branchModels: null,
       singularMapping: { attempted: false, httpStatus: null, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false, responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false, mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false, currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' },
       singularBranchModels: null,
-      singularAnchorTopology: null
+      singularAnchorTopology: null,
+      singularAnchorFragments: null
     };
     const pageOrigin = String(location?.origin || '');
     const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
@@ -1437,6 +1438,113 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
                       currentPathNodeCount: pathNodes.length,
                       offPathNodeCount: mappingKeys.length - pathNodes.length,
                       selectedUserTurns: topologySelectedUserTurns
+                    };
+                    const fragmentSources = [
+                      'direct-part',
+                      'recursive-leaf',
+                      'direct-contiguous-newline',
+                      'direct-contiguous-blankline',
+                      'recursive-contiguous-newline',
+                      'recursive-contiguous-blankline'
+                    ];
+                    const fragmentSourceFields = {
+                      'direct-part': ['directPartMatchNodeCount', 'directPartMatchCandidateCount'],
+                      'recursive-leaf': ['recursiveLeafMatchNodeCount', 'recursiveLeafMatchCandidateCount'],
+                      'direct-contiguous-newline': ['directContiguousNewlineMatchNodeCount', 'directContiguousNewlineMatchCandidateCount'],
+                      'direct-contiguous-blankline': ['directContiguousBlanklineMatchNodeCount', 'directContiguousBlanklineMatchCandidateCount'],
+                      'recursive-contiguous-newline': ['recursiveContiguousNewlineMatchNodeCount', 'recursiveContiguousNewlineMatchCandidateCount'],
+                      'recursive-contiguous-blankline': ['recursiveContiguousBlanklineMatchNodeCount', 'recursiveContiguousBlanklineMatchCandidateCount']
+                    };
+                    const fragmentCandidateLimit = 512;
+                    const fragmentSpanLimit = 8;
+                    const sourceCandidates = (parts, individualSource, newlineSource, blanklineSource) => {
+                      const candidates = [];
+                      for (const part of parts) {
+                        const text = normalizeText(part);
+                        if (text) candidates.push({ source: individualSource, text });
+                      }
+                      for (let start = 0; start < parts.length; start += 1) {
+                        for (let span = 2; span <= Math.min(fragmentSpanLimit, parts.length - start); span += 1) {
+                          const range = parts.slice(start, start + span);
+                          const newlineText = normalizeText(range.join('\n'));
+                          if (newlineText) candidates.push({ source: newlineSource, text: newlineText });
+                          const blanklineText = normalizeText(range.join('\n\n'));
+                          if (blanklineText) candidates.push({ source: blanklineSource, text: blanklineText });
+                          if (candidates.length > fragmentCandidateLimit) throw new Error('conversation_backend_history_diagnostics_fragment_candidate_limit');
+                        }
+                      }
+                      if (candidates.length > fragmentCandidateLimit) throw new Error('conversation_backend_history_diagnostics_fragment_candidate_limit');
+                      return candidates;
+                    };
+                    const fragmentCandidatesFor = (message) => {
+                      const direct = stringParts(message);
+                      const recursive = recursiveParts(message?.content).length ? recursiveParts(message.content) : recursiveParts(message);
+                      const candidates = [
+                        ...sourceCandidates(direct, 'direct-part', 'direct-contiguous-newline', 'direct-contiguous-blankline'),
+                        ...sourceCandidates(recursive, 'recursive-leaf', 'recursive-contiguous-newline', 'recursive-contiguous-blankline')
+                      ];
+                      if (candidates.length > fragmentCandidateLimit) throw new Error('conversation_backend_history_diagnostics_fragment_candidate_limit');
+                      return candidates;
+                    };
+                    const fragmentPartitions = [
+                      { name: 'currentPath', nodes: currentNodes },
+                      { name: 'offPath', nodes: offPathNodes },
+                      { name: 'allMapping', nodes: allNodes }
+                    ];
+                    const fragmentSelectedTurns = [];
+                    for (const expected of contentAnchorProbe.selectedUserTurns) {
+                      const aggregate = Object.fromEntries(fragmentPartitions.map(({ name }) => [name, Object.fromEntries(fragmentSources.map((source) => [source, { nodeKeys: new Set(), candidateCount: 0 }]))]));
+                      const matchingNodes = new Map();
+                      for (const { key: entryKey, node } of allNodes) {
+                        const message = node.message;
+                        if (!message || typeof message !== 'object' || Array.isArray(message) || message?.author?.role !== 'user') continue;
+                        const candidates = fragmentCandidatesFor(message);
+                        for (const candidate of candidates) {
+                          const candidateDigest = await digest(JSON.stringify({ role: 'user', text: candidate.text }));
+                          if (candidateDigest !== expected.contentDigest) continue;
+                          if (!matchingNodes.has(entryKey)) matchingNodes.set(entryKey, { entry: { key: entryKey, node }, sources: new Set() });
+                          matchingNodes.get(entryKey).sources.add(candidate.source);
+                          for (const partition of fragmentPartitions) {
+                            if (!partition.nodes.some((entry) => entry.key === entryKey)) continue;
+                            const counts = aggregate[partition.name][candidate.source];
+                            counts.nodeKeys.add(entryKey);
+                            counts.candidateCount += 1;
+                          }
+                        }
+                      }
+                      const toLocation = (name) => Object.fromEntries(fragmentSources.flatMap((source) => {
+                        const [nodeField, candidateField] = fragmentSourceFields[source];
+                        const counts = aggregate[name][source];
+                        return [[nodeField, counts.nodeKeys.size], [candidateField, counts.candidateCount]];
+                      }));
+                      let uniqueMatchingNode = { found: false };
+                      if (matchingNodes.size === 1) {
+                        const [{ entry, sources }] = matchingNodes.values();
+                        const node = entry.node;
+                        const message = node.message;
+                        uniqueMatchingNode = {
+                          found: true,
+                          location: currentPathSet.has(node) ? 'current-path' : 'off-path',
+                          matchedSources: fragmentSources.filter((source) => sources.has(source)),
+                          contentTypeBucket: contentTypeBucket(message),
+                          visibleByCurrentFilter: isVisible(message, roleOf(message)),
+                          ...exclusionFlags(message),
+                          endTurn: typeof message.end_turn === 'boolean' ? String(message.end_turn) : 'missing'
+                        };
+                      }
+                      fragmentSelectedTurns.push({
+                        expectedIndex: expected.expectedIndex,
+                        currentPath: toLocation('currentPath'),
+                        offPath: toLocation('offPath'),
+                        allMapping: toLocation('allMapping'),
+                        uniqueMatchingNode
+                      });
+                    }
+                    result.singularAnchorFragments = {
+                      mappingNodeCount: mappingKeys.length,
+                      currentPathNodeCount: pathNodes.length,
+                      offPathNodeCount: mappingKeys.length - pathNodes.length,
+                      selectedUserTurns: fragmentSelectedTurns
                     };
                   }
                 }

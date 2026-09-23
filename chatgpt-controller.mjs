@@ -757,6 +757,7 @@ function buildBackendConversationHistoryScript({ timeoutMs, maxTurns, maxCharsPe
 function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe, contentAnchorProbe }) {
   const sessionMaxBytes = 64 * 1024;
   const pageMaxBytes = 20 * 1024 * 1024;
+  const singularMaxBytes = 64 * 1024 * 1024;
   const totalMaxBytes = 64 * 1024 * 1024;
   const probe = legacyAnchorProbe || null;
   const contentProbe = contentAnchorProbe || null;
@@ -768,6 +769,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
     const contentAnchorProbe = ${JSON.stringify(contentProbe)};
     const sessionMaxBytes = ${JSON.stringify(sessionMaxBytes)};
     const pageMaxBytes = ${JSON.stringify(pageMaxBytes)};
+    const singularMaxBytes = ${JSON.stringify(singularMaxBytes)};
     const totalMaxBytes = ${JSON.stringify(totalMaxBytes)};
     const buckets = ['text', 'multimodal_text', 'code', 'thought_or_reasoning', 'user_editable_context', 'tool_or_execution', 'other_known_nonvisible', 'unknown', 'missing'];
     const modelNames = ['CURRENT', 'TEXT_ONLY_NL', 'TEXT_ONLY_BLANKLINE', 'VISIBLE_TEXT_NL', 'VISIBLE_TEXT_BLANKLINE', 'VISIBLE_TEXT_CODE_BLANKLINE', 'END_TURN_VISIBLE_TEXT_BLANKLINE'];
@@ -788,7 +790,9 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       models: Object.fromEntries(modelNames.map((name) => [name, makeModel()])),
       groupedModels: Object.fromEntries(modelNames.map((name) => [name, { noMerge: emptyGroupAlignment(), assistantMergeNewline: emptyGroupAlignment(), assistantMergeBlankline: emptyGroupAlignment() }])),
       branchShape: { currentNodeField: 'none', currentNodePresent: false, messageIdCount: 0, parentLinkField: 'none', messagesWithParentLink: 0, parentLinksResolvable: 0, parentLinksMissingTarget: 0, currentNodeFound: false, currentPathResolved: false, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingParent: false },
-      branchModels: null
+      branchModels: null,
+      singularMapping: { attempted: false, httpStatus: null, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false, responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false, mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false, currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' },
+      singularBranchModels: null
     };
     const pageOrigin = String(location?.origin || '');
     const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
@@ -800,6 +804,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => abortController.abort(), Math.min(timeoutMs, historyTimeoutMs));
     let accessToken = null;
+    let singularBodyForDiagnostics = null;
     try {
       const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
       const readBoundedText = async (response, limit) => {
@@ -868,6 +873,59 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         const pageInfo = snakeInfo || camelInfo;
         return { body, bytes: bounded.bytes, ...pageInfo };
       };
+      const readSingularConversation = async () => {
+        const diagnostic = result.singularMapping;
+        diagnostic.attempted = true;
+        let response;
+        try {
+          response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
+            method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
+            headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken },
+            signal: abortController.signal
+          });
+        } catch {
+          diagnostic.failure = abortController.signal.aborted || !deadline() ? 'timeout' : 'other-safe';
+          return null;
+        }
+        diagnostic.httpStatus = Number.isSafeInteger(response?.status) && response.status >= 100 && response.status <= 599 ? response.status : null;
+        diagnostic.httpOk = response?.ok === true;
+        if (!diagnostic.httpOk) {
+          diagnostic.failure = 'http';
+          return null;
+        }
+        let contentType = '';
+        try { contentType = String(response.headers?.get?.('content-type') || ''); } catch {}
+        diagnostic.contentTypeJson = /(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType);
+        if (!diagnostic.contentTypeJson) {
+          diagnostic.failure = 'non-json';
+          return null;
+        }
+        let bounded;
+        try {
+          bounded = await readBoundedText(response, singularMaxBytes);
+        } catch (error) {
+          const message = String(error?.message || '');
+          if (message.includes('too_large')) diagnostic.failure = 'too-large';
+          else if (message.includes('stream_unavailable')) diagnostic.failure = 'stream';
+          else if (message.includes('timeout') || abortController.signal.aborted || !deadline()) diagnostic.failure = 'timeout';
+          else diagnostic.failure = 'other-safe';
+          return null;
+        }
+        let body;
+        try {
+          body = JSON.parse(bounded.text);
+          diagnostic.jsonParsed = true;
+        } catch {
+          diagnostic.failure = 'parse';
+          return null;
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || (Object.getPrototypeOf(body) !== Object.prototype && Object.getPrototypeOf(body) !== null)) {
+          diagnostic.failure = 'shape';
+          return null;
+        }
+        diagnostic.rootObject = true;
+        return body;
+      };
       const sessionResponse = await fetch('/api/auth/session', { method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' }, signal: abortController.signal });
       if (!sessionResponse?.ok) throw new Error('conversation_backend_history_diagnostics_session_failed');
       let sessionType = '';
@@ -909,6 +967,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         hasPreviousPage = page.hasPreviousPage;
         cursor = hasPreviousPage ? page.startCursor : null;
       }
+      singularBodyForDiagnostics = await readSingularConversation();
       accessToken = null;
       const roleOf = (message) => message?.author?.role === 'user' || message?.author?.role === 'assistant' ? message.author.role : null;
       const contentTypeBucket = (message) => {
@@ -1169,6 +1228,120 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         for (const model of modelNames) {
           const turns = turnsForMessages(oldestToNewest, model).map((turn, index) => ({ ...turn, index }));
           result.branchModels[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
+        }
+      }
+      if (singularBodyForDiagnostics) {
+        const diagnostic = result.singularMapping;
+        const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+        const failSingular = (reason) => { diagnostic.failure = reason; };
+        const readStringAlias = (object, snake, camel) => {
+          const hasSnake = hasOwn(object, snake);
+          const hasCamel = hasOwn(object, camel);
+          const normalize = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+          const snakeValue = hasSnake ? normalize(object[snake]) : null;
+          const camelValue = hasCamel ? normalize(object[camel]) : null;
+          if (hasSnake && hasCamel && snakeValue !== camelValue) return { present: snakeValue !== null || camelValue !== null, conflict: true, value: null };
+          if (hasSnake && hasCamel && (snakeValue === null || camelValue === null)) return { present: false, conflict: true, value: null };
+          return { present: snakeValue !== null || camelValue !== null, conflict: false, value: hasSnake ? snakeValue : camelValue };
+        };
+        const responseId = readStringAlias(singularBodyForDiagnostics, 'conversation_id', 'conversationId');
+        diagnostic.responseConversationIdPresent = responseId.present;
+        diagnostic.responseConversationIdMatchesUrl = !responseId.conflict && responseId.value === conversationId;
+        if (!diagnostic.responseConversationIdMatchesUrl) failSingular('conversation-mismatch');
+
+        if (diagnostic.failure === 'none') {
+          diagnostic.mappingPresent = hasOwn(singularBodyForDiagnostics, 'mapping');
+          const mapping = singularBodyForDiagnostics.mapping;
+          diagnostic.mappingObject = !!mapping && typeof mapping === 'object' && !Array.isArray(mapping) && (Object.getPrototypeOf(mapping) === Object.prototype || Object.getPrototypeOf(mapping) === null);
+          if (!diagnostic.mappingObject) failSingular('mapping-missing');
+          else {
+            const mappingKeys = Object.keys(mapping);
+            diagnostic.mappingNodeCount = mappingKeys.length;
+            const currentAlias = readStringAlias(singularBodyForDiagnostics, 'current_node', 'currentNode');
+            diagnostic.currentNodePresent = currentAlias.present;
+            if (currentAlias.conflict) failSingular('shape');
+            else if (!currentAlias.present || !currentAlias.value) failSingular('current-node-missing');
+            else {
+              const nodesById = new Map();
+              for (const key of mappingKeys) {
+                const node = mapping[key];
+                if (!node || typeof node !== 'object' || Array.isArray(node) || (Object.getPrototypeOf(node) !== Object.prototype && Object.getPrototypeOf(node) !== null)) continue;
+                if (typeof node.id !== 'string' || !node.id.trim()) continue;
+                const id = node.id.trim();
+                if (!nodesById.has(id)) nodesById.set(id, []);
+                nodesById.get(id).push({ key, node });
+              }
+              const currentMatches = nodesById.get(currentAlias.value) || [];
+              const currentEntry = mapping[currentAlias.value];
+              diagnostic.currentNodeFound = hasOwn(mapping, currentAlias.value) && currentMatches.length === 1 && currentMatches[0].key === currentAlias.value && currentMatches[0].node === currentEntry;
+              if (!diagnostic.currentNodeFound) failSingular('current-node-not-found');
+              else {
+                const pathNodes = [];
+                const visited = new Set();
+                let nodeId = currentAlias.value;
+                let reachedRoot = false;
+                while (nodeId !== null) {
+                  if (visited.has(nodeId)) {
+                    diagnostic.currentPathCycleDetected = true;
+                    failSingular('cycle');
+                    break;
+                  }
+                  visited.add(nodeId);
+                  const matches = nodesById.get(nodeId) || [];
+                  if (matches.length !== 1 || matches[0].key !== nodeId || !hasOwn(mapping, nodeId)) {
+                    diagnostic.currentPathMissingNode = true;
+                    failSingular('missing-node');
+                    break;
+                  }
+                  const node = matches[0].node;
+                  diagnostic.currentPathNodeCount += 1;
+                  pathNodes.push(node);
+                  if (!hasOwn(node, 'message')) {
+                    failSingular('shape');
+                    break;
+                  }
+                  if (node.message !== null) {
+                    if (!node.message || typeof node.message !== 'object' || Array.isArray(node.message) || (Object.getPrototypeOf(node.message) !== Object.prototype && Object.getPrototypeOf(node.message) !== null)) {
+                      failSingular('shape');
+                      break;
+                    }
+                    diagnostic.currentPathMessageCount += 1;
+                  }
+                  if (!hasOwn(node, 'parent')) {
+                    diagnostic.currentPathInvalidParent = true;
+                    failSingular('invalid-parent');
+                    break;
+                  }
+                  if (node.parent === null) {
+                    reachedRoot = true;
+                    break;
+                  }
+                  if (typeof node.parent !== 'string' || !node.parent.trim()) {
+                    diagnostic.currentPathInvalidParent = true;
+                    failSingular('invalid-parent');
+                    break;
+                  }
+                  const parentId = node.parent.trim();
+                  const parentMatches = nodesById.get(parentId) || [];
+                  if (!hasOwn(mapping, parentId) || parentMatches.length !== 1 || parentMatches[0].key !== parentId || mapping[parentId] !== parentMatches[0].node) {
+                    diagnostic.currentPathMissingNode = true;
+                    failSingular('missing-node');
+                    break;
+                  }
+                  nodeId = parentId;
+                }
+                diagnostic.currentPathResolved = reachedRoot && !diagnostic.currentPathCycleDetected && !diagnostic.currentPathMissingNode && !diagnostic.currentPathInvalidParent && diagnostic.failure === 'none';
+                if (diagnostic.currentPathResolved) {
+                  const orderedPathMessages = pathNodes.slice().reverse().filter((node) => node.message !== null).map((node) => node.message);
+                  result.singularBranchModels = {};
+                  for (const model of modelNames) {
+                    const turns = turnsForMessages(orderedPathMessages, model).map((turn, index) => ({ ...turn, index }));
+                    result.singularBranchModels[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
+                  }
+                }
+              }
+            }
+          }
         }
       }
       for (const message of orderedMessages.slice(-40)) {

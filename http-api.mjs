@@ -83,6 +83,33 @@ const BACKEND_HISTORY_DIAGNOSTIC_BRANCH_SHAPE_ENUMS = Object.freeze({
   currentNodeField: ['current_node', 'currentNode', 'none', 'conflict'],
   parentLinkField: ['parent_id', 'parentId', 'parent', 'none', 'mixed']
 });
+const BACKEND_HISTORY_DIAGNOSTIC_SINGULAR_MAPPING_KEYS = Object.freeze([
+  'attempted',
+  'httpStatus',
+  'httpOk',
+  'contentTypeJson',
+  'jsonParsed',
+  'rootObject',
+  'responseConversationIdPresent',
+  'responseConversationIdMatchesUrl',
+  'mappingPresent',
+  'mappingObject',
+  'mappingNodeCount',
+  'currentNodePresent',
+  'currentNodeFound',
+  'currentPathResolved',
+  'currentPathNodeCount',
+  'currentPathMessageCount',
+  'currentPathCycleDetected',
+  'currentPathMissingNode',
+  'currentPathInvalidParent',
+  'failure'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_SINGULAR_FAILURES = Object.freeze([
+  'none', 'http', 'non-json', 'parse', 'shape', 'conversation-mismatch', 'mapping-missing',
+  'current-node-missing', 'current-node-not-found', 'cycle', 'missing-node', 'invalid-parent',
+  'timeout', 'too-large', 'stream', 'other-safe'
+]);
 const MAX_BACKEND_HISTORY_DIAGNOSTIC_COUNT = 1_000_000_000;
 
 function conversationUrlHash(url) {
@@ -541,7 +568,7 @@ function validateBackendHistoryDiagnosticsSignedInteger(value) {
 
 export function validateAndSanitizeBackendHistoryDiagnostics(value) {
   const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
-  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels']);
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels']);
   if (value.attempted !== true) invalid();
 
   validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
@@ -696,7 +723,58 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
 
   const branchShape = validateBranchShape(value.branchShape);
   if (branchShape.currentPathResolved !== (branchModels !== null)) invalid();
-  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels };
+
+  validateBackendHistoryDiagnosticsKeys(value.singularMapping, BACKEND_HISTORY_DIAGNOSTIC_SINGULAR_MAPPING_KEYS);
+  const singular = value.singularMapping;
+  const singularFailure = singular.failure;
+  if (!BACKEND_HISTORY_DIAGNOSTIC_SINGULAR_FAILURES.includes(singularFailure)) invalid();
+  const singularMapping = {
+    attempted: validateBackendHistoryDiagnosticsBoolean(singular.attempted),
+    httpStatus: singular.httpStatus === null ? null : validateBackendHistoryDiagnosticsCount(singular.httpStatus),
+    httpOk: validateBackendHistoryDiagnosticsBoolean(singular.httpOk),
+    contentTypeJson: validateBackendHistoryDiagnosticsBoolean(singular.contentTypeJson),
+    jsonParsed: validateBackendHistoryDiagnosticsBoolean(singular.jsonParsed),
+    rootObject: validateBackendHistoryDiagnosticsBoolean(singular.rootObject),
+    responseConversationIdPresent: validateBackendHistoryDiagnosticsBoolean(singular.responseConversationIdPresent),
+    responseConversationIdMatchesUrl: validateBackendHistoryDiagnosticsBoolean(singular.responseConversationIdMatchesUrl),
+    mappingPresent: validateBackendHistoryDiagnosticsBoolean(singular.mappingPresent),
+    mappingObject: validateBackendHistoryDiagnosticsBoolean(singular.mappingObject),
+    mappingNodeCount: validateBackendHistoryDiagnosticsCount(singular.mappingNodeCount),
+    currentNodePresent: validateBackendHistoryDiagnosticsBoolean(singular.currentNodePresent),
+    currentNodeFound: validateBackendHistoryDiagnosticsBoolean(singular.currentNodeFound),
+    currentPathResolved: validateBackendHistoryDiagnosticsBoolean(singular.currentPathResolved),
+    currentPathNodeCount: validateBackendHistoryDiagnosticsCount(singular.currentPathNodeCount),
+    currentPathMessageCount: validateBackendHistoryDiagnosticsCount(singular.currentPathMessageCount),
+    currentPathCycleDetected: validateBackendHistoryDiagnosticsBoolean(singular.currentPathCycleDetected),
+    currentPathMissingNode: validateBackendHistoryDiagnosticsBoolean(singular.currentPathMissingNode),
+    currentPathInvalidParent: validateBackendHistoryDiagnosticsBoolean(singular.currentPathInvalidParent),
+    failure: singularFailure
+  };
+  if (!singularMapping.attempted || (singularMapping.httpStatus !== null && singularMapping.httpStatus > 599) ||
+      singularMapping.httpOk !== (singularMapping.httpStatus !== null && singularMapping.httpStatus >= 200 && singularMapping.httpStatus < 300) ||
+      singularMapping.contentTypeJson && !singularMapping.httpOk ||
+      singularMapping.jsonParsed && !singularMapping.contentTypeJson ||
+      singularMapping.rootObject && !singularMapping.jsonParsed ||
+      singularMapping.responseConversationIdPresent && !singularMapping.rootObject ||
+      singularMapping.responseConversationIdMatchesUrl && !singularMapping.responseConversationIdPresent ||
+      singularMapping.mappingObject && !singularMapping.mappingPresent ||
+      singularMapping.mappingNodeCount > 0 && !singularMapping.mappingObject ||
+      singularMapping.currentNodePresent && !singularMapping.mappingObject ||
+      singularMapping.currentNodeFound && !singularMapping.currentNodePresent ||
+      singularMapping.currentPathResolved && (!singularMapping.currentNodeFound || singularMapping.currentPathNodeCount < 1 || singularMapping.currentPathCycleDetected || singularMapping.currentPathMissingNode || singularMapping.currentPathInvalidParent) ||
+      singularMapping.currentPathMessageCount > singularMapping.currentPathNodeCount ||
+      singularMapping.currentPathCycleDetected && singularFailure !== 'cycle' ||
+      singularMapping.currentPathMissingNode && singularFailure !== 'missing-node' ||
+      singularMapping.currentPathInvalidParent && singularFailure !== 'invalid-parent' ||
+      (singularFailure === 'none') !== singularMapping.currentPathResolved) invalid();
+
+  let singularBranchModels = null;
+  if (value.singularBranchModels !== null) {
+    validateBackendHistoryDiagnosticsKeys(value.singularBranchModels, BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES);
+    singularBranchModels = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => [name, validateAlignment(value.singularBranchModels[name])]));
+  }
+  if (singularMapping.currentPathResolved !== (singularBranchModels !== null)) invalid();
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {

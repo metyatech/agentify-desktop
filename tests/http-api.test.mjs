@@ -111,7 +111,30 @@ function validBackendHistoryDiagnostics({ withProbe = false, withContentProbe = 
       currentPathCycleDetected: false,
       currentPathMissingParent: false
     },
-    branchModels: null
+    branchModels: null,
+    singularMapping: {
+      attempted: true,
+      httpStatus: 404,
+      httpOk: false,
+      contentTypeJson: false,
+      jsonParsed: false,
+      rootObject: false,
+      responseConversationIdPresent: false,
+      responseConversationIdMatchesUrl: false,
+      mappingPresent: false,
+      mappingObject: false,
+      mappingNodeCount: 0,
+      currentNodePresent: false,
+      currentNodeFound: false,
+      currentPathResolved: false,
+      currentPathNodeCount: 0,
+      currentPathMessageCount: 0,
+      currentPathCycleDetected: false,
+      currentPathMissingNode: false,
+      currentPathInvalidParent: false,
+      failure: 'http'
+    },
+    singularBranchModels: null
   };
 }
 
@@ -140,10 +163,46 @@ test('http-api: backend history diagnostics validator accepts content localizati
   assert.equal(Object.hasOwn(sanitized.models.CURRENT.contentAnchorProbe.matches[0], 'contentDigest'), false);
 });
 
+test('http-api: backend history diagnostics validator accepts bounded singular mapping with null or reconstructed branch models', () => {
+  const absent = validBackendHistoryDiagnostics();
+  assert.equal(validateAndSanitizeBackendHistoryDiagnostics(absent).singularBranchModels, null);
+
+  const resolved = validBackendHistoryDiagnostics({ withProbe: true, withContentProbe: true });
+  resolved.singularMapping = {
+    attempted: true,
+    httpStatus: 200,
+    httpOk: true,
+    contentTypeJson: true,
+    jsonParsed: true,
+    rootObject: true,
+    responseConversationIdPresent: true,
+    responseConversationIdMatchesUrl: true,
+    mappingPresent: true,
+    mappingObject: true,
+    mappingNodeCount: 3,
+    currentNodePresent: true,
+    currentNodeFound: true,
+    currentPathResolved: true,
+    currentPathNodeCount: 3,
+    currentPathMessageCount: 2,
+    currentPathCycleDetected: false,
+    currentPathMissingNode: false,
+    currentPathInvalidParent: false,
+    failure: 'none'
+  };
+  resolved.singularBranchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, resolved.models.CURRENT]));
+  const sanitized = validateAndSanitizeBackendHistoryDiagnostics(resolved);
+  assert.deepEqual(sanitized, resolved);
+  assert.notStrictEqual(sanitized.singularMapping, resolved.singularMapping);
+  assert.notStrictEqual(sanitized.singularBranchModels.CURRENT, resolved.singularBranchModels.CURRENT);
+});
+
 test('http-api: backend history diagnostics validator rejects extra branch and content probe fields', () => {
   const cases = [
     ['branch shape', (value) => { value.branchShape.providerId = 'provider-id-secret'; }],
     ['branch model', (value) => { value.branchModels.CURRENT.parentId = 'parent-id-secret'; }],
+    ['singular mapping', (value) => { value.singularMapping.parentId = 'parent-id-secret'; }],
+    ['singular branch model', (value) => { value.singularBranchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, value.models.CURRENT])); value.singularBranchModels.CURRENT.parentId = 'parent-id-secret'; }],
     ['content probe', (value) => { value.models.CURRENT.contentAnchorProbe.secret = 'digest-secret'; }],
     ['content match', (value) => { value.models.CURRENT.contentAnchorProbe.matches[0].contentDigest = 'hash-secret'; }]
   ];
@@ -164,10 +223,12 @@ test('http-api: backend history diagnostics validator rejects extra branch and c
 test('http-api: backend history diagnostics validator rejects unknown nested fields and never serializes sentinels', () => {
   const cases = [
     ['top-level', (value) => { value.rawMessages = [{ text: 'raw-text-sentinel' }]; }],
+    ['unknown singular top-level', (value) => { value.singularAccessToken = 'token-sentinel'; }],
     ['backend', (value) => { value.backend.providerId = 'provider-id-sentinel'; }],
     ['model', (value) => { value.models.CURRENT.secret = 'secret-sentinel'; }],
     ['legacy probe', (value) => { value.models.CURRENT.legacyAnchorProbe = { ...value.models.CURRENT.legacyAnchorProbe, digest: 'hash-sentinel' }; }],
-    ['grouped model', (value) => { value.groupedModels.CURRENT.noMerge.cursor = 'cursor-sentinel'; }]
+    ['grouped model', (value) => { value.groupedModels.CURRENT.noMerge.cursor = 'cursor-sentinel'; }],
+    ['singular mapping nested', (value) => { value.singularMapping.rawBody = 'raw-text-sentinel'; }]
   ];
   for (const [name, mutate] of cases) {
     const value = validBackendHistoryDiagnostics({ withProbe: true });
@@ -195,6 +256,21 @@ test('http-api: backend history diagnostics validator enforces fixed models, buc
     const value = validBackendHistoryDiagnostics();
     mutate(value);
     assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), /conversation_backend_history_diagnostics_response_invalid/u, name);
+  }
+});
+
+test('http-api: backend history diagnostics validator rejects malformed singular status and singular branch schema', () => {
+  const cases = [
+    ['singular negative status', (value) => { value.singularMapping.httpStatus = -1; }],
+    ['singular wrong status type', (value) => { value.singularMapping.httpStatus = '404'; }],
+    ['singular unknown failure', (value) => { value.singularMapping.failure = 'token-secret'; }],
+    ['singular branch extra model', (value) => { value.singularBranchModels = { ...Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, value.models.CURRENT])), EXTRA: value.models.CURRENT }; }],
+    ['singular branch alignment field', (value) => { value.singularMapping = { ...value.singularMapping, attempted: true, httpStatus: 200, httpOk: true, contentTypeJson: true, jsonParsed: true, rootObject: true, responseConversationIdPresent: true, responseConversationIdMatchesUrl: true, mappingPresent: true, mappingObject: true, mappingNodeCount: 1, currentNodePresent: true, currentNodeFound: true, currentPathResolved: true, currentPathNodeCount: 1, currentPathMessageCount: 1, failure: 'none' }; value.singularBranchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, { ...value.models.CURRENT, providerId: 'provider-id-secret' }])); }]
+  ];
+  for (const [name, mutate] of cases) {
+    const value = validBackendHistoryDiagnostics();
+    mutate(value);
+    assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), (error) => error.message === 'conversation_backend_history_diagnostics_response_invalid' && !JSON.stringify(error).includes('secret'), name);
   }
 });
 

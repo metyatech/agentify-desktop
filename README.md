@@ -520,7 +520,13 @@ The response also reports whether exact `current_node`/`currentNode` and
 When they can, it compares the same fixed models on that branch, while leaving
 the flat models unchanged. This remains diagnostic-only: it does not change
 backend-history behavior, synthesize a mapping, scroll the DOM, or establish
-recovery/full-history proof.
+recovery/full-history proof. The diagnostic also makes one bounded,
+authenticated request to the singular `/backend-api/conversation/{id}` endpoint
+using the same in-memory session token. Its response is reduced to transport,
+mapping/path status, and the same safe model/anchor aggregates under
+`singularMapping` and `singularBranchModels`; the raw mapping never leaves page
+context. A failed singular request is reported with a fixed safe failure enum
+without changing the existing plural pagination result.
 
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:

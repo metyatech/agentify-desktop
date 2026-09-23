@@ -243,13 +243,15 @@ function createBackendDiagnosticPage({
   sessionOmitReader = false,
   backendResponses = null,
   singularResponse = null,
+  fullSingularResponse = null,
   digestOverrides = {},
   domRecords = []
 } = {}) {
   const calls = [];
   const singularCalls = [];
+  const fullSingularCalls = [];
   const allCalls = [];
-  const state = { readCount: 0, sessionReadCount: 0, backendRequestCount: 0, singularReadCount: 0, cancelCount: 0, sessionCancelCount: 0, singularCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false, singularResponseTextCalled: false };
+  const state = { readCount: 0, sessionReadCount: 0, backendRequestCount: 0, singularReadCount: 0, fullSingularReadCount: 0, cancelCount: 0, sessionCancelCount: 0, singularCancelCount: 0, fullSingularCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false, singularResponseTextCalled: false, fullSingularResponseTextCalled: false };
   const chunks = (streamChunks || [responseText]).map((chunk) => chunk instanceof Uint8Array
     ? chunk
     : new TextEncoder().encode(String(chunk)));
@@ -308,30 +310,35 @@ function createBackendDiagnosticPage({
         document: { querySelectorAll: (selector) => selector === '[data-content-search-unit-key]' ? domNodes : Array.from({ length: mountedDomTurnCount }, () => ({})) },
         fetch: async (url, options) => {
           const isSession = String(url) === '/api/auth/session';
-          const isSingular = !isSession && String(url).startsWith('/backend-api/conversation/');
+          const isFullSingular = !isSession && String(url).startsWith('/backend-api/conversation/') && String(url).endsWith('?include_full_conversation=true');
+          const isSingular = !isSession && !isFullSingular && String(url).startsWith('/backend-api/conversation/');
           const isPlural = !isSession && !isSingular && String(url).startsWith('/backend-api/conversations/');
           const call = { url, options };
           allCalls.push(call);
           if (isPlural) calls.push(call);
           if (isSingular) singularCalls.push(call);
+          if (isFullSingular) fullSingularCalls.push(call);
           const backendResponse = isPlural && Array.isArray(backendResponses) ? backendResponses[state.backendRequestCount] || null : null;
           const singularResult = isSingular ? singularResponse || { status: 404, contentType: 'application/json', responseText: '{}' } : null;
+          const fullSingularResult = isFullSingular ? fullSingularResponse || { status: 404, contentType: 'application/json', responseText: '{}' } : null;
           if (isPlural) state.backendRequestCount += 1;
-          const responseStatus = isSession ? sessionStatus : isSingular ? singularResult?.status ?? 404 : backendResponse?.status ?? status;
-          const responseContentType = isSession ? sessionContentType : isSingular ? singularResult?.contentType ?? 'application/json' : backendResponse?.contentType ?? contentType;
-          const responseTextValue = isSession ? sessionResponseText : isSingular ? singularResult?.responseText ?? '{}' : backendResponse?.responseText ?? responseText;
-          const responseContentLength = isSession ? sessionContentLength : isSingular ? singularResult?.contentLength ?? null : backendResponse?.contentLength ?? contentLength;
+          const singularResponseConfig = isFullSingular ? fullSingularResult : singularResult;
+          const isAnySingular = isSingular || isFullSingular;
+          const responseStatus = isSession ? sessionStatus : isAnySingular ? singularResponseConfig?.status ?? 404 : backendResponse?.status ?? status;
+          const responseContentType = isSession ? sessionContentType : isAnySingular ? singularResponseConfig?.contentType ?? 'application/json' : backendResponse?.contentType ?? contentType;
+          const responseTextValue = isSession ? sessionResponseText : isAnySingular ? singularResponseConfig?.responseText ?? '{}' : backendResponse?.responseText ?? responseText;
+          const responseContentLength = isSession ? sessionContentLength : isAnySingular ? singularResponseConfig?.contentLength ?? null : backendResponse?.contentLength ?? contentLength;
           const responseChunks = isSession
             ? sessionChunks
-            : (isSingular
-              ? (singularResult?.streamChunks || [responseTextValue]).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)))
+            : (isAnySingular
+              ? (singularResponseConfig?.streamChunks || [responseTextValue]).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)))
               : backendResponse
               ? (backendResponse.streamChunks || [responseTextValue])
               : chunks).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)));
-          const responseFetchError = isSession ? sessionFetchError : isSingular ? singularResult?.fetchError ?? null : backendResponse?.fetchError ?? fetchError;
-          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : isSingular ? singularResult?.fetchDelayMs ?? 0 : backendResponse?.fetchDelayMs ?? fetchDelayMs;
-          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : isSingular ? singularResult?.stallAfterReadIndex ?? null : backendResponse?.stallAfterReadIndex ?? stallAfterReadIndex;
-          const responseOmitReader = isSession ? sessionOmitReader : isSingular ? singularResult?.omitReader ?? false : backendResponse?.omitReader ?? omitReader;
+          const responseFetchError = isSession ? sessionFetchError : isAnySingular ? singularResponseConfig?.fetchError ?? null : backendResponse?.fetchError ?? fetchError;
+          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : isAnySingular ? singularResponseConfig?.fetchDelayMs ?? 0 : backendResponse?.fetchDelayMs ?? fetchDelayMs;
+          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : isAnySingular ? singularResponseConfig?.stallAfterReadIndex ?? null : backendResponse?.stallAfterReadIndex ?? stallAfterReadIndex;
+          const responseOmitReader = isSession ? sessionOmitReader : isAnySingular ? singularResponseConfig?.omitReader ?? false : backendResponse?.omitReader ?? omitReader;
           if (responseFetchError) throw responseFetchError;
           if (responseFetchDelayMs > 0) {
             await new Promise((resolve, reject) => {
@@ -355,6 +362,7 @@ function createBackendDiagnosticPage({
                   async read() {
                     if (isSession) state.sessionReadCount += 1;
                     else if (isSingular) state.singularReadCount += 1;
+                    else if (isFullSingular) state.fullSingularReadCount += 1;
                     else state.readCount += 1;
                     if (responseStallAfterReadIndex !== null && chunkIndex >= responseStallAfterReadIndex) {
                       await new Promise((resolve, reject) => {
@@ -370,11 +378,11 @@ function createBackendDiagnosticPage({
                     if (chunkIndex >= responseChunks.length) return { done: true, value: undefined };
                     return { done: false, value: responseChunks[chunkIndex++] };
                   },
-                  async cancel() { if (isSession) state.sessionCancelCount += 1; else if (isSingular) state.singularCancelCount += 1; else state.cancelCount += 1; }
+                  async cancel() { if (isSession) state.sessionCancelCount += 1; else if (isSingular) state.singularCancelCount += 1; else if (isFullSingular) state.fullSingularCancelCount += 1; else state.cancelCount += 1; }
                 };
               }
             },
-            async text() { if (isSession) state.sessionResponseTextCalled = true; else if (isSingular) state.singularResponseTextCalled = true; else state.responseTextCalled = true; return responseTextValue; }
+            async text() { if (isSession) state.sessionResponseTextCalled = true; else if (isSingular) state.singularResponseTextCalled = true; else if (isFullSingular) state.fullSingularResponseTextCalled = true; else state.responseTextCalled = true; return responseTextValue; }
           };
         },
         location: { origin: 'https://chatgpt.com', pathname },
@@ -385,7 +393,7 @@ function createBackendDiagnosticPage({
     },
     async getUrl() { return `https://chatgpt.com${pathname}`; }
   };
-  return { page, calls, singularCalls, allCalls, state };
+  return { page, calls, singularCalls, fullSingularCalls, allCalls, state };
 }
 
 function backendMappingFixture({ currentNode = 'assistant-2', branching = false, brokenParent = false, cycle = false } = {}) {
@@ -6792,7 +6800,7 @@ test('chatgpt-controller: backend history visibility diagnostics keep raw metada
   });
   const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
   assert.equal(fixture.calls.length, 1);
-  assert.equal(fixture.allCalls.length, 3);
+  assert.equal(fixture.allCalls.length, 4);
   assert.equal(result.attempted, true);
   assert.equal(result.backend.complete, true);
   assert.equal(result.backend.pageCount, 1);
@@ -6968,6 +6976,7 @@ test('chatgpt-controller: actual visibility diagnostics satisfy the server group
       'singularAnchorFragments',
       'singularAnchorTopology',
       'singularBranchModels',
+      'singularFullConversation',
       'singularMapping'
     ]);
     for (const model of Object.values(result.models)) {
@@ -7260,6 +7269,180 @@ test('chatgpt-controller: singular authenticated mapping diagnostic reuses sessi
     ...contentAnchorProbe.selectedUserTurns.map((turn) => turn.contentDigest),
     legacyAnchorProbe.reviewResponseDigest, legacyAnchorProbe.answerTranscriptSha256
   ]) assert.equal(serialized.includes(secret), false);
+});
+
+test('chatgpt-controller: full-conversation singular diagnostic uses the same token and analyzer without changing normal singular results', async () => {
+  const targetText = 'full-conversation-selected-user-private-sentinel';
+  const contentDigest = crypto.createHash('sha256')
+    .update(JSON.stringify({ role: 'user', text: targetText }), 'utf8').digest('hex');
+  const mappingFor = (finalText) => {
+    const mapping = {
+      root: { id: 'root', parent: null, children: ['user31'], message: null },
+      user31: { id: 'user31', parent: 'root', children: ['assistant'], message: { id: 'message-user31-private', author: { role: 'user' }, content: { content_type: 'text', parts: ['selected-user-31'] }, end_turn: true } },
+      assistant: { id: 'assistant', parent: 'user31', children: ['user33'], message: { id: 'message-assistant-private', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['assistant-reply'] }, end_turn: true } },
+      user33: { id: 'user33', parent: 'assistant', children: [], message: { id: 'message-user33-private', author: { role: 'user' }, content: { content_type: 'text', parts: [finalText] }, end_turn: true } }
+    };
+    if (finalText === targetText) mapping['side-node-private'] = {
+      id: 'side-node-private', parent: 'root', children: [], message: { id: 'side-message-private', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['side branch'] } }
+    };
+    return mapping;
+  };
+  const conversation = (mapping) => ({ conversation_id: 'backend-diagnostic-test', current_node: 'user33', mapping });
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify(conversation(mappingFor('normal-singular-does-not-have-selected-text'))) },
+    fullSingularResponse: { status: 200, responseText: JSON.stringify(conversation(mappingFor(targetText))) }
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 2, contentDigest }] }
+  });
+
+  assert.equal(fixture.allCalls.filter((call) => call.url === '/api/auth/session').length, 1);
+  assert.equal(fixture.singularCalls.length, 1);
+  assert.equal(fixture.fullSingularCalls.length, 1);
+  const [normalCall] = fixture.singularCalls;
+  const [fullCall] = fixture.fullSingularCalls;
+  assert.equal(normalCall.url, '/backend-api/conversation/backend-diagnostic-test');
+  assert.equal(fullCall.url, '/backend-api/conversation/backend-diagnostic-test?include_full_conversation=true');
+  for (const call of [normalCall, fullCall]) {
+    assert.equal(call.options.method, 'GET');
+    assert.equal(call.options.credentials, 'include');
+    assert.equal(call.options.cache, 'no-store');
+    assert.equal(call.options.redirect, 'error');
+    assert.equal(call.options.headers.Accept, 'application/json');
+    assert.equal(call.options.headers.Authorization, 'Bearer session-access-token-sentinel');
+    assert.ok(call.options.signal instanceof AbortSignal);
+  }
+  assert.equal(result.singularMapping.currentPathResolved, true);
+  assert.equal(result.singularMapping.mappingNodeCount, 4);
+  assert.equal(result.singularBranchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(result.singularFullConversation.mapping.currentPathResolved, true);
+  assert.equal(result.singularFullConversation.mapping.mappingNodeCount, 5);
+  assert.equal(result.singularFullConversation.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].uniqueMatchIndex, 2);
+  assert.equal(result.singularFullConversation.anchorTopology.mappingNodeCount, result.singularFullConversation.mapping.mappingNodeCount);
+  assert.equal(result.singularFullConversation.anchorFragments.mappingNodeCount, result.singularFullConversation.mapping.mappingNodeCount);
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(JSON.parse(JSON.stringify(result))), JSON.parse(JSON.stringify(result)));
+  const serialized = JSON.stringify(result);
+  for (const secret of [
+    'session-access-token-sentinel', 'message-user31-private', 'message-assistant-private', 'message-user33-private', targetText,
+    contentDigest, 'include_full_conversation=true'
+  ]) assert.equal(serialized.includes(secret), false);
+
+  const fragmentMapping = mappingFor('unrelated full message body');
+  fragmentMapping.user33.message.content.parts = ['full message prefix', targetText, 'full message suffix'];
+  const fragmentFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify(conversation(mappingFor('normal message body'))) },
+    fullSingularResponse: { status: 200, responseText: JSON.stringify(conversation(fragmentMapping)) }
+  });
+  const fragmentResult = await createController(fragmentFixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 2, contentDigest }] }
+  });
+  assert.equal(fragmentResult.singularBranchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(fragmentResult.singularFullConversation.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(fragmentResult.singularFullConversation.anchorFragments.selectedUserTurns[0].uniqueMatchingNode.found, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(fragmentResult.singularFullConversation.anchorFragments.selectedUserTurns[0].uniqueMatchingNode.matchedSources)), ['direct-part', 'recursive-leaf']);
+});
+
+test('chatgpt-controller: full-conversation singular failures preserve the normal singular diagnostic', async () => {
+  const normal = backendMappingFixture();
+  normal.mapping['root-sentinel'].message = null;
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'assistant-2', mapping: normal.mapping }) },
+    fullSingularResponse: { status: 404, responseText: '{"error":"full-response-private"}' }
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(result.singularMapping.currentPathResolved, true);
+  assert.equal(result.singularFullConversation.mapping.httpStatus, 404);
+  assert.equal(result.singularFullConversation.mapping.failure, 'http');
+  assert.equal(result.singularFullConversation.branchModels, null);
+  assert.equal(result.singularFullConversation.anchorTopology, null);
+  assert.equal(result.singularFullConversation.anchorFragments, null);
+  assert.equal(fixture.fullSingularCalls.length, 1);
+  assert.equal(JSON.stringify(result).includes('full-response-private'), false);
+
+  const cases = [
+    { name: 'parse', response: { status: 200, responseText: '{"privateBody":' }, failure: 'parse' },
+    { name: 'too-large', response: { status: 200, contentLength: String(64 * 1024 * 1024 + 1), responseText: '{}' }, failure: 'too-large' },
+    { name: 'conversation-mismatch', response: { status: 200, responseText: JSON.stringify({ conversation_id: 'other-private-id', current_node: 'assistant-2', mapping: normal.mapping }) }, failure: 'conversation-mismatch' },
+    { name: 'unresolved', response: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'missing-private-node', mapping: normal.mapping }) }, failure: 'current-node-not-found' }
+  ];
+  for (const item of cases) {
+    const diagnosticFixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+      singularResponse: { status: 200, responseText: JSON.stringify(normal) },
+      fullSingularResponse: item.response
+    });
+    const diagnostic = await createController(diagnosticFixture.page).readConversationBackendHistoryDiagnostics();
+    assert.equal(diagnostic.singularMapping.currentPathResolved, true, item.name);
+    assert.equal(diagnostic.singularFullConversation.mapping.failure, item.failure, item.name);
+    assert.equal(diagnosticFixture.fullSingularCalls.length, 1, item.name);
+    assert.equal(diagnostic.singularFullConversation.branchModels === null, true, item.name);
+    assert.equal(JSON.stringify(diagnostic).includes('other-private-id'), false, item.name);
+  }
+
+  const absentText = 'selected-content-not-in-full-mapping-private';
+  const absentDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: absentText }), 'utf8').digest('hex');
+  const absentMapping = { ...normal.mapping, 'root-sentinel': { ...normal.mapping['root-sentinel'], message: null } };
+  const absentFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'assistant-2', mapping: absentMapping }) },
+    fullSingularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'assistant-2', mapping: absentMapping }) }
+  });
+  const absent = await createController(absentFixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 2, contentDigest: absentDigest }] }
+  });
+  assert.equal(absent.singularFullConversation.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(absent.singularFullConversation.anchorTopology.selectedUserTurns[0].allMapping.currentExtractorMatchCount, 0);
+  assert.equal(absent.singularFullConversation.anchorFragments.selectedUserTurns[0].allMapping.directPartMatchNodeCount, 0);
+  assert.equal(absent.singularFullConversation.anchorFragments.selectedUserTurns[0].allMapping.recursiveLeafMatchNodeCount, 0);
+  assert.equal(JSON.stringify(absent).includes(absentText), false);
+
+  const oversizedFragmentMapping = structuredClone(normal.mapping);
+  oversizedFragmentMapping['root-sentinel'].message = null;
+  oversizedFragmentMapping['user-1'].message.content.parts = Array.from({ length: 100 }, (_, index) => `bounded-fragment-${index}`);
+  const cappedFixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'assistant-2', mapping: normal.mapping }) },
+    fullSingularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'assistant-2', mapping: oversizedFragmentMapping }) }
+  });
+  const capped = await createController(cappedFixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 0, contentDigest: absentDigest }] }
+  });
+  assert.equal(capped.singularMapping.currentPathResolved, true);
+  assert.equal(capped.singularFullConversation.mapping.failure, 'other-safe');
+  assert.equal(capped.singularFullConversation.branchModels, null);
+  assert.equal(cappedFixture.fullSingularCalls.length, 1);
+});
+
+test('chatgpt-controller: full-conversation mapping accepts equal size and localizes historical content on its side branch', async () => {
+  const selectedText = 'full-singular-off-path-anchor-private';
+  const digest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: selectedText }), 'utf8').digest('hex');
+  const mapping = {
+    root: { id: 'root', parent: null, children: ['user', 'side-user'], message: null },
+    user: { id: 'user', parent: 'root', children: ['assistant'], message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['current user'] } } },
+    assistant: { id: 'assistant', parent: 'user', children: [], message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: ['current reply'] } } },
+    'side-user': { id: 'side-user', parent: 'root', children: [], message: { author: { role: 'user' }, content: { content_type: 'text', parts: [selectedText] } } }
+  };
+  const response = { conversation_id: 'backend-diagnostic-test', current_node: 'assistant', mapping };
+  const fixture = createBackendDiagnosticPage({
+    backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+    singularResponse: { status: 200, responseText: JSON.stringify(response) },
+    fullSingularResponse: { status: 200, responseText: JSON.stringify(response) }
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({
+    contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 1, contentDigest: digest }] }
+  });
+  assert.equal(result.singularMapping.mappingNodeCount, result.singularFullConversation.mapping.mappingNodeCount);
+  assert.equal(result.singularFullConversation.mapping.currentPathResolved, true);
+  assert.equal(result.singularFullConversation.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(result.singularFullConversation.anchorTopology.selectedUserTurns[0].uniqueOffPathMatch.found, true);
+  assert.equal(result.singularFullConversation.anchorTopology.selectedUserTurns[0].uniqueOffPathMatch.role, 'user');
+  assert.equal(result.singularFullConversation.anchorFragments.selectedUserTurns[0].uniqueMatchingNode.location, 'off-path');
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(JSON.parse(JSON.stringify(result))), JSON.parse(JSON.stringify(result)));
+  const serialized = JSON.stringify(result);
+  for (const secret of [selectedText, digest, 'side-user']) assert.equal(serialized.includes(secret), false);
 });
 
 test('chatgpt-controller: singular anchor topology localizes selected content to unique off-path nodes without exposing raw data', async () => {

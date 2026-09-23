@@ -595,8 +595,12 @@ function validateBackendHistoryDiagnosticsSignedInteger(value) {
 }
 
 export function validateAndSanitizeBackendHistoryDiagnostics(value) {
+  return sanitizeBackendHistoryDiagnostics(value, true);
+}
+
+function sanitizeBackendHistoryDiagnostics(value, validateFullConversation) {
   const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
-  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels', 'singularAnchorTopology', 'singularAnchorFragments']);
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels', 'singularAnchorTopology', 'singularAnchorFragments', 'singularFullConversation']);
   if (value.attempted !== true) invalid();
 
   validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
@@ -936,7 +940,26 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
   }
   const fragmentEvidenceRequired = !!contentProbeMatches && singularMapping.currentPathResolved;
   if (fragmentEvidenceRequired !== (singularAnchorTopology !== null) || fragmentEvidenceRequired !== (singularAnchorFragments !== null)) invalid();
-  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology, singularAnchorFragments };
+  let singularFullConversation = null;
+  if (validateFullConversation) {
+    const full = value.singularFullConversation;
+    validateBackendHistoryDiagnosticsKeys(full, ['mapping', 'branchModels', 'anchorTopology', 'anchorFragments']);
+    const projected = sanitizeBackendHistoryDiagnostics({
+      ...value,
+      singularMapping: full.mapping,
+      singularBranchModels: full.branchModels,
+      singularAnchorTopology: full.anchorTopology,
+      singularAnchorFragments: full.anchorFragments,
+      singularFullConversation: null
+    }, false);
+    singularFullConversation = {
+      mapping: projected.singularMapping,
+      branchModels: projected.singularBranchModels,
+      anchorTopology: projected.singularAnchorTopology,
+      anchorFragments: projected.singularAnchorFragments
+    };
+  }
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology, singularAnchorFragments, singularFullConversation };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {

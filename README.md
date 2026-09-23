@@ -527,6 +527,13 @@ mapping/path status, and the same safe model/anchor aggregates under
 `singularMapping` and `singularBranchModels`; the raw mapping never leaves page
 context. A failed singular request is reported with a fixed safe failure enum
 without changing the existing plural pagination result.
+The same diagnostic makes one additional authenticated request to
+`/backend-api/conversation/{id}?include_full_conversation=true`, reusing the
+in-memory session token, bounded reader, deadline, and singular mapping/model/
+anchor analyzers. Its safe result is isolated under `singularFullConversation`
+(`mapping`, `branchModels`, `anchorTopology`, and `anchorFragments`). Failure of
+the full-conversation request does not replace or invalidate the normal
+singular result; neither raw mapping is returned outside page context.
 When a content anchor probe and resolved singular path are both available, the
 diagnostic also reports bounded node/candidate counts for six fixed fragment
 extractors (direct string parts, recursive text leaves, and contiguous joins

@@ -136,7 +136,19 @@ function validBackendHistoryDiagnostics({ withProbe = false, withContentProbe = 
     },
     singularBranchModels: null,
     singularAnchorTopology: null,
-    singularAnchorFragments: null
+    singularAnchorFragments: null,
+    singularFullConversation: {
+      mapping: {
+        attempted: true, httpStatus: 404, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false,
+        responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false,
+        mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false,
+        currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false,
+        currentPathInvalidParent: false, failure: 'http'
+      },
+      branchModels: null,
+      anchorTopology: null,
+      anchorFragments: null
+    }
   };
 }
 
@@ -147,6 +159,18 @@ test('http-api: backend history diagnostics validator reconstructs the exact saf
   assert.notStrictEqual(sanitized, source);
   assert.notStrictEqual(sanitized.models.CURRENT, source.models.CURRENT);
   assert.equal(Object.prototype.hasOwnProperty.call(sanitized.models.CURRENT, 'legacyAnchorProbe'), true);
+});
+
+test('http-api: full-conversation singular analysis is exact and reconstructed independently', () => {
+  const source = validBackendHistoryDiagnostics({ withProbe: true });
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(source).singularFullConversation, source.singularFullConversation);
+  const withUnknown = structuredClone(source);
+  withUnknown.singularFullConversation.mapping.rawBody = 'conversation-text-secret-sentinel';
+  assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(withUnknown), /conversation_backend_history_diagnostics_response_invalid/u);
+
+  const withInvalidBranch = structuredClone(source);
+  withInvalidBranch.singularFullConversation.extra = true;
+  assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(withInvalidBranch), /conversation_backend_history_diagnostics_response_invalid/u);
 });
 
 test('http-api: backend history diagnostics validator accepts content localization and branch aggregates', () => {

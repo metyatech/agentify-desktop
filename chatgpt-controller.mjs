@@ -794,7 +794,13 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       singularMapping: { attempted: false, httpStatus: null, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false, responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false, mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false, currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' },
       singularBranchModels: null,
       singularAnchorTopology: null,
-      singularAnchorFragments: null
+      singularAnchorFragments: null,
+      singularFullConversation: {
+        mapping: { attempted: false, httpStatus: null, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false, responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false, mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false, currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' },
+        branchModels: null,
+        anchorTopology: null,
+        anchorFragments: null
+      }
     };
     const pageOrigin = String(location?.origin || '');
     const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
@@ -875,12 +881,13 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         const pageInfo = snakeInfo || camelInfo;
         return { body, bytes: bounded.bytes, ...pageInfo };
       };
-      const readSingularConversation = async () => {
-        const diagnostic = result.singularMapping;
+      const readSingularConversation = async (includeFullConversation = false) => {
+        const diagnostic = includeFullConversation ? result.singularFullConversation.mapping : result.singularMapping;
         diagnostic.attempted = true;
         let response;
         try {
-          response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId), {
+          const fullQuery = includeFullConversation ? '?include_full_conversation=true' : '';
+          response = await fetch('/backend-api/conversation/' + encodeURIComponent(conversationId) + fullQuery, {
             method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
             headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken },
             signal: abortController.signal
@@ -970,6 +977,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         cursor = hasPreviousPage ? page.startCursor : null;
       }
       singularBodyForDiagnostics = await readSingularConversation();
+      const fullSingularBodyForDiagnostics = await readSingularConversation(true);
       accessToken = null;
       const roleOf = (message) => message?.author?.role === 'user' || message?.author?.role === 'assistant' ? message.author.role : null;
       const contentTypeBucket = (message) => {
@@ -1232,7 +1240,14 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
           result.branchModels[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
         }
       }
-      if (singularBodyForDiagnostics) {
+      const analyzeSingularConversation = async (singularBodyForAnalysis, singularMappingDiagnostic) => {
+        const result = {
+          singularMapping: singularMappingDiagnostic,
+          singularBranchModels: null,
+          singularAnchorTopology: null,
+          singularAnchorFragments: null
+        };
+      if (singularBodyForAnalysis) {
         const diagnostic = result.singularMapping;
         const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
         const failSingular = (reason) => { diagnostic.failure = reason; };
@@ -1246,20 +1261,20 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
           if (hasSnake && hasCamel && (snakeValue === null || camelValue === null)) return { present: false, conflict: true, value: null };
           return { present: snakeValue !== null || camelValue !== null, conflict: false, value: hasSnake ? snakeValue : camelValue };
         };
-        const responseId = readStringAlias(singularBodyForDiagnostics, 'conversation_id', 'conversationId');
+        const responseId = readStringAlias(singularBodyForAnalysis, 'conversation_id', 'conversationId');
         diagnostic.responseConversationIdPresent = responseId.present;
         diagnostic.responseConversationIdMatchesUrl = !responseId.conflict && responseId.value === conversationId;
         if (!diagnostic.responseConversationIdMatchesUrl) failSingular('conversation-mismatch');
 
         if (diagnostic.failure === 'none') {
-          diagnostic.mappingPresent = hasOwn(singularBodyForDiagnostics, 'mapping');
-          const mapping = singularBodyForDiagnostics.mapping;
+          diagnostic.mappingPresent = hasOwn(singularBodyForAnalysis, 'mapping');
+          const mapping = singularBodyForAnalysis.mapping;
           diagnostic.mappingObject = !!mapping && typeof mapping === 'object' && !Array.isArray(mapping) && (Object.getPrototypeOf(mapping) === Object.prototype || Object.getPrototypeOf(mapping) === null);
           if (!diagnostic.mappingObject) failSingular('mapping-missing');
           else {
             const mappingKeys = Object.keys(mapping);
             diagnostic.mappingNodeCount = mappingKeys.length;
-            const currentAlias = readStringAlias(singularBodyForDiagnostics, 'current_node', 'currentNode');
+            const currentAlias = readStringAlias(singularBodyForAnalysis, 'current_node', 'currentNode');
             diagnostic.currentNodePresent = currentAlias.present;
             if (currentAlias.conflict) failSingular('shape');
             else if (!currentAlias.present || !currentAlias.value) failSingular('current-node-missing');
@@ -1553,6 +1568,30 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
           }
         }
       }
+        return result;
+      };
+      const normalSingularAnalysis = await analyzeSingularConversation(singularBodyForDiagnostics, result.singularMapping);
+      Object.assign(result, normalSingularAnalysis);
+      let fullSingularAnalysis;
+      try {
+        fullSingularAnalysis = await analyzeSingularConversation(fullSingularBodyForDiagnostics, result.singularFullConversation.mapping);
+      } catch {
+        const diagnostic = result.singularFullConversation.mapping;
+        diagnostic.failure = abortController.signal.aborted || !deadline() ? 'timeout' : 'other-safe';
+        diagnostic.currentPathResolved = false;
+        fullSingularAnalysis = {
+          singularMapping: diagnostic,
+          singularBranchModels: null,
+          singularAnchorTopology: null,
+          singularAnchorFragments: null
+        };
+      }
+      result.singularFullConversation = {
+        mapping: fullSingularAnalysis.singularMapping,
+        branchModels: fullSingularAnalysis.singularBranchModels,
+        anchorTopology: fullSingularAnalysis.singularAnchorTopology,
+        anchorFragments: fullSingularAnalysis.singularAnchorFragments
+      };
       for (const message of orderedMessages.slice(-40)) {
         const role = roleOf(message);
         if (role) result.backendBuckets[role][contentTypeBucket(message)] += 1;

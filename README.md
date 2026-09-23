@@ -541,6 +541,20 @@ of at most eight fragments). Each message is capped at 512 generated
 candidates; reaching that cap fails the diagnostic instead of returning a
 partial search. Fragment text, positions, IDs, and digests remain private.
 
+To check whether a historical USER anchor remains discoverable through
+ChatGPT's conversation search index, use the separate authenticated
+`POST /conversation/historical-anchor-search-diagnostics` route with the
+expected conversation URL hash/path and an `{ "role": "user", "text": "<artifact turn>" }`
+anchor probe. The page context verifies that the live tab matches that expected
+conversation, derives at most three short deterministic query candidates, and
+uses one bounded first-page search request per candidate. It reuses one
+in-memory session token and never paginates, retries, or falls back. The
+response reports only query counts, expected-conversation equality counts,
+successful-response booleans, and whether a matching result had a non-empty
+snippet; query text, snippets, conversation IDs, tokens, and raw search items
+are not returned. This is diagnostic-only and does not modify conversation or
+history behavior.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

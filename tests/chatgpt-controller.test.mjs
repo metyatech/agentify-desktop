@@ -244,14 +244,16 @@ function createBackendDiagnosticPage({
   backendResponses = null,
   singularResponse = null,
   fullSingularResponse = null,
+  searchResponses = null,
   digestOverrides = {},
   domRecords = []
 } = {}) {
   const calls = [];
   const singularCalls = [];
   const fullSingularCalls = [];
+  const searchCalls = [];
   const allCalls = [];
-  const state = { readCount: 0, sessionReadCount: 0, backendRequestCount: 0, singularReadCount: 0, fullSingularReadCount: 0, cancelCount: 0, sessionCancelCount: 0, singularCancelCount: 0, fullSingularCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false, singularResponseTextCalled: false, fullSingularResponseTextCalled: false };
+  const state = { readCount: 0, sessionReadCount: 0, backendRequestCount: 0, singularReadCount: 0, fullSingularReadCount: 0, searchReadCount: 0, searchRequestCount: 0, cancelCount: 0, sessionCancelCount: 0, singularCancelCount: 0, fullSingularCancelCount: 0, responseTextCalled: false, sessionResponseTextCalled: false, singularResponseTextCalled: false, fullSingularResponseTextCalled: false };
   const chunks = (streamChunks || [responseText]).map((chunk) => chunk instanceof Uint8Array
     ? chunk
     : new TextEncoder().encode(String(chunk)));
@@ -296,6 +298,7 @@ function createBackendDiagnosticPage({
         AbortController,
         TextDecoder,
         TextEncoder,
+        URL,
         clearTimeout,
         crypto: {
           subtle: {
@@ -310,35 +313,40 @@ function createBackendDiagnosticPage({
         document: { querySelectorAll: (selector) => selector === '[data-content-search-unit-key]' ? domNodes : Array.from({ length: mountedDomTurnCount }, () => ({})) },
         fetch: async (url, options) => {
           const isSession = String(url) === '/api/auth/session';
+          const isSearch = !isSession && String(url).startsWith('/backend-api/conversations/search?query=');
           const isFullSingular = !isSession && String(url).startsWith('/backend-api/conversation/') && String(url).endsWith('?include_full_conversation=true');
           const isSingular = !isSession && !isFullSingular && String(url).startsWith('/backend-api/conversation/');
-          const isPlural = !isSession && !isSingular && String(url).startsWith('/backend-api/conversations/');
+          const isPlural = !isSession && !isSearch && !isSingular && String(url).startsWith('/backend-api/conversations/');
           const call = { url, options };
           allCalls.push(call);
           if (isPlural) calls.push(call);
           if (isSingular) singularCalls.push(call);
           if (isFullSingular) fullSingularCalls.push(call);
+          if (isSearch) searchCalls.push(call);
           const backendResponse = isPlural && Array.isArray(backendResponses) ? backendResponses[state.backendRequestCount] || null : null;
+          const searchResponse = isSearch && Array.isArray(searchResponses) ? searchResponses[state.searchRequestCount] || null : null;
           const singularResult = isSingular ? singularResponse || { status: 404, contentType: 'application/json', responseText: '{}' } : null;
           const fullSingularResult = isFullSingular ? fullSingularResponse || { status: 404, contentType: 'application/json', responseText: '{}' } : null;
           if (isPlural) state.backendRequestCount += 1;
+          if (isSearch) state.searchRequestCount += 1;
           const singularResponseConfig = isFullSingular ? fullSingularResult : singularResult;
           const isAnySingular = isSingular || isFullSingular;
-          const responseStatus = isSession ? sessionStatus : isAnySingular ? singularResponseConfig?.status ?? 404 : backendResponse?.status ?? status;
-          const responseContentType = isSession ? sessionContentType : isAnySingular ? singularResponseConfig?.contentType ?? 'application/json' : backendResponse?.contentType ?? contentType;
-          const responseTextValue = isSession ? sessionResponseText : isAnySingular ? singularResponseConfig?.responseText ?? '{}' : backendResponse?.responseText ?? responseText;
-          const responseContentLength = isSession ? sessionContentLength : isAnySingular ? singularResponseConfig?.contentLength ?? null : backendResponse?.contentLength ?? contentLength;
+          const responseConfig = isSearch ? searchResponse : isAnySingular ? singularResponseConfig : backendResponse;
+          const responseStatus = isSession ? sessionStatus : responseConfig?.status ?? status;
+          const responseContentType = isSession ? sessionContentType : responseConfig?.contentType ?? contentType;
+          const responseTextValue = isSession ? sessionResponseText : responseConfig?.responseText ?? responseText;
+          const responseContentLength = isSession ? sessionContentLength : responseConfig?.contentLength ?? contentLength;
           const responseChunks = isSession
             ? sessionChunks
-            : (isAnySingular
-              ? (singularResponseConfig?.streamChunks || [responseTextValue]).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)))
+            : ((isAnySingular || isSearch)
+              ? (responseConfig?.streamChunks || [responseTextValue]).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)))
               : backendResponse
               ? (backendResponse.streamChunks || [responseTextValue])
               : chunks).map((chunk) => chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk)));
-          const responseFetchError = isSession ? sessionFetchError : isAnySingular ? singularResponseConfig?.fetchError ?? null : backendResponse?.fetchError ?? fetchError;
-          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : isAnySingular ? singularResponseConfig?.fetchDelayMs ?? 0 : backendResponse?.fetchDelayMs ?? fetchDelayMs;
-          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : isAnySingular ? singularResponseConfig?.stallAfterReadIndex ?? null : backendResponse?.stallAfterReadIndex ?? stallAfterReadIndex;
-          const responseOmitReader = isSession ? sessionOmitReader : isAnySingular ? singularResponseConfig?.omitReader ?? false : backendResponse?.omitReader ?? omitReader;
+          const responseFetchError = isSession ? sessionFetchError : responseConfig?.fetchError ?? fetchError;
+          const responseFetchDelayMs = isSession ? sessionFetchDelayMs : responseConfig?.fetchDelayMs ?? fetchDelayMs;
+          const responseStallAfterReadIndex = isSession ? sessionStallAfterReadIndex : responseConfig?.stallAfterReadIndex ?? stallAfterReadIndex;
+          const responseOmitReader = isSession ? sessionOmitReader : responseConfig?.omitReader ?? omitReader;
           if (responseFetchError) throw responseFetchError;
           if (responseFetchDelayMs > 0) {
             await new Promise((resolve, reject) => {
@@ -363,6 +371,7 @@ function createBackendDiagnosticPage({
                     if (isSession) state.sessionReadCount += 1;
                     else if (isSingular) state.singularReadCount += 1;
                     else if (isFullSingular) state.fullSingularReadCount += 1;
+                    else if (isSearch) state.searchReadCount += 1;
                     else state.readCount += 1;
                     if (responseStallAfterReadIndex !== null && chunkIndex >= responseStallAfterReadIndex) {
                       await new Promise((resolve, reject) => {
@@ -385,7 +394,7 @@ function createBackendDiagnosticPage({
             async text() { if (isSession) state.sessionResponseTextCalled = true; else if (isSingular) state.singularResponseTextCalled = true; else if (isFullSingular) state.fullSingularResponseTextCalled = true; else state.responseTextCalled = true; return responseTextValue; }
           };
         },
-        location: { origin: 'https://chatgpt.com', pathname },
+        location: { origin: 'https://chatgpt.com', pathname, href: `https://chatgpt.com${pathname}` },
         setTimeout,
         clearTimeout
       };
@@ -393,7 +402,7 @@ function createBackendDiagnosticPage({
     },
     async getUrl() { return `https://chatgpt.com${pathname}`; }
   };
-  return { page, calls, singularCalls, fullSingularCalls, allCalls, state };
+  return { page, calls, singularCalls, fullSingularCalls, searchCalls, allCalls, state };
 }
 
 function backendMappingFixture({ currentNode = 'assistant-2', branching = false, brokenParent = false, cycle = false } = {}) {
@@ -7674,6 +7683,92 @@ test('chatgpt-controller: singular mapping diagnostic reduces transport and grap
   assert.equal(stalled.singularCalls.length, 1);
   assert.equal(stalledResult.singularMapping.failure, 'timeout');
   assert.equal(stalled.state.singularCancelCount, 1);
+});
+
+test('chatgpt-controller: historical anchor search binds the live conversation and returns only bounded aggregates', async () => {
+  const pathname = '/c/backend-diagnostic-test';
+  const anchorText = 'Distinctive topology marker resolves adapter fragment checkpoint orchard lattice horizon. '.repeat(5);
+  const searchResponses = Array.from({ length: 3 }, () => ({
+    status: 200,
+    responseText: JSON.stringify({ items: [{ conversation_id: 'backend-diagnostic-test', payload: { snippet: 'snippet-secret-sentinel' } }] })
+  }));
+  const fixture = createBackendDiagnosticPage({ pathname, searchResponses });
+  const expectedHash = crypto.createHash('sha256').update(`https://chatgpt.com${pathname}`, 'utf8').digest('hex');
+  const result = await createController(fixture.page).readHistoricalAnchorSearchDiagnostics({
+    timeoutMs: 5_000,
+    expectedConversationUrlHash: expectedHash,
+    expectedConversationPath: pathname,
+    anchorProbe: { role: 'user', text: anchorText }
+  });
+  assert.equal(fixture.allCalls.filter((call) => call.url === '/api/auth/session').length, 1);
+  assert.equal(fixture.searchCalls.length, 3);
+  assert.equal(fixture.state.searchRequestCount, 3);
+  for (const call of fixture.searchCalls) {
+    assert.match(call.url, /^\/backend-api\/conversations\/search\?query=/u);
+    assert.equal(call.options.method, 'GET');
+    assert.equal(call.options.credentials, 'include');
+    assert.equal(call.options.cache, 'no-store');
+    assert.equal(call.options.redirect, 'error');
+    assert.equal(call.options.headers.Accept, 'application/json');
+    assert.equal(call.options.headers.Authorization, 'Bearer session-access-token-sentinel');
+    const query = new URL(`https://chatgpt.com${call.url}`).searchParams.get('query');
+    assert.ok(query && query.length <= 80 && anchorText.includes(query));
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    attempted: true,
+    endpointAvailable: true,
+    queryCount: 3,
+    queries: [0, 1, 2].map((ordinal) => ({ ordinal, httpOk: true, jsonParsed: true, resultCount: 1, expectedConversationMatchCount: 1, expectedConversationMatched: true, snippetPresentForExpectedConversation: true })),
+    anyExpectedConversationMatch: true,
+    allSuccessfulQueriesMatchExpectedConversation: true,
+    uniqueExpectedConversationAcrossSuccessfulQueries: true
+  });
+  const serialized = JSON.stringify(result);
+  for (const secret of [anchorText, 'snippet-secret-sentinel', 'session-access-token-sentinel', 'backend-diagnostic-test']) assert.equal(serialized.includes(secret), false);
+});
+
+test('chatgpt-controller: historical anchor search keeps absent, duplicate, HTTP, malformed, and oversized outcomes aggregate-only', async () => {
+  const pathname = '/c/backend-diagnostic-test';
+  const anchorText = 'Distinctive topology marker resolves adapter fragment checkpoint orchard lattice horizon. '.repeat(5);
+  const expectedHash = crypto.createHash('sha256').update(`https://chatgpt.com${pathname}`, 'utf8').digest('hex');
+  const cases = [
+    { name: 'absent', response: { status: 200, responseText: JSON.stringify({ items: [{ conversation_id: 'other-id-secret' }] }) }, expected: { endpointAvailable: true, matches: 0 } },
+    { name: 'duplicate', response: { status: 200, responseText: JSON.stringify({ items: [{ conversation_id: 'backend-diagnostic-test' }, { conversation_id: 'backend-diagnostic-test' }] }) }, expected: { endpointAvailable: true, matches: 2 } },
+    { name: 'http', response: { status: 403, responseText: 'private-http-body' }, expected: { endpointAvailable: false, matches: 0 } },
+    { name: 'malformed', response: { status: 200, responseText: '{private-malformed-body' }, expected: { endpointAvailable: false, matches: 0 } },
+    { name: 'oversized', response: { status: 200, contentLength: String(1024 * 1024 + 1) }, expected: { endpointAvailable: false, matches: 0 } }
+  ];
+  for (const item of cases) {
+    const fixture = createBackendDiagnosticPage({ pathname, searchResponses: Array.from({ length: 3 }, () => item.response) });
+    const result = await createController(fixture.page).readHistoricalAnchorSearchDiagnostics({ expectedConversationUrlHash: expectedHash, expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } });
+    assert.equal(result.endpointAvailable, item.expected.endpointAvailable, item.name);
+    assert.equal(fixture.searchCalls.length, 3, item.name);
+    assert.equal(fixture.allCalls.filter((call) => call.url === '/api/auth/session').length, 1, item.name);
+    assert.equal(result.queries[0].expectedConversationMatchCount, item.expected.matches, item.name);
+    const serialized = JSON.stringify(result);
+    for (const secret of [anchorText, 'other-id-secret', 'private-http-body', 'private-malformed-body', 'session-access-token-sentinel']) assert.equal(serialized.includes(secret), false, item.name);
+    assert.equal(fixture.state.responseTextCalled, false, item.name);
+  }
+
+  const singleMatch = createBackendDiagnosticPage({
+    pathname,
+    searchResponses: [
+      { status: 200, responseText: JSON.stringify({ items: [{ conversation_id: 'backend-diagnostic-test', payload: { snippet: 'snippet-secret-sentinel' } }] }) },
+      { status: 200, responseText: JSON.stringify({ items: [{ conversation_id: 'other-id-secret' }] }) },
+      { status: 200, responseText: JSON.stringify({ items: [] }) }
+    ]
+  });
+  const singleMatchResult = await createController(singleMatch.page).readHistoricalAnchorSearchDiagnostics({ expectedConversationUrlHash: expectedHash, expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } });
+  assert.deepEqual(Array.from(singleMatchResult.queries, (query) => query.expectedConversationMatchCount), [1, 0, 0]);
+  assert.equal(singleMatchResult.anyExpectedConversationMatch, true);
+  assert.equal(singleMatchResult.uniqueExpectedConversationAcrossSuccessfulQueries, true);
+  assert.equal(JSON.stringify(singleMatchResult).includes('snippet-secret-sentinel'), false);
+
+  const mismatch = createBackendDiagnosticPage({ pathname, searchResponses: [] });
+  await assert.rejects(() => createController(mismatch.page).readHistoricalAnchorSearchDiagnostics({
+    expectedConversationUrlHash: '0'.repeat(64), expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText }
+  }), /historical_anchor_search_binding_invalid/u);
+  assert.equal(mismatch.allCalls.length, 0);
 });
 
 test('chatgpt-controller: singular mapping follows camel aliases, permits a null-message root, and excludes side branches', async () => {

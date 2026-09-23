@@ -17,6 +17,8 @@ const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_CONVERSATION_WINDOWS_RESPONSE_BYTES = 10 * 1024 * 1024;
 const MAX_CONVERSATION_BACKEND_HISTORY_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES = 256 * 1024;
+const MAX_HISTORICAL_ANCHOR_SEARCH_RESPONSE_BYTES = 16 * 1024;
+const MAX_HISTORICAL_ANCHOR_SEARCH_TEXT_BYTES = 128 * 1024;
 const MAX_ATTACHMENT_DIAGNOSTIC_ITEMS = 50;
 const MAX_ATTACHMENT_DIAGNOSTIC_NAME_LENGTH = 256;
 const MAX_ATTACHMENT_DIAGNOSTIC_ERROR_LENGTH = 160;
@@ -441,6 +443,12 @@ export function mapErrorToHttp(error) {
   if (msg === 'conversation_backend_history_diagnostics_limits_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_limits_invalid' } };
   if (msg === 'conversation_backend_history_diagnostics_probe_invalid') return { code: 400, body: { error: 'conversation_backend_history_diagnostics_probe_invalid' } };
   if (msg === 'conversation_backend_history_diagnostics_response_invalid') return { code: 500, body: { error: 'conversation_backend_history_diagnostics_response_invalid' } };
+  if (msg === 'historical_anchor_search_request_invalid') return { code: 400, body: { error: 'historical_anchor_search_request_invalid' } };
+  if (msg === 'historical_anchor_search_response_invalid') return { code: 500, body: { error: 'historical_anchor_search_response_invalid' } };
+  if (msg === 'historical_anchor_search_controller_unavailable') return { code: 409, body: { error: 'historical_anchor_search_controller_unavailable' } };
+  if (msg === 'historical_anchor_search_binding_invalid') return { code: 409, body: { error: 'historical_anchor_search_binding_invalid' } };
+  if (msg === 'historical_anchor_search_session_failed') return { code: 502, body: { error: 'historical_anchor_search_session_failed' } };
+  if (msg === 'historical_anchor_search_query_unavailable') return { code: 422, body: { error: 'historical_anchor_search_query_unavailable' } };
   if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
   if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
@@ -960,6 +968,35 @@ function sanitizeBackendHistoryDiagnostics(value, validateFullConversation) {
     };
   }
   return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology, singularAnchorFragments, singularFullConversation };
+}
+
+export function validateAndSanitizeHistoricalAnchorSearchDiagnostics(value) {
+  const invalid = () => { throw new Error('historical_anchor_search_response_invalid'); };
+  const exact = (object, keys) => isPlainBackendHistoryDiagnosticsObject(object) && Object.keys(object).length === keys.length && keys.every((key) => Object.hasOwn(object, key));
+  const bool = (item) => { if (typeof item !== 'boolean') invalid(); return item; };
+  const count = (item) => { if (!Number.isSafeInteger(item) || item < 0 || item > 1_000_000) invalid(); return item; };
+  const keys = ['attempted', 'endpointAvailable', 'queryCount', 'queries', 'anyExpectedConversationMatch', 'allSuccessfulQueriesMatchExpectedConversation', 'uniqueExpectedConversationAcrossSuccessfulQueries'];
+  if (!exact(value, keys) || value.attempted !== true || !Number.isSafeInteger(value.queryCount) || value.queryCount < 1 || value.queryCount > 3 || !Array.isArray(value.queries) || value.queries.length !== value.queryCount) invalid();
+  const queries = value.queries.map((query, ordinal) => {
+    if (!exact(query, ['ordinal', 'httpOk', 'jsonParsed', 'resultCount', 'expectedConversationMatchCount', 'expectedConversationMatched', 'snippetPresentForExpectedConversation']) || query.ordinal !== ordinal) invalid();
+    const httpOk = bool(query.httpOk);
+    const jsonParsed = bool(query.jsonParsed);
+    const resultCount = count(query.resultCount);
+    const expectedConversationMatchCount = count(query.expectedConversationMatchCount);
+    const expectedConversationMatched = bool(query.expectedConversationMatched);
+    const snippetPresentForExpectedConversation = bool(query.snippetPresentForExpectedConversation);
+    if (expectedConversationMatchCount > resultCount || expectedConversationMatched !== (expectedConversationMatchCount > 0) ||
+        snippetPresentForExpectedConversation && !expectedConversationMatched || !httpOk && (jsonParsed || resultCount !== 0 || expectedConversationMatchCount !== 0)) invalid();
+    return { ordinal, httpOk, jsonParsed, resultCount, expectedConversationMatchCount, expectedConversationMatched, snippetPresentForExpectedConversation };
+  });
+  const successful = queries.filter((query) => query.httpOk && query.jsonParsed);
+  const anyExpectedConversationMatch = queries.some((query) => query.expectedConversationMatched);
+  const allSuccessfulQueriesMatchExpectedConversation = successful.length > 0 && successful.every((query) => query.expectedConversationMatched);
+  const uniqueExpectedConversationAcrossSuccessfulQueries = successful.length > 0 && successful.some((query) => query.expectedConversationMatched) && successful.every((query) => query.expectedConversationMatchCount <= 1);
+  if (value.endpointAvailable !== (successful.length > 0) || bool(value.anyExpectedConversationMatch) !== anyExpectedConversationMatch ||
+      bool(value.allSuccessfulQueriesMatchExpectedConversation) !== allSuccessfulQueriesMatchExpectedConversation ||
+      bool(value.uniqueExpectedConversationAcrossSuccessfulQueries) !== uniqueExpectedConversationAcrossSuccessfulQueries) invalid();
+  return { attempted: true, endpointAvailable: successful.length > 0, queryCount: queries.length, queries, anyExpectedConversationMatch, allSuccessfulQueriesMatchExpectedConversation, uniqueExpectedConversationAcrossSuccessfulQueries };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -2785,6 +2822,37 @@ export function startHttpApi({
         const diagnostics = await controller.readConversationBackendHistoryDiagnostics({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe, contentAnchorProbe });
         const safeDiagnostics = validateAndSanitizeBackendHistoryDiagnostics(diagnostics);
         return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES });
+      }
+
+      if (url.pathname === '/conversation/historical-anchor-search-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: MAX_HISTORICAL_ANCHOR_SEARCH_TEXT_BYTES + 16_384 });
+        const allowedKeys = ['tabId', 'key', 'timeoutMs', 'expectedConversationUrlHash', 'expectedConversationPath', 'anchorProbe'];
+        const invalid = () => { throw new Error('historical_anchor_search_request_invalid'); };
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !allowedKeys.includes(key))) invalid();
+        const requestedTabId = typeof body.tabId === 'string' ? body.tabId.trim() : '';
+        const requestedKey = typeof body.key === 'string' ? body.key.trim() : '';
+        if (!requestedTabId && !requestedKey || requestedTabId && requestedKey) invalid();
+        if (typeof body.expectedConversationUrlHash !== 'string' || !/^[0-9a-f]{64}$/u.test(body.expectedConversationUrlHash) ||
+            typeof body.expectedConversationPath !== 'string' || !/^\/c\/[^/?#]+$/u.test(body.expectedConversationPath) ||
+            !body.anchorProbe || typeof body.anchorProbe !== 'object' || Array.isArray(body.anchorProbe) ||
+            Object.keys(body.anchorProbe).length !== 2 || Object.keys(body.anchorProbe).some((key) => !['role', 'text'].includes(key)) ||
+            body.anchorProbe.role !== 'user' || typeof body.anchorProbe.text !== 'string' || !body.anchorProbe.text.trim() ||
+            Buffer.byteLength(body.anchorProbe.text, 'utf8') > MAX_HISTORICAL_ANCHOR_SEARCH_TEXT_BYTES) invalid();
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId ? listed.filter((tab) => tab?.id === requestedTabId) : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readHistoricalAnchorSearchDiagnostics !== 'function') throw new Error('historical_anchor_search_controller_unavailable');
+        const diagnostics = await controller.readHistoricalAnchorSearchDiagnostics({
+          timeoutMs: strictPositiveIntOr(body.timeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'historical_anchor_search_request_invalid'),
+          expectedConversationUrlHash: body.expectedConversationUrlHash,
+          expectedConversationPath: body.expectedConversationPath,
+          anchorProbe: body.anchorProbe
+        });
+        const safeDiagnostics = validateAndSanitizeHistoricalAnchorSearchDiagnostics(diagnostics);
+        return sendJson(res, 200, { ok: true, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_HISTORICAL_ANCHOR_SEARCH_RESPONSE_BYTES });
       }
 
       if (url.pathname === '/download-images' && req.method === 'POST') {

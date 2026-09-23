@@ -5,7 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-import { mapErrorToHttp, startHttpApi, validateAndSanitizeBackendHistoryDiagnostics } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi, validateAndSanitizeBackendHistoryDiagnostics, validateAndSanitizeHistoricalAnchorSearchDiagnostics } from '../http-api.mjs';
 import { ChatGPTController } from '../chatgpt-controller.mjs';
 import { ChromeCdpBrowserBackend } from '../chrome-cdp-backend.mjs';
 
@@ -4891,6 +4891,44 @@ test('http-api: backend conversation diagnostics is a bounded read-only controll
 
   const unauthorized = await req({ port, method: 'POST', pth: '/conversation/backend-diagnostics', body: { key: 'review' } });
   assert.equal(unauthorized.res.status, 401);
+});
+
+test('http-api: historical anchor search route scopes, validates, and returns only safe aggregates', async (t) => {
+  const calls = [];
+  const controller = {
+    readHistoricalAnchorSearchDiagnostics: async (options) => {
+      calls.push(options);
+      return {
+        attempted: true,
+        endpointAvailable: true,
+        queryCount: 1,
+        queries: [{ ordinal: 0, httpOk: true, jsonParsed: true, resultCount: 2, expectedConversationMatchCount: 1, expectedConversationMatched: true, snippetPresentForExpectedConversation: true }],
+        anyExpectedConversationMatch: true,
+        allSuccessfulQueriesMatchExpectedConversation: true,
+        uniqueExpectedConversationAcrossSuccessfulQueries: true
+      };
+    }
+  };
+  const tabs = { listTabs: () => [{ id: 'search-tab-id-secret', key: 'review', vendorId: 'chatgpt' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 'search-tab-id-secret', serverId: 'sid-test', stateDir: '/tmp', getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const anchorText = 'anchor-query-text-secret-sentinel';
+  const response = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/historical-anchor-search-diagnostics',
+    body: { key: 'review', timeoutMs: 10_000, expectedConversationUrlHash: 'a'.repeat(64), expectedConversationPath: '/c/example', anchorProbe: { role: 'user', text: anchorText } }
+  });
+  assert.equal(response.res.status, 200);
+  assert.deepEqual(calls, [{ timeoutMs: 10_000, expectedConversationUrlHash: 'a'.repeat(64), expectedConversationPath: '/c/example', anchorProbe: { role: 'user', text: anchorText } }]);
+  const serialized = JSON.stringify(response.data);
+  for (const secret of [anchorText, 'search-tab-id-secret', 'snippet-content-secret-sentinel']) assert.equal(serialized.includes(secret), false);
+  assert.equal(response.data.diagnostics.expectedConversationMatched, undefined);
+  const invalid = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/historical-anchor-search-diagnostics', body: { key: 'review', expectedConversationUrlHash: 'A'.repeat(64), expectedConversationPath: '/c/example', anchorProbe: { role: 'user', text: anchorText } } });
+  assert.equal(invalid.res.status, 400);
+  assert.deepEqual(validateAndSanitizeHistoricalAnchorSearchDiagnostics(response.data.diagnostics), response.data.diagnostics);
+  assert.throws(() => validateAndSanitizeHistoricalAnchorSearchDiagnostics({ ...response.data.diagnostics, secret: anchorText }), /historical_anchor_search_response_invalid/u);
 });
 
 test('http-api: backend conversation history is authenticated, bounded, and exposes only complete pagination output', async (t) => {

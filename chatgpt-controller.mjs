@@ -1612,6 +1612,142 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
   })()`;
 }
 
+function buildHistoricalAnchorSearchDiagnosticsScript({ timeoutMs, expectedConversationUrlHash, expectedConversationPath, anchorText }) {
+  const maxResponseBytes = 1024 * 1024;
+  return String.raw`(async () => {
+    const timeoutMs = ${JSON.stringify(timeoutMs)};
+    const expectedUrlHash = ${JSON.stringify(expectedConversationUrlHash)};
+    const expectedPath = ${JSON.stringify(expectedConversationPath)};
+    const sourceText = ${JSON.stringify(anchorText)};
+    const maxResponseBytes = ${JSON.stringify(maxResponseBytes)};
+    const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/gu, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
+    const fail = (code) => { throw new Error(code); };
+    const url = String(location.href || '');
+    const urlBytes = new TextEncoder().encode(url);
+    const urlHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', urlBytes)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    let parsedUrl;
+    try { parsedUrl = new URL(url); } catch { fail('historical_anchor_search_binding_invalid'); }
+    if (urlHash !== expectedUrlHash || parsedUrl.origin !== 'https://chatgpt.com' || parsedUrl.pathname !== expectedPath) fail('historical_anchor_search_binding_invalid');
+    const conversationMatch = /^\/c\/([^/?#]+)$/u.exec(parsedUrl.pathname);
+    if (!conversationMatch) fail('historical_anchor_search_binding_invalid');
+    let conversationId;
+    try { conversationId = decodeURIComponent(conversationMatch[1]); } catch { fail('historical_anchor_search_binding_invalid'); }
+    if (!conversationId) fail('historical_anchor_search_binding_invalid');
+
+    const normalized = normalizeText(sourceText);
+    const points = Array.from(normalized);
+    const starts = points.length <= 80 ? [0] : [0, Math.floor((points.length - 80) / 2), points.length - 80];
+    const stopWords = new Set(['about', 'after', 'again', 'also', 'been', 'being', 'could', 'does', 'doing', 'from', 'have', 'hello', 'help', 'here', 'into', 'just', 'know', 'let', 'make', 'maybe', 'more', 'most', 'need', 'other', 'over', 'please', 'same', 'some', 'such', 'than', 'that', 'their', 'there', 'these', 'they', 'think', 'this', 'those', 'through', 'thanks', 'thank', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your']);
+    const queries = [];
+    const seen = new Set();
+    for (const start of starts) {
+      const query = points.slice(start, start + 80).join('').trim();
+      const terms = query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [];
+      const distinctive = terms.filter((term) => !stopWords.has(term));
+      if (Array.from(query).length < 20 || Array.from(query).length > 80 || !/\p{L}/u.test(query) || distinctive.length < 3 || /(?:https?:\/\/|www\.)/iu.test(query) || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/iu.test(query)) continue;
+      if (seen.has(query)) continue;
+      seen.add(query);
+      queries.push(query);
+      if (queries.length === 3) break;
+    }
+    if (!queries.length) fail('historical_anchor_search_query_unavailable');
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let accessToken = null;
+    try {
+      const readBoundedText = async (response) => {
+        const declared = Number(response?.headers?.get?.('content-length'));
+        if (Number.isSafeInteger(declared) && declared >= 0 && declared > maxResponseBytes) {
+          try { await response?.body?.cancel?.(); } catch {}
+          return null;
+        }
+        const reader = response?.body?.getReader?.();
+        if (!reader) return null;
+        const decoder = new TextDecoder();
+        const chunks = [];
+        let bytes = 0;
+        const readWithAbort = async () => {
+          if (controller.signal.aborted) return null;
+          let onAbort;
+          const aborted = new Promise((resolve) => {
+            onAbort = () => resolve(null);
+            controller.signal.addEventListener('abort', onAbort, { once: true });
+          });
+          try { return await Promise.race([reader.read(), aborted]); }
+          finally { controller.signal.removeEventListener('abort', onAbort); }
+        };
+        try {
+          while (true) {
+            const item = await readWithAbort();
+            if (item === null) { try { await reader.cancel(); } catch {} return null; }
+            if (item.done) break;
+            const chunk = item.value instanceof Uint8Array ? item.value : new Uint8Array(item.value);
+            bytes += chunk.byteLength;
+            if (bytes > maxResponseBytes) { try { await reader.cancel(); } catch {} return null; }
+            chunks.push(decoder.decode(chunk, { stream: true }));
+          }
+          chunks.push(decoder.decode());
+          return chunks.join('');
+        } catch { try { await reader.cancel(); } catch {} return null; }
+      };
+      let sessionResponse;
+      try {
+        sessionResponse = await fetch('/api/auth/session', { method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json' }, signal: controller.signal });
+      } catch { fail('historical_anchor_search_session_failed'); }
+      if (!sessionResponse?.ok) fail('historical_anchor_search_session_failed');
+      let sessionType = '';
+      try { sessionType = String(sessionResponse.headers?.get?.('content-type') || ''); } catch {}
+      if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(sessionType)) fail('historical_anchor_search_session_failed');
+      const sessionText = await readBoundedText(sessionResponse);
+      if (typeof sessionText !== 'string') fail('historical_anchor_search_session_failed');
+      let session;
+      try { session = JSON.parse(sessionText); } catch { fail('historical_anchor_search_session_failed'); }
+      if (!session || typeof session !== 'object' || Array.isArray(session) || typeof session.accessToken !== 'string' || !session.accessToken.trim() || session.accessToken.length > 16 * 1024) fail('historical_anchor_search_session_failed');
+      accessToken = session.accessToken;
+
+      const results = [];
+      let endpointAvailable = false;
+      for (let ordinal = 0; ordinal < queries.length; ordinal += 1) {
+        const query = queries[ordinal];
+        const row = { ordinal, httpOk: false, jsonParsed: false, resultCount: 0, expectedConversationMatchCount: 0, expectedConversationMatched: false, snippetPresentForExpectedConversation: false };
+        results.push(row);
+        if (controller.signal.aborted) continue;
+        let response;
+        try {
+          const searchUrl = '/backend-api/conversations/search?query=' + encodeURIComponent(query);
+          response = await fetch(searchUrl, { method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken }, signal: controller.signal });
+        } catch { continue; }
+        row.httpOk = response?.ok === true;
+        if (!row.httpOk) continue;
+        let contentType = '';
+        try { contentType = String(response.headers?.get?.('content-type') || ''); } catch {}
+        if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType)) continue;
+        const bodyText = await readBoundedText(response);
+        if (typeof bodyText !== 'string') continue;
+        let body;
+        try { body = JSON.parse(bodyText); } catch { continue; }
+        row.jsonParsed = true;
+        if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.items)) { row.jsonParsed = false; continue; }
+        endpointAvailable = true;
+        row.resultCount = body.items.length;
+        const expectedItems = body.items.filter((item) => item && typeof item === 'object' && !Array.isArray(item) && item.conversation_id === conversationId);
+        row.expectedConversationMatchCount = expectedItems.length;
+        row.expectedConversationMatched = expectedItems.length > 0;
+        row.snippetPresentForExpectedConversation = expectedItems.some((item) => typeof item.payload?.snippet === 'string' && item.payload.snippet.trim().length > 0);
+      }
+      const successful = results.filter((row) => row.httpOk && row.jsonParsed);
+      const anyExpectedConversationMatch = results.some((row) => row.expectedConversationMatched);
+      const allSuccessfulQueriesMatchExpectedConversation = successful.length > 0 && successful.every((row) => row.expectedConversationMatched);
+      const uniqueExpectedConversationAcrossSuccessfulQueries = successful.length > 0 && successful.some((row) => row.expectedConversationMatched) && successful.every((row) => row.expectedConversationMatchCount <= 1);
+      return { attempted: true, endpointAvailable, queryCount: queries.length, queries: results, anyExpectedConversationMatch, allSuccessfulQueriesMatchExpectedConversation, uniqueExpectedConversationAcrossSuccessfulQueries };
+    } finally {
+      accessToken = null;
+      clearTimeout(timeout);
+    }
+  })()`;
+}
+
 function normalizeUserTurnText(value) {
   return String(value || '')
     .replace(/\u0000/g, '')
@@ -8177,6 +8313,29 @@ export class ChatGPTController {
       tailMaxTurns: boundedTailMaxTurns,
       legacyAnchorProbe,
       contentAnchorProbe
+    })));
+  }
+
+  async readHistoricalAnchorSearchDiagnostics({
+    timeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
+    expectedConversationUrlHash,
+    expectedConversationPath,
+    anchorProbe
+  } = {}) {
+    const boundedTimeoutMs = Number(timeoutMs);
+    if (!Number.isSafeInteger(boundedTimeoutMs) || boundedTimeoutMs < 1_000 || boundedTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS ||
+        typeof expectedConversationUrlHash !== 'string' || !/^[0-9a-f]{64}$/u.test(expectedConversationUrlHash) ||
+        typeof expectedConversationPath !== 'string' || !/^\/c\/[^/?#]+$/u.test(expectedConversationPath) ||
+        !anchorProbe || typeof anchorProbe !== 'object' || Array.isArray(anchorProbe) ||
+        Object.keys(anchorProbe).length !== 2 || Object.keys(anchorProbe).some((key) => !['role', 'text'].includes(key)) ||
+        anchorProbe.role !== 'user' || typeof anchorProbe.text !== 'string' || !anchorProbe.text.trim() || Buffer.byteLength(anchorProbe.text, 'utf8') > 128 * 1024) {
+      throw new Error('historical_anchor_search_request_invalid');
+    }
+    return await this.runExclusive(async () => await this.#eval(buildHistoricalAnchorSearchDiagnosticsScript({
+      timeoutMs: boundedTimeoutMs,
+      expectedConversationUrlHash,
+      expectedConversationPath,
+      anchorText: anchorProbe.text
     })));
   }
 

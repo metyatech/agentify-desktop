@@ -44,7 +44,16 @@ const backendHistoryDiagnosticBuckets = [
   'missing'
 ];
 
-function validBackendHistoryDiagnostics({ withProbe = false } = {}) {
+function validBackendHistoryDiagnostics({ withProbe = false, withContentProbe = false } = {}) {
+  const contentAnchorProbe = () => ({
+    allPresent: true,
+    allUnique: true,
+    ordered: true,
+    exactExpectedIndices: true,
+    matches: [{ expectedIndex: 2, matchCount: 1, uniqueMatchIndex: 2, deltaFromExpected: 0 }],
+    expectedGap: null,
+    resolvedGap: null
+  });
   const alignment = () => ({
     backendCandidateTurnCount: 0,
     exactCommonSuffixLength: 0,
@@ -62,7 +71,8 @@ function validBackendHistoryDiagnostics({ withProbe = false } = {}) {
       latestTurnDigestMatches: true,
       transcriptMatches: true,
       allMatch: true
-    } } : {})
+    } } : {}),
+    ...(withContentProbe ? { contentAnchorProbe: contentAnchorProbe() } : {})
   });
   const grouped = () => ({
     backendTurnCount: 0,
@@ -86,7 +96,22 @@ function validBackendHistoryDiagnostics({ withProbe = false } = {}) {
       noMerge: grouped(),
       assistantMergeNewline: grouped(),
       assistantMergeBlankline: grouped()
-    }]))
+    }])),
+    branchShape: {
+      currentNodeField: 'none',
+      currentNodePresent: false,
+      messageIdCount: 0,
+      parentLinkField: 'none',
+      messagesWithParentLink: 0,
+      parentLinksResolvable: 0,
+      parentLinksMissingTarget: 0,
+      currentNodeFound: false,
+      currentPathResolved: false,
+      currentPathMessageCount: 0,
+      currentPathCycleDetected: false,
+      currentPathMissingParent: false
+    },
+    branchModels: null
   };
 }
 
@@ -97,6 +122,43 @@ test('http-api: backend history diagnostics validator reconstructs the exact saf
   assert.notStrictEqual(sanitized, source);
   assert.notStrictEqual(sanitized.models.CURRENT, source.models.CURRENT);
   assert.equal(Object.prototype.hasOwnProperty.call(sanitized.models.CURRENT, 'legacyAnchorProbe'), true);
+});
+
+test('http-api: backend history diagnostics validator accepts content localization and branch aggregates', () => {
+  const source = validBackendHistoryDiagnostics({ withProbe: true, withContentProbe: true });
+  source.models.CURRENT.contentAnchorProbe.matches.push({ expectedIndex: 4, matchCount: 1, uniqueMatchIndex: 4, deltaFromExpected: 0 });
+  source.models.CURRENT.contentAnchorProbe.expectedGap = 2;
+  source.models.CURRENT.contentAnchorProbe.resolvedGap = 2;
+  source.models.CURRENT.contentAnchorProbe.matches[0].expectedIndex = 2;
+  source.models.CURRENT.contentAnchorProbe.allPresent = true;
+  source.models.CURRENT.contentAnchorProbe.allUnique = true;
+  source.models.CURRENT.contentAnchorProbe.ordered = true;
+  source.models.CURRENT.contentAnchorProbe.exactExpectedIndices = true;
+  const sanitized = validateAndSanitizeBackendHistoryDiagnostics(source);
+  assert.deepEqual(sanitized, source);
+  assert.equal(sanitized.branchModels, null);
+  assert.equal(Object.hasOwn(sanitized.models.CURRENT.contentAnchorProbe.matches[0], 'contentDigest'), false);
+});
+
+test('http-api: backend history diagnostics validator rejects extra branch and content probe fields', () => {
+  const cases = [
+    ['branch shape', (value) => { value.branchShape.providerId = 'provider-id-secret'; }],
+    ['branch model', (value) => { value.branchModels.CURRENT.parentId = 'parent-id-secret'; }],
+    ['content probe', (value) => { value.models.CURRENT.contentAnchorProbe.secret = 'digest-secret'; }],
+    ['content match', (value) => { value.models.CURRENT.contentAnchorProbe.matches[0].contentDigest = 'hash-secret'; }]
+  ];
+  for (const [name, mutate] of cases) {
+    const value = validBackendHistoryDiagnostics({ withContentProbe: true });
+    value.branchShape.currentNodeField = 'current_node';
+    value.branchShape.currentNodePresent = true;
+    value.branchShape.messageIdCount = 1;
+    value.branchShape.currentNodeFound = true;
+    value.branchShape.currentPathResolved = true;
+    value.branchShape.currentPathMessageCount = 1;
+    value.branchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, value.models.CURRENT]));
+    mutate(value);
+    assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), (error) => error.message === 'conversation_backend_history_diagnostics_response_invalid' && !JSON.stringify(error).includes('secret'), name);
+  }
 });
 
 test('http-api: backend history diagnostics validator rejects unknown nested fields and never serializes sentinels', () => {
@@ -4724,15 +4786,26 @@ test('http-api: backend history visibility diagnostics is authenticated and stri
     answerLatestTurnDigest: 'c'.repeat(64),
     answerTranscriptSha256: 'd'.repeat(64)
   };
-  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe } });
+  const contentProbe = { selectedUserTurns: [{ expectedIndex: 2, contentDigest: 'e'.repeat(64) }] };
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe, contentAnchorProbe: contentProbe } });
   assert.equal(result.res.status, 200);
   assert.equal(result.data.diagnostics.backend.complete, true);
-  assert.deepEqual(calls, [{ timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe }]);
+  assert.deepEqual(calls, [{ timeoutMs: 2_000, historyTimeoutMs: 3_000, tailMaxTurns: 4, legacyAnchorProbe: probe, contentAnchorProbe: contentProbe }]);
 
   const unauthorized = await req({ port: server.address().port, method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review' } });
   assert.equal(unauthorized.res.status, 401);
   const invalid = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', legacyAnchorProbe: { ...probe, reviewResponseDigest: 'not-a-hash' } } });
   assert.equal(invalid.res.status, 400);
+  const invalidContent = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: -1, contentDigest: 'e'.repeat(64) }] } } });
+  assert.equal(invalidContent.res.status, 400);
+  const unknownContent = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 1, contentDigest: 'e'.repeat(64), text: 'secret-sentinel' }] } } });
+  assert.equal(unknownContent.res.status, 400);
+  const malformedDigest = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 1, contentDigest: 'E'.repeat(64) }] } } });
+  assert.equal(malformedDigest.res.status, 400);
+  const unordered = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 2, contentDigest: 'e'.repeat(64) }, { expectedIndex: 2, contentDigest: 'f'.repeat(64) }] } } });
+  assert.equal(unordered.res.status, 400);
+  const nullProbe = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/conversation/backend-history-diagnostics', body: { key: 'review', contentAnchorProbe: null } });
+  assert.equal(nullProbe.res.status, 400);
   assert.equal(calls.length, 1);
 });
 

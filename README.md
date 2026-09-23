@@ -504,15 +504,23 @@ POST /conversation/backend-history-diagnostics
 Authorization: Bearer <local-token>
 Content-Type: application/json
 
-{"tabId":"existing-chatgpt-tab","timeoutMs":180000,"historyTimeoutMs":180000,"tailMaxTurns":100}
+{"tabId":"existing-chatgpt-tab","timeoutMs":180000,"historyTimeoutMs":180000,"tailMaxTurns":100,"contentAnchorProbe":{"selectedUserTurns":[{"expectedIndex":31,"contentDigest":"<lowercase-sha256>"}]}}
 ```
 
 This diagnostic follows the same authenticated, bounded pagination route but
 keeps raw messages, metadata, cursors, IDs, and text inside the ChatGPT page
 context. It compares fixed visibility models and adjacent DOM-unit grouping,
-returning only bounded counts, booleans, fixed bucket names, and optional
-legacy-anchor booleans. It does not change backend-history behavior, synthesize
-a mapping, scroll the DOM, or establish recovery/full-history proof.
+returning only bounded counts, booleans, fixed bucket names, optional
+legacy-anchor booleans, and digest-match locations as indices/counts/deltas.
+`contentAnchorProbe.selectedUserTurns` accepts 1–32 strictly increasing
+`expectedIndex` values and lowercase SHA256 content digests using the
+ai-autopilot `contentDigest` algorithm; raw text and digests are never returned.
+The response also reports whether exact `current_node`/`currentNode` and
+`parent_id`/`parentId`/`parent` fields can reconstruct a unique current branch.
+When they can, it compares the same fixed models on that branch, while leaving
+the flat models unchanged. This remains diagnostic-only: it does not change
+backend-history behavior, synthesize a mapping, scroll the DOM, or establish
+recovery/full-history proof.
 
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:

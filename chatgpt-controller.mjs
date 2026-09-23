@@ -754,16 +754,18 @@ function buildBackendConversationHistoryScript({ timeoutMs, maxTurns, maxCharsPe
   })()`;
 }
 
-function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe }) {
+function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe, contentAnchorProbe }) {
   const sessionMaxBytes = 64 * 1024;
   const pageMaxBytes = 20 * 1024 * 1024;
   const totalMaxBytes = 64 * 1024 * 1024;
   const probe = legacyAnchorProbe || null;
+  const contentProbe = contentAnchorProbe || null;
   return String.raw`(async () => {
     const timeoutMs = ${JSON.stringify(timeoutMs)};
     const historyTimeoutMs = ${JSON.stringify(historyTimeoutMs)};
     const tailMaxTurns = ${JSON.stringify(tailMaxTurns)};
     const anchorProbe = ${JSON.stringify(probe)};
+    const contentAnchorProbe = ${JSON.stringify(contentProbe)};
     const sessionMaxBytes = ${JSON.stringify(sessionMaxBytes)};
     const pageMaxBytes = ${JSON.stringify(pageMaxBytes)};
     const totalMaxBytes = ${JSON.stringify(totalMaxBytes)};
@@ -771,7 +773,12 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
     const modelNames = ['CURRENT', 'TEXT_ONLY_NL', 'TEXT_ONLY_BLANKLINE', 'VISIBLE_TEXT_NL', 'VISIBLE_TEXT_BLANKLINE', 'VISIBLE_TEXT_CODE_BLANKLINE', 'END_TURN_VISIBLE_TEXT_BLANKLINE'];
     const emptyAlignment = () => ({ backendCandidateTurnCount: 0, exactCommonSuffixLength: 0, orderedExactMatchCount: 0, domUnmatchedCount: 0, backendUnmatchedCount: 0, extraBackendUserCount: 0, extraBackendAssistantCount: 0, extraDomUserCount: 0, extraDomAssistantCount: 0 });
     const emptyGroupAlignment = () => ({ backendTurnCount: 0, domGroupedTurnCount: 0, orderedExactMatchCount: 0, exactCommonSuffixLength: 0, domUnmatchedCount: 0, backendUnmatchedCount: 0 });
-    const makeModel = () => ({ ...emptyAlignment(), legacyAnchorProbe: anchorProbe ? { reviewResponseMatches: false, selectedTurnsMatch: false, answerBoundaryMatches: false, latestTurnDigestMatches: false, transcriptMatches: false, allMatch: false } : undefined });
+    const emptyContentAnchorProbe = () => ({ allPresent: false, allUnique: false, ordered: false, exactExpectedIndices: false, matches: (contentAnchorProbe?.selectedUserTurns || []).map((turn) => ({ expectedIndex: turn.expectedIndex, matchCount: 0, uniqueMatchIndex: null, deltaFromExpected: null })), expectedGap: contentAnchorProbe?.selectedUserTurns?.length === 2 ? contentAnchorProbe.selectedUserTurns[1].expectedIndex - contentAnchorProbe.selectedUserTurns[0].expectedIndex : null, resolvedGap: null });
+    const makeModel = () => ({
+      ...emptyAlignment(),
+      ...(anchorProbe ? { legacyAnchorProbe: { reviewResponseMatches: false, selectedTurnsMatch: false, answerBoundaryMatches: false, latestTurnDigestMatches: false, transcriptMatches: false, allMatch: false } } : {}),
+      ...(contentAnchorProbe ? { contentAnchorProbe: emptyContentAnchorProbe() } : {})
+    });
     const result = {
       attempted: true,
       backend: { complete: false, pageCount: 0, totalBackendMessageCount: 0, terminalOldestReached: false },
@@ -779,7 +786,9 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       backendBuckets: { user: Object.fromEntries(buckets.map((bucket) => [bucket, 0])), assistant: Object.fromEntries(buckets.map((bucket) => [bucket, 0])) },
       exclusionCounts: { recipientNonAll: 0, visuallyHidden: 0, isCompleteFalse: 0, aggregateResult: 0, command: 0, toolCall: 0, toolCalls: 0 },
       models: Object.fromEntries(modelNames.map((name) => [name, makeModel()])),
-      groupedModels: Object.fromEntries(modelNames.map((name) => [name, { noMerge: emptyGroupAlignment(), assistantMergeNewline: emptyGroupAlignment(), assistantMergeBlankline: emptyGroupAlignment() }]))
+      groupedModels: Object.fromEntries(modelNames.map((name) => [name, { noMerge: emptyGroupAlignment(), assistantMergeNewline: emptyGroupAlignment(), assistantMergeBlankline: emptyGroupAlignment() }])),
+      branchShape: { currentNodeField: 'none', currentNodePresent: false, messageIdCount: 0, parentLinkField: 'none', messagesWithParentLink: 0, parentLinksResolvable: 0, parentLinksMissingTarget: 0, currentNodeFound: false, currentPathResolved: false, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingParent: false },
+      branchModels: null
     };
     const pageOrigin = String(location?.origin || '');
     const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
@@ -870,6 +879,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       const seenCursors = new Set();
       const seenMessages = new Map();
       const orderedMessages = [];
+      let firstPageBodyForDiagnostics = null;
       let cursor = null;
       let hasPreviousPage = true;
       let totalBytes = 0;
@@ -879,6 +889,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         if (cursor !== null) { if (seenCursors.has(cursor)) throw new Error('conversation_backend_history_diagnostics_cursor_cycle'); seenCursors.add(cursor); }
         const pageUrl = '/backend-api/conversations/' + encodeURIComponent(conversationId) + (cursor === null ? '?include_has_versions=true&num_turns=100' : '/messages?before=' + encodeURIComponent(cursor) + '&include_has_versions=true&num_turns=100');
         const page = await fetchJson(pageUrl);
+        if (pageCount === 0) firstPageBodyForDiagnostics = page.body;
         const responseConversationId = page.body.conversation_id ?? page.body.conversationId;
         if (responseConversationId !== undefined && responseConversationId !== conversationId) throw new Error('conversation_backend_history_diagnostics_conversation_mismatch');
         pageCount += 1;
@@ -967,7 +978,8 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
         if (model === 'END_TURN_VISIBLE_TEXT_BLANKLINE') return (bucket === 'text' || bucket === 'multimodal_text') && message.end_turn !== false;
         return false;
       };
-      const allModelTurns = (model) => orderedMessages.filter((message) => allowed(message, model)).map((message) => ({ role: roleOf(message), text: textFor(message, model) }));
+      const turnsForMessages = (messages, model) => messages.filter((message) => allowed(message, model)).map((message) => ({ role: roleOf(message), text: textFor(message, model) }));
+      const allModelTurns = (model) => turnsForMessages(orderedMessages, model);
       const key = (turn) => JSON.stringify([turn.role, turn.text]);
       const lcs = (left, right) => { const dp = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0)); for (let i = 1; i <= left.length; i += 1) for (let j = 1; j <= right.length; j += 1) dp[i][j] = key(left[i - 1]) === key(right[j - 1]) ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]); return dp[left.length][right.length]; };
       const suffix = (left, right) => { let count = 0; for (let i = 1; i <= Math.min(left.length, right.length); i += 1) { if (key(left.at(-i)) !== key(right.at(-i))) break; count += 1; } return count; };
@@ -1005,6 +1017,28 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
           && anchorProbe.answerTranscriptSha256 === await digest(JSON.stringify(selected.map((turn) => ({ index: turn.index, role: turn.role, text: turn.text }))));
         return { reviewResponseMatches, selectedTurnsMatch, answerBoundaryMatches, latestTurnDigestMatches, transcriptMatches, allMatch: reviewResponseMatches && selectedTurnsMatch && answerBoundaryMatches && latestTurnDigestMatches && transcriptMatches };
       };
+      const contentAnchorCheck = async (turns) => {
+        if (!contentAnchorProbe) return undefined;
+        const matches = [];
+        for (const expected of contentAnchorProbe.selectedUserTurns) {
+          const found = [];
+          for (const turn of turns) {
+            if (turn.role !== 'user') continue;
+            const normalizedText = String(turn.text || '').replace(/\r\n?/gu, '\n');
+            const contentDigest = await digest(JSON.stringify({ role: turn.role, text: normalizedText }));
+            if (contentDigest === expected.contentDigest) found.push(turn.index);
+          }
+          const uniqueMatchIndex = found.length === 1 ? found[0] : null;
+          matches.push({ expectedIndex: expected.expectedIndex, matchCount: found.length, uniqueMatchIndex, deltaFromExpected: uniqueMatchIndex === null ? null : uniqueMatchIndex - expected.expectedIndex });
+        }
+        const allPresent = matches.every((match) => match.matchCount > 0);
+        const allUnique = matches.every((match) => match.matchCount === 1);
+        const ordered = allUnique && matches.every((match, index) => index === 0 || match.uniqueMatchIndex > matches[index - 1].uniqueMatchIndex);
+        const exactExpectedIndices = allUnique && matches.every((match) => match.uniqueMatchIndex === match.expectedIndex);
+        const expectedGap = matches.length === 2 ? matches[1].expectedIndex - matches[0].expectedIndex : null;
+        const resolvedGap = matches.length === 2 && allUnique ? matches[1].uniqueMatchIndex - matches[0].uniqueMatchIndex : null;
+        return { allPresent, allUnique, ordered, exactExpectedIndices, matches, expectedGap, resolvedGap };
+      };
       const domModel = ${buildChatGPTDomModelScript()};
       const domRead = domModel.read();
       const domUnits = domRead.valid ? domRead.records.filter((record) => (record.role === 'user' || record.role === 'assistant') && record.text).slice(-tailMaxTurns).map((record) => ({ role: record.role, text: normalizeText(record.text), turnId: record.turnId || null })) : [];
@@ -1015,6 +1049,128 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       result.dom.groupedTurnCountNewline = domGroupedNl.length;
       result.dom.groupedTurnCountBlankline = domGroupedBlank.length;
       result.dom.multiUnitGroupCount = groupTurns('\n').filter((group) => group.unitCount > 1).length;
+
+      const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+      const idForMessage = (message) => {
+        const value = message?.id ?? message?.message_id;
+        return typeof value === 'string' && value.trim() ? value.trim() : null;
+      };
+      const messagesById = new Map();
+      const parentAliasesSeen = new Set();
+      for (const message of orderedMessages) {
+        const id = idForMessage(message);
+        if (id) {
+          if (!messagesById.has(id)) messagesById.set(id, []);
+          messagesById.get(id).push(message);
+        }
+      }
+      const readParent = (message) => {
+        const aliases = ['parent_id', 'parentId', 'parent'].filter((field) => own(message, field));
+        if (!aliases.length) return { kind: 'invalid', aliases: [] };
+        const states = aliases.map((field) => {
+          const value = message[field];
+          if (value === null) return { field, kind: 'root', value: null };
+          if (typeof value === 'string' && value.trim()) return { field, kind: 'parent', value: value.trim() };
+          return { field, kind: 'invalid', value: null };
+        });
+        if (states.some((state) => state.kind === 'invalid')) return { kind: 'invalid', aliases };
+        const first = states[0];
+        if (states.some((state) => state.kind !== first.kind || state.value !== first.value)) return { kind: 'conflict', aliases };
+        return first.kind === 'parent'
+          ? { kind: 'parent', parentId: first.value, aliases }
+          : { kind: 'root', aliases };
+      };
+      let currentNodeId = null;
+      const hasCurrentSnake = own(firstPageBodyForDiagnostics, 'current_node');
+      const hasCurrentCamel = own(firstPageBodyForDiagnostics, 'currentNode');
+      if (hasCurrentSnake && hasCurrentCamel) {
+        const snakeValue = typeof firstPageBodyForDiagnostics.current_node === 'string' && firstPageBodyForDiagnostics.current_node.trim() ? firstPageBodyForDiagnostics.current_node.trim() : null;
+        const camelValue = typeof firstPageBodyForDiagnostics.currentNode === 'string' && firstPageBodyForDiagnostics.currentNode.trim() ? firstPageBodyForDiagnostics.currentNode.trim() : null;
+        if (snakeValue !== null && snakeValue === camelValue) {
+          result.branchShape.currentNodeField = 'current_node';
+          currentNodeId = snakeValue;
+          result.branchShape.currentNodePresent = true;
+        } else {
+          result.branchShape.currentNodeField = 'conflict';
+          result.branchShape.currentNodePresent = snakeValue !== null || camelValue !== null;
+        }
+      } else if (hasCurrentSnake || hasCurrentCamel) {
+        const field = hasCurrentSnake ? 'current_node' : 'currentNode';
+        const value = firstPageBodyForDiagnostics[field];
+        result.branchShape.currentNodeField = field;
+        if (typeof value === 'string' && value.trim()) {
+          currentNodeId = value.trim();
+          result.branchShape.currentNodePresent = true;
+        }
+      }
+      result.branchShape.messageIdCount = Array.from(messagesById.values()).reduce((count, items) => count + (items.length === 1 ? 1 : 0), 0);
+      let parentAliasConflict = false;
+      const parentInfoByMessage = new Map();
+      for (const message of orderedMessages) {
+        const info = readParent(message);
+        parentInfoByMessage.set(message, info);
+        if (info.kind === 'parent') {
+          result.branchShape.messagesWithParentLink += 1;
+          for (const field of info.aliases) parentAliasesSeen.add(field);
+          if ((messagesById.get(info.parentId) || []).length === 1) result.branchShape.parentLinksResolvable += 1;
+          else result.branchShape.parentLinksMissingTarget += 1;
+        } else if (info.kind === 'conflict' || info.kind === 'invalid') {
+          if (info.kind === 'conflict') {
+            parentAliasConflict = true;
+            result.branchShape.messagesWithParentLink += 1;
+          }
+          for (const field of info.aliases) parentAliasesSeen.add(field);
+        }
+      }
+      result.branchShape.parentLinkField = parentAliasConflict || parentAliasesSeen.size > 1
+        ? 'mixed'
+        : (parentAliasesSeen.values().next().value || 'none');
+      if (currentNodeId !== null && (messagesById.get(currentNodeId) || []).length === 1) result.branchShape.currentNodeFound = true;
+      const currentPathMessages = [];
+      let currentPathComplete = false;
+      if (result.branchShape.currentNodeField !== 'conflict' && result.branchShape.currentNodeFound) {
+        let currentId = currentNodeId;
+        const visitedIds = new Set();
+        while (currentId !== null) {
+          if (visitedIds.has(currentId)) {
+            result.branchShape.currentPathCycleDetected = true;
+            break;
+          }
+          visitedIds.add(currentId);
+          const found = messagesById.get(currentId);
+          if (!found || found.length !== 1) {
+            result.branchShape.currentPathMissingParent = true;
+            break;
+          }
+          const message = found[0];
+          currentPathMessages.push(message);
+          const parent = parentInfoByMessage.get(message);
+          if (!parent || parent.kind === 'invalid' || parent.kind === 'conflict') {
+            if (parent?.kind === 'invalid') result.branchShape.currentPathMissingParent = true;
+            break;
+          }
+          if (parent.kind === 'root') {
+            currentPathComplete = true;
+            break;
+          }
+          const parentMessages = messagesById.get(parent.parentId);
+          if (!parentMessages || parentMessages.length !== 1) {
+            result.branchShape.currentPathMissingParent = true;
+            break;
+          }
+          currentId = parent.parentId;
+        }
+      }
+      result.branchShape.currentPathMessageCount = currentPathMessages.length;
+      result.branchShape.currentPathResolved = currentPathComplete && !parentAliasConflict && !result.branchShape.currentPathCycleDetected && !result.branchShape.currentPathMissingParent;
+      if (result.branchShape.currentPathResolved) {
+        const oldestToNewest = currentPathMessages.slice().reverse();
+        result.branchModels = {};
+        for (const model of modelNames) {
+          const turns = turnsForMessages(oldestToNewest, model).map((turn, index) => ({ ...turn, index }));
+          result.branchModels[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
+        }
+      }
       for (const message of orderedMessages.slice(-40)) {
         const role = roleOf(message);
         if (role) result.backendBuckets[role][contentTypeBucket(message)] += 1;
@@ -1022,7 +1178,7 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       }
       for (const model of modelNames) {
         const turns = allModelTurns(model).map((turn, index) => ({ ...turn, index }));
-        result.models[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}) };
+        result.models[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
         const merge = (separator) => { const merged = []; for (const turn of turns) { const previous = merged.at(-1); if (previous && previous.role === 'assistant' && turn.role === 'assistant') previous.text = normalizeText(previous.text + separator + turn.text); else merged.push({ ...turn }); } return merged; };
         result.groupedModels[model] = { noMerge: groupedAlignment(turns, domGroupedNl), assistantMergeNewline: groupedAlignment(merge('\n'), domGroupedNl), assistantMergeBlankline: groupedAlignment(merge('\n\n'), domGroupedBlank) };
       }
@@ -7583,7 +7739,8 @@ export class ChatGPTController {
     timeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
     historyTimeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
     tailMaxTurns = 100,
-    legacyAnchorProbe = null
+    legacyAnchorProbe = null,
+    contentAnchorProbe = null
   } = {}) {
     const boundedTimeoutMs = Number(timeoutMs);
     const boundedHistoryTimeoutMs = Number(historyTimeoutMs);
@@ -7597,7 +7754,8 @@ export class ChatGPTController {
       timeoutMs: boundedTimeoutMs,
       historyTimeoutMs: boundedHistoryTimeoutMs,
       tailMaxTurns: boundedTailMaxTurns,
-      legacyAnchorProbe
+      legacyAnchorProbe,
+      contentAnchorProbe
     })));
   }
 

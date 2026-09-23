@@ -6950,6 +6950,8 @@ test('chatgpt-controller: actual visibility diagnostics satisfy the server group
       'attempted',
       'backend',
       'backendBuckets',
+      'branchModels',
+      'branchShape',
       'dom',
       'exclusionCounts',
       'groupedModels',
@@ -6979,6 +6981,195 @@ test('chatgpt-controller: actual visibility diagnostics satisfy the server group
     const sanitized = validateAndSanitizeBackendHistoryDiagnostics(serializedProducerResult);
     assert.deepEqual(sanitized, serializedProducerResult);
   }
+});
+
+test('chatgpt-controller: actual diagnostics with both probes pass the exact server schema when branch models are null', async () => {
+  const sha = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  const userText = 'schema-user-secret';
+  const legacyAnchorProbe = {
+    reviewResponseIndex: 0,
+    reviewResponseDigest: sha('schema-review-secret'),
+    selectedUserTurns: [{ index: 1, digest: sha(JSON.stringify({ index: 1, role: 'user', text: userText })) }],
+    answerFirstIndex: 1,
+    answerLastIndex: 1,
+    answerLatestTurnDigest: sha(JSON.stringify({ index: 1, role: 'user', text: userText })),
+    answerTranscriptSha256: sha(JSON.stringify([{ index: 1, role: 'user', text: userText }]))
+  };
+  const contentAnchorProbe = { selectedUserTurns: [{ expectedIndex: 1, contentDigest: sha(JSON.stringify({ role: 'user', text: userText })) }] };
+  const fixture = createBackendDiagnosticPage({ backendResponses: [{ responseText: JSON.stringify({
+    messages: [
+      { id: 'schema-review-id', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['schema-review-secret'] } },
+      { id: 'schema-user-id', author: { role: 'user' }, content: { content_type: 'text', parts: [userText] } }
+    ], page_info: { has_previous_page: false }
+  }) }] });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ legacyAnchorProbe, contentAnchorProbe });
+  assert.equal(result.branchModels, null);
+  assert.equal(result.models.TEXT_ONLY_NL.contentAnchorProbe.exactExpectedIndices, true);
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(JSON.parse(JSON.stringify(result))), JSON.parse(JSON.stringify(result)));
+  assert.doesNotMatch(JSON.stringify(result), /schema-review-id|schema-user-id|schema-review-secret|schema-user-secret/u);
+});
+
+test('chatgpt-controller: content anchor probe localizes selected user content without returning digests', async () => {
+  const contentDigest = (text) => crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: String(text || '').replace(/\r\n?/gu, '\n') }), 'utf8').digest('hex');
+  const messages = [
+    { id: 'loc-u0', author: { role: 'user' }, content: { content_type: 'text', parts: ['first'] } },
+    { id: 'loc-a0', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['reply'] } },
+    { id: 'loc-u1', author: { role: 'user' }, content: { content_type: 'text', parts: ['selected one'] } },
+    { id: 'loc-a1', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['reply two'] } },
+    { id: 'loc-u2', author: { role: 'user' }, content: { content_type: 'text', parts: ['selected two'] } },
+    { id: 'loc-a2', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['final'] } }
+  ];
+  const run = async (selectedUserTurns, suppliedMessages = messages) => {
+    const fixture = createBackendDiagnosticPage({ backendResponses: [{ responseText: JSON.stringify({ messages: suppliedMessages, page_info: { has_previous_page: false } }) }] });
+    const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ contentAnchorProbe: { selectedUserTurns } });
+    assert.equal(fixture.calls.length, 1);
+    return result;
+  };
+  const pair = [
+    { expectedIndex: 2, contentDigest: contentDigest('selected one') },
+    { expectedIndex: 4, contentDigest: contentDigest('selected two') }
+  ];
+  const exact = await run(pair);
+  const exactProbe = exact.models.TEXT_ONLY_NL.contentAnchorProbe;
+  assert.deepEqual(JSON.parse(JSON.stringify(exactProbe)), {
+    allPresent: true, allUnique: true, ordered: true, exactExpectedIndices: true,
+    matches: [
+      { expectedIndex: 2, matchCount: 1, uniqueMatchIndex: 2, deltaFromExpected: 0 },
+      { expectedIndex: 4, matchCount: 1, uniqueMatchIndex: 4, deltaFromExpected: 0 }
+    ],
+    expectedGap: 2, resolvedGap: 2
+  });
+
+  const shiftedEarlier = await run([{ expectedIndex: 3, contentDigest: pair[0].contentDigest }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(shiftedEarlier.models.TEXT_ONLY_NL.contentAnchorProbe.matches[0])), { expectedIndex: 3, matchCount: 1, uniqueMatchIndex: 2, deltaFromExpected: -1 });
+  const shiftedLater = await run([{ expectedIndex: 1, contentDigest: pair[0].contentDigest }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(shiftedLater.models.TEXT_ONLY_NL.contentAnchorProbe.matches[0])), { expectedIndex: 1, matchCount: 1, uniqueMatchIndex: 2, deltaFromExpected: 1 });
+
+  const globalOffset = await run([
+    { expectedIndex: 3, contentDigest: pair[0].contentDigest },
+    { expectedIndex: 5, contentDigest: pair[1].contentDigest }
+  ]);
+  assert.equal(globalOffset.models.TEXT_ONLY_NL.contentAnchorProbe.expectedGap, 2);
+  assert.equal(globalOffset.models.TEXT_ONLY_NL.contentAnchorProbe.resolvedGap, 2);
+  assert.equal(globalOffset.models.TEXT_ONLY_NL.contentAnchorProbe.ordered, true);
+  const changedGapMessages = [messages[0], messages[1], messages[2], messages[3],
+    { id: 'loc-extra', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['extra'] } }, ...messages.slice(4)];
+  const changedGap = await run(pair, changedGapMessages);
+  assert.equal(changedGap.models.TEXT_ONLY_NL.contentAnchorProbe.expectedGap, 2);
+  assert.equal(changedGap.models.TEXT_ONLY_NL.contentAnchorProbe.resolvedGap, 3);
+
+  const duplicate = await run([{ expectedIndex: 2, contentDigest: contentDigest('selected one') }], [
+    ...messages,
+    { id: 'loc-u1-duplicate', author: { role: 'user' }, content: { content_type: 'text', parts: ['selected one'] } }
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(duplicate.models.TEXT_ONLY_NL.contentAnchorProbe.matches[0])), { expectedIndex: 2, matchCount: 2, uniqueMatchIndex: null, deltaFromExpected: null });
+  assert.equal(duplicate.models.TEXT_ONLY_NL.contentAnchorProbe.allUnique, false);
+
+  const missing = await run([{ expectedIndex: 2, contentDigest: contentDigest('not present') }]);
+  assert.equal(missing.models.TEXT_ONLY_NL.contentAnchorProbe.matches[0].matchCount, 0);
+  assert.equal(missing.models.TEXT_ONLY_NL.contentAnchorProbe.allPresent, false);
+  const wrongRole = await run([{ expectedIndex: 2, contentDigest: contentDigest('same text') }], [
+    { id: 'wrong-role-same-text', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['same text'] } }
+  ]);
+  assert.equal(wrongRole.models.TEXT_ONLY_NL.contentAnchorProbe.matches[0].matchCount, 0);
+
+  for (const result of [exact, shiftedEarlier, shiftedLater, globalOffset, changedGap, duplicate, missing, wrongRole]) {
+    const serialized = JSON.stringify(result);
+    assert.doesNotMatch(serialized, /selected one|selected two|loc-u|loc-a|not present|same text|session-access-token-sentinel/u);
+    assert.doesNotMatch(serialized, new RegExp(contentDigest('selected one'), 'u'));
+  }
+});
+
+test('chatgpt-controller: flat backend visibility models resolve current branch shape with exact aliases only', async () => {
+  const messages = [
+    { id: 'branch-review', parent_id: null, author: { role: 'assistant' }, end_turn: true, content: { content_type: 'text', parts: ['review'] } },
+    { id: 'branch-side', parent_id: 'branch-review', author: { role: 'assistant' }, end_turn: true, content: { content_type: 'text', parts: ['side branch'] } },
+    { id: 'branch-answer', parent_id: 'branch-review', author: { role: 'user' }, end_turn: true, content: { content_type: 'text', parts: ['selected answer'] } },
+    { id: 'branch-final', parent_id: 'branch-answer', author: { role: 'assistant' }, end_turn: true, content: { content_type: 'text', parts: ['current response'] } }
+  ];
+  const sha = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+  const digestTurn = (turn) => sha(JSON.stringify({ index: turn.index, role: turn.role, text: turn.text }));
+  const expectedTurns = [
+    { index: 0, role: 'assistant', text: 'review' },
+    { index: 1, role: 'user', text: 'selected answer' }
+  ];
+  const legacyAnchorProbe = {
+    reviewResponseIndex: 0,
+    reviewResponseDigest: sha('review'),
+    selectedUserTurns: [{ index: 1, digest: digestTurn(expectedTurns[1]) }],
+    answerFirstIndex: 1,
+    answerLastIndex: 1,
+    answerLatestTurnDigest: digestTurn(expectedTurns[1]),
+    answerTranscriptSha256: sha(JSON.stringify([expectedTurns[1]]))
+  };
+  const contentAnchorProbe = { selectedUserTurns: [{ expectedIndex: 1, contentDigest: sha(JSON.stringify({ role: 'user', text: 'selected answer' })) }] };
+  const fixture = createBackendDiagnosticPage({
+    domRecords: [{ role: 'assistant', turnId: 'branch-turn-0', text: 'review' }, { role: 'user', turnId: 'branch-turn-1', text: 'selected answer' }, { role: 'assistant', turnId: 'branch-turn-2', text: 'current response' }],
+    backendResponses: [{ responseText: JSON.stringify({ current_node: 'branch-final', messages, page_info: { has_previous_page: false } }) }]
+  });
+  const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({ legacyAnchorProbe, contentAnchorProbe });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.branchShape)), {
+    currentNodeField: 'current_node', currentNodePresent: true, messageIdCount: 4,
+    parentLinkField: 'parent_id', messagesWithParentLink: 3, parentLinksResolvable: 3, parentLinksMissingTarget: 0,
+    currentNodeFound: true, currentPathResolved: true, currentPathMessageCount: 3,
+    currentPathCycleDetected: false, currentPathMissingParent: false
+  });
+  assert.equal(result.models.END_TURN_VISIBLE_TEXT_BLANKLINE.legacyAnchorProbe.allMatch, false);
+  assert.equal(result.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.legacyAnchorProbe.allMatch, true);
+  assert.equal(result.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.contentAnchorProbe.exactExpectedIndices, true);
+  assert.equal(result.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 3);
+  assert.equal(result.models.END_TURN_VISIBLE_TEXT_BLANKLINE.backendCandidateTurnCount, 4);
+  assert.deepEqual(Object.keys(result.branchShape).sort(), ['currentNodeField', 'currentNodePresent', 'messageIdCount', 'parentLinkField', 'messagesWithParentLink', 'parentLinksResolvable', 'parentLinksMissingTarget', 'currentNodeFound', 'currentPathResolved', 'currentPathMessageCount', 'currentPathCycleDetected', 'currentPathMissingParent'].sort());
+  assert.deepEqual(Object.keys(result.branchModels).sort(), ['CURRENT', 'TEXT_ONLY_NL', 'TEXT_ONLY_BLANKLINE', 'VISIBLE_TEXT_NL', 'VISIBLE_TEXT_BLANKLINE', 'VISIBLE_TEXT_CODE_BLANKLINE', 'END_TURN_VISIBLE_TEXT_BLANKLINE'].sort());
+  assert.doesNotMatch(JSON.stringify(result), /branch-review|branch-side|branch-answer|branch-final|side branch|selected answer|current response/u);
+
+  const sanitized = validateAndSanitizeBackendHistoryDiagnostics(JSON.parse(JSON.stringify(result)));
+  assert.deepEqual(sanitized, JSON.parse(JSON.stringify(result)));
+  const polluted = structuredClone(result);
+  polluted.branchModels.END_TURN_VISIBLE_TEXT_BLANKLINE.parentValue = 'parent-secret';
+  assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(polluted), /conversation_backend_history_diagnostics_response_invalid/u);
+});
+
+test('chatgpt-controller: branch diagnostics accept camel aliases and fail closed on missing targets, cycles, or alias conflicts', async () => {
+  const validCamel = createBackendDiagnosticPage({ backendResponses: [{ responseText: JSON.stringify({
+    currentNode: 'camel-a',
+    messages: [
+      { id: 'camel-u', parent: null, author: { role: 'user' }, content: { content_type: 'text', parts: ['u'] } },
+      { id: 'camel-a', parentId: 'camel-u', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['a'] } }
+    ], page_info: { has_previous_page: false }
+  }) }] });
+  const camelResult = await createController(validCamel.page).readConversationBackendHistoryDiagnostics();
+  assert.equal(camelResult.branchShape.currentNodeField, 'currentNode');
+  assert.equal(camelResult.branchShape.parentLinkField, 'parentId');
+  assert.equal(camelResult.branchShape.currentPathResolved, true);
+
+  const cases = [
+    { body: { messages: [], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'none', currentNodeFound: false, currentPathResolved: false, currentPathMessageCount: 0 } },
+    { body: { current_node: 'absent-id', messages: [{ id: 'other-id', parent_id: null }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: false, currentPathResolved: false, currentPathMessageCount: 0 } },
+    { body: { current_node: 'missing-parent-leaf', messages: [{ id: 'missing-parent-leaf', parent_id: 'not-present' }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: true, currentPathResolved: false, currentPathMissingParent: true, parentLinksMissingTarget: 1 } },
+    { body: { current_node: 'no-parent-field', messages: [{ id: 'no-parent-field' }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: true, currentPathResolved: false, currentPathMissingParent: true } },
+    { body: { current_node: 'cycle-a', messages: [{ id: 'cycle-a', parent_id: 'cycle-b' }, { id: 'cycle-b', parent_id: 'cycle-a' }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: true, currentPathResolved: false, currentPathCycleDetected: true } },
+    { body: { current_node: 'alias-a', currentNode: 'alias-b', messages: [{ id: 'alias-a', parent_id: null }, { id: 'alias-b', parent_id: null }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'conflict', currentNodeFound: false, currentPathResolved: false } },
+    { body: { current_node: 'parent-conflict-a', messages: [{ id: 'parent-conflict-root', parent_id: null }, { id: 'parent-conflict-a', parent_id: 'parent-conflict-root', parentId: 'different-parent' }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: true, currentPathResolved: false, parentLinkField: 'mixed' } },
+    { body: { current_node: 'side-root', messages: [{ id: 'side-root', parent_id: null }, { id: 'side-leaf', parent_id: 'side-root', parentId: 'different-root' }], page_info: { has_previous_page: false } }, shape: { currentNodeField: 'current_node', currentNodeFound: true, currentPathResolved: false, parentLinkField: 'mixed' } }
+  ];
+  for (const { body, shape } of cases) {
+    const fixture = createBackendDiagnosticPage({ backendResponses: [{ responseText: JSON.stringify(body) }] });
+    const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics();
+    for (const [key, value] of Object.entries(shape)) assert.equal(result.branchShape[key], value, key);
+    if (!result.branchShape.currentPathResolved) assert.equal(result.branchModels, null);
+    assert.doesNotMatch(JSON.stringify(result), /absent-id|not-present|cycle-a|cycle-b|alias-a|alias-b|parent-conflict|different-parent/u);
+  }
+
+  const duplicateId = createBackendDiagnosticPage({ backendResponses: [{ responseText: JSON.stringify({
+    current_node: 'duplicate-id',
+    messages: [
+      { id: 'duplicate-id', author: { role: 'user' }, content: { parts: ['one'] } },
+      { id: 'duplicate-id', author: { role: 'user' }, content: { parts: ['different'] } }
+    ], page_info: { has_previous_page: false }
+  }) }] });
+  await assert.rejects(() => createController(duplicateId.page).readConversationBackendHistoryDiagnostics(), /conversation_backend_history_diagnostics_duplicate_conflict/u);
+  assert.equal(duplicateId.calls.length, 1);
 });
 
 test('chatgpt-controller: backend history visibility diagnostics follows bounded older pages once and fails closed on cursor cycles', async () => {

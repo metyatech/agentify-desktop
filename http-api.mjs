@@ -64,6 +64,25 @@ const BACKEND_HISTORY_DIAGNOSTIC_GROUP_KEYS = Object.freeze([
   'domUnmatchedCount',
   'backendUnmatchedCount'
 ]);
+const BACKEND_HISTORY_DIAGNOSTIC_CONTENT_ANCHOR_KEYS = Object.freeze([
+  'allPresent',
+  'allUnique',
+  'ordered',
+  'exactExpectedIndices',
+  'matches',
+  'expectedGap',
+  'resolvedGap'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_CONTENT_MATCH_KEYS = Object.freeze([
+  'expectedIndex',
+  'matchCount',
+  'uniqueMatchIndex',
+  'deltaFromExpected'
+]);
+const BACKEND_HISTORY_DIAGNOSTIC_BRANCH_SHAPE_ENUMS = Object.freeze({
+  currentNodeField: ['current_node', 'currentNode', 'none', 'conflict'],
+  parentLinkField: ['parent_id', 'parentId', 'parent', 'none', 'mixed']
+});
 const MAX_BACKEND_HISTORY_DIAGNOSTIC_COUNT = 1_000_000_000;
 
 function conversationUrlHash(url) {
@@ -459,6 +478,30 @@ function validateBackendHistoryDiagnosticsProbe(value) {
   };
 }
 
+function validateBackendHistoryContentAnchorProbe(value) {
+  if (value === undefined) return null;
+  if (!isPlainBackendHistoryDiagnosticsObject(value)) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  const hasExactKeys = (object, keys) => {
+    const expected = new Set(keys);
+    return isPlainBackendHistoryDiagnosticsObject(object) && Object.keys(object).length === expected.size && Object.keys(object).every((key) => expected.has(key));
+  };
+  if (!hasExactKeys(value, ['selectedUserTurns'])) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  if (!Array.isArray(value.selectedUserTurns) || value.selectedUserTurns.length < 1 || value.selectedUserTurns.length > 32) {
+    throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+  }
+  let previous = -1;
+  const selectedUserTurns = value.selectedUserTurns.map((turn) => {
+    if (!hasExactKeys(turn, ['expectedIndex', 'contentDigest'])) throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+    if (!Number.isSafeInteger(turn.expectedIndex) || turn.expectedIndex < 0 || turn.expectedIndex <= previous ||
+        typeof turn.contentDigest !== 'string' || !/^[0-9a-f]{64}$/u.test(turn.contentDigest)) {
+      throw new Error('conversation_backend_history_diagnostics_probe_invalid');
+    }
+    previous = turn.expectedIndex;
+    return { expectedIndex: turn.expectedIndex, contentDigest: turn.contentDigest };
+  });
+  return { selectedUserTurns };
+}
+
 function isPlainBackendHistoryDiagnosticsObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -486,9 +529,19 @@ function validateBackendHistoryDiagnosticsCount(value) {
   return value;
 }
 
+function validateBackendHistoryDiagnosticsIndex(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  return value;
+}
+
+function validateBackendHistoryDiagnosticsSignedInteger(value) {
+  if (!Number.isSafeInteger(value)) throw new Error('conversation_backend_history_diagnostics_response_invalid');
+  return value;
+}
+
 export function validateAndSanitizeBackendHistoryDiagnostics(value) {
   const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
-  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels']);
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels']);
   if (value.attempted !== true) invalid();
 
   validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
@@ -524,10 +577,53 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
     validateBackendHistoryDiagnosticsCount(value.exclusionCounts[key])
   ]));
 
+  const validateContentAnchorProbe = (probe) => {
+    validateBackendHistoryDiagnosticsKeys(probe, BACKEND_HISTORY_DIAGNOSTIC_CONTENT_ANCHOR_KEYS);
+    const matches = probe.matches;
+    if (!Array.isArray(matches) || matches.length < 1 || matches.length > 32) invalid();
+    const sanitizedMatches = matches.map((match) => {
+      validateBackendHistoryDiagnosticsKeys(match, BACKEND_HISTORY_DIAGNOSTIC_CONTENT_MATCH_KEYS);
+      return {
+        expectedIndex: validateBackendHistoryDiagnosticsIndex(match.expectedIndex),
+        matchCount: validateBackendHistoryDiagnosticsCount(match.matchCount),
+        uniqueMatchIndex: match.uniqueMatchIndex === null ? null : validateBackendHistoryDiagnosticsIndex(match.uniqueMatchIndex),
+        deltaFromExpected: match.deltaFromExpected === null ? null : validateBackendHistoryDiagnosticsSignedInteger(match.deltaFromExpected)
+      };
+    });
+    for (let index = 1; index < sanitizedMatches.length; index += 1) {
+      if (sanitizedMatches[index].expectedIndex <= sanitizedMatches[index - 1].expectedIndex) invalid();
+    }
+    for (const match of sanitizedMatches) {
+      const unique = match.matchCount === 1;
+      if ((match.uniqueMatchIndex !== null) !== unique || (match.deltaFromExpected !== null) !== unique) invalid();
+      if (unique && match.deltaFromExpected !== match.uniqueMatchIndex - match.expectedIndex) invalid();
+    }
+    const allPresent = sanitizedMatches.every((match) => match.matchCount > 0);
+    const allUnique = sanitizedMatches.every((match) => match.matchCount === 1);
+    const ordered = allUnique && sanitizedMatches.every((match, index) => index === 0 || match.uniqueMatchIndex > sanitizedMatches[index - 1].uniqueMatchIndex);
+    const exactExpectedIndices = allUnique && sanitizedMatches.every((match) => match.uniqueMatchIndex === match.expectedIndex);
+    const expectedGap = sanitizedMatches.length === 2 ? sanitizedMatches[1].expectedIndex - sanitizedMatches[0].expectedIndex : null;
+    const resolvedGap = sanitizedMatches.length === 2 && allUnique
+      ? sanitizedMatches[1].uniqueMatchIndex - sanitizedMatches[0].uniqueMatchIndex
+      : null;
+    if (probe.allPresent !== allPresent || probe.allUnique !== allUnique || probe.ordered !== ordered ||
+        probe.exactExpectedIndices !== exactExpectedIndices || probe.expectedGap !== expectedGap || probe.resolvedGap !== resolvedGap) invalid();
+    return {
+      allPresent,
+      allUnique,
+      ordered,
+      exactExpectedIndices,
+      matches: sanitizedMatches,
+      expectedGap,
+      resolvedGap
+    };
+  };
+
   const validateAlignment = (alignment) => {
-    const keys = alignment && Object.prototype.hasOwnProperty.call(alignment, 'legacyAnchorProbe')
-      ? [...BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS, 'legacyAnchorProbe']
-      : [...BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS];
+    const optionalKeys = [];
+    if (alignment && Object.prototype.hasOwnProperty.call(alignment, 'legacyAnchorProbe')) optionalKeys.push('legacyAnchorProbe');
+    if (alignment && Object.prototype.hasOwnProperty.call(alignment, 'contentAnchorProbe')) optionalKeys.push('contentAnchorProbe');
+    const keys = [...BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS, ...optionalKeys];
     validateBackendHistoryDiagnosticsKeys(alignment, keys);
     const sanitized = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_ALIGNMENT_KEYS.map((key) => [
       key,
@@ -541,11 +637,44 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
         validateBackendHistoryDiagnosticsBoolean(alignment.legacyAnchorProbe[key])
       ]));
     }
+    if (keys.includes('contentAnchorProbe')) sanitized.contentAnchorProbe = validateContentAnchorProbe(alignment.contentAnchorProbe);
+    return sanitized;
+  };
+
+  const validateBranchShape = (shape) => {
+    const keys = ['currentNodeField', 'currentNodePresent', 'messageIdCount', 'parentLinkField', 'messagesWithParentLink', 'parentLinksResolvable', 'parentLinksMissingTarget', 'currentNodeFound', 'currentPathResolved', 'currentPathMessageCount', 'currentPathCycleDetected', 'currentPathMissingParent'];
+    validateBackendHistoryDiagnosticsKeys(shape, keys);
+    if (!BACKEND_HISTORY_DIAGNOSTIC_BRANCH_SHAPE_ENUMS.currentNodeField.includes(shape.currentNodeField) ||
+        !BACKEND_HISTORY_DIAGNOSTIC_BRANCH_SHAPE_ENUMS.parentLinkField.includes(shape.parentLinkField)) invalid();
+    const sanitized = {
+      currentNodeField: shape.currentNodeField,
+      currentNodePresent: validateBackendHistoryDiagnosticsBoolean(shape.currentNodePresent),
+      messageIdCount: validateBackendHistoryDiagnosticsCount(shape.messageIdCount),
+      parentLinkField: shape.parentLinkField,
+      messagesWithParentLink: validateBackendHistoryDiagnosticsCount(shape.messagesWithParentLink),
+      parentLinksResolvable: validateBackendHistoryDiagnosticsCount(shape.parentLinksResolvable),
+      parentLinksMissingTarget: validateBackendHistoryDiagnosticsCount(shape.parentLinksMissingTarget),
+      currentNodeFound: validateBackendHistoryDiagnosticsBoolean(shape.currentNodeFound),
+      currentPathResolved: validateBackendHistoryDiagnosticsBoolean(shape.currentPathResolved),
+      currentPathMessageCount: validateBackendHistoryDiagnosticsCount(shape.currentPathMessageCount),
+      currentPathCycleDetected: validateBackendHistoryDiagnosticsBoolean(shape.currentPathCycleDetected),
+      currentPathMissingParent: validateBackendHistoryDiagnosticsBoolean(shape.currentPathMissingParent)
+    };
+    if (sanitized.parentLinksResolvable + sanitized.parentLinksMissingTarget > sanitized.messagesWithParentLink ||
+        sanitized.messageIdCount < sanitized.currentPathMessageCount ||
+        sanitized.currentNodeFound && !sanitized.currentNodePresent ||
+        sanitized.currentPathResolved && (!sanitized.currentNodePresent || !sanitized.currentNodeFound || sanitized.currentPathCycleDetected || sanitized.currentPathMissingParent)) invalid();
     return sanitized;
   };
 
   validateBackendHistoryDiagnosticsKeys(value.models, BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES);
   const models = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => [name, validateAlignment(value.models[name])]));
+
+  let branchModels = null;
+  if (value.branchModels !== null) {
+    validateBackendHistoryDiagnosticsKeys(value.branchModels, BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES);
+    branchModels = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => [name, validateAlignment(value.branchModels[name])]));
+  }
 
   const validateGroup = (group) => {
     validateBackendHistoryDiagnosticsKeys(group, BACKEND_HISTORY_DIAGNOSTIC_GROUP_KEYS);
@@ -565,7 +694,9 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
     }];
   }));
 
-  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels };
+  const branchShape = validateBranchShape(value.branchShape);
+  if (branchShape.currentPathResolved !== (branchModels !== null)) invalid();
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -2364,7 +2495,7 @@ export function startHttpApi({
 
       if (url.pathname === '/conversation/backend-history-diagnostics' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 32_768 });
-        const requestKeys = new Set(['tabId', 'key', 'timeoutMs', 'historyTimeoutMs', 'tailMaxTurns', 'legacyAnchorProbe']);
+        const requestKeys = new Set(['tabId', 'key', 'timeoutMs', 'historyTimeoutMs', 'tailMaxTurns', 'legacyAnchorProbe', 'contentAnchorProbe']);
         if (body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).some((key) => !requestKeys.has(key))) {
           throw new Error('conversation_backend_history_diagnostics_limits_invalid');
         }
@@ -2387,7 +2518,8 @@ export function startHttpApi({
         const historyTimeoutMs = strictPositiveIntOr(body.historyTimeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'conversation_backend_history_diagnostics_limits_invalid');
         const tailMaxTurns = strictPositiveIntOr(body.tailMaxTurns, 100, 100, 'conversation_backend_history_diagnostics_limits_invalid');
         const legacyAnchorProbe = validateBackendHistoryDiagnosticsProbe(body.legacyAnchorProbe);
-        const diagnostics = await controller.readConversationBackendHistoryDiagnostics({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe });
+        const contentAnchorProbe = validateBackendHistoryContentAnchorProbe(body.contentAnchorProbe);
+        const diagnostics = await controller.readConversationBackendHistoryDiagnostics({ timeoutMs, historyTimeoutMs, tailMaxTurns, legacyAnchorProbe, contentAnchorProbe });
         const safeDiagnostics = validateAndSanitizeBackendHistoryDiagnostics(diagnostics);
         return sendJson(res, 200, { ok: true, tabId: tab.id, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_CONVERSATION_BACKEND_HISTORY_DIAGNOSTICS_RESPONSE_BYTES });
       }

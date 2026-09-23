@@ -568,7 +568,7 @@ function validateBackendHistoryDiagnosticsSignedInteger(value) {
 
 export function validateAndSanitizeBackendHistoryDiagnostics(value) {
   const invalid = () => { throw new Error('conversation_backend_history_diagnostics_response_invalid'); };
-  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels']);
+  validateBackendHistoryDiagnosticsKeys(value, ['attempted', 'backend', 'dom', 'backendBuckets', 'exclusionCounts', 'models', 'groupedModels', 'branchShape', 'branchModels', 'singularMapping', 'singularBranchModels', 'singularAnchorTopology']);
   if (value.attempted !== true) invalid();
 
   validateBackendHistoryDiagnosticsKeys(value.backend, ['complete', 'pageCount', 'totalBackendMessageCount', 'terminalOldestReached']);
@@ -774,7 +774,65 @@ export function validateAndSanitizeBackendHistoryDiagnostics(value) {
     singularBranchModels = Object.fromEntries(BACKEND_HISTORY_DIAGNOSTIC_MODEL_NAMES.map((name) => [name, validateAlignment(value.singularBranchModels[name])]));
   }
   if (singularMapping.currentPathResolved !== (singularBranchModels !== null)) invalid();
-  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels };
+
+  let singularAnchorTopology = null;
+  if (value.singularAnchorTopology !== null) {
+    const topology = value.singularAnchorTopology;
+    validateBackendHistoryDiagnosticsKeys(topology, ['mappingNodeCount', 'currentPathNodeCount', 'offPathNodeCount', 'selectedUserTurns']);
+    const mappingNodeCount = validateBackendHistoryDiagnosticsCount(topology.mappingNodeCount);
+    const currentPathNodeCount = validateBackendHistoryDiagnosticsCount(topology.currentPathNodeCount);
+    const offPathNodeCount = validateBackendHistoryDiagnosticsCount(topology.offPathNodeCount);
+    if (!singularMapping.currentPathResolved || mappingNodeCount !== singularMapping.mappingNodeCount || currentPathNodeCount !== singularMapping.currentPathNodeCount || currentPathNodeCount > mappingNodeCount || offPathNodeCount !== mappingNodeCount - currentPathNodeCount || !Array.isArray(topology.selectedUserTurns) || topology.selectedUserTurns.length < 1 || topology.selectedUserTurns.length > 32) invalid();
+    const locationKeys = ['currentExtractorMatchCount', 'stringPartsNewlineMatchCount', 'stringPartsBlanklineMatchCount', 'recursivePartsNewlineMatchCount', 'recursivePartsBlanklineMatchCount'];
+    const selectedUserTurns = topology.selectedUserTurns.map((item) => {
+      validateBackendHistoryDiagnosticsKeys(item, ['expectedIndex', 'currentPath', 'offPath', 'allMapping', 'uniqueOffPathMatch']);
+      const expectedIndex = validateBackendHistoryDiagnosticsIndex(item.expectedIndex);
+      const validateLocation = (location, nodeCount) => {
+        validateBackendHistoryDiagnosticsKeys(location, locationKeys);
+        return Object.fromEntries(locationKeys.map((key) => {
+          const count = validateBackendHistoryDiagnosticsCount(location[key]);
+          if (count > nodeCount) invalid();
+          return [key, count];
+        }));
+      };
+      const currentPath = validateLocation(item.currentPath, singularMapping.currentPathMessageCount);
+      const offPath = validateLocation(item.offPath, offPathNodeCount);
+      const allMapping = validateLocation(item.allMapping, mappingNodeCount);
+      for (const key of locationKeys) if (currentPath[key] + offPath[key] !== allMapping[key]) invalid();
+      const match = item.uniqueOffPathMatch;
+      if (match?.found === false) {
+        validateBackendHistoryDiagnosticsKeys(match, ['found']);
+        return { expectedIndex, currentPath, offPath, allMapping, uniqueOffPathMatch: { found: false } };
+      }
+      validateBackendHistoryDiagnosticsKeys(match, ['found', 'role', 'contentTypeBucket', 'visibleByCurrentFilter', 'recipientNonAll', 'visuallyHidden', 'isCompleteFalse', 'aggregateResult', 'command', 'toolCall', 'toolCalls', 'endTurn', 'parentOnCurrentPath', 'childOnCurrentPathCount', 'siblingOnCurrentPathCount']);
+      if (match.found !== true || match.role !== 'user' && match.role !== 'assistant' && match.role !== 'other' || !BACKEND_HISTORY_DIAGNOSTIC_BUCKET_NAMES.includes(match.contentTypeBucket) || !['true', 'false', 'missing'].includes(match.endTurn)) invalid();
+      const safeMatch = {
+        found: true,
+        role: match.role,
+        contentTypeBucket: match.contentTypeBucket,
+        visibleByCurrentFilter: validateBackendHistoryDiagnosticsBoolean(match.visibleByCurrentFilter),
+        recipientNonAll: validateBackendHistoryDiagnosticsBoolean(match.recipientNonAll),
+        visuallyHidden: validateBackendHistoryDiagnosticsBoolean(match.visuallyHidden),
+        isCompleteFalse: validateBackendHistoryDiagnosticsBoolean(match.isCompleteFalse),
+        aggregateResult: validateBackendHistoryDiagnosticsBoolean(match.aggregateResult),
+        command: validateBackendHistoryDiagnosticsBoolean(match.command),
+        toolCall: validateBackendHistoryDiagnosticsBoolean(match.toolCall),
+        toolCalls: validateBackendHistoryDiagnosticsBoolean(match.toolCalls),
+        endTurn: match.endTurn,
+        parentOnCurrentPath: validateBackendHistoryDiagnosticsBoolean(match.parentOnCurrentPath),
+        childOnCurrentPathCount: validateBackendHistoryDiagnosticsCount(match.childOnCurrentPathCount),
+        siblingOnCurrentPathCount: validateBackendHistoryDiagnosticsCount(match.siblingOnCurrentPathCount)
+      };
+      const visibleByCurrentFilter = safeMatch.role === 'user' && !safeMatch.recipientNonAll && !safeMatch.visuallyHidden && !safeMatch.isCompleteFalse && !safeMatch.aggregateResult && !safeMatch.command && !safeMatch.toolCall && !safeMatch.toolCalls;
+      if (safeMatch.role !== 'user' || safeMatch.visibleByCurrentFilter !== visibleByCurrentFilter || safeMatch.childOnCurrentPathCount > currentPathNodeCount || safeMatch.siblingOnCurrentPathCount > currentPathNodeCount || !locationKeys.some((key) => offPath[key] > 0) || locationKeys.some((key) => offPath[key] > 1)) invalid();
+      return { expectedIndex, currentPath, offPath, allMapping, uniqueOffPathMatch: safeMatch };
+    });
+    for (let index = 1; index < selectedUserTurns.length; index += 1) if (selectedUserTurns[index].expectedIndex <= selectedUserTurns[index - 1].expectedIndex) invalid();
+    const expected = models.CURRENT.contentAnchorProbe?.matches;
+    if (!expected || expected.length !== selectedUserTurns.length || expected.some((match, index) => match.expectedIndex !== selectedUserTurns[index].expectedIndex)) invalid();
+    singularAnchorTopology = { mappingNodeCount, currentPathNodeCount, offPathNodeCount, selectedUserTurns };
+  }
+  return { attempted: true, backend, dom, backendBuckets, exclusionCounts, models, groupedModels, branchShape, branchModels, singularMapping, singularBranchModels, singularAnchorTopology };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {

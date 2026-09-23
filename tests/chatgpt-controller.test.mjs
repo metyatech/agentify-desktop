@@ -6965,6 +6965,7 @@ test('chatgpt-controller: actual visibility diagnostics satisfy the server group
       'exclusionCounts',
       'groupedModels',
       'models',
+      'singularAnchorTopology',
       'singularBranchModels',
       'singularMapping'
     ]);
@@ -7258,6 +7259,73 @@ test('chatgpt-controller: singular authenticated mapping diagnostic reuses sessi
     ...contentAnchorProbe.selectedUserTurns.map((turn) => turn.contentDigest),
     legacyAnchorProbe.reviewResponseDigest, legacyAnchorProbe.answerTranscriptSha256
   ]) assert.equal(serialized.includes(secret), false);
+});
+
+test('chatgpt-controller: singular anchor topology localizes selected content to unique off-path nodes without exposing raw data', async () => {
+  const targetText = 'off-path-user-content-private-sentinel';
+  const contentDigest = crypto.createHash('sha256').update(JSON.stringify({ role: 'user', text: targetText }), 'utf8').digest('hex');
+  const buildAndRead = async ({ currentMatch = false, offCopies = 1, hidden = true } = {}) => {
+    const pathUserText = currentMatch ? targetText : 'current-user-not-selected';
+    const mapping = {
+      'node-root-private': { id: 'node-root-private', parent: null, children: ['node-current-user-private', 'node-old-user-private'], message: null },
+      'node-current-user-private': { id: 'node-current-user-private', parent: 'node-root-private', children: ['node-current-assistant-private'], message: { id: 'message-current-user-private', author: { role: 'user' }, content: { content_type: 'text', parts: [pathUserText] } } },
+      'node-current-assistant-private': { id: 'node-current-assistant-private', parent: 'node-current-user-private', children: ['node-replacement-private'], message: { id: 'message-current-assistant-private', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['current assistant private text'] } } },
+      'node-replacement-private': { id: 'node-replacement-private', parent: 'node-current-assistant-private', children: [], message: { id: 'message-replacement-private', author: { role: 'user' }, content: { content_type: 'text', parts: ['replacement current user'] } } },
+      'node-old-user-private': { id: 'node-old-user-private', parent: 'node-root-private', children: ['node-current-assistant-private'], message: {
+        id: 'message-old-user-private', author: { role: 'user' }, recipient: hidden ? 'python' : 'all', end_turn: false,
+        content: { content_type: hidden ? 'secret_reasoning_unknown_xyz' : 'text', parts: [offCopies > 0 ? targetText : 'off-path-unrelated-content'] },
+        ...(hidden ? { metadata: { is_visually_hidden_from_conversation: true, is_complete: false } } : {})
+      } },
+      'node-side-assistant-private': { id: 'node-side-assistant-private', parent: 'node-root-private', children: [], message: { id: 'message-side-assistant-private', author: { role: 'assistant' }, content: { content_type: 'text', parts: ['unrelated side content'] } } },
+      'node-side-empty-private': { id: 'node-side-empty-private', parent: 'node-root-private', children: [], message: null }
+    };
+    const addDuplicate = offCopies > 1;
+    if (addDuplicate) mapping['node-old-user-duplicate-private'] = { id: 'node-old-user-duplicate-private', parent: 'node-root-private', children: [], message: { ...mapping['node-old-user-private'].message, id: 'message-old-user-duplicate-private' } };
+    const fixture = createBackendDiagnosticPage({
+      backendResponses: [{ responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: false } }) }],
+      singularResponse: { status: 200, responseText: JSON.stringify({ conversation_id: 'backend-diagnostic-test', current_node: 'node-replacement-private', mapping }) }
+    });
+    const result = await createController(fixture.page).readConversationBackendHistoryDiagnostics({
+      contentAnchorProbe: { selectedUserTurns: [{ expectedIndex: 33, contentDigest }] }
+    });
+    return { result, fixture };
+  };
+
+  const { result, fixture } = await buildAndRead();
+  assert.deepEqual(JSON.parse(JSON.stringify(result.singularAnchorTopology)), {
+    mappingNodeCount: 7,
+    currentPathNodeCount: 4,
+    offPathNodeCount: 3,
+    selectedUserTurns: [{
+      expectedIndex: 33,
+      currentPath: { currentExtractorMatchCount: 0, stringPartsNewlineMatchCount: 0, stringPartsBlanklineMatchCount: 0, recursivePartsNewlineMatchCount: 0, recursivePartsBlanklineMatchCount: 0 },
+      offPath: { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 },
+      allMapping: { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 },
+      uniqueOffPathMatch: { found: true, role: 'user', contentTypeBucket: 'unknown', visibleByCurrentFilter: false, recipientNonAll: true, visuallyHidden: true, isCompleteFalse: true, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'false', parentOnCurrentPath: true, childOnCurrentPathCount: 1, siblingOnCurrentPathCount: 1 }
+    }]
+  });
+  assert.equal(fixture.singularCalls.length, 1);
+  const producerJson = JSON.parse(JSON.stringify(result));
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(producerJson), producerJson);
+  const safe = JSON.stringify(result);
+  for (const secret of [targetText, contentDigest, 'node-', 'message-', 'secret_reasoning_unknown_xyz', 'session-access-token-sentinel']) assert.equal(safe.includes(secret), false, secret);
+
+  const pathOnly = await buildAndRead({ currentMatch: true, offCopies: 0 });
+  const pathOnlyLocation = pathOnly.result.singularAnchorTopology.selectedUserTurns[0];
+  assert.equal(pathOnlyLocation.currentPath.currentExtractorMatchCount, 1);
+  assert.equal(pathOnlyLocation.offPath.currentExtractorMatchCount, 0);
+  assert.equal(pathOnlyLocation.allMapping.currentExtractorMatchCount, 1);
+  assert.equal(pathOnlyLocation.uniqueOffPathMatch.found, false);
+
+  const duplicate = await buildAndRead({ offCopies: 2 });
+  const duplicateLocation = duplicate.result.singularAnchorTopology.selectedUserTurns[0];
+  assert.equal(duplicateLocation.offPath.currentExtractorMatchCount, 2);
+  assert.equal(duplicateLocation.uniqueOffPathMatch.found, false);
+
+  const absent = await buildAndRead({ offCopies: 0 });
+  const absentLocation = absent.result.singularAnchorTopology.selectedUserTurns[0];
+  assert.equal(absentLocation.offPath.currentExtractorMatchCount, 0);
+  assert.equal(absentLocation.uniqueOffPathMatch.found, false);
 });
 
 test('chatgpt-controller: singular mapping diagnostic reduces transport and graph failures to fixed safe values', async () => {

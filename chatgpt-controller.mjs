@@ -792,7 +792,8 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
       branchShape: { currentNodeField: 'none', currentNodePresent: false, messageIdCount: 0, parentLinkField: 'none', messagesWithParentLink: 0, parentLinksResolvable: 0, parentLinksMissingTarget: 0, currentNodeFound: false, currentPathResolved: false, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingParent: false },
       branchModels: null,
       singularMapping: { attempted: false, httpStatus: null, httpOk: false, contentTypeJson: false, jsonParsed: false, rootObject: false, responseConversationIdPresent: false, responseConversationIdMatchesUrl: false, mappingPresent: false, mappingObject: false, mappingNodeCount: 0, currentNodePresent: false, currentNodeFound: false, currentPathResolved: false, currentPathNodeCount: 0, currentPathMessageCount: 0, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' },
-      singularBranchModels: null
+      singularBranchModels: null,
+      singularAnchorTopology: null
     };
     const pageOrigin = String(location?.origin || '');
     const pathMatch = pageOrigin === 'https://chatgpt.com' ? /^\/c\/([^/]+)\/?$/u.exec(String(location?.pathname || '')) : null;
@@ -1337,6 +1338,106 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
                   for (const model of modelNames) {
                     const turns = turnsForMessages(orderedPathMessages, model).map((turn, index) => ({ ...turn, index }));
                     result.singularBranchModels[model] = { ...alignment(turns, domUnits), ...(anchorProbe ? { legacyAnchorProbe: await anchorCheck(turns) } : {}), ...(contentAnchorProbe ? { contentAnchorProbe: await contentAnchorCheck(turns) } : {}) };
+                  }
+                  if (contentAnchorProbe) {
+                    const currentPathIds = new Set(pathNodes.map((node) => typeof node.id === 'string' ? node.id.trim() : ''));
+                    currentPathIds.delete('');
+                    const currentPathSet = new Set(pathNodes);
+                    const mappingNodes = mappingKeys.map((key) => ({ key, node: mapping[key] }));
+                    const currentNodes = mappingNodes.filter(({ node }) => currentPathSet.has(node));
+                    const offPathNodes = mappingNodes.filter(({ node }) => !currentPathSet.has(node));
+                    const allNodes = mappingNodes;
+                    const partitionMessages = (nodes) => nodes.filter(({ node }) => node.message !== null && node.message && typeof node.message === 'object' && !Array.isArray(node.message)).map(({ node }) => node.message);
+                    const currentMessages = partitionMessages(currentNodes);
+                    const offPathMessages = partitionMessages(offPathNodes);
+                    const allMessages = partitionMessages(allNodes);
+                    const roleBucket = (message) => {
+                      const role = message?.author?.role;
+                      return role === 'user' || role === 'assistant' ? role : 'other';
+                    };
+                    const extractorTexts = (message) => {
+                      const current = textFor(message, 'CURRENT');
+                      const strings = stringParts(message);
+                      const stringNl = normalizeText(strings.join('\n'));
+                      const stringBlank = normalizeText(strings.join('\n\n'));
+                      const recursive = recursiveParts(message?.content).length ? recursiveParts(message.content) : recursiveParts(message);
+                      return {
+                        currentExtractor: current,
+                        stringPartsNewline: stringNl,
+                        stringPartsBlankline: stringBlank,
+                        recursivePartsNewline: normalizeText(recursive.join('\n')),
+                        recursivePartsBlankline: normalizeText(recursive.join('\n\n'))
+                      };
+                    };
+                    const locationAggregate = async (messages, expected) => {
+                      const counts = { currentExtractorMatchCount: 0, stringPartsNewlineMatchCount: 0, stringPartsBlanklineMatchCount: 0, recursivePartsNewlineMatchCount: 0, recursivePartsBlanklineMatchCount: 0 };
+                      for (const message of messages) {
+                        if (message?.author?.role !== 'user') continue;
+                        const texts = extractorTexts(message);
+                        for (const [field, text] of Object.entries(texts)) {
+                          const contentDigest = await digest(JSON.stringify({ role: 'user', text: normalizeText(text) }));
+                          if (contentDigest === expected.contentDigest) counts[field + 'MatchCount'] += 1;
+                        }
+                      }
+                      return counts;
+                    };
+                    const exclusionFlags = (message) => {
+                      const metadata = message?.metadata;
+                      return {
+                        recipientNonAll: Object.prototype.hasOwnProperty.call(message, 'recipient') && message.recipient !== null && message.recipient !== 'all',
+                        visuallyHidden: metadata?.is_visually_hidden_from_conversation === true,
+                        isCompleteFalse: metadata?.is_complete === false,
+                        aggregateResult: !!metadata?.aggregate_result,
+                        command: !!metadata?.command,
+                        toolCall: !!metadata?.tool_call,
+                        toolCalls: !!metadata?.tool_calls
+                      };
+                    };
+                    const topologySelectedUserTurns = [];
+                    for (const expected of contentAnchorProbe.selectedUserTurns) {
+                      const currentPath = await locationAggregate(currentMessages, expected);
+                      const offPath = await locationAggregate(offPathMessages, expected);
+                      const allMapping = await locationAggregate(allMessages, expected);
+                      const matchingOffPathNodes = [];
+                      for (const entry of offPathNodes) {
+                        const message = entry.node.message;
+                        if (!message || typeof message !== 'object' || Array.isArray(message) || message?.author?.role !== 'user') continue;
+                        const texts = extractorTexts(message);
+                        let matched = false;
+                        for (const text of Object.values(texts)) {
+                          if (await digest(JSON.stringify({ role: 'user', text: normalizeText(text) })) === expected.contentDigest) matched = true;
+                        }
+                        if (matched) matchingOffPathNodes.push(entry);
+                      }
+                      let uniqueOffPathMatch = { found: false };
+                      if (matchingOffPathNodes.length === 1) {
+                        const { key: nodeKey, node } = matchingOffPathNodes[0];
+                        const message = node.message;
+                        const parent = typeof node.parent === 'string' && node.parent.trim() ? node.parent.trim() : null;
+                        const children = Array.isArray(node.children) ? node.children : [];
+                        const childOnCurrentPathCount = new Set(children.filter((child) => typeof child === 'string' && currentPathIds.has(child.trim())).map((child) => child.trim())).size;
+                        const siblingOnCurrentPathCount = parent === null ? 0 : mappingNodes.filter((entry) => entry.key !== nodeKey && currentPathSet.has(entry.node) && typeof entry.node?.parent === 'string' && entry.node.parent.trim() === parent).length;
+                        const endTurn = typeof message.end_turn === 'boolean' ? String(message.end_turn) : 'missing';
+                        uniqueOffPathMatch = {
+                          found: true,
+                          role: roleBucket(message),
+                          contentTypeBucket: contentTypeBucket(message),
+                          visibleByCurrentFilter: isVisible(message, roleOf(message)),
+                          ...exclusionFlags(message),
+                          endTurn,
+                          parentOnCurrentPath: parent !== null && currentPathIds.has(parent),
+                          childOnCurrentPathCount,
+                          siblingOnCurrentPathCount
+                        };
+                      }
+                      topologySelectedUserTurns.push({ expectedIndex: expected.expectedIndex, currentPath, offPath, allMapping, uniqueOffPathMatch });
+                    }
+                    result.singularAnchorTopology = {
+                      mappingNodeCount: mappingKeys.length,
+                      currentPathNodeCount: pathNodes.length,
+                      offPathNodeCount: mappingKeys.length - pathNodes.length,
+                      selectedUserTurns: topologySelectedUserTurns
+                    };
                   }
                 }
               }

@@ -134,7 +134,8 @@ function validBackendHistoryDiagnostics({ withProbe = false, withContentProbe = 
       currentPathInvalidParent: false,
       failure: 'http'
     },
-    singularBranchModels: null
+    singularBranchModels: null,
+    singularAnchorTopology: null
   };
 }
 
@@ -183,7 +184,7 @@ test('http-api: backend history diagnostics validator accepts bounded singular m
     currentNodePresent: true,
     currentNodeFound: true,
     currentPathResolved: true,
-    currentPathNodeCount: 3,
+    currentPathNodeCount: 2,
     currentPathMessageCount: 2,
     currentPathCycleDetected: false,
     currentPathMissingNode: false,
@@ -191,10 +192,50 @@ test('http-api: backend history diagnostics validator accepts bounded singular m
     failure: 'none'
   };
   resolved.singularBranchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, resolved.models.CURRENT]));
+  resolved.singularAnchorTopology = {
+    mappingNodeCount: 3,
+    currentPathNodeCount: 2,
+    offPathNodeCount: 1,
+    selectedUserTurns: [{
+      expectedIndex: 2,
+      currentPath: { currentExtractorMatchCount: 0, stringPartsNewlineMatchCount: 0, stringPartsBlanklineMatchCount: 0, recursivePartsNewlineMatchCount: 0, recursivePartsBlanklineMatchCount: 0 },
+      offPath: { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 },
+      allMapping: { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 },
+      uniqueOffPathMatch: { found: true, role: 'user', contentTypeBucket: 'text', visibleByCurrentFilter: true, recipientNonAll: false, visuallyHidden: false, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'missing', parentOnCurrentPath: true, childOnCurrentPathCount: 0, siblingOnCurrentPathCount: 1 }
+    }]
+  };
   const sanitized = validateAndSanitizeBackendHistoryDiagnostics(resolved);
   assert.deepEqual(sanitized, resolved);
   assert.notStrictEqual(sanitized.singularMapping, resolved.singularMapping);
   assert.notStrictEqual(sanitized.singularBranchModels.CURRENT, resolved.singularBranchModels.CURRENT);
+  assert.notStrictEqual(sanitized.singularAnchorTopology.selectedUserTurns[0], resolved.singularAnchorTopology.selectedUserTurns[0]);
+});
+
+test('http-api: backend history diagnostics sanitizer validates and reconstructs singular anchor topology', () => {
+  const valid = validBackendHistoryDiagnostics({ withContentProbe: true });
+  valid.singularMapping = { attempted: true, httpStatus: 200, httpOk: true, contentTypeJson: true, jsonParsed: true, rootObject: true, responseConversationIdPresent: true, responseConversationIdMatchesUrl: true, mappingPresent: true, mappingObject: true, mappingNodeCount: 3, currentNodePresent: true, currentNodeFound: true, currentPathResolved: true, currentPathNodeCount: 2, currentPathMessageCount: 2, currentPathCycleDetected: false, currentPathMissingNode: false, currentPathInvalidParent: false, failure: 'none' };
+  valid.models.CURRENT.contentAnchorProbe = { allPresent: true, allUnique: true, ordered: true, exactExpectedIndices: true, matches: [{ expectedIndex: 2, matchCount: 1, uniqueMatchIndex: 2, deltaFromExpected: 0 }], expectedGap: null, resolvedGap: null };
+  valid.singularBranchModels = Object.fromEntries(backendHistoryDiagnosticModels.map((model) => [model, valid.models.CURRENT]));
+  const current = { currentExtractorMatchCount: 0, stringPartsNewlineMatchCount: 0, stringPartsBlanklineMatchCount: 0, recursivePartsNewlineMatchCount: 0, recursivePartsBlanklineMatchCount: 0 };
+  const off = { currentExtractorMatchCount: 1, stringPartsNewlineMatchCount: 1, stringPartsBlanklineMatchCount: 1, recursivePartsNewlineMatchCount: 1, recursivePartsBlanklineMatchCount: 1 };
+  valid.singularAnchorTopology = { mappingNodeCount: 3, currentPathNodeCount: 2, offPathNodeCount: 1, selectedUserTurns: [{ expectedIndex: 2, currentPath: current, offPath: off, allMapping: off, uniqueOffPathMatch: { found: true, role: 'user', contentTypeBucket: 'unknown', visibleByCurrentFilter: false, recipientNonAll: true, visuallyHidden: true, isCompleteFalse: false, aggregateResult: false, command: false, toolCall: false, toolCalls: false, endTurn: 'false', parentOnCurrentPath: true, childOnCurrentPathCount: 1, siblingOnCurrentPathCount: 1 } }] };
+  assert.deepEqual(validateAndSanitizeBackendHistoryDiagnostics(valid), valid);
+
+  const cases = [
+    ['extra nested topology field', (value) => { value.singularAnchorTopology.selectedUserTurns[0].uniqueOffPathMatch.secret = 'text-secret-sentinel'; }],
+    ['inconsistent node partition', (value) => { value.singularAnchorTopology.offPathNodeCount = 2; }],
+    ['location partition mismatch', (value) => { value.singularAnchorTopology.selectedUserTurns[0].allMapping.currentExtractorMatchCount = 2; }],
+    ['visibility mismatch', (value) => { value.singularAnchorTopology.selectedUserTurns[0].uniqueOffPathMatch.visibleByCurrentFilter = true; }],
+    ['expected index mismatch', (value) => { value.singularAnchorTopology.selectedUserTurns[0].expectedIndex = 3; }],
+    ['negative count', (value) => { value.singularAnchorTopology.selectedUserTurns[0].offPath.stringPartsNewlineMatchCount = -1; }]
+  ];
+  for (const [name, mutate] of cases) {
+    const value = structuredClone(valid);
+    mutate(value);
+    assert.throws(() => validateAndSanitizeBackendHistoryDiagnostics(value), /conversation_backend_history_diagnostics_response_invalid/u, name);
+  }
+  const withoutContent = validBackendHistoryDiagnostics();
+  assert.equal(validateAndSanitizeBackendHistoryDiagnostics(withoutContent).singularAnchorTopology, null);
 });
 
 test('http-api: backend history diagnostics validator rejects extra branch and content probe fields', () => {

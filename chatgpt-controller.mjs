@@ -1612,6 +1612,31 @@ function buildBackendConversationHistoryDiagnosticsScript({ timeoutMs, historyTi
   })()`;
 }
 
+function historicalAnchorQueryCandidatesSource() {
+  return String.raw`(sourceText, normalizeText) => {
+    const normalized = normalizeText(sourceText);
+    const points = Array.from(normalized);
+    const starts = points.length <= 80 ? [0] : [0, Math.floor((points.length - 80) / 2), points.length - 80];
+    const stopWords = new Set(['about', 'after', 'again', 'also', 'been', 'being', 'could', 'does', 'doing', 'from', 'have', 'hello', 'help', 'here', 'into', 'just', 'know', 'let', 'make', 'maybe', 'more', 'most', 'need', 'other', 'over', 'please', 'same', 'some', 'such', 'than', 'that', 'their', 'there', 'these', 'they', 'think', 'this', 'those', 'through', 'thanks', 'thank', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your']);
+    const minimumCjkNaturalLanguageChars = 12;
+    const queries = [];
+    const seen = new Set();
+    for (const start of starts) {
+      const query = points.slice(start, start + 80).join('').trim();
+      const terms = query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [];
+      const distinctive = terms.filter((term) => !stopWords.has(term));
+      const cjkChars = Array.from(query).filter((char) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(char)).length;
+      const hasEnoughNaturalLanguageSignal = distinctive.length >= 3 || cjkChars >= minimumCjkNaturalLanguageChars;
+      if (Array.from(query).length < 20 || Array.from(query).length > 80 || !/\p{L}/u.test(query) || !hasEnoughNaturalLanguageSignal || /(?:https?:\/\/|www\.)/iu.test(query) || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/iu.test(query)) continue;
+      if (seen.has(query)) continue;
+      seen.add(query);
+      queries.push(query);
+      if (queries.length === 3) break;
+    }
+    return queries;
+  }`;
+}
+
 function buildHistoricalAnchorSearchDiagnosticsScript({ timeoutMs, expectedConversationUrlHash, expectedConversationPath, anchorText }) {
   const maxResponseBytes = 1024 * 1024;
   return String.raw`(async () => {
@@ -1634,25 +1659,8 @@ function buildHistoricalAnchorSearchDiagnosticsScript({ timeoutMs, expectedConve
     try { conversationId = decodeURIComponent(conversationMatch[1]); } catch { fail('historical_anchor_search_binding_invalid'); }
     if (!conversationId) fail('historical_anchor_search_binding_invalid');
 
-    const normalized = normalizeText(sourceText);
-    const points = Array.from(normalized);
-    const starts = points.length <= 80 ? [0] : [0, Math.floor((points.length - 80) / 2), points.length - 80];
-    const stopWords = new Set(['about', 'after', 'again', 'also', 'been', 'being', 'could', 'does', 'doing', 'from', 'have', 'hello', 'help', 'here', 'into', 'just', 'know', 'let', 'make', 'maybe', 'more', 'most', 'need', 'other', 'over', 'please', 'same', 'some', 'such', 'than', 'that', 'their', 'there', 'these', 'they', 'think', 'this', 'those', 'through', 'thanks', 'thank', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your']);
-    const minimumCjkNaturalLanguageChars = 12;
-    const queries = [];
-    const seen = new Set();
-    for (const start of starts) {
-      const query = points.slice(start, start + 80).join('').trim();
-      const terms = query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [];
-      const distinctive = terms.filter((term) => !stopWords.has(term));
-      const cjkChars = Array.from(query).filter((char) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(char)).length;
-      const hasEnoughNaturalLanguageSignal = distinctive.length >= 3 || cjkChars >= minimumCjkNaturalLanguageChars;
-      if (Array.from(query).length < 20 || Array.from(query).length > 80 || !/\p{L}/u.test(query) || !hasEnoughNaturalLanguageSignal || /(?:https?:\/\/|www\.)/iu.test(query) || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/iu.test(query)) continue;
-      if (seen.has(query)) continue;
-      seen.add(query);
-      queries.push(query);
-      if (queries.length === 3) break;
-    }
+    const generateQueries = ${historicalAnchorQueryCandidatesSource()};
+    const queries = generateQueries(sourceText, normalizeText);
     if (!queries.length) fail('historical_anchor_search_query_unavailable');
 
     const controller = new AbortController();
@@ -1747,6 +1755,308 @@ function buildHistoricalAnchorSearchDiagnosticsScript({ timeoutMs, expectedConve
     } finally {
       accessToken = null;
       clearTimeout(timeout);
+    }
+  })()`;
+}
+
+function buildHistoricalAnchorQueryOverlapDiagnosticsScript({ timeoutMs, expectedConversationUrlHash, expectedConversationPath, anchorText }) {
+  const sessionMaxBytes = 64 * 1024;
+  const pageMaxBytes = 20 * 1024 * 1024;
+  const singularMaxBytes = 64 * 1024 * 1024;
+  const totalMaxBytes = 64 * 1024 * 1024;
+  return String.raw`(async () => {
+    const timeoutMs = ${JSON.stringify(timeoutMs)};
+    const expectedUrlHash = ${JSON.stringify(expectedConversationUrlHash)};
+    const expectedPath = ${JSON.stringify(expectedConversationPath)};
+    const sourceText = ${JSON.stringify(anchorText)};
+    const sessionMaxBytes = ${JSON.stringify(sessionMaxBytes)};
+    const pageMaxBytes = ${JSON.stringify(pageMaxBytes)};
+    const singularMaxBytes = ${JSON.stringify(singularMaxBytes)};
+    const totalMaxBytes = ${JSON.stringify(totalMaxBytes)};
+    const maxPages = ${JSON.stringify(MAX_BACKEND_CONVERSATION_HISTORY_PAGES)};
+    const fail = (code) => { throw new Error(code); };
+    const normalizeText = (value) => String(value || '').replace(/\u0000/g, '').replace(/\r\n?/gu, '\n').split('\n').map((line) => line.replace(/[ \t]+$/u, '')).join('\n').trim();
+    const generateQueries = ${historicalAnchorQueryCandidatesSource()};
+    const queries = generateQueries(sourceText, normalizeText);
+    if (queries.length < 1 || queries.length > 3) fail('historical_anchor_query_overlap_query_unavailable');
+
+    const currentUrl = String(location.href || '');
+    let parsedUrl;
+    try { parsedUrl = new URL(currentUrl); } catch { fail('historical_anchor_query_overlap_binding_invalid'); }
+    const urlBytes = new TextEncoder().encode(currentUrl);
+    const currentHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', urlBytes)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    if (currentHash !== expectedUrlHash || parsedUrl.origin !== 'https://chatgpt.com' || parsedUrl.pathname !== expectedPath) fail('historical_anchor_query_overlap_binding_invalid');
+    const pathMatch = /^\/c\/([^/?#]+)$/u.exec(parsedUrl.pathname);
+    if (!pathMatch) fail('historical_anchor_query_overlap_binding_invalid');
+    let conversationId;
+    try { conversationId = decodeURIComponent(pathMatch[1]); } catch { fail('historical_anchor_query_overlap_binding_invalid'); }
+    if (!conversationId) fail('historical_anchor_query_overlap_binding_invalid');
+
+    const startedAt = Date.now();
+    const deadline = () => Date.now() - startedAt <= timeoutMs;
+    const abortController = new AbortController();
+    const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+    let accessToken = null;
+    try {
+      const readBoundedText = async (response, limit) => {
+        let declared = null;
+        try {
+          const rawLength = response?.headers?.get?.('content-length');
+          const parsedLength = rawLength === null || rawLength === undefined || rawLength === '' ? null : Number(rawLength);
+          if (Number.isSafeInteger(parsedLength) && parsedLength >= 0) declared = parsedLength;
+        } catch {}
+        if (declared !== null && declared > limit) throw new Error('historical_anchor_query_overlap_too_large');
+        const reader = response?.body?.getReader?.();
+        if (!reader) throw new Error('historical_anchor_query_overlap_stream_unavailable');
+        const decoder = new TextDecoder();
+        const chunks = [];
+        let bytes = 0;
+        const readWithDeadline = async () => {
+          if (abortController.signal.aborted || !deadline()) throw new Error('historical_anchor_query_overlap_timeout');
+          let onAbort;
+          const aborted = new Promise((_, reject) => {
+            onAbort = () => reject(new Error('historical_anchor_query_overlap_timeout'));
+            abortController.signal.addEventListener('abort', onAbort, { once: true });
+          });
+          try { return await Promise.race([reader.read(), aborted]); }
+          finally { abortController.signal.removeEventListener('abort', onAbort); }
+        };
+        try {
+          while (true) {
+            const item = await readWithDeadline();
+            if (item.done) break;
+            const chunk = item.value instanceof Uint8Array ? item.value : new Uint8Array(item.value);
+            bytes += chunk.byteLength;
+            if (bytes > limit) throw new Error('historical_anchor_query_overlap_too_large');
+            chunks.push(decoder.decode(chunk, { stream: true }));
+          }
+          chunks.push(decoder.decode());
+          return { text: chunks.join(''), bytes };
+        } catch (error) {
+          try { await reader.cancel(); } catch {}
+          if (error?.message === 'historical_anchor_query_overlap_too_large' || error?.message === 'historical_anchor_query_overlap_timeout') throw error;
+          throw new Error('historical_anchor_query_overlap_stream_unavailable');
+        }
+      };
+      const readJson = async (url, limit, failureCode) => {
+        let response;
+        try {
+          response = await fetch(url, {
+            method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
+            headers: { Accept: 'application/json', Authorization: 'Bearer ' + accessToken },
+            signal: abortController.signal
+          });
+        } catch { fail(failureCode); }
+        if (!response?.ok) fail(failureCode);
+        let contentType = '';
+        try { contentType = String(response.headers?.get?.('content-type') || ''); } catch {}
+        if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(contentType)) fail(failureCode);
+        let bounded;
+        try { bounded = await readBoundedText(response, limit); }
+        catch (error) {
+          if (error?.message === 'historical_anchor_query_overlap_too_large' || error?.message === 'historical_anchor_query_overlap_timeout') throw error;
+          throw new Error(failureCode);
+        }
+        let body;
+        try { body = JSON.parse(bounded.text); } catch { fail(failureCode); }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || (Object.getPrototypeOf(body) !== Object.prototype && Object.getPrototypeOf(body) !== null)) fail(failureCode);
+        return { body, bytes: bounded.bytes };
+      };
+
+      const sessionResponse = await fetch('/api/auth/session', {
+        method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error',
+        headers: { Accept: 'application/json' }, signal: abortController.signal
+      }).catch(() => null);
+      if (!sessionResponse?.ok) fail('historical_anchor_query_overlap_session_failed');
+      let sessionType = '';
+      try { sessionType = String(sessionResponse.headers?.get?.('content-type') || ''); } catch {}
+      if (!/(^|;)\s*application\/(?:json|[^;]+\+json)\b/iu.test(sessionType)) fail('historical_anchor_query_overlap_session_failed');
+      let sessionBounded;
+      try { sessionBounded = await readBoundedText(sessionResponse, sessionMaxBytes); }
+      catch { fail('historical_anchor_query_overlap_session_failed'); }
+      let session;
+      try { session = JSON.parse(sessionBounded.text); } catch { fail('historical_anchor_query_overlap_session_failed'); }
+      if (!session || typeof session !== 'object' || Array.isArray(session) || typeof session.accessToken !== 'string' || !session.accessToken.trim() || session.accessToken.length > 16 * 1024) fail('historical_anchor_query_overlap_session_failed');
+      accessToken = session.accessToken;
+      session = null;
+
+      const singular = await readJson('/backend-api/conversation/' + encodeURIComponent(conversationId), singularMaxBytes, 'historical_anchor_query_overlap_singular_failed');
+      let totalBackendBytes = singular.bytes;
+      if (totalBackendBytes > totalMaxBytes) fail('historical_anchor_query_overlap_too_large');
+      const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+      const plain = (value) => !!value && typeof value === 'object' && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+      const readAlias = (object, snake, camel) => {
+        const hasSnake = own(object, snake);
+        const hasCamel = own(object, camel);
+        const normalize = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+        const snakeValue = hasSnake ? normalize(object[snake]) : null;
+        const camelValue = hasCamel ? normalize(object[camel]) : null;
+        if (hasSnake && hasCamel && snakeValue !== camelValue) return { present: snakeValue !== null || camelValue !== null, conflict: true, value: null };
+        if (hasSnake && hasCamel && (snakeValue === null || camelValue === null)) return { present: false, conflict: true, value: null };
+        return { present: snakeValue !== null || camelValue !== null, conflict: false, value: hasSnake ? snakeValue : camelValue };
+      };
+      const responseId = readAlias(singular.body, 'conversation_id', 'conversationId');
+      if (responseId.conflict || !responseId.present || responseId.value !== conversationId || !own(singular.body, 'mapping') || !plain(singular.body.mapping)) fail('historical_anchor_query_overlap_singular_failed');
+      const mapping = singular.body.mapping;
+      const currentAlias = readAlias(singular.body, 'current_node', 'currentNode');
+      if (currentAlias.conflict || !currentAlias.present) fail('historical_anchor_query_overlap_singular_failed');
+      const entries = Object.entries(mapping).map(([key, node]) => ({ key, node }));
+      const nodesById = new Map();
+      for (const entry of entries) {
+        if (!plain(entry.node) || typeof entry.node.id !== 'string' || !entry.node.id.trim()) continue;
+        const id = entry.node.id.trim();
+        if (!nodesById.has(id)) nodesById.set(id, []);
+        nodesById.get(id).push(entry);
+      }
+      const currentMatches = nodesById.get(currentAlias.value) || [];
+      if (!own(mapping, currentAlias.value) || currentMatches.length !== 1 || currentMatches[0].key !== currentAlias.value || mapping[currentAlias.value] !== currentMatches[0].node) fail('historical_anchor_query_overlap_singular_failed');
+      const currentPathNodes = [];
+      const visited = new Set();
+      let nodeId = currentAlias.value;
+      let reachedRoot = false;
+      while (nodeId !== null) {
+        if (visited.has(nodeId)) fail('historical_anchor_query_overlap_singular_failed');
+        visited.add(nodeId);
+        const matches = nodesById.get(nodeId) || [];
+        if (matches.length !== 1 || matches[0].key !== nodeId || !own(mapping, nodeId)) fail('historical_anchor_query_overlap_singular_failed');
+        const node = matches[0].node;
+        if (!own(node, 'message') || !own(node, 'parent')) fail('historical_anchor_query_overlap_singular_failed');
+        if (node.message !== null && !plain(node.message)) fail('historical_anchor_query_overlap_singular_failed');
+        currentPathNodes.push(node);
+        if (node.parent === null) { reachedRoot = true; break; }
+        if (typeof node.parent !== 'string' || !node.parent.trim()) fail('historical_anchor_query_overlap_singular_failed');
+        const parentId = node.parent.trim();
+        const parents = nodesById.get(parentId) || [];
+        if (!own(mapping, parentId) || parents.length !== 1 || parents[0].key !== parentId || mapping[parentId] !== parents[0].node) fail('historical_anchor_query_overlap_singular_failed');
+        nodeId = parentId;
+      }
+      if (!reachedRoot) fail('historical_anchor_query_overlap_singular_failed');
+
+      const recursiveParts = (value, depth = 0) => {
+        if (depth > 20 || value === null || value === undefined) return [];
+        if (typeof value === 'string') return [value];
+        if (Array.isArray(value)) return value.flatMap((item) => recursiveParts(item, depth + 1));
+        if (typeof value !== 'object') return [];
+        const out = [];
+        if (typeof value.text === 'string') out.push(value.text);
+        if (typeof value.content === 'string') out.push(value.content);
+        if (typeof value.value === 'string') out.push(value.value);
+        if (Array.isArray(value.parts)) out.push(...recursiveParts(value.parts, depth + 1));
+        if (Array.isArray(value.content)) out.push(...recursiveParts(value.content, depth + 1));
+        return out;
+      };
+      const stringParts = (message) => Array.isArray(message?.content?.parts) ? message.content.parts.filter((part) => typeof part === 'string') : [];
+      const messageRepresentations = (message) => {
+        const contentRecursive = recursiveParts(message?.content);
+        const current = normalizeText((contentRecursive.length ? contentRecursive : recursiveParts(message)).join('\n'));
+        const direct = stringParts(message);
+        const recursive = contentRecursive.length ? contentRecursive : recursiveParts(message);
+        return [current, normalizeText(direct.join('\n')), normalizeText(direct.join('\n\n')), normalizeText(recursive.join('\n')), normalizeText(recursive.join('\n\n'))];
+      };
+      const roleMatches = (message) => message?.author?.role === 'user' || message?.author?.role === 'assistant';
+      const messageMatches = (message, query) => roleMatches(message) && messageRepresentations(message).some((text) => text.includes(query));
+      const currentPathSet = new Set(currentPathNodes);
+      const offPathNodes = entries.filter(({ node }) => !currentPathSet.has(node));
+      const allMappingNodes = entries;
+      const nodeMessages = (nodes) => nodes.filter(({ node }) => node?.message !== null && plain(node?.message) && roleMatches(node.message));
+      const currentPathMessages = nodeMessages(currentPathNodes.map((node) => ({ node })));
+      const offPathMessages = nodeMessages(offPathNodes);
+      const allMappingMessages = nodeMessages(allMappingNodes);
+      if (currentPathMessages.length + offPathMessages.length !== allMappingMessages.length) fail('historical_anchor_query_overlap_singular_failed');
+
+      const parsePageInfo = (candidate) => {
+        if (!plain(candidate)) fail('historical_anchor_query_overlap_plural_failed');
+        const hasSnake = own(candidate, 'has_previous_page');
+        const hasCamel = own(candidate, 'hasPreviousPage');
+        if (!hasSnake && !hasCamel) fail('historical_anchor_query_overlap_plural_failed');
+        if ((hasSnake && typeof candidate.has_previous_page !== 'boolean') || (hasCamel && typeof candidate.hasPreviousPage !== 'boolean')) fail('historical_anchor_query_overlap_plural_failed');
+        if (hasSnake && hasCamel && candidate.has_previous_page !== candidate.hasPreviousPage) fail('historical_anchor_query_overlap_plural_failed');
+        const hasPreviousPage = hasSnake ? candidate.has_previous_page : candidate.hasPreviousPage;
+        const normalizeCursor = (value) => { if (value === null) return null; if (typeof value !== 'string') fail('historical_anchor_query_overlap_plural_failed'); return value.trim(); };
+        const hasSnakeCursor = own(candidate, 'start_cursor');
+        const hasCamelCursor = own(candidate, 'startCursor');
+        const snakeCursor = hasSnakeCursor ? normalizeCursor(candidate.start_cursor) : null;
+        const camelCursor = hasCamelCursor ? normalizeCursor(candidate.startCursor) : null;
+        if (hasSnakeCursor && hasCamelCursor && snakeCursor !== camelCursor) fail('historical_anchor_query_overlap_plural_failed');
+        const startCursor = hasSnakeCursor ? snakeCursor : camelCursor;
+        if (hasPreviousPage && !startCursor) fail('historical_anchor_query_overlap_plural_failed');
+        return { hasPreviousPage, startCursor };
+      };
+      const parsePage = (body) => {
+        if (!Array.isArray(body.messages)) fail('historical_anchor_query_overlap_plural_failed');
+        const hasSnake = own(body, 'page_info');
+        const hasCamel = own(body, 'pageInfo');
+        if (!hasSnake && !hasCamel) fail('historical_anchor_query_overlap_plural_failed');
+        const snakeInfo = hasSnake ? parsePageInfo(body.page_info) : null;
+        const camelInfo = hasCamel ? parsePageInfo(body.pageInfo) : null;
+        if (snakeInfo && camelInfo && (snakeInfo.hasPreviousPage !== camelInfo.hasPreviousPage || snakeInfo.startCursor !== camelInfo.startCursor)) fail('historical_anchor_query_overlap_plural_failed');
+        return snakeInfo || camelInfo;
+      };
+      const seenCursors = new Set();
+      const seenMessageIds = new Map();
+      const pluralMessages = [];
+      let cursor = null;
+      let hasPreviousPage = true;
+      let pageCount = 0;
+      while (hasPreviousPage) {
+        if (pageCount >= maxPages) fail('historical_anchor_query_overlap_plural_failed');
+        if (cursor !== null) {
+          if (seenCursors.has(cursor)) fail('historical_anchor_query_overlap_plural_failed');
+          seenCursors.add(cursor);
+        }
+        const pagePath = '/backend-api/conversations/' + encodeURIComponent(conversationId)
+          + (cursor === null ? '?include_has_versions=true&num_turns=100' : '/messages?before=' + encodeURIComponent(cursor) + '&include_has_versions=true&num_turns=100');
+        const page = await readJson(pagePath, pageMaxBytes, 'historical_anchor_query_overlap_plural_failed');
+        totalBackendBytes += page.bytes;
+        if (totalBackendBytes > totalMaxBytes) fail('historical_anchor_query_overlap_too_large');
+        const responseConversationId = page.body.conversation_id ?? page.body.conversationId;
+        if (responseConversationId !== undefined && responseConversationId !== conversationId) fail('historical_anchor_query_overlap_plural_failed');
+        const pageInfo = parsePage(page.body);
+        for (const message of page.body.messages) {
+          if (!plain(message)) fail('historical_anchor_query_overlap_plural_failed');
+          const idValue = message.id ?? message.message_id;
+          const id = typeof idValue === 'string' && idValue.trim() ? idValue.trim() : null;
+          if (!id) fail('historical_anchor_query_overlap_plural_failed');
+          const signature = JSON.stringify({ role: typeof message?.author?.role === 'string' ? message.author.role : null, message });
+          const prior = seenMessageIds.get(id);
+          if (prior !== undefined) {
+            if (prior !== signature) fail('historical_anchor_query_overlap_plural_failed');
+            continue;
+          }
+          seenMessageIds.set(id, signature);
+          pluralMessages.push(message);
+        }
+        pageCount += 1;
+        hasPreviousPage = pageInfo.hasPreviousPage;
+        cursor = hasPreviousPage ? pageInfo.startCursor : null;
+      }
+
+      const resultQueries = queries.map((query, ordinal) => {
+        const pluralMessageMatchCount = pluralMessages.reduce((count, message) => count + (messageMatches(message, query) ? 1 : 0), 0);
+        const singularCurrentPathNodeMatchCount = currentPathMessages.reduce((count, entry) => count + (messageMatches(entry.node.message, query) ? 1 : 0), 0);
+        const singularOffPathNodeMatchCount = offPathMessages.reduce((count, entry) => count + (messageMatches(entry.node.message, query) ? 1 : 0), 0);
+        const singularAllMappingNodeMatchCount = allMappingMessages.reduce((count, entry) => count + (messageMatches(entry.node.message, query) ? 1 : 0), 0);
+        if (singularCurrentPathNodeMatchCount + singularOffPathNodeMatchCount !== singularAllMappingNodeMatchCount) fail('historical_anchor_query_overlap_plural_failed');
+        return {
+          ordinal,
+          pluralMessageMatchCount,
+          singularCurrentPathNodeMatchCount,
+          singularOffPathNodeMatchCount,
+          singularAllMappingNodeMatchCount,
+          currentBackendMatch: pluralMessageMatchCount > 0 || singularAllMappingNodeMatchCount > 0
+        };
+      });
+      const anyCurrentBackendMatch = resultQueries.some((query) => query.currentBackendMatch);
+      return {
+        attempted: true,
+        queryCount: resultQueries.length,
+        queries: resultQueries,
+        anyCurrentBackendMatch,
+        allQueriesAbsentFromCurrentBackend: !anyCurrentBackendMatch
+      };
+    } finally {
+      accessToken = null;
+      clearTimeout(timeoutHandle);
     }
   })()`;
 }
@@ -8335,6 +8645,29 @@ export class ChatGPTController {
       throw new Error('historical_anchor_search_request_invalid');
     }
     return await this.runExclusive(async () => await this.#eval(buildHistoricalAnchorSearchDiagnosticsScript({
+      timeoutMs: boundedTimeoutMs,
+      expectedConversationUrlHash,
+      expectedConversationPath,
+      anchorText: anchorProbe.text
+    })));
+  }
+
+  async readHistoricalAnchorQueryOverlapDiagnostics({
+    timeoutMs = MAX_CONVERSATION_HISTORY_TIMEOUT_MS,
+    expectedConversationUrlHash,
+    expectedConversationPath,
+    anchorProbe
+  } = {}) {
+    const boundedTimeoutMs = Number(timeoutMs);
+    if (!Number.isSafeInteger(boundedTimeoutMs) || boundedTimeoutMs < 1_000 || boundedTimeoutMs > MAX_CONVERSATION_HISTORY_TIMEOUT_MS ||
+        typeof expectedConversationUrlHash !== 'string' || !/^[0-9a-f]{64}$/u.test(expectedConversationUrlHash) ||
+        typeof expectedConversationPath !== 'string' || !/^\/c\/[^/?#]+$/u.test(expectedConversationPath) ||
+        !anchorProbe || typeof anchorProbe !== 'object' || Array.isArray(anchorProbe) ||
+        Object.keys(anchorProbe).length !== 2 || Object.keys(anchorProbe).some((key) => !['role', 'text'].includes(key)) ||
+        anchorProbe.role !== 'user' || typeof anchorProbe.text !== 'string' || !anchorProbe.text.trim() || Buffer.byteLength(anchorProbe.text, 'utf8') > 128 * 1024) {
+      throw new Error('historical_anchor_query_overlap_request_invalid');
+    }
+    return await this.runExclusive(async () => await this.#eval(buildHistoricalAnchorQueryOverlapDiagnosticsScript({
       timeoutMs: boundedTimeoutMs,
       expectedConversationUrlHash,
       expectedConversationPath,

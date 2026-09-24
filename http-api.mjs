@@ -449,6 +449,14 @@ export function mapErrorToHttp(error) {
   if (msg === 'historical_anchor_search_binding_invalid') return { code: 409, body: { error: 'historical_anchor_search_binding_invalid' } };
   if (msg === 'historical_anchor_search_session_failed') return { code: 502, body: { error: 'historical_anchor_search_session_failed' } };
   if (msg === 'historical_anchor_search_query_unavailable') return { code: 422, body: { error: 'historical_anchor_search_query_unavailable' } };
+  if (msg === 'historical_anchor_query_overlap_request_invalid') return { code: 400, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_response_invalid') return { code: 500, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_controller_unavailable') return { code: 409, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_binding_invalid') return { code: 409, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_query_unavailable') return { code: 422, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_session_failed' || msg === 'historical_anchor_query_overlap_singular_failed' || msg === 'historical_anchor_query_overlap_plural_failed' || msg === 'historical_anchor_query_overlap_stream_unavailable') return { code: 502, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_timeout') return { code: 504, body: { error: msg } };
+  if (msg === 'historical_anchor_query_overlap_too_large') return { code: 413, body: { error: msg } };
   if (msg === 'conversation_turn_limits_invalid') return { code: 400, body: { error: 'conversation_turn_limits_invalid' } };
   if (msg === 'conversation_turn_too_large' || msg === 'conversation_too_large') return { code: 413, body: { error: msg, data: error?.data || null } };
   if (msg === 'missing_key') return { code: 400, body: { error: 'missing_key' } };
@@ -997,6 +1005,30 @@ export function validateAndSanitizeHistoricalAnchorSearchDiagnostics(value) {
       bool(value.allSuccessfulQueriesMatchExpectedConversation) !== allSuccessfulQueriesMatchExpectedConversation ||
       bool(value.uniqueExpectedConversationAcrossSuccessfulQueries) !== uniqueExpectedConversationAcrossSuccessfulQueries) invalid();
   return { attempted: true, endpointAvailable: successful.length > 0, queryCount: queries.length, queries, anyExpectedConversationMatch, allSuccessfulQueriesMatchExpectedConversation, uniqueExpectedConversationAcrossSuccessfulQueries };
+}
+
+export function validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics(value) {
+  const invalid = () => { throw new Error('historical_anchor_query_overlap_response_invalid'); };
+  const exact = (object, keys) => isPlainBackendHistoryDiagnosticsObject(object) && Object.keys(object).length === keys.length && keys.every((key) => Object.hasOwn(object, key));
+  const bool = (item) => { if (typeof item !== 'boolean') invalid(); return item; };
+  const count = (item) => { if (!Number.isSafeInteger(item) || item < 0 || item > 1_000_000) invalid(); return item; };
+  const keys = ['attempted', 'queryCount', 'queries', 'anyCurrentBackendMatch', 'allQueriesAbsentFromCurrentBackend'];
+  if (!exact(value, keys) || value.attempted !== true || !Number.isSafeInteger(value.queryCount) || value.queryCount < 1 || value.queryCount > 3 || !Array.isArray(value.queries) || value.queries.length !== value.queryCount) invalid();
+  const queries = value.queries.map((query, ordinal) => {
+    if (!exact(query, ['ordinal', 'pluralMessageMatchCount', 'singularCurrentPathNodeMatchCount', 'singularOffPathNodeMatchCount', 'singularAllMappingNodeMatchCount', 'currentBackendMatch']) || query.ordinal !== ordinal) invalid();
+    const pluralMessageMatchCount = count(query.pluralMessageMatchCount);
+    const singularCurrentPathNodeMatchCount = count(query.singularCurrentPathNodeMatchCount);
+    const singularOffPathNodeMatchCount = count(query.singularOffPathNodeMatchCount);
+    const singularAllMappingNodeMatchCount = count(query.singularAllMappingNodeMatchCount);
+    const currentBackendMatch = bool(query.currentBackendMatch);
+    if (singularCurrentPathNodeMatchCount + singularOffPathNodeMatchCount !== singularAllMappingNodeMatchCount ||
+        currentBackendMatch !== (pluralMessageMatchCount > 0 || singularAllMappingNodeMatchCount > 0)) invalid();
+    return { ordinal, pluralMessageMatchCount, singularCurrentPathNodeMatchCount, singularOffPathNodeMatchCount, singularAllMappingNodeMatchCount, currentBackendMatch };
+  });
+  const anyCurrentBackendMatch = queries.some((query) => query.currentBackendMatch);
+  const allQueriesAbsentFromCurrentBackend = queries.every((query) => !query.currentBackendMatch);
+  if (bool(value.anyCurrentBackendMatch) !== anyCurrentBackendMatch || bool(value.allQueriesAbsentFromCurrentBackend) !== allQueriesAbsentFromCurrentBackend) invalid();
+  return { attempted: true, queryCount: queries.length, queries, anyCurrentBackendMatch, allQueriesAbsentFromCurrentBackend };
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -2852,6 +2884,37 @@ export function startHttpApi({
           anchorProbe: body.anchorProbe
         });
         const safeDiagnostics = validateAndSanitizeHistoricalAnchorSearchDiagnostics(diagnostics);
+        return sendJson(res, 200, { ok: true, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_HISTORICAL_ANCHOR_SEARCH_RESPONSE_BYTES });
+      }
+
+      if (url.pathname === '/conversation/historical-anchor-query-overlap-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: MAX_HISTORICAL_ANCHOR_SEARCH_TEXT_BYTES + 16_384 });
+        const allowedKeys = ['tabId', 'key', 'timeoutMs', 'expectedConversationUrlHash', 'expectedConversationPath', 'anchorProbe'];
+        const invalid = () => { throw new Error('historical_anchor_query_overlap_request_invalid'); };
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !allowedKeys.includes(key))) invalid();
+        const requestedTabId = typeof body.tabId === 'string' ? body.tabId.trim() : '';
+        const requestedKey = typeof body.key === 'string' ? body.key.trim() : '';
+        if (!requestedTabId && !requestedKey || requestedTabId && requestedKey) invalid();
+        if (typeof body.expectedConversationUrlHash !== 'string' || !/^[0-9a-f]{64}$/u.test(body.expectedConversationUrlHash) ||
+            typeof body.expectedConversationPath !== 'string' || !/^\/c\/[^/?#]+$/u.test(body.expectedConversationPath) ||
+            !body.anchorProbe || typeof body.anchorProbe !== 'object' || Array.isArray(body.anchorProbe) ||
+            Object.keys(body.anchorProbe).length !== 2 || Object.keys(body.anchorProbe).some((key) => !['role', 'text'].includes(key)) ||
+            body.anchorProbe.role !== 'user' || typeof body.anchorProbe.text !== 'string' || !body.anchorProbe.text.trim() ||
+            Buffer.byteLength(body.anchorProbe.text, 'utf8') > MAX_HISTORICAL_ANCHOR_SEARCH_TEXT_BYTES) invalid();
+        const listed = Array.isArray(tabs.listTabs?.()) ? tabs.listTabs() : [];
+        const matches = requestedTabId ? listed.filter((tab) => tab?.id === requestedTabId) : listed.filter((tab) => tab?.key === requestedKey);
+        if (matches.length !== 1) throw new Error('tab_not_found');
+        const tab = matches[0];
+        if (tab.vendorId !== 'chatgpt') throw new Error('chatgpt_tab_required');
+        const controller = tabs.getControllerById(tab.id);
+        if (typeof controller?.readHistoricalAnchorQueryOverlapDiagnostics !== 'function') throw new Error('historical_anchor_query_overlap_controller_unavailable');
+        const diagnostics = await controller.readHistoricalAnchorQueryOverlapDiagnostics({
+          timeoutMs: strictPositiveIntOr(body.timeoutMs, DEFAULT_CONVERSATION_HISTORY_TIMEOUT_MS, MAX_CONVERSATION_HISTORY_TIMEOUT_MS, 'historical_anchor_query_overlap_request_invalid'),
+          expectedConversationUrlHash: body.expectedConversationUrlHash,
+          expectedConversationPath: body.expectedConversationPath,
+          anchorProbe: body.anchorProbe
+        });
+        const safeDiagnostics = validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics(diagnostics);
         return sendJson(res, 200, { ok: true, vendorId: 'chatgpt', diagnostics: safeDiagnostics }, { maxBytes: MAX_HISTORICAL_ANCHOR_SEARCH_RESPONSE_BYTES });
       }
 

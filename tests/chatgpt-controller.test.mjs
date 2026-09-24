@@ -7838,6 +7838,126 @@ test('chatgpt-controller: historical anchor search supports bounded deterministi
   }
 });
 
+test('chatgpt-controller: search and backend-overlap diagnostics share deterministic CJK query ordinals', async () => {
+  const pathname = '/c/overlap-diagnostic-test';
+  const expectedHash = crypto.createHash('sha256').update(`https://chatgpt.com${pathname}`, 'utf8').digest('hex');
+  const cjk = Array.from('あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも');
+  const anchorText = Array.from({ length: 200 }, (_, index) => cjk[index % cjk.length]).join('');
+  const searchFixture = createBackendDiagnosticPage({
+    pathname,
+    searchResponses: Array.from({ length: 3 }, () => ({ responseText: JSON.stringify({ items: [] }) }))
+  });
+  await createController(searchFixture.page).readHistoricalAnchorSearchDiagnostics({
+    timeoutMs: 5_000,
+    expectedConversationUrlHash: expectedHash,
+    expectedConversationPath: pathname,
+    anchorProbe: { role: 'user', text: anchorText }
+  });
+  const generatedQueries = searchFixture.searchCalls.map((call) => new URL(`https://chatgpt.com${call.url}`).searchParams.get('query'));
+  assert.equal(generatedQueries.length, 3);
+
+  const mapping = {
+    'root-private-id': { id: 'root-private-id', parent: null, message: null },
+    'current-private-id': {
+      id: 'current-private-id', parent: 'root-private-id',
+      message: { author: { role: 'user' }, content: { content_type: 'text', parts: [generatedQueries[0], 'separator', generatedQueries[0]] } }
+    },
+    'offpath-private-id': {
+      id: 'offpath-private-id', parent: 'root-private-id',
+      message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: [generatedQueries[1]] } }
+    }
+  };
+  const duplicatePluralMessage = { id: 'plural-duplicate-private-id', author: { role: 'user' }, content: { content_type: 'text', parts: [generatedQueries[2]] } };
+  const fixture = createBackendDiagnosticPage({
+    pathname,
+    singularResponse: { responseText: JSON.stringify({ conversation_id: 'overlap-diagnostic-test', current_node: 'current-private-id', mapping }) },
+    backendResponses: [
+      { responseText: JSON.stringify({ messages: [duplicatePluralMessage], page_info: { has_previous_page: true, start_cursor: 'overlap-cursor-private' } }) },
+      { responseText: JSON.stringify({ messages: [duplicatePluralMessage, { id: 'plural-unique-private-id', author: { role: 'assistant' }, content: { parts: [generatedQueries[1]] } }], page_info: { has_previous_page: false } }) }
+    ]
+  });
+  const result = await createController(fixture.page).readHistoricalAnchorQueryOverlapDiagnostics({
+    timeoutMs: 5_000,
+    expectedConversationUrlHash: expectedHash,
+    expectedConversationPath: pathname,
+    anchorProbe: { role: 'user', text: anchorText }
+  });
+  assert.equal(fixture.allCalls.filter((call) => call.url === '/api/auth/session').length, 1);
+  assert.equal(fixture.singularCalls.length, 1);
+  assert.equal(fixture.calls.length, 2);
+  assert.equal(fixture.searchCalls.length, 0);
+  assert.equal(fixture.calls[0].url, '/backend-api/conversations/overlap-diagnostic-test?include_has_versions=true&num_turns=100');
+  assert.equal(new URL(`https://chatgpt.com${fixture.calls[1].url}`).searchParams.get('before'), 'overlap-cursor-private');
+  for (const call of [...fixture.singularCalls, ...fixture.calls]) {
+    assert.equal(call.options.method, 'GET');
+    assert.equal(call.options.credentials, 'include');
+    assert.equal(call.options.cache, 'no-store');
+    assert.equal(call.options.redirect, 'error');
+    assert.equal(call.options.headers.Accept, 'application/json');
+    assert.equal(call.options.headers.Authorization, 'Bearer session-access-token-sentinel');
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    attempted: true,
+    queryCount: 3,
+    queries: [
+      { ordinal: 0, pluralMessageMatchCount: 0, singularCurrentPathNodeMatchCount: 1, singularOffPathNodeMatchCount: 0, singularAllMappingNodeMatchCount: 1, currentBackendMatch: true },
+      { ordinal: 1, pluralMessageMatchCount: 1, singularCurrentPathNodeMatchCount: 0, singularOffPathNodeMatchCount: 1, singularAllMappingNodeMatchCount: 1, currentBackendMatch: true },
+      { ordinal: 2, pluralMessageMatchCount: 1, singularCurrentPathNodeMatchCount: 0, singularOffPathNodeMatchCount: 0, singularAllMappingNodeMatchCount: 0, currentBackendMatch: true }
+    ],
+    anyCurrentBackendMatch: true,
+    allQueriesAbsentFromCurrentBackend: false
+  });
+  const serialized = JSON.stringify(result);
+  for (const secret of [anchorText, ...generatedQueries, 'current-private-id', 'offpath-private-id', 'plural-duplicate-private-id', 'overlap-cursor-private', 'session-access-token-sentinel']) assert.equal(serialized.includes(secret), false);
+  assert.equal(fixture.state.responseTextCalled, false);
+});
+
+test('chatgpt-controller: backend-overlap reports absence safely and rejects bad binding, pagination cycles, and oversized data', async () => {
+  const pathname = '/c/overlap-negative-test';
+  const expectedHash = crypto.createHash('sha256').update(`https://chatgpt.com${pathname}`, 'utf8').digest('hex');
+  const anchorText = 'DISTINCTIVE ORCHARD CHECKPOINT LATTICE VERIFIES DIAGNOSTIC QUERY PROVENANCE ACROSS CURRENT PAGES.';
+  const emptyMapping = {
+    'root-private': { id: 'root-private', parent: null, message: null },
+    'current-private': { id: 'current-private', parent: 'root-private', message: { author: { role: 'assistant' }, content: { content_type: 'text', parts: [anchorText.toLowerCase()] } } }
+  };
+  const absent = createBackendDiagnosticPage({
+    pathname,
+    singularResponse: { responseText: JSON.stringify({ conversation_id: 'overlap-negative-test', current_node: 'current-private', mapping: emptyMapping }) },
+    backendResponses: [{ responseText: JSON.stringify({ messages: [{ id: 'unrelated-plural-id', author: { role: 'user' }, content: { content_type: 'text', parts: [anchorText.toLowerCase()] } }], page_info: { has_previous_page: false } }) }]
+  });
+  const absentResult = await createController(absent.page).readHistoricalAnchorQueryOverlapDiagnostics({ expectedConversationUrlHash: expectedHash, expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } });
+  assert.equal(absentResult.queryCount, 3);
+  assert.equal(absentResult.queries.every((query) => !query.currentBackendMatch), true);
+  assert.equal(absentResult.anyCurrentBackendMatch, false);
+  assert.equal(absentResult.allQueriesAbsentFromCurrentBackend, true);
+
+  const mismatch = createBackendDiagnosticPage({ pathname });
+  await assert.rejects(() => createController(mismatch.page).readHistoricalAnchorQueryOverlapDiagnostics({ expectedConversationUrlHash: '0'.repeat(64), expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } }), /historical_anchor_query_overlap_binding_invalid/u);
+  assert.equal(mismatch.allCalls.length, 0);
+
+  const cycle = createBackendDiagnosticPage({
+    pathname,
+    singularResponse: { responseText: JSON.stringify({ conversation_id: 'overlap-negative-test', current_node: 'current-private', mapping: emptyMapping }) },
+    backendResponses: [
+      { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'cycle-private-cursor' } }) },
+      { responseText: JSON.stringify({ messages: [], page_info: { has_previous_page: true, start_cursor: 'cycle-private-cursor' } }) }
+    ]
+  });
+  await assert.rejects(() => createController(cycle.page).readHistoricalAnchorQueryOverlapDiagnostics({ expectedConversationUrlHash: expectedHash, expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } }), /historical_anchor_query_overlap_plural_failed/u);
+  assert.equal(cycle.calls.length, 2);
+  assert.equal(cycle.searchCalls.length, 0);
+
+  const oversized = createBackendDiagnosticPage({
+    pathname,
+    singularResponse: { status: 200, contentLength: String(64 * 1024 * 1024 + 1), responseText: '{}' }
+  });
+  await assert.rejects(() => createController(oversized.page).readHistoricalAnchorQueryOverlapDiagnostics({ expectedConversationUrlHash: expectedHash, expectedConversationPath: pathname, anchorProbe: { role: 'user', text: anchorText } }), /historical_anchor_query_overlap_too_large/u);
+  assert.equal(oversized.singularCalls.length, 1);
+  assert.equal(oversized.calls.length, 0);
+  assert.equal(oversized.searchCalls.length, 0);
+  assert.equal(oversized.state.singularResponseTextCalled, false);
+});
+
 test('chatgpt-controller: singular mapping follows camel aliases, permits a null-message root, and excludes side branches', async () => {
   const mapping = {
     'root-private': { id: 'root-private', parent: null, message: null },

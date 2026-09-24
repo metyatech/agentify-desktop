@@ -555,6 +555,18 @@ snippet; query text, snippets, conversation IDs, tokens, and raw search items
 are not returned. This is diagnostic-only and does not modify conversation or
 history behavior.
 
+To compare those exact generated search candidates with currently retrievable
+backend content without issuing another search, use the authenticated
+`POST /conversation/historical-anchor-query-overlap-diagnostics` route with the
+same expected-conversation binding and USER `anchorProbe`. It fetches the
+authenticated normal singular mapping plus all bounded plural-history pages,
+then reports per-query counts of distinct matching plural messages and
+singular current-path/off-path nodes. It uses the same five fixed text
+representations and exact normalized substring matching; no query, text, ID,
+token, or raw backend response is returned. This route does not call the
+conversation-search endpoint, and it does not change backend-history or
+recovery behavior.
+
 For read-only browser visibility diagnostics without scrolling, use the
 authenticated endpoint:
 

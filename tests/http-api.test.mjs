@@ -5,7 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-import { mapErrorToHttp, startHttpApi, validateAndSanitizeBackendHistoryDiagnostics, validateAndSanitizeHistoricalAnchorSearchDiagnostics } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi, validateAndSanitizeBackendHistoryDiagnostics, validateAndSanitizeHistoricalAnchorSearchDiagnostics, validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics } from '../http-api.mjs';
 import { ChatGPTController } from '../chatgpt-controller.mjs';
 import { ChromeCdpBrowserBackend } from '../chrome-cdp-backend.mjs';
 
@@ -4929,6 +4929,54 @@ test('http-api: historical anchor search route scopes, validates, and returns on
   assert.equal(invalid.res.status, 400);
   assert.deepEqual(validateAndSanitizeHistoricalAnchorSearchDiagnostics(response.data.diagnostics), response.data.diagnostics);
   assert.throws(() => validateAndSanitizeHistoricalAnchorSearchDiagnostics({ ...response.data.diagnostics, secret: anchorText }), /historical_anchor_search_response_invalid/u);
+});
+
+test('http-api: historical anchor query overlap route binds a tab and returns exact safe counts only', async (t) => {
+  const calls = [];
+  const diagnostics = {
+    attempted: true,
+    queryCount: 2,
+    queries: [
+      { ordinal: 0, pluralMessageMatchCount: 1, singularCurrentPathNodeMatchCount: 1, singularOffPathNodeMatchCount: 0, singularAllMappingNodeMatchCount: 1, currentBackendMatch: true },
+      { ordinal: 1, pluralMessageMatchCount: 0, singularCurrentPathNodeMatchCount: 0, singularOffPathNodeMatchCount: 0, singularAllMappingNodeMatchCount: 0, currentBackendMatch: false }
+    ],
+    anyCurrentBackendMatch: true,
+    allQueriesAbsentFromCurrentBackend: false
+  };
+  const controller = { readHistoricalAnchorQueryOverlapDiagnostics: async (options) => { calls.push(options); return diagnostics; } };
+  const tabs = { listTabs: () => [{ id: 'overlap-tab-id-secret', key: 'review', vendorId: 'chatgpt' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 'overlap-tab-id-secret', serverId: 'sid-overlap-test', stateDir: '/tmp', getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const anchorText = 'overlap-anchor-text-secret-sentinel';
+  const response = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/historical-anchor-query-overlap-diagnostics',
+    body: { key: 'review', timeoutMs: 10_000, expectedConversationUrlHash: 'a'.repeat(64), expectedConversationPath: '/c/example', anchorProbe: { role: 'user', text: anchorText } }
+  });
+  assert.equal(response.res.status, 200);
+  assert.deepEqual(calls, [{ timeoutMs: 10_000, expectedConversationUrlHash: 'a'.repeat(64), expectedConversationPath: '/c/example', anchorProbe: { role: 'user', text: anchorText } }]);
+  assert.deepEqual(response.data.diagnostics, diagnostics);
+  assert.deepEqual(validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics(response.data.diagnostics), diagnostics);
+  const serialized = JSON.stringify(response.data);
+  for (const secret of [anchorText, 'overlap-tab-id-secret', 'query-private-sentinel', 'backend-text-private-sentinel']) assert.equal(serialized.includes(secret), false);
+
+  const invalid = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/conversation/historical-anchor-query-overlap-diagnostics',
+    body: { key: 'review', anchorProbe: { role: 'user', text: anchorText, query: 'query-private-sentinel' } }
+  });
+  assert.equal(invalid.res.status, 400);
+  assert.throws(() => validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics({ ...diagnostics, extra: 'private' }), /historical_anchor_query_overlap_response_invalid/u);
+  const impossible = structuredClone(diagnostics);
+  impossible.queries[0].singularOffPathNodeMatchCount = 1;
+  assert.throws(() => validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics(impossible), /historical_anchor_query_overlap_response_invalid/u);
+  const unknownNested = structuredClone(diagnostics);
+  unknownNested.queries[0].messageId = 'message-id-secret';
+  assert.throws(() => validateAndSanitizeHistoricalAnchorQueryOverlapDiagnostics(unknownNested), /historical_anchor_query_overlap_response_invalid/u);
 });
 
 test('http-api: backend conversation history is authenticated, bounded, and exposes only complete pagination output', async (t) => {

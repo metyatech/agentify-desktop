@@ -7771,6 +7771,73 @@ test('chatgpt-controller: historical anchor search keeps absent, duplicate, HTTP
   assert.equal(mismatch.allCalls.length, 0);
 });
 
+test('chatgpt-controller: historical anchor search supports bounded deterministic CJK queries without leaking text', async () => {
+  const pathname = '/c/japanese-search-test';
+  const expectedHash = crypto.createHash('sha256').update(`https://chatgpt.com${pathname}`, 'utf8').digest('hex');
+  const run = async (anchorText) => {
+    const fixture = createBackendDiagnosticPage({
+      pathname,
+      searchResponses: Array.from({ length: 3 }, () => ({ status: 200, responseText: JSON.stringify({ items: [] }) }))
+    });
+    const result = await createController(fixture.page).readHistoricalAnchorSearchDiagnostics({
+      timeoutMs: 5_000,
+      expectedConversationUrlHash: expectedHash,
+      expectedConversationPath: pathname,
+      anchorProbe: { role: 'user', text: anchorText }
+    });
+    const queries = fixture.searchCalls.map((call) => new URL(`https://chatgpt.com${call.url}`).searchParams.get('query'));
+    return { fixture, result, queries };
+  };
+
+  const japaneseAnchor = 'historical-anchor-日本語-secret-sentinel：選択された回答を検索するための自然な文章です。内容の一致だけを安全に確認します。';
+  const japanese = await run(japaneseAnchor);
+  assert.ok(japanese.queries.length >= 1);
+  assert.ok(japanese.queries.every((query) => query !== null && Array.from(query).length >= 20 && Array.from(query).length <= 80));
+  const japaneseSerialized = JSON.stringify(japanese.result);
+  assert.equal(japaneseSerialized.includes(japaneseAnchor), false);
+  assert.equal(japaneseSerialized.includes('日本語-secret-sentinel'), false);
+
+  const distinctCjk = Array.from('あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも');
+  const longJapanese = Array.from({ length: 200 }, (_, index) => distinctCjk[index % distinctCjk.length]).join('');
+  const longFirst = await run(longJapanese);
+  const longSecond = await run(longJapanese);
+  const expectedStarts = [0, 60, 120];
+  const expectedQueries = expectedStarts.map((start) => Array.from(longJapanese).slice(start, start + 80).join(''));
+  assert.equal(longFirst.queries.length <= 3, true);
+  assert.equal(longFirst.queries.length, 3);
+  assert.equal(longFirst.queries.every((query) => query !== null && Array.from(query).length >= 20 && Array.from(query).length <= 80), true);
+  assert.equal(longFirst.queries.every((query, index) => query === expectedQueries[index]), true);
+  assert.equal(longFirst.queries.every((query, index) => query === longSecond.queries[index]), true);
+
+  const duplicates = await run('あ'.repeat(81));
+  assert.equal(duplicates.queries.length, 1);
+
+  const mixed = await run('## 日本語の自然文でhistorical-anchor検索を確認します。 version42');
+  assert.equal(mixed.queries.length, 1);
+  assert.equal(mixed.fixture.searchCalls.length, 1);
+
+  const rejectedAnchors = [
+    'あ'.repeat(19),
+    `${'漢'.repeat(11)} this that have been with your other please`,
+    'https://example.example/path?ref=abc123456789',
+    '12345678-abcd-1234-abcd-1234567890ab'
+  ];
+  for (const anchorText of rejectedAnchors) {
+    const fixture = createBackendDiagnosticPage({ pathname, searchResponses: [] });
+    let caughtError;
+    await assert.rejects(() => createController(fixture.page).readHistoricalAnchorSearchDiagnostics({
+      expectedConversationUrlHash: expectedHash,
+      expectedConversationPath: pathname,
+      anchorProbe: { role: 'user', text: anchorText }
+    }), (error) => {
+      caughtError = error;
+      return error.message === 'historical_anchor_search_query_unavailable';
+    });
+    assert.equal(fixture.allCalls.length, 0);
+    assert.equal(caughtError.message.includes(anchorText), false);
+  }
+});
+
 test('chatgpt-controller: singular mapping follows camel aliases, permits a null-message root, and excludes side branches', async () => {
   const mapping = {
     'root-private': { id: 'root-private', parent: null, message: null },

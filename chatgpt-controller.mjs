@@ -1638,13 +1638,16 @@ function buildHistoricalAnchorSearchDiagnosticsScript({ timeoutMs, expectedConve
     const points = Array.from(normalized);
     const starts = points.length <= 80 ? [0] : [0, Math.floor((points.length - 80) / 2), points.length - 80];
     const stopWords = new Set(['about', 'after', 'again', 'also', 'been', 'being', 'could', 'does', 'doing', 'from', 'have', 'hello', 'help', 'here', 'into', 'just', 'know', 'let', 'make', 'maybe', 'more', 'most', 'need', 'other', 'over', 'please', 'same', 'some', 'such', 'than', 'that', 'their', 'there', 'these', 'they', 'think', 'this', 'those', 'through', 'thanks', 'thank', 'under', 'very', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your']);
+    const minimumCjkNaturalLanguageChars = 12;
     const queries = [];
     const seen = new Set();
     for (const start of starts) {
       const query = points.slice(start, start + 80).join('').trim();
       const terms = query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [];
       const distinctive = terms.filter((term) => !stopWords.has(term));
-      if (Array.from(query).length < 20 || Array.from(query).length > 80 || !/\p{L}/u.test(query) || distinctive.length < 3 || /(?:https?:\/\/|www\.)/iu.test(query) || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/iu.test(query)) continue;
+      const cjkChars = Array.from(query).filter((char) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(char)).length;
+      const hasEnoughNaturalLanguageSignal = distinctive.length >= 3 || cjkChars >= minimumCjkNaturalLanguageChars;
+      if (Array.from(query).length < 20 || Array.from(query).length > 80 || !/\p{L}/u.test(query) || !hasEnoughNaturalLanguageSignal || /(?:https?:\/\/|www\.)/iu.test(query) || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/iu.test(query)) continue;
       if (seen.has(query)) continue;
       seen.add(query);
       queries.push(query);
